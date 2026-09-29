@@ -1,6 +1,6 @@
 //! Host side of the K1 hash-chain build kernel.
 use crate::context::{GpuContext, pack_blocks};
-use gzc_core::config::{BLOCK_SIZE, HASH_BITS};
+use gzc_core::config::{BLOCK_SIZE, HASH_BITS, LOG2_BLOCK};
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
 
@@ -21,14 +21,24 @@ pub fn pred_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * 2 * BLOCK_SIZE as u64 * 4
 }
 
+/// Largest `n_blocks` one `ChainsKernel::record` call may take under `limits`: the data
+/// (n*BLOCK_SIZE + 4 bytes), head and pred buffers each fit one storage binding and one buffer,
+/// the dispatch fits `max_compute_workgroups_per_dimension`, and the kernel's u32 indices
+/// `(b*2+width) << HASH_BITS` and `(b*2+width) * BLOCK_SIZE` cannot wrap. 0 if one block doesn't fit.
+pub fn max_blocks_per_batch(limits: &wgpu::Limits) -> u32 {
+    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+    let by_data = limit.saturating_sub(4) / BLOCK_SIZE as u64;
+    let by_buffers = by_data.min(limit / head_bytes(1)).min(limit / pred_bytes(1));
+    let by_index = (1u64 << (32 - HASH_BITS.max(LOG2_BLOCK))) / 2;
+    by_buffers.min(by_index).min(limits.max_compute_workgroups_per_dimension as u64) as u32
+}
+
 /// Computes long and short hash chains for BLOCK_SIZE blocks on the GPU,
 /// splitting into as many K1 dispatches as device limits require.
 pub fn gpu_preds(ctx: &GpuContext, blocks: &[&[u8]]) -> anyhow::Result<Vec<Preds>> {
     let kernel = ChainsKernel::new(ctx);
-    let limits = ctx.device.limits();
-    let max_blocks = (limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / pred_bytes(1))
-        .min(limits.max_compute_workgroups_per_dimension as u64)
-        .max(1) as usize;
+    let max_blocks = max_blocks_per_batch(&ctx.device.limits()) as usize;
+    anyhow::ensure!(max_blocks > 0, "device limits too small for one K1 block");
 
     let mut out = Vec::with_capacity(blocks.len());
     for batch in blocks.chunks(max_blocks) {
@@ -93,6 +103,11 @@ impl ChainsKernel {
 
     /// data: packed blocks; head: n_blocks*2*2^HASH_BITS u32 (cleared by this call via encoder.clear_buffer);
     /// pred: n_blocks*2*BLOCK_SIZE u32, layout [block][width 0=long,1=short][pos]
+    ///
+    /// Precondition: `n_blocks <= max_blocks_per_batch(&ctx.device.limits())`. That keeps every
+    /// buffer within the binding/buffer limits, the dispatch within the workgroup limit, and
+    /// `n_blocks * 2 <= 2^(32 - max(HASH_BITS, LOG2_BLOCK))` so the shader's u32 head/pred
+    /// indices do not wrap.
     pub fn record(
         &self,
         ctx: &GpuContext,
@@ -119,5 +134,54 @@ impl ChainsKernel {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 2, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    fn limits(binding: u64, buffer: u64, wg: u32) -> wgpu::Limits {
+        wgpu::Limits {
+            max_storage_buffer_binding_size: binding,
+            max_buffer_size: buffer,
+            max_compute_workgroups_per_dimension: wg,
+            ..wgpu::Limits::default()
+        }
+    }
+
+    fn fits(n: u32, limit: u64) -> bool {
+        head_bytes(n) <= limit && pred_bytes(n) <= limit && n as u64 * BLOCK_SIZE as u64 + 4 <= limit
+    }
+
+    #[test]
+    fn batch_fits_every_buffer_at_default_limits() {
+        let n = max_blocks_per_batch(&limits(128 * MIB, 256 * MIB, 65535));
+        #[cfg(feature = "block-128k")]
+        assert_eq!(n, 128); // pred-bound: 1 MiB per block
+        #[cfg(feature = "block-16k")]
+        assert_eq!(n, 256); // head-bound: 512 KiB per block (pred is only 128 KiB)
+        assert!(fits(n, 128 * MIB) && !fits(n + 1, 128 * MIB));
+    }
+
+    #[test]
+    fn batch_respects_buffer_size_and_workgroup_cap() {
+        assert_eq!(max_blocks_per_batch(&limits(128 * MIB, 128 * MIB, 3)), 3);
+        let n = max_blocks_per_batch(&limits(u64::MAX, 4 * MIB, 65535));
+        assert!(n > 0 && fits(n, 4 * MIB) && !fits(n + 1, 4 * MIB));
+    }
+
+    #[test]
+    fn batch_keeps_u32_indices_in_range() {
+        // With unlimited buffers the cap keeps (b*2+width) << HASH_BITS and * BLOCK_SIZE in u32.
+        let n = max_blocks_per_batch(&limits(u64::MAX, u64::MAX, u32::MAX));
+        assert_eq!(n as u64 * 2, 1u64 << (32 - HASH_BITS.max(LOG2_BLOCK)));
+    }
+
+    #[test]
+    fn batch_is_zero_when_one_block_does_not_fit() {
+        assert_eq!(max_blocks_per_batch(&limits(256 * 1024, 256 * 1024, 65535)), 0);
     }
 }
