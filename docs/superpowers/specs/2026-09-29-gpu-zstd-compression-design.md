@@ -100,7 +100,10 @@ Parameters for the level-3 calibration: `min_match = 5`, hash widths 8 bytes
    predecessors (long first, then short), compute the forward match length
    `len` (bounded by `BLOCK_SIZE - p`). Keep the longest; ties go to the
    nearest `q`. Store `best[p] = (offset = p - q, len)` if `len ≥ min_match`,
-   else none.
+   else none. Candidate comparison stops at `MATCH_SEARCH_CAP = 64` bytes
+   (bounded compare), so K2 is O(BLOCK_SIZE · cap) even on long repeats; an
+   uncapped search is O(BLOCK_SIZE²) per block on flat data (measured: 9.5 MB/s
+   on 8 threads for real DDS).
 3. **Greedy parse (K3), one pass per block.** `anchor = 0`, `p = 0`,
    `rep = [1, 4, 8]`, loop while `p < BLOCK_SIZE - 8`:
    - If `p > anchor` and `p ≥ rep[0]`, check a repeat match at `p` with
@@ -109,7 +112,9 @@ Parameters for the level-3 calibration: `min_match = 5`, hash widths 8 bytes
      mapped to a repeat code if it equals one of `rep`).
    - Else advance `p` by `1 + ((p - anchor) >> 8)` (literal-run acceleration),
      bounded to not skip past the end.
-   - Match lengths are bounded by the block end (`BLOCK_SIZE - p`).
+   - Match lengths are bounded by the block end (`BLOCK_SIZE - p`). When the
+     parse takes `best[p]` with `len == MATCH_SEARCH_CAP`, it first extends the
+     match with an uncapped compare (linear overall, since `p` skips past it).
    - On a match: emit `Sequence { lit_len: p - anchor, match_len, off_base }`,
      update `rep` exactly per the zstd spec (including the `lit_len == 0`
      repeat-code shift rule), set `p += match_len`, `anchor = p`.
