@@ -30,3 +30,25 @@ Non-default block size (all three feature-gated crates must agree):
 cargo test --workspace --no-default-features \
   --features gzc-core/block-16k,gzc-gpu/block-16k,gzc-bench/block-16k
 ```
+
+## Benchmark CLI
+
+`gzc-bench cpu` runs the CPU libzstd baseline over a corpus, across the given
+compression levels and thread counts, and writes a results table, a JSON
+dump and a self-contained HTML report (throughput-vs-ratio chart, headline
+comparison at the 1/10 Gbit marks, and a per-kind ratio table).
+
+```sh
+# Data-free smoke run (no corpus on disk required):
+cargo run --release -p gzc-bench -- cpu --synthetic --levels 1,3 --threads 1,8
+
+# Against a real corpus directory, filtered to DDS/NIF files:
+cargo run --release -p gzc-bench -- cpu \
+  --input data/corpus --ext dds,nif \
+  --levels 1,3,5,7,9,12,15,19 --threads 1,8,16,32 \
+  --out out
+```
+
+`--max-bytes N` caps the amount of corpus data loaded (stops adding files
+once the running total reaches `N`). Reports land in `--out` (default
+`out/`, gitignored): `results.json` and `report.html`.
