@@ -4,6 +4,7 @@
 //! greedy parse over a hash-chain match finder, using integer arithmetic only so the
 //! GPU mirrors it exactly.
 use crate::config::{BLOCK_SIZE, MIN_MATCH, NO_POS, PARSE_END};
+use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash_long, hash_short};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
@@ -117,6 +118,14 @@ pub fn compress_block(block: &[u8], params: RefParams) -> BlockOutput {
     greedy_parse(block, &best, params)
 }
 
+/// Compress one full-size block straight to a zstd frame: `compress_block` followed
+/// by `write_frame`. This is the CPU reference compressor's end-to-end entry point,
+/// used by `gzc-bench ref` and exercised by `all_synthetic_frames_roundtrip` below.
+pub fn compress_block_to_frame(block: &[u8], params: RefParams, opts: FrameOptions) -> Vec<u8> {
+    let out = compress_block(block, params);
+    write_frame(block, &out, opts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +212,17 @@ mod tests {
         let a = compress_block(&bytes, LVL3);
         let b = compress_block(&bytes, LVL3);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn all_synthetic_frames_roundtrip() {
+        for (name, bytes) in synth::test_cases() {
+            for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                let frame = compress_block_to_frame(&blk.data, LVL3, FrameOptions::default());
+                let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                    .unwrap_or_else(|e| panic!("{name} block {i}: libzstd rejected frame: {e}"));
+                assert_eq!(dec, blk.data, "{name} block {i}: roundtrip mismatch");
+            }
+        }
     }
 }

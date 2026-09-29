@@ -77,3 +77,29 @@ cargo run --release -p gzc-bench -- cpu \
 `--max-bytes N` caps the amount of corpus data loaded (stops adding files
 once the running total reaches `N`). Reports land in `--out` (default
 `out/`, gitignored): `results.json` and `report.html`.
+
+`gzc-bench ref` runs the CPU reference compressor (`gzc_core::reference`, engine
+`cpu-ref`, config `lvl3-greedy`: level-3-style greedy parse, predefined FSE
+tables, raw literals) over a corpus, across the given thread counts, and writes
+the same table/JSON/HTML report shape. `--verify` decompresses every produced
+frame with libzstd after the timed pass and errors on any mismatch against the
+original block.
+
+```sh
+cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
+
+cargo run --release -p gzc-bench -- ref \
+  --input data/corpus --ext dds,nif --max-bytes 2000000000 \
+  --threads 8 --verify --out out
+```
+
+`gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`) then cpu-ref
+(across `--threads`, with `--verify`) — and, once the GPU engine lands, gpu too
+— into a single combined report, so all engines' ratio-vs-throughput points sit
+on one chart:
+
+```sh
+cargo run --release -p gzc-bench -- all \
+  --input data/corpus --ext dds,nif --max-bytes 2000000000 \
+  --levels 1,3,5,7,9,12,15,19 --threads 1,8,16,32 --verify --out out
+```
