@@ -7,7 +7,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::config::BLOCK_SIZE;
 use crate::seq::BlockOutput;
-use crate::seqenc::write_sequences_section;
+use crate::seqenc::write_sequences_section_auto;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameOptions {
@@ -70,7 +70,7 @@ pub fn write_frame(block: &[u8], out: &BlockOutput, opts: FrameOptions) -> Vec<u
         );
         let mut content = Vec::with_capacity(out.literals.len() + 16 + out.sequences.len() * 4);
         write_literals_raw(&out.literals, &mut content);
-        write_sequences_section(&out.sequences, &mut content);
+        write_sequences_section_auto(&out.sequences, &mut content);
         if content.len() < BLOCK_SIZE {
             block_header(BLOCK_COMPRESSED, content.len(), &mut f);
             f.extend_from_slice(&content);
