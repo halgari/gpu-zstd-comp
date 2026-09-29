@@ -84,27 +84,32 @@ gpu-zstd-comp/
 Parameters for the level-3 calibration: `min_match = 5`, hash widths 8 bytes
 ("long") and 5 bytes ("short"), chain depth `D = 1` per hash, greedy parse.
 
-1. **Key + sort (K1).** For each position `p` in `0..BLOCK_SIZE - 8`, compute
-   `h = hash_w(bytes[p..p+w])` with `HASH_BITS = 32 - log2(BLOCK_SIZE)` bits, and
-   `key = (h << log2(BLOCK_SIZE)) | p`. Sort keys ascending per block. Positions
-   whose hash window would read past the block get no key (sentinel). Each run of
-   equal `h` is that hash's chain in increasing position order; the chain
-   predecessors of `p` are the preceding entries in its run. Done for each hash
-   width → `pred_long[p]`, `pred_short[p]` (up to `D` predecessors each; the
-   sorted array itself serves as the chain).
+1. **Hash chains (K1).** For each position `p` in `0..=BLOCK_SIZE - 8`, compute
+   `h = hash_w(block, p)` (`HASH_BITS = 16`; see `gzc_core::hash`). `pred_w[p]` is
+   the most recent `q < p` with the same `h` (or `NO_POS`). This is a hash chain:
+   `pred[pred[p]]` is the next-older candidate, so depth `D > 1` needs no extra
+   structure. Computed for both widths → `pred_long`, `pred_short`.
+   CPU: one ascending pass with a `2^HASH_BITS` table. GPU: one workgroup per
+   block walks the block in tiles of 256 positions; within a tile a shared-memory
+   bitonic sort of `(h, index)` finds in-tile predecessors, the first of each
+   equal-hash run takes its predecessor from a per-block global table
+   `head[h]`, and the last of each run writes `head[h]`. Output is identical to
+   the CPU pass. (This replaces an earlier "global radix sort" idea: same
+   result, far simpler.)
 2. **Match find (K2).** For each `p`: for each candidate `q` among its
    predecessors (long first, then short), compute the forward match length
    `len` (bounded by `BLOCK_SIZE - p`). Keep the longest; ties go to the
    nearest `q`. Store `best[p] = (offset = p - q, len)` if `len ≥ min_match`,
    else none.
 3. **Greedy parse (K3), one pass per block.** `anchor = 0`, `p = 0`,
-   `rep = [1, 4, 8]`, limit `real_end = BLOCK_SIZE`:
-   - Check a repeat match at `p` with `rep[0]` (if `p ≥ rep[0]`): byte-compare;
-     if length ≥ `min_match`, take it (repeat code).
+   `rep = [1, 4, 8]`, loop while `p < BLOCK_SIZE - 8`:
+   - If `p > anchor` and `p ≥ rep[0]`, check a repeat match at `p` with
+     offset `rep[0]`: byte-compare; if length ≥ `min_match`, take it (off_base 1).
    - Else if `best[p]` exists, take it (explicit offset; the offBase is still
      mapped to a repeat code if it equals one of `rep`).
    - Else advance `p` by `1 + ((p - anchor) >> 8)` (literal-run acceleration),
      bounded to not skip past the end.
+   - Match lengths are bounded by the block end (`BLOCK_SIZE - p`).
    - On a match: emit `Sequence { lit_len: p - anchor, match_len, off_base }`,
      update `rep` exactly per the zstd spec (including the `lit_len == 0`
      repeat-code shift rule), set `p += match_len`, `anchor = p`.
@@ -126,8 +131,8 @@ top-K candidates per position. A suffix-array match finder is an M4 option.
 - Block bytes are uploaded as `array<u32>` (WGSL has no u8 storage); shaders
   extract bytes with shift/mask.
 - Kernels per batch of `N` blocks:
-  - K1: per-block key generation + radix sort (one workgroup per block per hash
-    width, operating in global memory scratch).
+  - K1: per-block hash chains (one workgroup per block, 256-position tiles,
+    shared-memory bitonic sort per tile, per-block `head` table in global memory).
   - K2: one thread per position, `best[]` as two u32 (offset, len).
   - K3: one thread per block, greedy parse → sequences + literals into
     per-block output regions sized for the worst case, plus counts.
@@ -145,7 +150,8 @@ top-K candidates per position. A suffix-array match finder is an M4 option.
   are injected at pipeline creation via WGSL `override` constants or source
   templating.
 
-Memory budget: ~2.5 MB scratch per 128 KB block → ~1.3 GB for N = 512.
+Memory budget: ~2.5 MB scratch per 128 KB block (pred ×2, head ×2 at 256 KB each,
+best, sequences, literals) → ~1.3 GB for N = 512.
 
 ### 3.4 gzc-bench
 
