@@ -1,4 +1,5 @@
-//! speed2 E2 step 1: K2 over a host-built bucket-sorted candidate array vs K1 + K2 over hash chains.
+//! Measurement tool (speed2 E2, not part of the test suite): K2 over a host-built bucket-sorted
+//! candidate array, and the GPU sorted K1 + window K2, against K1 + K2 over hash chains.
 //!
 //! `cargo run --release -p gzc-gpu --example e2_probe -- <corpus dir> [stride] [blocks]`
 //! Takes every `stride`-th 128 KiB block of the corpus's .dds/.nif files (default 20, up to
@@ -6,7 +7,7 @@
 //! GPU window K2 against `gzc_core::reference::find_best`, and times each kernel (median of 5).
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, PARSE_END};
 use gzc_core::hash::bucket_sort;
-use gzc_core::params::{LVL9, LVL9D16, LVL9S13, MatchParams};
+use gzc_core::params::{LVL9, MatchParams};
 use gzc_core::reference::{chains, find_best};
 use gzc_gpu::chains::{ChainsKernel, finder_wgsl, head_bytes, pred_bytes, pred_fp};
 use gzc_gpu::compressor::{BEST_OFF_BITS, decode_best};
@@ -147,7 +148,8 @@ fn main() -> anyhow::Result<()> {
         })
     };
 
-    for (name, p) in [("lvl9", LVL9), ("lvl9d16", LVL9D16), ("lvl9s13", LVL9S13), ("s12", MatchParams { hash_bits: 12, ..LVL9S13 }), ("s13d16", MatchParams { depth: 16, ..LVL9S13 }), ("s12d16", MatchParams { hash_bits: 12, depth: 16, ..LVL9S13 })] {
+    let v = |hash_bits, depth| MatchParams { hash_bits, depth, ..LVL9 };
+    for (name, p) in [("lvl9", LVL9), ("d16", v(16, 16)), ("s13", v(13, 32)), ("s12", v(12, 32)), ("s13d16", v(13, 16)), ("s12d16", v(12, 16))] {
         // CPU reference (checked for every block).
         let want: Vec<Vec<gzc_core::reference::Match>> = par_map(&blocks, |b| find_best(b, &chains(b, &p), &p));
         // Chain path: K1 (GPU) + K2.

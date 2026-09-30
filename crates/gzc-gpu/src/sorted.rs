@@ -1,8 +1,8 @@
 //! Host side of the bucket-sorted K1 (speed2 E2, `k1_sort_sg.wgsl`) and its window K2
 //! (`k2_window.wgsl`).
 //!
-//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s13`, `lvl9s12`
-//! and their segmented / depth-16 variants), K1 builds, per block, every hashed position ordered
+//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s12`, `lvl9s12seg`,
+//! `lvl9s12d16seg`), K1 builds, per block, every hashed position ordered
 //! by key and position (`gzc_core::hash::bucket_sort`) into the `pred` buffer: a counting sort in
 //! workgroup memory (one 32-lane subgroup per block) ranks the positions into `best` (scratch),
 //! then a block-major scatter places them. K2 then walks, for each slot, the entries just below
@@ -13,8 +13,9 @@
 //! K1 has a subgroup version (`k1_sort_sg.wgsl`: ballots and shuffles, subgroups of at least 32
 //! lanes) and a workgroup-memory version without subgroups (`k1_sort.wgsl`), picked like the chain
 //! K1's two kernels: the subgroup one when the device has suitable subgroups and it passes its
-//! self-test. Both need `table_bytes` of workgroup memory within the device's limit (the context
-//! keeps wgpu's default 16 KiB, so a 13-bit key needs blocks of at most 64 KiB); otherwise (or
+//! self-test. Each needs its `workgroup_bytes` within the device's limit (the context keeps wgpu's
+//! default 16 KiB: a 12-bit key fits both versions at every block size; a 13-bit key fits only the
+//! subgroup version, only at blocks of at most 64 KiB); otherwise (or
 //! with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the same chains over the
 //! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
 use crate::chains::finder_wgsl;
@@ -33,6 +34,13 @@ pub const MAX_SORT_KEY_BITS: u32 = 13;
 /// more than 2^16 bytes).
 pub fn table_bytes(p: &MatchParams) -> u32 {
     (if LOG2_BLOCK <= 16 { 2 } else { 4 }) << p.hash_bits
+}
+
+/// All the workgroup memory of the sorted K1's `main_sg` (`subgroups`: the counters only) or
+/// `main` (plus its two 32-word tile arrays, `tkey` and `tbase`). `SortKernel::new` builds a
+/// version only when this fits the device's `max_compute_workgroup_storage_size`.
+pub fn workgroup_bytes(p: &MatchParams, subgroups: bool) -> u32 {
+    table_bytes(p) + if subgroups { 0 } else { 2 * 32 * 4 }
 }
 
 /// Whether `p` is a preset the sorted finder serves: a Single hash with a key of at most
@@ -55,13 +63,11 @@ impl SortKernel {
     /// subgroups have at least 32 lanes and its self-test passes; otherwise the workgroup-memory
     /// version (whose failed build or self-test, reported on stderr, also gives `None`).
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
-        if !sorted_params(params)
-            || std::env::var("GZC_SORTED").is_ok_and(|v| v == "0")
-            || ctx.device.limits().max_compute_workgroup_storage_size < table_bytes(params)
-        {
+        if !sorted_params(params) || std::env::var("GZC_SORTED").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
-        if ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 {
+        let limit = ctx.device.limits().max_compute_workgroup_storage_size;
+        if ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 && workgroup_bytes(params, true) <= limit {
             let built = crate::compressor::with_error_scopes(ctx, || {
                 let k = Self::build(ctx, params, true);
                 k.self_test(ctx, params)?;
@@ -71,6 +77,9 @@ impl SortKernel {
                 Ok(k) => return Ok(Some(k)),
                 Err(e) => eprintln!("gzc-gpu: sorted K1 subgroup kernel failed to build or its self-test ({e}); using the workgroup-memory one"),
             }
+        }
+        if workgroup_bytes(params, false) > limit {
+            return Ok(None);
         }
         let built = crate::compressor::with_error_scopes(ctx, || {
             let k = Self::build(ctx, params, false);

@@ -23,9 +23,9 @@ pub struct MatchParams {
     /// Bytes compared per candidate; the parse extends matches that hit the cap.
     pub search_cap: u32,
     /// Bits of the match-finder hash key (`hash::key`: the 16-bit hash's top `hash_bits` bits).
-    /// 16 for the chain presets; 13 for `lvl9s13`, whose GPU finder bucket-sorts candidates by
-    /// the key in workgroup memory (2^13 counters). Candidates, and so `find_best`, are the same
-    /// hash chains either way, over this key.
+    /// 16 for the chain presets; 12 for the `lvl9s12*` presets, whose GPU finder bucket-sorts the
+    /// candidates by key with 2^hash_bits counters in workgroup memory (`gzc_gpu::sorted`).
+    /// Candidates, and so `find_best`, are the hash chains over this key either way.
     pub hash_bits: u32,
     /// 0: the lazy parse runs over the whole block. Otherwise log2 of the parse segment
     /// (`lazy::lazy_parse_segmented`): segments of `1 << segment_log2` bytes are parsed
@@ -96,36 +96,24 @@ pub const LVL9: MatchParams =
 /// a parse that runs one GPU lane per segment. Ratio ~0.01 % below lvl9, above libzstd L9.
 pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
-/// `lvl9` with a 13-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
-/// bucket-sorted array (a counting sort over 2^13 keys in workgroup memory) instead of 16-bit hash
-/// chains. Full corpus at 64 KiB: 1.33929 (lvl9 1.33932).
-pub const LVL9S13: MatchParams = MatchParams { hash_bits: 13, ..LVL9 };
-/// `lvl9s13` with a 12-bit key: at 64 KiB blocks as dense as 13 bits at 128 KiB, and half the
-/// sorted K1's workgroup memory (8 KiB). 1.33927 at 64 KiB.
+/// `lvl9` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
+/// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
+/// instead of 16-bit hash chains. Full corpus at 64 KiB: 1.33927 (lvl9 1.33932).
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
-/// `lvl9` walking 16 candidates instead of 32 (speed2 E4): K2 -29 %, 1.33902 at 64 KiB.
-pub const LVL9D16: MatchParams = MatchParams { depth: 16, ..LVL9 };
-/// The bucket-sorted finders with the segmented parse (E1 + E2).
-pub const LVL9S13SEG: MatchParams = MatchParams { hash_bits: 13, ..LVL9SEG };
+/// `lvl9s12` with the segmented parse (E2 + E1): 1.33926 at 64 KiB, 1.35456 at 128 KiB.
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// Depth 16 with the segmented parse (E4 + E1; 1.33901 at 64 KiB), and with the 12-bit sorted
-/// finder (E4 + E2 + E1; 1.33860).
-pub const LVL9D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9SEG };
+/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4): 1.33860 at 64 KiB.
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 12] = [
+pub const PRESETS: [(&str, MatchParams); 8] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
     ("lvl9", LVL9),
-    ("lvl9s13", LVL9S13),
-    ("lvl9s12", LVL9S12),
-    ("lvl9d16", LVL9D16),
     ("lvl9seg", LVL9SEG),
-    ("lvl9s13seg", LVL9S13SEG),
+    ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
-    ("lvl9d16seg", LVL9D16SEG),
     ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
@@ -156,8 +144,8 @@ mod tests {
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
         assert_eq!(RUNG2, m(Hashes::Single, 4, 8, 1));
         assert_eq!(LVL9, m(Hashes::Single, 4, 32, 2));
-        assert_eq!(LVL9S13, MatchParams { hash_bits: 13, ..m(Hashes::Single, 4, 32, 2) });
-        assert_eq!(LVL9D16, m(Hashes::Single, 4, 16, 2));
+        assert_eq!(LVL9S12, MatchParams { hash_bits: 12, ..m(Hashes::Single, 4, 32, 2) });
+        assert_eq!(LVL9S12D16SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..m(Hashes::Single, 4, 16, 2) });
         assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {

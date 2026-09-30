@@ -355,12 +355,13 @@ mod tests {
         compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::params::LVL9 });
     }
 
-    /// The window walk over the bucket-sorted array equals the chain walk, for the new 13-bit key
-    /// and for the 16-bit one (and a shallow depth, where windows rarely reach other buckets).
+    /// The window walk over the bucket-sorted array equals the chain walk, for 11/12/13-bit keys and
+    /// the 16-bit one, at depths 4, 16 and 32 (shallow walks rarely reach other buckets).
     #[test]
     fn window_walk_equals_chain_walk() {
-        use crate::params::{LVL9, LVL9S13};
-        for params in [LVL9S13, LVL9, MatchParams { depth: 4, ..LVL9S13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
+        use crate::params::{LVL9, LVL9S12, LVL9S12D16SEG};
+        let s13 = MatchParams { hash_bits: 13, ..LVL9 };
+        for params in [LVL9S12, LVL9S12D16SEG, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
                     let block = &blk.data;

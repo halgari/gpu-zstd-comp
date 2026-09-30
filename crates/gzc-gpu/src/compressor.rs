@@ -11,9 +11,8 @@
 //! K3 writes only the sequences and counts; the literals are the block bytes the sequences leave
 //! uncovered, so K5 gathers them from `data` and the parse path from the host's copy of the block
 //! (`decode_output`).
-use crate::chains::{self, ChainsKernel, head_bytes, pred_bytes};
+use crate::chains::{self, ChainsKernel, finder_wgsl, head_bytes, pred_bytes};
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
-use crate::chains::finder_wgsl;
 use crate::sorted::SortKernel;
 use anyhow::{Context as _, anyhow};
 use gzc_core::codes::{
@@ -59,6 +58,9 @@ const COMPRESS_BATCH_CAP: u32 = 256;
 /// `k5_huffman` only run with `GpuParams::emit_frames`; K5, which writes the literals section
 /// (Huffman-coded only with `huffman`), is dispatched before K4; see `Kernels::names`).
 pub const KERNEL_NAMES: [&str; 5] = ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"];
+
+/// `KERNEL_NAMES` when K1/K2 run the bucket-sorted finder (`Kernels::uses_sorted_finder`).
+pub const SORTED_KERNEL_NAMES: [&str; 5] = ["k1_sort", "k2_window", "k3_parse", "k4_entropy", "k5_huffman"];
 
 /// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
 pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
@@ -622,7 +624,8 @@ impl Kernels {
 
     /// Names of the kernels `record_timed` runs, in timestamp order.
     pub fn names(&self) -> &'static [&'static str] {
-        &KERNEL_NAMES[..if self.emits_frames() { 5 } else { 3 }]
+        let names = if self.sorted.is_some() { &SORTED_KERNEL_NAMES } else { &KERNEL_NAMES };
+        &names[..if self.emits_frames() { 5 } else { 3 }]
     }
 
     /// Upload is done by the caller (queue.write_buffer into bufs.data). Records K1→K2→K3, and

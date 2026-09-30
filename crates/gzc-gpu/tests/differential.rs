@@ -10,9 +10,7 @@ use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases, segment_test_cases};
 use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{
-    LVL3, LVL9, LVL9D16, LVL9D16SEG, LVL9S12, LVL9S12D16SEG, LVL9S12SEG, LVL9S13, LVL9S13SEG, LVL9SEG, MatchParams, RUNG1, RUNG2,
-};
+use gzc_core::params::{LVL3, LVL9, LVL9S12, LVL9S12D16SEG, LVL9S12SEG, LVL9SEG, MatchParams, RUNG1, RUNG2};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -48,18 +46,14 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
 }
 
 /// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 12] = [
+const GPU_PRESETS: [(&str, MatchParams); 8] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
     ("lvl9", LVL9),
-    ("lvl9s13", LVL9S13),
-    ("lvl9s12", LVL9S12),
-    ("lvl9d16", LVL9D16),
     ("lvl9seg", LVL9SEG),
-    ("lvl9s13seg", LVL9S13SEG),
+    ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
-    ("lvl9d16seg", LVL9D16SEG),
     ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
@@ -1237,7 +1231,7 @@ fn literals_are_the_uncovered_block_bytes() {
 /// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), a Single
 /// chain with a small cap, and short keys (the bucket-sorted finder, k1_sort_sg / k2_window) with
 /// deep walks and min_match > 4.
-const K2_VARIANTS: [MatchParams; 9] = [
+const K2_VARIANTS: [MatchParams; 11] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
@@ -1249,6 +1243,10 @@ const K2_VARIANTS: [MatchParams; 9] = [
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 11, segment_log2: 0 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12, segment_log2: 0 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13, segment_log2: 0 },
+    // The measured-and-dropped E2/E4 presets: a 13-bit sorted key (lvl9s13) and depth-16 chains
+    // (lvl9d16).
+    MatchParams { hash_bits: 13, ..LVL9 },
+    MatchParams { depth: 16, ..LVL9 },
 ];
 
 /// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4

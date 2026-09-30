@@ -53,12 +53,12 @@ fn key_word(base: u32, p: u32) -> vec2<u32> {
     return vec2<u32>(mix(lo, hi & mask) >> KEY_SHIFT, p | pred_fp(lo, hi));
 }
 
-// Without subgroups: the tile's keys (NO_TILE_KEY for dead lanes) and each group's cursor.
+// Without subgroups: the tile's keys (NO_TILE_KEY for dead lanes; before the ranking, the scan's
+// per-lane partial sums) and each group's cursor. 256 bytes beside the counters
+// (`sorted::workgroup_bytes`).
 const NO_TILE_KEY: u32 = 0xFFFFFFFFu;
 var<workgroup> tkey: array<u32, 32>;
 var<workgroup> tbase: array<u32, 32>;
-// Scan partials, one per lane.
-var<workgroup> tsum: array<u32, 32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
@@ -78,18 +78,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     workgroupBarrier();
 
     // 2. Exclusive scan: lane l owns counter words [l * PER, (l + 1) * PER); its partial sum's
-    // prefix over the lanes below comes from tsum.
+    // prefix over the lanes below comes from tkey (free until the ranking, which first writes it
+    // after the barrier ending the scan).
     const PER: u32 = NWORDS / 32u;
     var sum = 0u;
     for (var i = 0u; i < PER; i++) {
         let x = atomicLoad(&cnt[lane * PER + i]);
         sum += select(x, (x & 0xFFFFu) + (x >> 16u), CNT16);
     }
-    tsum[lane] = sum;
+    tkey[lane] = sum;
     workgroupBarrier();
     var run = 0u;
     for (var l = 0u; l < lane; l++) {
-        run += tsum[l];
+        run += tkey[l];
     }
     for (var i = 0u; i < PER; i++) {
         let x = atomicLoad(&cnt[lane * PER + i]);
