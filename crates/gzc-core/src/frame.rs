@@ -6,12 +6,22 @@
 use xxhash_rust::xxh64::xxh64;
 
 use crate::config::BLOCK_SIZE;
+use crate::huffman::{write_literals_section, write_raw_rle_header};
 use crate::seq::BlockOutput;
 use crate::seqenc::write_sequences_section_auto;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrameOptions {
+    /// Append the 4-byte xxh64 content checksum.
     pub checksum: bool,
+    /// Entropy-code literals (Huffman / RLE) instead of always storing them raw.
+    pub huffman: bool,
+}
+
+impl Default for FrameOptions {
+    fn default() -> Self {
+        FrameOptions { checksum: false, huffman: true }
+    }
 }
 
 const MAGIC: u32 = 0xFD2F_B528;
@@ -22,15 +32,7 @@ const BLOCK_COMPRESSED: u32 = 2;
 
 /// Raw_Literals_Block: literals section header (type 0) followed by the literal bytes.
 pub fn write_literals_raw(lits: &[u8], out: &mut Vec<u8>) {
-    let n = lits.len() as u32;
-    assert!(n < 1 << 20, "too many literals: {n}");
-    if n < 32 {
-        out.push((n << 3) as u8);
-    } else if n < 4096 {
-        out.extend_from_slice(&(((n << 4) | 0b0100) as u16).to_le_bytes());
-    } else {
-        out.extend_from_slice(&((n << 4) | 0b1100).to_le_bytes()[..3]);
-    }
+    write_raw_rle_header(0, lits.len(), out);
     out.extend_from_slice(lits);
 }
 
@@ -69,7 +71,11 @@ pub fn write_frame(block: &[u8], out: &BlockOutput, opts: FrameOptions) -> Vec<u
             "BlockOutput does not cover the block"
         );
         let mut content = Vec::with_capacity(out.literals.len() + 16 + out.sequences.len() * 4);
-        write_literals_raw(&out.literals, &mut content);
+        if opts.huffman {
+            write_literals_section(&out.literals, &mut content);
+        } else {
+            write_literals_raw(&out.literals, &mut content);
+        }
         write_sequences_section_auto(&out.sequences, &mut content);
         if content.len() < BLOCK_SIZE {
             block_header(BLOCK_COMPRESSED, content.len(), &mut f);
@@ -185,11 +191,120 @@ mod tests {
         assert_eq!(hdr(BLOCK_SIZE), (((BLOCK_SIZE as u32) << 4) | 0b1100).to_le_bytes()[..3].to_vec());
     }
 
+    /// Literals section type (0 raw, 1 RLE, 2 compressed) of a Compressed block's frame.
+    fn literals_type(frame: &[u8], opts: FrameOptions) -> u8 {
+        assert_eq!(block_type(frame, opts), COMPRESSED);
+        frame[frame_header(opts).len() + 3] & 3
+    }
+
+    /// Byte length of the literals section starting at `sec[0]`.
+    fn literals_section_len(sec: &[u8]) -> usize {
+        let b0 = sec[0] as usize;
+        let sf = (b0 >> 2) & 3;
+        match b0 & 3 {
+            0 | 1 => {
+                let (hdr, n) = match sf {
+                    0 | 2 => (1, b0 >> 3),
+                    1 => (2, (b0 >> 4) | (sec[1] as usize) << 4),
+                    _ => (3, (b0 >> 4) | (sec[1] as usize) << 4 | (sec[2] as usize) << 12),
+                };
+                hdr + if b0 & 3 == 0 { n } else { 1 }
+            }
+            _ => {
+                let v = u64::from_le_bytes([sec[0], sec[1], sec[2], sec[3], sec[4], 0, 0, 0]);
+                let (hdr, bits) = match sf {
+                    0 | 1 => (3, 10),
+                    2 => (4, 14),
+                    _ => (5, 18),
+                };
+                hdr + ((v >> (4 + bits)) & ((1 << bits) - 1)) as usize
+            }
+        }
+    }
+
     #[test]
     fn frame_roundtrip_no_sequences() {
+        // All-literal text with no matches: Huffman literals make the block Compressed with nbSeq = 0.
         let block = synth::text(3, BLOCK_SIZE);
         let out = BlockOutput { sequences: vec![], literals: block.clone() };
-        roundtrip(&block, &out, FrameOptions::default());
+        let opts = FrameOptions::default();
+        let frame = roundtrip(&block, &out, opts);
+        assert_eq!(literals_type(&frame, opts), COMPRESSED);
+        let content = &frame[frame_header(opts).len() + 3..];
+        let lit_len = literals_section_len(content);
+        assert_eq!(content.len(), lit_len + 1, "only the nbSeq byte follows the literals");
+        assert_eq!(content[lit_len], 0, "nbSeq == 0");
+        assert!(frame.len() < BLOCK_SIZE * 3 / 4, "text literals should shrink: {}", frame.len());
+        // without Huffman the same block cannot compress
+        let raw_opts = FrameOptions { huffman: false, ..opts };
+        assert_eq!(block_type(&roundtrip(&block, &out, raw_opts), raw_opts), RAW);
+    }
+
+    #[test]
+    fn synthetic_cases_roundtrip_with_huffman_literals() {
+        let opts = FrameOptions::default();
+        let mut direct = 0;
+        for (name, data) in synth::test_cases() {
+            for (i, b) in crate::block::chunk_file(&data).into_iter().enumerate() {
+                let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                let frame = roundtrip(&b.data, &out, opts);
+                if matches!(name, "text" | "nif" | "exact_block") {
+                    assert_eq!(literals_type(&frame, opts), COMPRESSED, "{name}#{i}: literals not Huffman-coded");
+                    // text-like literals stay below 128: direct 4-bit weights (header byte >= 128)
+                    let content = &frame[frame_header(opts).len() + 3..];
+                    let hdr = [3, 3, 4, 5][((content[0] >> 2) & 3) as usize];
+                    if name != "nif" {
+                        assert!(content[hdr] >= 128, "{name}#{i}: expected direct weights");
+                        direct += 1;
+                    }
+                }
+            }
+        }
+        assert!(direct >= 2);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_in_frames() {
+        // Skewed random literals reaching past 127 (max_symbol >= 128) force FSE-compressed weights.
+        let opts = FrameOptions::default();
+        let mut r = Lcg(21);
+        let mut lits = move || (r.next() & r.next() & r.next()) as u8;
+        let bs = BLOCK_SIZE as u32;
+        for script in [vec![(bs / 2, 1000, bs / 4)], vec![(300, 7, 20); (bs / 640) as usize], vec![(5, 3, 8); (bs / 26) as usize]] {
+            let (block, out) = scripted(&script, &mut lits);
+            let frame = roundtrip(&block, &out, opts);
+            assert_eq!(literals_type(&frame, opts), COMPRESSED);
+            let content = &frame[frame_header(opts).len() + 3..];
+            let hdr = [3, 3, 4, 5][((content[0] >> 2) & 3) as usize];
+            assert!(content[hdr] < 128, "expected FSE-compressed weights, header {}", content[hdr]);
+        }
+    }
+
+    #[test]
+    fn huffman_frames_never_grow() {
+        let on = FrameOptions::default();
+        let off = FrameOptions { huffman: false, ..on };
+        let mut cases: Vec<(Vec<u8>, BlockOutput)> = Vec::new();
+        for (_, data) in synth::test_cases() {
+            for b in crate::block::chunk_file(&data) {
+                let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                cases.push((b.data, out));
+            }
+        }
+        let mut r = Lcg(0xabc);
+        for i in 0..60 {
+            let nseq = 1 + r.below(3000);
+            let (script, _) = random_script(&mut r, nseq);
+            cases.push(scripted(&script, &mut lit_source(500 + i)));
+        }
+        let mut saved = 0i64;
+        for (i, (block, out)) in cases.iter().enumerate() {
+            let a = roundtrip(block, out, on).len();
+            let b = roundtrip(block, out, off).len();
+            assert!(a <= b + 1, "case {i}: huffman frame {a} > raw-literals frame {b} + 1");
+            saved += b as i64 - a as i64;
+        }
+        assert!(saved > 0);
     }
 
     #[test]
@@ -359,7 +474,7 @@ mod tests {
 
     #[test]
     fn checksum_option_roundtrips() {
-        let opts = FrameOptions { checksum: true };
+        let opts = FrameOptions { checksum: true, ..Default::default() };
         assert_eq!(frame_header(opts)[4] & 0b100, 0b100);
         let bs = BLOCK_SIZE as u32;
         let cases = [
@@ -384,5 +499,83 @@ mod tests {
         let script = [(1, 1, 3), (bs / 4, bs / 4, bs / 4), (0, 1, 3), (2, 2, bs / 4)];
         let (_, frame) = roundtrip_script(&script, 12);
         assert_eq!(block_type(&frame, FrameOptions::default()), COMPRESSED);
+    }
+
+    /// Ratio report over the real corpus (not part of the normal suite; needs `data/`):
+    /// `GZC_CORPUS=/path/to/data/corpus GZC_CORPUS_MB=500 cargo test --release -p gzc-core corpus_ratio -- --ignored --nocapture`
+    /// Takes the first `GZC_CORPUS_MB` (default 500) MB of .dds/.nif files (only `GZC_CORPUS_EXT` if set)
+    /// in sorted path order and
+    /// prints real bytes / frame bytes for the reference parse with Huffman literals, with raw
+    /// literals, and libzstd level 3 on the same padded blocks, overall and per extension.
+    #[test]
+    #[ignore]
+    fn corpus_ratio() {
+        use std::path::{Path, PathBuf};
+        fn walk(dir: &Path, only: Option<&str>, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                let e = ext(&p);
+                if p.is_dir() {
+                    walk(&p, only, out);
+                } else if matches!(e.as_str(), "dds" | "nif") && only.is_none_or(|o| o == e) {
+                    out.push(p);
+                }
+            }
+        }
+        fn ext(p: &Path) -> String {
+            p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
+        }
+        let root = std::env::var("GZC_CORPUS")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+        let limit: u64 = std::env::var("GZC_CORPUS_MB").map(|v| v.parse().unwrap()).unwrap_or(500) * 1_000_000;
+        let mut files = Vec::new();
+        let only = std::env::var("GZC_CORPUS_EXT").ok();
+        walk(Path::new(&root), only.as_deref(), &mut files);
+        files.sort();
+        let mut jobs: Vec<(String, std::sync::Arc<crate::block::Block>)> = Vec::new();
+        let mut taken = 0u64;
+        for f in files {
+            if taken >= limit {
+                break;
+            }
+            let bytes = std::fs::read(&f).unwrap();
+            taken += bytes.len() as u64;
+            for b in crate::block::chunk_file(&bytes) {
+                jobs.push((ext(&f), std::sync::Arc::new(b)));
+            }
+        }
+        // per extension: [real, huffman, raw-literals, libzstd L3]
+        let totals = std::sync::Mutex::new(std::collections::BTreeMap::<String, [u64; 4]>::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((e, b)) = jobs.get(i) else { break };
+                        let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                        let on = write_frame(&b.data, &out, FrameOptions::default());
+                        let off = write_frame(&b.data, &out, FrameOptions { huffman: false, ..Default::default() });
+                        let dec = zstd::bulk::decompress(&on, BLOCK_SIZE).expect("libzstd rejected frame");
+                        assert!(dec == b.data, "decoded block differs");
+                        let l3 = zstd::bulk::compress(&b.data, 3).unwrap();
+                        let row = [b.real_len, on.len(), off.len(), l3.len()].map(|x| x as u64);
+                        let mut t = totals.lock().unwrap();
+                        for key in [e.clone(), "ALL".to_string()] {
+                            let acc = t.entry(key).or_default();
+                            for k in 0..4 {
+                                acc[k] += row[k];
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        println!("{:>5} {:>12} {:>9} {:>9} {:>9}", "ext", "real bytes", "huffman", "raw-lits", "zstd-L3");
+        for (e, t) in totals.into_inner().unwrap() {
+            let r = |k: usize| t[0] as f64 / t[k] as f64;
+            println!("{e:>5} {:>12} {:>9.4} {:>9.4} {:>9.4}", t[0], r(1), r(2), r(3));
+        }
     }
 }
