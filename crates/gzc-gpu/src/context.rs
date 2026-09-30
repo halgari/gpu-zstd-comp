@@ -9,9 +9,10 @@ pub struct GpuContext {
     /// A queue of a transfer-only family on the same `VkDevice` (speed-2 E3): frame-path
     /// pipelines read their frames back through it, concurrently with the next batch's kernels
     /// (`pipeline`). Vulkan adapters with such a family (NVIDIA: family 1; AMD: SDMA when the
-    /// driver exposes it), unless `GZC_TRANSFER_QUEUE=0` or frame packing is on. Declared first:
-    /// it must drop before `device`, whose teardown destroys the `VkDevice` and then the instance
-    /// (a `VkDevice` outliving its instance crashes the driver).
+    /// driver exposes it) of Vulkan 1.2+ with timeline semaphores, unless
+    /// `GpuOptions::transfer_queue` is off or frame packing is on. The queue and the wgpu device
+    /// share one `transfer::DeviceOwner`, which destroys the `VkDevice` after both are gone and
+    /// keeps the Vulkan instance alive until then, so the field order does not matter.
     pub transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -38,55 +39,99 @@ pub struct GpuContext {
     pub direct_upload: bool,
 }
 
+/// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
+/// `GpuContext::new` uses; tests build it directly to cover every path whatever the environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuOptions {
+    /// Enable subgroups when the adapter has them (`GZC_NO_SUBGROUPS` turns them off).
+    pub subgroups: bool,
+    /// Frame packing (`GZC_PACK`): requests `MAPPABLE_PRIMARY_BUFFERS` for `pipeline::PackKernel`.
+    pub pack_frames: bool,
+    /// The direct upload (E8): `None` = on with full ReBAR (`rebar`), `Some(b)` = forced (on only
+    /// where `MAPPABLE_PRIMARY_BUFFERS` exists). `GZC_DIRECT_UPLOAD=0/1`.
+    pub direct_upload: Option<bool>,
+    /// The transfer-queue readback (E3) where the adapter supports it (`GZC_TRANSFER_QUEUE=0`
+    /// turns it off).
+    pub transfer_queue: bool,
+}
+
+impl Default for GpuOptions {
+    /// Everything on where supported, ignoring the environment.
+    fn default() -> Self {
+        Self { subgroups: true, pack_frames: false, direct_upload: None, transfer_queue: true }
+    }
+}
+
+impl GpuOptions {
+    /// The defaults with the `GZC_*` environment overrides applied.
+    pub fn from_env() -> Self {
+        let set = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
+        Self {
+            subgroups: !set("GZC_NO_SUBGROUPS"),
+            pack_frames: set("GZC_PACK"),
+            direct_upload: match std::env::var("GZC_DIRECT_UPLOAD").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            },
+            transfer_queue: !std::env::var("GZC_TRANSFER_QUEUE").is_ok_and(|v| v == "0"),
+        }
+    }
+}
+
 impl GpuContext {
     /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
-    /// enabling timestamp queries and subgroups when available. Setting the
-    /// environment variable `GZC_NO_SUBGROUPS` to anything but `0` leaves subgroups off, which
-    /// selects K1's fallback kernel and, since `compressor::k3_mode` also checks `ctx.subgroups`,
-    /// forces the sequential K3 as well (`K3Mode::Seq`, not the subgroup-cooperative `k3_coop.wgsl`).
-    /// `GZC_PACK` set to anything but `0` requests
-    /// `MAPPABLE_PRIMARY_BUFFERS` (see `with_options`), which turns on the pipeline's frame packing.
+    /// enabling timestamp queries and subgroups when available (`GpuOptions::from_env`):
+    /// `GZC_NO_SUBGROUPS` leaves subgroups off, which selects K1's fallback kernel and, since
+    /// `compressor::k3_mode` also checks `ctx.subgroups`, the sequential K3; `GZC_PACK` turns on
+    /// the pipeline's frame packing; `GZC_DIRECT_UPLOAD` and `GZC_TRANSFER_QUEUE` see
+    /// `GpuOptions`.
     pub fn new() -> anyhow::Result<Self> {
-        let off = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v != "0");
-        let pack = std::env::var("GZC_PACK").is_ok_and(|v| v != "0");
-        Self::with_options(!off, pack)
+        Self::with_gpu_options(GpuOptions::from_env())
     }
 
     /// `new`, with subgroups (and so K1's subgroup kernel) enabled only if `allow` and the adapter
     /// supports them. `with_subgroups(false)` gives the context a device without subgroup support
-    /// gets; tests use it to cover K1's fallback kernel. Frame packing as in `new`.
+    /// gets; tests use it to cover K1's fallback kernel. The rest as in `new`.
     pub fn with_subgroups(allow: bool) -> anyhow::Result<Self> {
-        Self::with_options(allow, std::env::var("GZC_PACK").is_ok_and(|v| v != "0"))
+        Self::with_gpu_options(GpuOptions { subgroups: allow, ..GpuOptions::from_env() })
     }
 
     /// Subgroups as in `with_subgroups(allow_subgroups)`; with `mappable`, also the native-only
     /// `MAPPABLE_PRIMARY_BUFFERS` feature when the adapter has it (`pack_frames`), with which
     /// frame-path pipelines pack their frames (`pipeline::PackKernel`, opt-in: slower than the
-    /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards). The feature is also requested
-    /// for the direct upload (`direct_upload`, on by default with full ReBAR).
+    /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards). The rest as in `new`.
     pub fn with_options(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
-        let p = Prepared::new(allow_subgroups, mappable)?;
-        let transfer_family = (!p.pack_frames && !std::env::var("GZC_TRANSFER_QUEUE").is_ok_and(|v| v == "0"))
-            .then(|| {
-                crate::multiqueue::queue_families(&p.adapter).into_iter().find(|f| {
-                    use ash::vk::QueueFlags as Q;
-                    f.flags.contains(Q::TRANSFER) && !f.flags.intersects(Q::COMPUTE | Q::GRAPHICS) && f.count > 0
-                })
-            })
-            .flatten();
-        if let Some(f) = transfer_family {
-            let rd = crate::multiqueue::RawDevice::new(&p, &[(f.index, 0)])?;
-            let mut ctx = rd.context(&p, 0, 0)?;
-            ctx.transfer = Some(std::sync::Arc::new(crate::transfer::TransferQueue::new(
-                rd.owner.clone(),
-                f.index,
-                rd.memory,
-                p.adapter.clone(),
-            )));
-            return Ok(ctx);
+        Self::with_gpu_options(GpuOptions {
+            subgroups: allow_subgroups,
+            pack_frames: mappable,
+            ..GpuOptions::from_env()
+        })
+    }
+
+    /// Opens the device as `opts` says. With `opts.transfer_queue`, no packing, and a Vulkan
+    /// adapter that has a usable transfer-only family (`multiqueue::transfer_family`), the
+    /// `VkDevice` is created here with that extra queue (`transfer`); if that fails the context
+    /// falls back to wgpu's own device (with a warning), as it does everywhere else.
+    pub fn with_gpu_options(opts: GpuOptions) -> anyhow::Result<Self> {
+        let p = Prepared::new(opts)?;
+        let family =
+            (opts.transfer_queue && !p.pack_frames).then(|| crate::multiqueue::transfer_family(&p.adapter)).flatten();
+        if let Some(family) = family {
+            let with_transfer = || -> anyhow::Result<Self> {
+                let rd = crate::multiqueue::RawDevice::new(&p, &[(family, 0)])?;
+                let mut ctx = rd.context(&p, 0, 0)?;
+                let tq = crate::transfer::TransferQueue::new(rd.owner.clone(), family, rd.memory);
+                ctx.transfer = Some(std::sync::Arc::new(tq));
+                Ok(ctx)
+            };
+            match with_transfer() {
+                Ok(ctx) => return Ok(ctx),
+                Err(e) => eprintln!("gzc: transfer queue unavailable ({e:#}); reading back on the main queue"),
+            }
         }
-        let (device, queue) = pollster::block_on(p.adapter.request_device(&p.descriptor()))
-            .context("request_device")?;
+        let (device, queue) =
+            pollster::block_on(p.adapter.request_device(&p.descriptor())).context("request_device")?;
         Ok(p.context(device, queue))
     }
 }
@@ -129,7 +174,8 @@ impl Prepared {
         }
     }
 
-    pub fn new(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
+    pub fn new(opts: GpuOptions) -> anyhow::Result<Self> {
+        let (allow_subgroups, mappable) = (opts.subgroups, opts.pack_frames);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -160,12 +206,7 @@ impl Prepared {
         // Native-only feature, requested for frame packing (`pipeline::PackKernel`) and for the
         // direct upload.
         let has_mappable = adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-        let direct_upload = has_mappable
-            && match std::env::var("GZC_DIRECT_UPLOAD").as_deref() {
-                Ok("0") => false,
-                Ok("1") => true,
-                _ => rebar(&adapter),
-            };
+        let direct_upload = has_mappable && opts.direct_upload.unwrap_or_else(|| rebar(&adapter));
         let pack_frames = mappable && has_mappable;
         let mappable_storage = pack_frames || direct_upload;
         if mappable_storage {
@@ -245,7 +286,12 @@ impl GpuContext {
         if copy_src {
             usage |= wgpu::BufferUsages::COPY_SRC;
         }
-        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
     }
 
     /// Copies `count` elements of `T` starting at byte `offset` of `buf` (which needs COPY_SRC)

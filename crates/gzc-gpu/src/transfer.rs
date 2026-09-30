@@ -1,75 +1,97 @@
-//! A dedicated transfer queue next to wgpu's queue (speed-2 E3, stage 1).
+//! A dedicated transfer queue next to wgpu's queue (speed-2 E3).
 //!
 //! wgpu runs every submission on one queue, strictly one after another, so the readback copy of
 //! batch i (frames -> host) used to sit between batch i's K4 and batch i+1's K1. On the RTX 5090
 //! the copy engine behind a transfer-only queue family runs that copy concurrently with the next
 //! batch's kernels at no measurable cost to them (`multiqueue::tests::transfer_probe`).
 //!
-//! `GpuContext::with_options` creates the `VkDevice` itself (with one extra queue of a
-//! transfer-only family) when the adapter is Vulkan and has such a family, and wraps its queue 0
-//! of family 0 in the usual `wgpu::Device` (`device_from_raw` + `create_device_from_hal`); the
-//! extra queue is driven here with raw Vulkan (ash): a command pool, timeline semaphores and the
-//! buffers both queues touch, created `CONCURRENT` over the two families (so no queue-family
-//! ownership transfers are needed) and imported into wgpu with `create_buffer_from_hal`.
-use std::sync::Arc;
+//! `GpuContext::with_gpu_options` creates the `VkDevice` itself (with one extra queue of a
+//! transfer-only family) when the adapter is Vulkan 1.2 with timeline semaphores and has such a
+//! family, and wraps its queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
+//! `create_device_from_hal`); the extra queue is driven here with raw Vulkan (ash): a command
+//! pool, timeline semaphores and the buffers both queues touch, created `CONCURRENT` over the two
+//! families (so no queue-family ownership transfers are needed) and imported into wgpu with
+//! `create_buffer_from_hal`.
+//!
+//! Lifetimes: every object here holds an `Arc<DeviceOwner>`, which destroys the `VkDevice` after
+//! the last of them (and the wgpu device) is gone and keeps the Vulkan instance alive until then.
+//! GPU-side lifetimes (a buffer or semaphore must outlive the submissions using it) are the
+//! caller's: the entry points that create such uses are `unsafe` or `pub(crate)`.
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, anyhow};
 use ash::vk;
 
-/// Destroys the `VkDevice` once the wgpu device and every `TransferQueue` user are gone.
-pub(crate) struct DeviceOwner(pub ash::Device);
+/// Destroys the `VkDevice` once the wgpu device and every user of this module are gone. Holds the
+/// adapter so the Vulkan instance outlives the device (a `VkDevice` destroyed after its instance
+/// crashes the NVIDIA driver).
+pub(crate) struct DeviceOwner {
+    pub device: ash::Device,
+    _adapter: wgpu::Adapter,
+}
+
+impl DeviceOwner {
+    pub(crate) fn new(device: ash::Device, adapter: wgpu::Adapter) -> Self {
+        Self { device, _adapter: adapter }
+    }
+}
 
 impl Drop for DeviceOwner {
     fn drop(&mut self) {
-        // SAFETY: the last user of the VkDevice (the hal device's drop callback or a
-        // TransferQueue) is gone, and with it every object created on the device.
+        // SAFETY: the last user of the VkDevice (a hal device's drop callback or an object of this
+        // module) is gone, and with it every object created on the device.
         unsafe {
-            let _ = self.0.device_wait_idle();
-            self.0.destroy_device(None);
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
         }
     }
 }
 
 /// The extra queue of a transfer-only family on the context's `VkDevice`.
 pub struct TransferQueue {
-    pub(crate) device: ash::Device,
-    pub(crate) queue: vk::Queue,
+    owner: Arc<DeviceOwner>,
+    /// `vkQueueSubmit` / `vkQueueWaitIdle` need external synchronization of the queue.
+    queue: Mutex<vk::Queue>,
     /// The transfer queue's family (the wgpu queue is family 0).
     pub family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
-    _owner: Arc<DeviceOwner>,
-    /// Keeps the Vulkan instance alive until the device is gone (declared after `_owner`).
-    _adapter: wgpu::Adapter,
+    /// Held while semaphore waits/signals are staged on the wgpu queue and that queue's next
+    /// submission is made (`submit_wgpu`), so no other submission through this crate picks them
+    /// up.
+    wgpu_submit: Mutex<()>,
 }
 
 impl TransferQueue {
-    pub(crate) fn new(
-        owner: Arc<DeviceOwner>,
-        family: u32,
-        memory: vk::PhysicalDeviceMemoryProperties,
-        adapter: wgpu::Adapter,
-    ) -> Self {
-        let device = owner.0.clone();
+    pub(crate) fn new(owner: Arc<DeviceOwner>, family: u32, memory: vk::PhysicalDeviceMemoryProperties) -> Self {
         // SAFETY: the device was created with one queue of `family`.
-        let queue = unsafe { device.get_device_queue(family, 0) };
-        Self { device, queue, family, memory, _owner: owner, _adapter: adapter }
+        let queue = unsafe { owner.device.get_device_queue(family, 0) };
+        Self { owner, queue: Mutex::new(queue), family, memory, wgpu_submit: Mutex::new(()) }
     }
 
-    /// The first memory type allowed by `bits` with all of `want`, else with all of `fallback`.
-    fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags, fallback: vk::MemoryPropertyFlags) -> Option<(u32, bool)> {
+    fn device(&self) -> &ash::Device {
+        &self.owner.device
+    }
+
+    /// The first memory type allowed by `bits` that `pick` accepts, in `prefs` order.
+    fn memory_type(&self, bits: u32, prefs: &[&dyn Fn(vk::MemoryPropertyFlags) -> bool]) -> Option<(u32, bool)> {
         let types = &self.memory.memory_types[..self.memory.memory_type_count as usize];
-        let find = |flags: vk::MemoryPropertyFlags| {
-            types.iter().enumerate().find(|(i, t)| bits & (1 << i) != 0 && t.property_flags.contains(flags))
-        };
-        find(want)
-            .or_else(|| find(fallback))
-            .map(|(i, t)| (i as u32, t.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
+        // Never protected memory, nor AMD's uncached/device-coherent types.
+        let excluded = vk::MemoryPropertyFlags::PROTECTED
+            | vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD
+            | vk::MemoryPropertyFlags::DEVICE_UNCACHED_AMD;
+        prefs.iter().find_map(|pick| {
+            types
+                .iter()
+                .enumerate()
+                .find(|(i, t)| bits & (1 << i) != 0 && !t.property_flags.intersects(excluded) && pick(t.property_flags))
+                .map(|(i, t)| (i as u32, t.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
+        })
     }
 
     /// A buffer of `size` bytes with its own memory: device-local and shared (`CONCURRENT`)
-    /// between the wgpu queue's family 0 and the transfer family, or (`host`) host-visible,
-    /// preferably cached, used by the transfer queue only and mapped for good.
-    pub fn buffer(&self, size: u64, usage: vk::BufferUsageFlags, host: bool) -> anyhow::Result<RawBuffer> {
+    /// between the wgpu queue's family 0 and the transfer family, or (`host`) host-visible memory
+    /// (cached system memory preferred) used by the transfer queue only and mapped for good.
+    pub(crate) fn buffer(&self, size: u64, usage: vk::BufferUsageFlags, host: bool) -> anyhow::Result<RawBuffer> {
         let families = [0, self.family];
         let mut info = vk::BufferCreateInfo::default().size(size.max(4)).usage(usage);
         info = if host {
@@ -77,16 +99,24 @@ impl TransferQueue {
         } else {
             info.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&families)
         };
-        let d = &self.device;
-        // SAFETY: plain object creation on a live device; every object is destroyed by RawBuffer.
+        let d = self.device();
+        use vk::MemoryPropertyFlags as F;
+        // SAFETY: plain object creation on a live device; every object is destroyed by RawBuffer
+        // (or here on failure).
         unsafe {
             let buffer = d.create_buffer(&info, None).context("vkCreateBuffer")?;
             let req = d.get_buffer_memory_requirements(buffer);
-            use vk::MemoryPropertyFlags as F;
             let pick = if host {
-                self.memory_type(req.memory_type_bits, F::HOST_VISIBLE | F::HOST_CACHED, F::HOST_VISIBLE | F::HOST_COHERENT)
+                self.memory_type(
+                    req.memory_type_bits,
+                    &[
+                        &|f| f.contains(F::HOST_VISIBLE | F::HOST_CACHED) && !f.contains(F::DEVICE_LOCAL),
+                        &|f| f.contains(F::HOST_VISIBLE | F::HOST_CACHED),
+                        &|f| f.contains(F::HOST_VISIBLE | F::HOST_COHERENT),
+                    ],
+                )
             } else {
-                self.memory_type(req.memory_type_bits, F::DEVICE_LOCAL, F::DEVICE_LOCAL)
+                self.memory_type(req.memory_type_bits, &[&|f| f.contains(F::DEVICE_LOCAL)])
             };
             let Some((type_index, coherent)) = pick else {
                 d.destroy_buffer(buffer, None);
@@ -104,27 +134,31 @@ impl TransferQueue {
                     return Err(anyhow!("vkAllocateMemory({size} bytes): {e}"));
                 }
             };
-            let mut raw = RawBuffer { device: d.clone(), buffer, memory, size, ptr: std::ptr::null_mut(), coherent };
+            let mut raw =
+                RawBuffer { owner: self.owner.clone(), buffer, memory, size, ptr: std::ptr::null_mut(), coherent };
             d.bind_buffer_memory(buffer, memory, 0).context("vkBindBufferMemory")?;
             if host {
-                raw.ptr = d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).context("vkMapMemory")?.cast();
+                raw.ptr =
+                    d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).context("vkMapMemory")?.cast();
             }
             Ok(raw)
         }
     }
 
     /// A timeline semaphore at 0.
-    pub fn timeline(&self) -> anyhow::Result<Timeline> {
-        let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+    pub(crate) fn timeline(&self) -> anyhow::Result<Timeline> {
+        let mut ty =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
         // SAFETY: plain object creation; destroyed by Timeline.
-        let sem = unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None) }
-            .context("vkCreateSemaphore")?;
-        Ok(Timeline { device: self.device.clone(), sem })
+        let sem =
+            unsafe { self.device().create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None) }
+                .context("vkCreateSemaphore")?;
+        Ok(Timeline { owner: self.owner.clone(), sem })
     }
 
     /// A command pool of the transfer family with `n` resettable primary command buffers.
-    pub fn commands(&self, n: u32) -> anyhow::Result<Commands> {
-        let d = &self.device;
+    pub(crate) fn commands(&self, n: u32) -> anyhow::Result<Commands> {
+        let d = self.device();
         // SAFETY: plain object creation; destroyed by Commands.
         unsafe {
             let pool = d
@@ -135,6 +169,7 @@ impl TransferQueue {
                     None,
                 )
                 .context("vkCreateCommandPool")?;
+            let mut commands = Commands { owner: self.owner.clone(), pool, buffers: Vec::new() };
             let buffers = d
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
@@ -143,14 +178,23 @@ impl TransferQueue {
                         .command_buffer_count(n),
                 )
                 .context("vkAllocateCommandBuffers")?;
-            Ok(Commands { device: d.clone(), pool, buffers })
+            commands.buffers = buffers;
+            Ok(commands)
         }
     }
 
     /// Records `copies` (src, src offset, dst, dst offset, bytes) into `cmd`, followed by a
     /// barrier that makes them visible to the host, and submits it once `wait` reaches
-    /// `wait_value`; signals `signal` to `signal_value` when done. `cmd` must not be pending.
-    pub fn copy(
+    /// `wait_value`; signals `signal` to `signal_value` when done.
+    ///
+    /// # Safety
+    /// - `cmd` belongs to a `Commands` of this queue and is not pending (its previous submission
+    ///   completed).
+    /// - Every buffer in `copies` is valid for the copy and outlives the submission, and so do
+    ///   `wait` and `signal`: the caller keeps them until `signal` reaches `signal_value` (or the
+    ///   queue is idle).
+    /// - Whatever writes the sources is ordered before `wait` reaches `wait_value`.
+    pub(crate) unsafe fn copy(
         &self,
         cmd: vk::CommandBuffer,
         copies: &[(vk::Buffer, u64, vk::Buffer, u64, u64)],
@@ -159,12 +203,14 @@ impl TransferQueue {
         signal: &Timeline,
         signal_value: u64,
     ) -> anyhow::Result<()> {
-        let d = &self.device;
-        // SAFETY: `cmd` is idle (its previous submission was waited for), every buffer outlives
-        // the submission (the caller keeps them until `signal` reaches `signal_value`).
+        let d = self.device();
+        // SAFETY: the caller's contract above; the queue is externally synchronized by the lock.
         unsafe {
             d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
             for &(src, so, dst, dof, size) in copies {
                 if size > 0 {
                     d.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy { src_offset: so, dst_offset: dof, size }]);
@@ -195,45 +241,87 @@ impl TransferQueue {
                 .command_buffers(&cmds)
                 .signal_semaphores(&signals)
                 .push_next(&mut values);
-            d.queue_submit(self.queue, &[submit], vk::Fence::null()).context("vkQueueSubmit (transfer)")?;
+            let queue = self.queue.lock().unwrap();
+            d.queue_submit(*queue, &[submit], vk::Fence::null()).context("vkQueueSubmit (transfer)")?;
         }
         Ok(())
     }
 
+    /// Submits `cmd` on `wgpu_queue` (the wgpu queue of this queue's device) with a wait for
+    /// `wait` and a signal of `signal` attached (timeline values), and returns its submission
+    /// index. The staging and the submission happen under one lock, so no other submission made
+    /// through this function picks up the semaphores. Code submitting to the same `wgpu::Queue`
+    /// from another thread while this runs could still pick them up: every `Pipeline` submits
+    /// from the thread that runs it, and nothing else in the crate submits to a context a
+    /// streaming pipeline is using.
+    ///
+    /// # Safety
+    /// `wait` and `signal` outlive the submission (the caller waits for it before dropping them).
+    pub(crate) unsafe fn submit_wgpu(
+        &self,
+        wgpu_queue: &wgpu::Queue,
+        cmd: wgpu::CommandBuffer,
+        wait: Option<(&Timeline, u64)>,
+        signal: Option<(&Timeline, u64)>,
+    ) -> anyhow::Result<wgpu::SubmissionIndex> {
+        let _guard = self.wgpu_submit.lock().unwrap();
+        {
+            // SAFETY: see the contract; the hal queue is only used to stage the semaphores.
+            let hal = unsafe { wgpu_queue.as_hal::<wgpu::hal::api::Vulkan>() }
+                .ok_or_else(|| anyhow!("not a Vulkan queue"))?;
+            if let Some((t, v)) = wait {
+                hal.add_wait_semaphore(t.sem, Some(v), vk::PipelineStageFlags::ALL_COMMANDS);
+            }
+            if let Some((t, v)) = signal {
+                hal.add_signal_semaphore(t.sem, Some(v));
+            }
+        }
+        Ok(wgpu_queue.submit([cmd]))
+    }
+
     /// Blocks until `t` reaches `value`.
-    pub fn wait(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
+    pub(crate) fn wait(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
         let (sems, values) = ([t.sem], [value]);
         // SAFETY: plain wait on a live semaphore.
-        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&values), u64::MAX) }
-            .context("vkWaitSemaphores")
+        unsafe {
+            self.device().wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&values), u64::MAX)
+        }
+        .context("vkWaitSemaphores")
     }
 
     /// The current value of `t`.
-    pub fn value(&self, t: &Timeline) -> anyhow::Result<u64> {
+    pub(crate) fn value(&self, t: &Timeline) -> anyhow::Result<u64> {
         // SAFETY: plain query on a live semaphore.
-        unsafe { self.device.get_semaphore_counter_value(t.sem) }.context("vkGetSemaphoreCounterValue")
+        unsafe { self.device().get_semaphore_counter_value(t.sem) }.context("vkGetSemaphoreCounterValue")
     }
 
-    /// Signals `t` to `value` from the host if it is below (after an error, with both queues idle).
-    pub fn catch_up(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
+    /// Signals `t` to `value` from the host if it is below.
+    ///
+    /// # Safety
+    /// No submission that signals `t` is pending (both queues are idle), so the host signal
+    /// cannot race a GPU one or move the value backwards.
+    pub(crate) unsafe fn catch_up(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
         if self.value(t)? < value {
-            // SAFETY: no pending GPU signal of `t` (the queues are idle), and `value` is larger.
-            unsafe { self.device.signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(t.sem).value(value)) }
-                .context("vkSignalSemaphore")?;
+            // SAFETY: the caller's contract; `value` is larger than the current value.
+            unsafe {
+                self.device().signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(t.sem).value(value))
+            }
+            .context("vkSignalSemaphore")?;
         }
         Ok(())
     }
 
     /// Blocks until the transfer queue is idle.
     pub fn idle(&self) {
-        // SAFETY: plain wait.
-        let _ = unsafe { self.device.queue_wait_idle(self.queue) };
+        let queue = self.queue.lock().unwrap();
+        // SAFETY: plain wait; the queue is externally synchronized by the lock.
+        let _ = unsafe { self.device().queue_wait_idle(*queue) };
     }
 }
 
 /// A buffer and its dedicated memory (see `TransferQueue::buffer`); host buffers stay mapped.
-pub struct RawBuffer {
-    device: ash::Device,
+pub(crate) struct RawBuffer {
+    owner: Arc<DeviceOwner>,
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub size: u64,
@@ -254,20 +342,25 @@ impl RawBuffer {
         if !self.coherent {
             let range = vk::MappedMemoryRange::default().memory(self.memory).offset(0).size(vk::WHOLE_SIZE);
             // SAFETY: the memory is mapped.
-            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) };
+            let _ = unsafe { self.owner.device.invalidate_mapped_memory_ranges(&[range]) };
         }
         // SAFETY: the mapping covers `size` bytes and lives as long as `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.size as usize) }
     }
 
-    /// The buffer as a `wgpu::Buffer` of `device` (which must live on the same `VkDevice`), with
-    /// `usage` (a subset of what it was created with). The wgpu buffer does not own it: `self` must
-    /// outlive every GPU use of it.
-    pub fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
-        // SAFETY: the VkBuffer is valid, bound to memory we manage, and outlives the wgpu buffer's
-        // GPU uses (see above); wgpu never maps it.
+    /// The buffer as a `wgpu::Buffer` of `device`, with `usage`. The wgpu buffer does not own the
+    /// `VkBuffer` (wgpu never destroys or maps it).
+    ///
+    /// # Safety
+    /// - `device` is a wgpu device on this buffer's `VkDevice`.
+    /// - `usage` is covered by the Vulkan usage flags the buffer was created with, and wgpu only
+    ///   uses the buffer on queues of the families it was created for.
+    /// - `self` outlives every GPU use of the returned buffer (drop it only after the device is
+    ///   idle).
+    pub unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        // SAFETY: the caller's contract; externally owned, so wgpu-hal never vkDestroyBuffers it
+        // (`Buffer::from_raw` would).
         unsafe {
-            // Externally owned: wgpu-hal must not vkDestroyBuffer it (`from_raw` would).
             let hal = wgpu::hal::vulkan::Buffer::from_raw_externally_owned(self.buffer, Box::new(|| {}));
             device.create_buffer_from_hal::<wgpu::hal::api::Vulkan>(
                 hal,
@@ -282,30 +375,30 @@ impl Drop for RawBuffer {
         // SAFETY: the owner waited for every GPU use to finish.
         unsafe {
             if !self.ptr.is_null() {
-                self.device.unmap_memory(self.memory);
+                self.owner.device.unmap_memory(self.memory);
             }
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
+            self.owner.device.destroy_buffer(self.buffer, None);
+            self.owner.device.free_memory(self.memory, None);
         }
     }
 }
 
 /// A timeline semaphore.
-pub struct Timeline {
-    device: ash::Device,
+pub(crate) struct Timeline {
+    owner: Arc<DeviceOwner>,
     pub sem: vk::Semaphore,
 }
 
 impl Drop for Timeline {
     fn drop(&mut self) {
         // SAFETY: no pending submission uses it (the owner waited).
-        unsafe { self.device.destroy_semaphore(self.sem, None) };
+        unsafe { self.owner.device.destroy_semaphore(self.sem, None) };
     }
 }
 
 /// A command pool and its command buffers.
-pub struct Commands {
-    device: ash::Device,
+pub(crate) struct Commands {
+    owner: Arc<DeviceOwner>,
     pool: vk::CommandPool,
     pub buffers: Vec<vk::CommandBuffer>,
 }
@@ -313,26 +406,8 @@ pub struct Commands {
 impl Drop for Commands {
     fn drop(&mut self) {
         // SAFETY: no command buffer is pending (the owner waited).
-        unsafe { self.device.destroy_command_pool(self.pool, None) };
+        unsafe { self.owner.device.destroy_command_pool(self.pool, None) };
     }
-}
-
-/// The wgpu queue's hal side, for staging semaphore waits/signals on its next submission.
-/// `None` on non-Vulkan backends.
-pub(crate) fn stage_on_next_submit(
-    queue: &wgpu::Queue,
-    wait: Option<(&Timeline, u64)>,
-    signal: Option<(&Timeline, u64)>,
-) -> anyhow::Result<()> {
-    // SAFETY: the semaphores outlive the submission that uses them (the owner waits for it).
-    let hal = unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }.ok_or_else(|| anyhow!("not a Vulkan queue"))?;
-    if let Some((t, v)) = wait {
-        hal.add_wait_semaphore(t.sem, Some(v), vk::PipelineStageFlags::ALL_COMMANDS);
-    }
-    if let Some((t, v)) = signal {
-        hal.add_signal_semaphore(t.sem, Some(v));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

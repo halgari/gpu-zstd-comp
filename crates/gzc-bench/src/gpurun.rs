@@ -158,7 +158,12 @@ pub fn run_gpu(
     }
     let gpu_ms: f64 = stats.kernel_ms.iter().map(|k| k.1).sum();
     if gpu_ms > 0.0 {
-        eprintln!("    {:<10} {gpu_ms:>10.1} ms total {:>8.2} ms/batch {:>9.1} MB/s", "sum", gpu_ms / batches, mb / (gpu_ms / 1e3));
+        eprintln!(
+            "    {:<10} {gpu_ms:>10.1} ms total {:>8.2} ms/batch {:>9.1} MB/s",
+            "sum",
+            gpu_ms / batches,
+            mb / (gpu_ms / 1e3)
+        );
     }
     // Where the rest of the time goes (see gzc_gpu::pipeline::TRANSFER_NAMES).
     for (name, ms) in &stats.transfer_ms {
@@ -167,12 +172,7 @@ pub fn run_gpu(
 
     Ok(RunResult {
         engine: "gpu".to_string(),
-        config: format!(
-            "{preset} {}b{} i{}",
-            if cfg.params.huffman { "" } else { "rawlit " },
-            cfg.batch,
-            cfg.inflight
-        ),
+        config: format!("{preset} {}b{} i{}", if cfg.params.huffman { "" } else { "rawlit " }, cfg.batch, cfg.inflight),
         threads: Some(writer_threads),
         real_bytes,
         compressed_bytes: sizes.iter().sum(),

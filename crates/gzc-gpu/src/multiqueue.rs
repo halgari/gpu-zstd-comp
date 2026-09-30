@@ -38,6 +38,39 @@ pub(crate) fn queue_families(adapter: &wgpu::Adapter) -> Vec<QueueFamily> {
         .collect()
 }
 
+/// The queue family the transfer readback can use on `adapter`: Vulkan with a family that is
+/// transfer-only (neither compute nor graphics; never family 0, wgpu's) and has a queue, on a
+/// device and instance of Vulkan 1.2 or later with `timelineSemaphore` (the pipeline orders the
+/// two queues with timeline semaphores through the 1.2 core entry points). None otherwise.
+pub(crate) fn transfer_family(adapter: &wgpu::Adapter) -> Option<u32> {
+    // SAFETY: plain property queries while `adapter` lives.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let instance = hal.shared_instance();
+    let phd = hal.raw_physical_device();
+    let v12 = vk::API_VERSION_1_2;
+    if instance.instance_api_version() < v12 || hal.physical_device_capabilities().properties().api_version < v12 {
+        return None;
+    }
+    let mut t = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut t);
+    // SAFETY: plain property query (Vulkan 1.1+, checked above).
+    unsafe { instance.raw_instance().get_physical_device_features2(phd, &mut f2) };
+    if t.timeline_semaphore != vk::TRUE {
+        return None;
+    }
+    drop(hal);
+    queue_families(adapter)
+        .into_iter()
+        .find(|f| {
+            use vk::QueueFlags as Q;
+            f.index != 0
+                && f.flags.contains(Q::TRANSFER)
+                && !f.flags.intersects(Q::COMPUTE | Q::GRAPHICS)
+                && f.count > 0
+        })
+        .map(|f| f.index)
+}
+
 /// A `VkDevice` created with family 0 queue 0 plus extra queues, before any wgpu device wraps it.
 pub(crate) struct RawDevice {
     pub raw: ash::Device,
@@ -73,22 +106,28 @@ impl RawDevice {
         }
         let exts = hal.required_device_extensions(p.required_features);
         let mut phd_features = hal.physical_device_features(&exts, p.required_features);
-        // Probe knob: GZC_PROBE_PRIO0 = the family-0 queues' priority (others 1.0).
-        let p0: f32 = std::env::var("GZC_PROBE_PRIO0").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-        let prio: Vec<Vec<f32>> = counts.iter().map(|(&f, &n)| vec![if f == 0 { p0 } else { 1.0 }; n as usize]).collect();
+        // Test-only probe knob: GZC_PROBE_PRIO0 = the family-0 queues' priority in 0..=1 (others 1).
+        #[cfg(test)]
+        let p0: f32 =
+            std::env::var("GZC_PROBE_PRIO0").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.0, 1.0);
+        #[cfg(not(test))]
+        let p0 = 1.0f32;
+        let prio: Vec<Vec<f32>> =
+            counts.iter().map(|(&f, &n)| vec![if f == 0 { p0 } else { 1.0 }; n as usize]).collect();
         let infos: Vec<vk::DeviceQueueCreateInfo> = counts
             .iter()
             .zip(&prio)
             .map(|((&f, _), p)| vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(p))
             .collect();
         let ext_ptrs: Vec<*const std::ffi::c_char> = exts.iter().map(|e| e.as_ptr()).collect();
-        let info = phd_features
-            .add_to_device_create(vk::DeviceCreateInfo::default().queue_create_infos(&infos).enabled_extension_names(&ext_ptrs));
+        let info = phd_features.add_to_device_create(
+            vk::DeviceCreateInfo::default().queue_create_infos(&infos).enabled_extension_names(&ext_ptrs),
+        );
         // SAFETY: the create info is what `open_with_callback` builds, plus queues.
         let raw = unsafe { instance.create_device(phd, &info, None) }.context("vkCreateDevice")?;
         // SAFETY: plain property query.
         let memory = unsafe { instance.get_physical_device_memory_properties(phd) };
-        let owner = Arc::new(DeviceOwner(raw.clone()));
+        let owner = Arc::new(DeviceOwner::new(raw.clone(), p.adapter.clone()));
         Ok(Self { raw, owner, families, memory, exts })
     }
 
@@ -135,7 +174,11 @@ impl MultiQueue {
     /// Opens the adapter as `GpuContext::with_options(allow_subgroups, mappable)` does, with the
     /// extra `(family, queue index)` queues each wrapped in a `GpuContext` (see `RawDevice::new`).
     pub fn open(allow_subgroups: bool, mappable: bool, extra: &[(u32, u32)]) -> anyhow::Result<Self> {
-        let p = Prepared::new(allow_subgroups, mappable)?;
+        let p = Prepared::new(crate::context::GpuOptions {
+            subgroups: allow_subgroups,
+            pack_frames: mappable,
+            ..crate::context::GpuOptions::from_env()
+        })?;
         let rd = RawDevice::new(&p, extra)?;
         let main = rd.context(&p, 0, 0)?;
         let extra = extra.iter().map(|&(f, i)| rd.context(&p, f, i)).collect::<anyhow::Result<Vec<_>>>()?;
@@ -165,7 +208,8 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     walk(&p, out);
-                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dds") || x.eq_ignore_ascii_case("nif")) {
+                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dds") || x.eq_ignore_ascii_case("nif"))
+                {
                     out.push(p);
                 }
             }
@@ -313,11 +357,8 @@ mod tests {
         let swap = std::env::var("GZC_PROBE_SWAP").is_ok_and(|v| v == "1");
         let last = mq.extra.len() - 1;
         let main = if swap { &mq.extra[last] } else { &mq.main };
-        let others: Vec<(&GpuContext, (u32, u32))> = if swap {
-            vec![(&mq.main, (0, 0))]
-        } else {
-            mq.extra.iter().zip(extra.iter().copied()).collect()
-        };
+        let others: Vec<(&GpuContext, (u32, u32))> =
+            if swap { vec![(&mq.main, (0, 0))] } else { mq.extra.iter().zip(extra.iter().copied()).collect() };
         let km = Kernels::new(main, params).unwrap();
         eprintln!("k3 mode {:?}, n = {n}", km.k3_mode());
         let a = upload(main, a_blocks);
@@ -409,7 +450,8 @@ mod tests {
                     q.queue.submit([k12_ts(q, &kq, &b, &tb)]);
                     wait(q);
                 }
-                let v: Vec<u64> = if alone_main { main.read_buffer(&ta.resolve, 0, 2) } else { q.read_buffer(&tb.resolve, 0, 4) };
+                let v: Vec<u64> =
+                    if alone_main { main.read_buffer(&ta.resolve, 0, 2) } else { q.read_buffer(&tb.resolve, 0, 4) };
                 let p = main.queue.get_timestamp_period() as f64 / 1e6;
                 let d: Vec<String> = v.chunks(2).map(|c| format!("{:.2}", (c[1] - c[0]) as f64 * p)).collect();
                 eprintln!("  {label}: {}", d.join(" / "));

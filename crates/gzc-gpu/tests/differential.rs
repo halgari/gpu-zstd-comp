@@ -490,6 +490,35 @@ fn compress_frames_needs_emit_frames() {
     assert!(frames_from_parses(&ctx, &kernels, &[&block], &[BlockOutput::default()]).is_err());
 }
 
+/// K4 runs without index clamps, so `frames_from_parses` rejects parses that break zstd's
+/// sequence invariants (match_len < 3, off_base 0 or beyond the block, lengths that wrap u32)
+/// instead of handing them to the GPU.
+#[test]
+fn frames_from_parses_rejects_invalid_sequences() {
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+    let kernels = Kernels::new(&ctx, params).unwrap();
+    let block = zeros(BLOCK_SIZE);
+    let seq = |lit_len, match_len, off_base| gzc_core::seq::Sequence { lit_len, match_len, off_base };
+    let parse = |s: gzc_core::seq::Sequence| {
+        let covered = (s.lit_len as usize).saturating_add(s.match_len as usize).min(BLOCK_SIZE);
+        BlockOutput { sequences: vec![s], literals: vec![0u8; s.lit_len as usize + (BLOCK_SIZE - covered)] }
+    };
+    let bad = [
+        seq(0, 2, 4),                     // match_len below MINMATCH
+        seq(0, 8, 0),                     // off_base 0
+        seq(0, 8, BLOCK_SIZE as u32 + 4), // offset beyond the block
+        seq(1, u32::MAX, 4),              // lit_len + match_len wraps u32
+    ];
+    for s in bad {
+        let p = parse(s);
+        assert!(frames_from_parses(&ctx, &kernels, &[&block], &[p]).is_err(), "{s:?} accepted");
+    }
+    // A valid one still works.
+    let good = parse(seq(0, 8, 1 + 3));
+    assert!(frames_from_parses(&ctx, &kernels, &[&block], &[good]).is_ok());
+}
+
 // ---- K4 alone on scripted parses: exact ties and boundaries the match finder rarely produces ----
 
 /// (block, parse) from (lit_len, offset, match_len) steps, literals drawn from `seed`; the rest of
