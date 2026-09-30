@@ -604,9 +604,9 @@ mod tests {
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
         #[cfg(feature = "block-128k")]
         {
-            // ~2.9 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
+            // ~2.5 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((2.9..3.1).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
+            assert!((2.4..2.6).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
             assert!((0.49..0.51).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
     }

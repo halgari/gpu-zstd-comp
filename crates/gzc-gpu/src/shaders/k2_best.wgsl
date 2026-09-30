@@ -2,8 +2,9 @@
 // Dispatch (BLOCK_SIZE / 256, n_blocks, 1): one thread per (position, block).
 // For p < PARSE_END it walks up to DEPTH candidates of each of the N_HASHES chains in turn
 // (Dfast: long, then short), keeping the longest match capped at SEARCH_CAP (ties: larger q).
-// best[(b*BLOCK_SIZE + p)*2 ..] = (offset, capped len), (0, 0) when the best length is below
-// MIN_MATCH or p >= PARSE_END. K3 extends matches whose len == SEARCH_CAP.
+// best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset, 0 when the best length is
+// below MIN_MATCH or p >= PARSE_END (BEST_OFF_BITS is injected by the host: offset < BLOCK_SIZE
+// <= 2^BEST_OFF_BITS, len <= SEARCH_CAP <= 256). K3 extends matches whose len == SEARCH_CAP.
 // Cap early-out, byte-identical to the full walk: (1) within a chain q strictly decreases
 // (pred[q] < q), so after a candidate reaches SEARCH_CAP every later one has len <= SEARCH_CAP
 // and a smaller q, and loses (a tie keeps the larger q). (2) Across chains (Dfast: long chain
@@ -69,10 +70,9 @@ fn match_len_capped(pw: u32, sp: u32, p0: u32, p1: u32, base: u32, q: u32, max: 
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     let b = gid.y;
-    let o = (b * BLOCK_SIZE + p) * 2u;
+    let o = b * BLOCK_SIZE + p;
     if (p >= PARSE_END) {
         best[o] = 0u;
-        best[o + 1u] = 0u;
         return;
     }
     let base = block_base(b);
@@ -99,11 +99,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             q = pred[pb + q];
         }
     }
-    if (best_len >= MIN_MATCH) {
-        best[o] = p - best_q;
-        best[o + 1u] = best_len;
-    } else {
-        best[o] = 0u;
-        best[o + 1u] = 0u;
-    }
+    best[o] = select(0u, (best_len << BEST_OFF_BITS) | (p - best_q), best_len >= MIN_MATCH);
 }
