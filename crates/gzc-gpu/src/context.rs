@@ -199,7 +199,15 @@ impl Prepared {
 
     pub fn new(opts: GpuOptions) -> anyhow::Result<Self> {
         let (allow_subgroups, mappable) = (opts.subgroups, opts.pack_frames);
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        #[allow(unused_mut)]
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        // Apple builds compile wgpu's Vulkan backend (for `hal::api::Vulkan`, see Cargo.toml); keep
+        // them on Metal so an installed MoltenVK is never picked unless WGPU_BACKEND asks for it.
+        #[cfg(target_vendor = "apple")]
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            desc.backends = wgpu::Backends::METAL;
+        }
+        let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()

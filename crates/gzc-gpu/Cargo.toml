@@ -21,5 +21,12 @@ anyhow = { workspace = true }
 # probe (`context::rebar`) and the extra queues of the multi-queue path.
 ash = "0.38"
 
+# wgpu-hal only exports its Vulkan API types (`hal::api::Vulkan`, used by the transfer-queue and
+# ReBAR paths) when its `vulkan` backend is compiled, which on Apple targets needs
+# `vulkan-portability`. It only makes those paths compile: `GpuContext::new` still picks Metal on
+# Apple (unless WGPU_BACKEND says otherwise), and a Metal adapter takes the non-Vulkan fallbacks.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan-portability"] }
+
 [dev-dependencies]
 zstd = { workspace = true }
