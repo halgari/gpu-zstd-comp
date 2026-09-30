@@ -129,7 +129,23 @@ the host thread is timed with `Instant`. `GZC_NO_TIMESTAMPS=1` turns all queries
 | host: submit, upload-map wait, unmap | 0.3 | |
 | host: fill (first upload) / drain | 13.3 / 2.7 ms once | 0.6 % of the run |
 
-Wall time per batch is 104.1 ms, which equals kernels + copies (103.5) plus fill/drain. **The run is GPU-bound and the
+After S6 (lvl9 b2431 i3, 22 batches, median run 2579.9 MB/s):
+
+| Item | ms/batch | Notes |
+|---|---:|---|
+| kernels K1–K5 | 105.33 | 43.3 µs/block against 47.4 before |
+| GPU upload copy | 2.32 | |
+| GPU readback copy | 5.98 | |
+| GPU idle between submissions | 0.02 | includes the previous batch's timestamp resolve + copy |
+| host: upload memcpy + unmap | 14.95 | overlapped |
+| host: frame delivery | 9.57 | overlapped |
+| host: submit, upload-map wait, unmap | 0.26 | |
+| host: fill / drain | 15.6 / 0.6 ms once | |
+
+Wall time is 114.4 ms/batch, which equals kernels + copies (113.6) plus fill/drain. The copies are still 7.3 % of
+the time, all of it serial with the kernels.
+
+Before S6, wall time per batch was 104.1 ms, which equals kernels + copies (103.5) plus fill/drain. **The run is GPU-bound and the
 host is idle ~80 % of the time.** The whole "host overhead" is the two copies, which the single wgpu queue runs
 serially with the kernels (7.2 ms/batch, 7 %).
 
@@ -171,6 +187,14 @@ Findings:
   `--batch max` grows from 2026 to 2431.
 - The upload copy (2.3 ms/batch now) could go away if the kernels read `data` straight from the (ReBAR, device-local)
   upload buffer. It was not tried: without ReBAR, that buffer lives in host memory and every kernel would read over PCIe.
+
+**`--inflight 2` observation (for the controller's protocol decision).** With slots now cheap, lvl9 `--batch max
+--inflight 2` gets b2701 and **2769.8 MB/s** (2769.8 / 2767.0 / 2794.9), +7.4 % over S6 at i3. The protocol is still i3.
+
+**`GZC_PACK` is an explicit exception to the keep/revert rule (controller ruling).** It is slower on the 5090 but kept
+opt-in, to be re-measured on the PCIe 4.0 ×8 target card. `MAPPABLE_PRIMARY_BUFFERS`, a native-only feature, is
+requested only when packing is asked for: `GZC_PACK`, or `GpuContext::with_options(_, true)` in its test. The
+default path does not enable it.
 
 **Kept:** the profiler, `GZC_NO_TIMESTAMPS`, the shared device buffers, and `GZC_PACK` as opt-in. **Reverted:** the
 deferred-readback and in-pass-pack scheduling (commits 301fd30, and the hooks in compressor.rs/chains.rs, which are

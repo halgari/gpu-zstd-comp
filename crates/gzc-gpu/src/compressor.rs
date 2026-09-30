@@ -197,31 +197,10 @@ impl BatchBuffers {
             frame_len: frames.then(|| ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
         }
     }
-
-    /// New `data` (and K4 output) buffers, sharing `other`'s scratch buffers: head, pred, best,
-    /// seqs, lits and counts. Safe for batches recorded into later submissions on the same queue
-    /// as long as every batch reads those buffers back (or consumes them in K4) within its own
-    /// submission: wgpu orders the submissions and their buffer hazards.
-    pub fn new_sharing(ctx: &GpuContext, other: &BatchBuffers, frames: bool) -> Self {
-        let capacity = other.capacity;
-        Self {
-            capacity,
-            n_hashes: other.n_hashes,
-            data: ctx.storage_buffer("batch.data", data_bytes(capacity), false),
-            head: other.head.clone(),
-            pred: other.pred.clone(),
-            best: other.best.clone(),
-            seqs: other.seqs.clone(),
-            lits: other.lits.clone(),
-            counts: other.counts.clone(),
-            frames: frames.then(|| ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
-            frame_len: frames.then(|| ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
-        }
-    }
 }
 
-/// Bytes of the scratch buffers `BatchBuffers::new_sharing` shares (head, pred, best, seqs, lits,
-/// counts) for `n_blocks` under match params `m` (one head/pred chain per `m.n_hashes()`).
+/// Bytes of the scratch buffers (head, pred, best, seqs, lits, counts) for `n_blocks` under match
+/// params `m` (one head/pred chain per `m.n_hashes()`).
 pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
     head_bytes(n_blocks, m.n_hashes())
         + pred_bytes(n_blocks, m.n_hashes())
@@ -231,7 +210,8 @@ pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
         + counts_bytes(n_blocks)
 }
 
-/// Bytes of the per-slot buffers (data, plus frames and frame_len with `frames`) for `n_blocks`.
+/// Bytes of the remaining `BatchBuffers` (data, plus frames and frame_len with `frames`) for
+/// `n_blocks`; the pipeline allocates them once, shared by all its slots.
 pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
     data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + frame_len_bytes(n_blocks) } else { 0 }
 }

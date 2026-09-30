@@ -47,7 +47,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         packed[b >> 2u] = vec4<u32>(len_at(b, n), len_at(b + 1u, n), len_at(b + 2u, n), len_at(b + 3u, n));
     }
     let dst = (PACK_BASE >> 2u) + part[0];
-    let chunks = (frame_len[b] + 15u) >> 4u;
+    // K4 never reports more than FRAME_STRIDE bytes; the clamp keeps a bad length from reading
+    // into the next block's frame (the host rejects it anyway).
+    let chunks = min((frame_len[b] + 15u) >> 4u, FRAME_WORDS >> 2u);
     let src = b * (FRAME_WORDS >> 2u);
     for (var k = t; k < chunks; k += WG) {
         packed[dst + k] = frames[src + k];
