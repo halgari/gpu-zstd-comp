@@ -52,7 +52,7 @@ fn main_opt(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p1 = load_u32_at(base, p + 4u);
     let fp4 = pred_fp(p0, p1);
     let fp3 = pred_fp3(p0);
-    let pb4 = 2u * b * BLOCK_SIZE;
+    let pb4 = N_HASHES * b * BLOCK_SIZE;
     let pb3 = pb4 + BLOCK_SIZE;
     // Chain heads q4 / q3 (PRED_NONE: done), their pred words w4 / w3 (q's successor and
     // fingerprint; loaded one step ahead), and the steps left n4 / n3.

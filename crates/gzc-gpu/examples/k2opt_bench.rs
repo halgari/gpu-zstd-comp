@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     for f in &files {
         let bytes = std::fs::read(f)?;
         for chunk in bytes.chunks(BLOCK_SIZE) {
-            if i % stride == 0 {
+            if i.is_multiple_of(stride) {
                 let mut blk = vec![0u8; BLOCK_SIZE];
                 blk[..chunk.len()].copy_from_slice(chunk);
                 pending.push(blk);

@@ -6,6 +6,12 @@ pub fn read_u32(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
 }
 
+/// Keep in mind when changing: `k2_opt.wgsl`'s `ub = 2` skip on an h4 fingerprint mismatch
+/// (entries on the `Opt3` h4 chain whose first 4 bytes differ share < 3 bytes) relies on
+/// `hash_width(.., 4) = mix(lo, 0)` being injective in byte 3 for fixed bytes 0..3. That holds
+/// because both multipliers are odd, `hi = 0`, and the 16-bit key keeps bits 24..31 of the
+/// product, where byte 3 enters as `(byte3 * K) << 24`, a bijection. Checked by
+/// `gzc-gpu/tests/cands.rs::h4_hash_is_injective_in_byte_3`.
 fn mix(lo: u32, hi: u32) -> u32 {
     (lo.wrapping_mul(0x9E37_79B1) ^ hi.wrapping_mul(0x85EB_CA77)).wrapping_mul(0xC2B2_AE3D) >> (32 - HASH_BITS)
 }

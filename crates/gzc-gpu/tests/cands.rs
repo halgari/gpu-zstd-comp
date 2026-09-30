@@ -112,7 +112,9 @@ fn opt_cand_kernel_rejects_non_opt_params() {
 
 /// Informal (reads the real corpus): K1 + K2opt against `find_cands` on real .dds/.nif blocks.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test cands corpus -- --ignored --nocapture`
-/// Takes up to `GZC_CORPUS_BLOCKS` (default 4000) blocks, spread over the files in sorted order.
+/// Takes up to `GZC_CORPUS_BLOCKS` (default 4000) blocks sampled uniformly over the whole corpus:
+/// every k-th of all (file, block) pairs, files in sorted path order, k = total blocks / wanted.
+/// Skips (with a message) when the corpus directory does not exist.
 #[test]
 #[ignore]
 fn corpus_cands_match_cpu() {
@@ -130,23 +132,38 @@ fn corpus_cands_match_cpu() {
     }
     let root = std::env::var("GZC_CORPUS")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+    if !Path::new(&root).is_dir() {
+        eprintln!("corpus directory {root} not found (set GZC_CORPUS): skipping");
+        return;
+    }
     let want_blocks: usize = std::env::var("GZC_CORPUS_BLOCKS").map(|v| v.parse().unwrap()).unwrap_or(4000);
     let mut files = Vec::new();
     walk(Path::new(&root), &mut files);
     files.sort();
-    let step = (files.len() / want_blocks).max(1);
+    // Blocks per file (chunk_file: ceil(len / BLOCK_SIZE)), from the file sizes.
+    let counts: Vec<usize> =
+        files.iter().map(|f| (std::fs::metadata(f).unwrap().len() as usize).div_ceil(BLOCK_SIZE)).collect();
+    let total: usize = counts.iter().sum();
+    let step = (total / want_blocks.max(1)).max(1);
     let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
-    for f in files.iter().step_by(step) {
+    let mut first = 0usize; // global index of the file's first block
+    for (f, &n) in files.iter().zip(&counts) {
         if blocks.len() >= want_blocks {
             break;
         }
-        let bytes = std::fs::read(f).unwrap();
-        for (i, b) in chunk_file(&bytes).into_iter().take(4).enumerate() {
-            blocks.push((format!("{}[{i}]", f.display()), b.data));
+        // The file's blocks whose global index first + i is a multiple of step.
+        let picked: Vec<usize> = (first.div_ceil(step) * step..first + n).step_by(step).map(|g| g - first).collect();
+        if !picked.is_empty() {
+            let chunks = chunk_file(&std::fs::read(f).unwrap());
+            assert_eq!(chunks.len(), n, "{}", f.display());
+            for i in picked {
+                blocks.push((format!("{}[{i}]", f.display()), chunks[i].data.clone()));
+            }
         }
+        first += n;
     }
     blocks.truncate(want_blocks);
-    eprintln!("{} blocks from {} files", blocks.len(), files.len());
+    eprintln!("{} blocks (every {step}th of {total}) from {} files", blocks.len(), files.len());
     let ctx = GpuContext::new().expect("GPU required");
     eprintln!("subgroups: {}", ctx.subgroups);
     for chunk in blocks.chunks(500) {

@@ -55,6 +55,10 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
 - **Fingerprint caveat.** Entries on the `h4` chain whose first 4 bytes differ (16-bit hash collisions) can
   still share 3 bytes with `p`, and such an entry is a valid 3-byte record. A 4-byte fingerprint mismatch may
   therefore skip the compare only once `best >= 3`, or when the first 3 bytes also differ.
+  With our hash the second case always holds, so the caveat cannot fire. `hash_width(.., 4)` keeps the top 16
+  bits of `lo × odd`, where byte 3 enters the top 8 bits bijectively. So equal h4 keys with differing 4 bytes
+  also differ in the first 3 bytes, and K2opt skips them outright (`k2_opt.wgsl`, test
+  `h4_hash_is_injective_in_byte_3`).
 - Output is two u32 words per position (8 B): `offA:16|lenA:8|lenB:8`, `offB:16|0`.
 - The CPU oracle is `reference::find_cands`, with identical order and tie rules.
 - The sorted finder (speed2 E2) is optional follow-up work (S5). S1 uses the chain K1.
