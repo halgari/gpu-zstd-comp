@@ -27,8 +27,8 @@ enum Command {
     Cpu(CpuArgs),
     /// CPU reference compressor (the algorithm the GPU mirrors).
     Ref(RefArgs),
-    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames on the GPU;
-    /// literals stay raw until the GPU does Huffman).
+    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames, Huffman
+    /// literals included, on the GPU).
     Gpu(GpuArgs),
     /// Every engine (cpu-libzstd, cpu-ref, gpu) into one report.
     All(AllArgs),
