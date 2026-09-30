@@ -5,7 +5,7 @@
 // best[(b*BLOCK_SIZE + p)*2 ..] = (offset, capped len), (0, 0) when the best length is below
 // MIN_MATCH or p >= PARSE_END. K3 extends matches whose len == SEARCH_CAP.
 // MIN_MATCH, SEARCH_CAP, DEPTH and N_HASHES come from the MatchParams the host injects per
-// Kernels (`context::params_wgsl`). K1's pred layout is still two chains per block.
+// Kernels (`context::params_wgsl`). pred layout (K1): [block][chain][pos], N_HASHES chains per block.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> pred: array<u32>;
@@ -24,8 +24,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = block_base(b);
     var best_len = 0u;
     var best_q = 0u;
-    for (var width = 0u; width < N_HASHES; width++) {
-        let pb = (b * 2u + width) * BLOCK_SIZE;
+    for (var chain = 0u; chain < N_HASHES; chain++) {
+        let pb = (b * N_HASHES + chain) * BLOCK_SIZE;
         var q = pred[pb + p];
         for (var d = 0u; d < DEPTH; d++) {
             if (q == NO_POS) { break; }

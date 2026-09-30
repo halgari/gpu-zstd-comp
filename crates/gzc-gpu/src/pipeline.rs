@@ -24,7 +24,7 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
-    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, check_matching, counts_bytes, decode_output,
+    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
     data_bytes, frame_bytes, frame_len_bytes, frames_bytes, k4_tables_bytes, lits_bytes, max_batch_blocks,
     scratch_bytes, seqs_bytes, slot_bytes,
 };
@@ -131,17 +131,17 @@ impl<'a> Pipeline<'a> {
     /// a batch above `max_batch_blocks`, match params the GPU does not support (see
     /// `Kernels::new`), or a wgpu out-of-memory/validation error.
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
-        let max = max_batch_blocks(&ctx.device.limits());
+        let m = cfg.params.matching;
+        let max = max_batch_blocks(&ctx.device.limits(), &m);
         anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
         anyhow::ensure!(cfg.batch >= 1 && cfg.batch <= max, "batch {} not in 1..={max} for this device", cfg.batch);
 
-        check_matching(&cfg.params.matching)?;
-
         let scopes = ErrorScopes::push(ctx);
         let frames = cfg.params.emit_frames;
+        // Kernels::new validates the match params (`check_matching`) before any buffer is allocated.
         let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames);
-        let mut bufs = vec![BatchBuffers::new(ctx, cfg.batch, frames)];
+        let mut bufs = vec![BatchBuffers::new(ctx, cfg.batch, frames, &m)];
         for _ in 1..cfg.inflight {
             bufs.push(BatchBuffers::new_sharing(ctx, &bufs[0], frames));
         }
@@ -181,6 +181,24 @@ impl<'a> Pipeline<'a> {
             .collect();
         scopes.pop()?;
         Ok(Self { ctx, cfg: *cfg, kernels, layout, slots })
+    }
+
+    /// Bytes of every buffer the pipeline created, the shared scratch buffers once; timestamp
+    /// query sets and their resolve buffers are left out, as in `vram_bytes`.
+    #[cfg(test)]
+    fn allocated_bytes(&self) -> u64 {
+        let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, |b| b.size());
+        let s = &self.slots[0].bufs;
+        let scratch = [&s.head, &s.pred, &s.best, &s.seqs, &s.lits, &s.counts].iter().map(|b| b.size()).sum::<u64>();
+        let per_slot: u64 = self
+            .slots
+            .iter()
+            .map(|slot| {
+                let b = &slot.bufs;
+                b.data.size() + opt(&b.frames) + opt(&b.frame_len) + slot.upload.size() + slot.staging.size()
+            })
+            .sum();
+        scratch + per_slot + self.kernels.own_buffer_bytes()
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's parse
@@ -429,16 +447,19 @@ impl ErrorScopes {
     }
 }
 
-/// Device memory a `Pipeline` for `cfg` allocates: the shared scratch buffers once, and per slot
-/// its data/output buffers plus its upload and readback staging buffers (mappable; counted
-/// although drivers may place them in host memory), plus K4's constant tables. K5 has no buffers
-/// of its own. Uploads go through the persistent upload buffers only, so no transient staging
-/// adds to this. Timestamp query sets are not counted.
+/// Device memory a `Pipeline` for `cfg` allocates: the shared scratch buffers once (their hash
+/// chain buffers sized by `cfg.params.matching`: one chain for single-hash presets, two for
+/// Dfast), and per slot its data/output buffers plus its upload and readback staging buffers
+/// (mappable; counted although drivers may place them in host memory), plus K4's constant
+/// tables. K5 has no buffers of its own. Uploads go through the persistent upload buffers only,
+/// so no transient staging adds to this. Timestamp query sets are not counted.
 pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
     let frames = cfg.params.emit_frames;
     let per_slot =
         slot_bytes(cfg.batch, frames) + data_bytes(cfg.batch) + StagingLayout::new(cfg.batch, frames).size;
-    scratch_bytes(cfg.batch) + cfg.inflight as u64 * per_slot + if frames { k4_tables_bytes() } else { 0 }
+    scratch_bytes(cfg.batch, &cfg.params.matching)
+        + cfg.inflight as u64 * per_slot
+        + if frames { k4_tables_bytes() } else { 0 }
 }
 
 /// Builds a parse-path `Pipeline` for `cfg` (whose `emit_frames` must be false) and streams
@@ -468,7 +489,8 @@ pub fn compress_stream_frames(
 mod tests {
     use super::*;
     use gzc_core::block::chunk_file;
-    use gzc_core::params::{LVL3, LVL9};
+    use crate::chains::{head_bytes, pred_bytes};
+    use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::frame::write_frame;
     use gzc_core::synth::test_cases;
@@ -572,8 +594,8 @@ mod tests {
         let per_slot = vram_bytes(&frames(100, 2)) - one;
         assert_eq!(vram_bytes(&frames(100, 4)), one + 3 * per_slot);
         assert_eq!(per_slot, slot_bytes(100, true) + data_bytes(100) + StagingLayout::new(100, true).size);
-        assert_eq!(one, scratch_bytes(100) + per_slot + k4_tables_bytes());
-        assert!(one > scratch_bytes(100) + per_slot, "scratch counted once, plus the K4 tables");
+        assert_eq!(one, scratch_bytes(100, &LVL3) + per_slot + k4_tables_bytes());
+        assert!(one > scratch_bytes(100, &LVL3) + per_slot, "scratch counted once, plus the K4 tables");
         // The parse path reads back the fixed-stride seqs and lits instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
         // K5 (Huffman literals) needs no buffers of its own.
@@ -583,9 +605,28 @@ mod tests {
         {
             // ~2.9 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((2.9..3.1).contains(&mib(scratch_bytes(100))), "{}", mib(scratch_bytes(100)));
+            assert!((2.9..3.1).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
             assert!((0.49..0.51).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
+    }
+
+    /// `vram_bytes` equals the bytes of every buffer a `Pipeline` actually creates (shared scratch
+    /// once), per preset: single-hash presets allocate one chain's head/pred.
+    #[test]
+    fn vram_matches_params() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        for matching in [LVL3, RUNG1] {
+            for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
+                let cfg = PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
+                let pipe = Pipeline::new(&ctx, &cfg).unwrap();
+                assert_eq!(pipe.allocated_bytes(), vram_bytes(&cfg), "{matching:?} {emit_frames} b{batch} i{inflight}");
+            }
+        }
+        let scratch = |m: MatchParams| {
+            vram_bytes(&PipelineConfig { batch: 10, inflight: 1, params: GpuParams { matching: m, emit_frames: true, huffman: true } })
+        };
+        // One chain instead of two: head and pred halve.
+        assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + pred_bytes(10, 1));
     }
 
     #[test]

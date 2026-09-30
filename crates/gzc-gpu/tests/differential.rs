@@ -8,7 +8,7 @@ use gzc_core::frame::{FrameOptions, frame_header, write_frame, write_literals_ra
 use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
-use gzc_core::params::{LVL3, LVL9, MatchParams};
+use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1};
 use gzc_core::reference::compress_block;
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -38,6 +38,9 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
     let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: false, huffman: false }).expect("Kernels::new");
     (ctx, kernels)
 }
+
+/// The presets the GPU implements, each checked by the differential tests below.
+const GPU_PRESETS: [(&str, MatchParams); 2] = [("lvl3", LVL3), ("rung1", RUNG1)];
 
 /// LVL3 with a deeper chain walk.
 const DEPTH4: MatchParams = MatchParams { depth: 4, ..LVL3 };
@@ -79,12 +82,15 @@ fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]
 
 #[test]
 fn gpu_matches_reference() {
-    let (ctx, kernels) = setup(LVL3);
-    // All blocks in one batch (every block has neighbours on both sides)...
-    check_batch(&ctx, &kernels, &all_blocks(), LVL3);
-    // ...and each block alone, so its end is followed only by the trailing zero word.
-    for b in all_blocks() {
-        check_batch(&ctx, &kernels, std::slice::from_ref(&b), LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        // All blocks in one batch (every block has neighbours on both sides)...
+        check_batch(&ctx, &kernels, &all_blocks(), params);
+        // ...and each block alone, so its end is followed only by the trailing zero word.
+        for b in all_blocks() {
+            check_batch(&ctx, &kernels, std::slice::from_ref(&b), params);
+        }
     }
 }
 
@@ -120,7 +126,6 @@ fn capped_search_prefers_closer_candidate() {
 /// past the end would see a mismatch).
 #[test]
 fn block_ends_with_adjacent_neighbours() {
-    let (ctx, kernels) = setup(LVL3);
     let period3 = case("period3");
     // period3 continued across the boundary: its phase at BLOCK_SIZE.
     let mut period3_cont = period3.clone();
@@ -142,26 +147,36 @@ fn block_ends_with_adjacent_neighbours() {
         named("random", &random(11, BLOCK_SIZE)),
         named("zeros", &zeros(BLOCK_SIZE)),
     ];
-    check_batch(&ctx, &kernels, &blocks, LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        check_batch(&ctx, &kernels, &blocks, params);
+    }
 }
 
 #[test]
 fn gpu_frames_roundtrip() {
-    let (ctx, kernels) = setup(LVL3);
-    let blocks = all_blocks();
-    let outs = check_batch(&ctx, &kernels, &blocks, LVL3);
-    for ((name, block), out) in blocks.iter().zip(&outs) {
-        let frame = write_frame(block, out, FrameOptions::default());
-        let back = zstd::bulk::decompress(&frame, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: libzstd: {e}"));
-        assert!(back == *block, "{name}: libzstd output differs from input block");
+    for (preset, params) in GPU_PRESETS {
+        let (ctx, kernels) = setup(params);
+        let blocks = all_blocks();
+        let outs = check_batch(&ctx, &kernels, &blocks, params);
+        for ((name, block), out) in blocks.iter().zip(&outs) {
+            let frame = write_frame(block, out, FrameOptions::default());
+            let back =
+                zstd::bulk::decompress(&frame, BLOCK_SIZE).unwrap_or_else(|e| panic!("{preset} {name}: libzstd: {e}"));
+            assert!(back == *block, "{preset} {name}: libzstd output differs from input block");
+        }
     }
 }
 
 #[test]
 fn batch_of_300_mixed() {
-    let (ctx, kernels) = setup(LVL3);
-    let blocks: Vec<_> = all_blocks().into_iter().cycle().take(300).collect();
-    check_batch(&ctx, &kernels, &blocks, LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        let blocks: Vec<_> = all_blocks().into_iter().cycle().take(300).collect();
+        check_batch(&ctx, &kernels, &blocks, params);
+    }
 }
 
 /// Kernels for different match params coexist in one process, and unsupported or invalid
@@ -172,9 +187,11 @@ fn kernels_per_params_coexist_and_reject_unsupported() {
     let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
     let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
     let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
+    let rung1 = Kernels::new(&ctx, gp(RUNG1)).unwrap();
     let blocks = [("text".to_string(), text(12, BLOCK_SIZE))];
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     check_batch(&ctx, &depth4, &blocks, DEPTH4);
+    check_batch(&ctx, &rung1, &blocks, RUNG1);
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     let e = Kernels::new(&ctx, gp(LVL9)).err().expect("lvl9 rejected");
     assert!(e.to_string().contains("not implemented yet on gpu"), "{e}");
@@ -193,10 +210,15 @@ fn empty_batch_is_empty() {
 /// The CPU frame options of the raw-literals GPU path (`GpuParams { huffman: false }`).
 const NO_HUFFMAN: FrameOptions = FrameOptions { checksum: false, huffman: false };
 
-/// Frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
+/// LVL3 frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
 fn setup_frames(huffman: bool) -> (GpuContext, Kernels) {
+    setup_frames_for(LVL3, huffman)
+}
+
+/// `setup_frames` for any match params.
+fn setup_frames_for(matching: MatchParams, huffman: bool) -> (GpuContext, Kernels) {
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let kernels = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: true, huffman }).expect("Kernels::new");
+    let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: true, huffman }).expect("Kernels::new");
     assert_eq!(kernels.frame_options().huffman, huffman);
     (ctx, kernels)
 }
@@ -320,13 +342,13 @@ fn first_byte_diff(got: &[u8], want: &[u8]) -> String {
 }
 
 /// GPU frames for `blocks` must equal `write_frame` on the CPU reference parse (with the
-/// kernels' frame options), and decode.
+/// kernels' match params and frame options), and decode.
 fn check_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]) {
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let frames = compress_frames(ctx, kernels, &refs).expect("compress_frames");
     assert_eq!(frames.len(), blocks.len());
     for (i, ((name, block), got)) in blocks.iter().zip(&frames).enumerate() {
-        let want = write_frame(block, &compress_block(block, LVL3), kernels.frame_options());
+        let want = write_frame(block, &compress_block(block, kernels.matching()), kernels.frame_options());
         assert!(*got == want, "batch index {i} ({name}): GPU frame != CPU frame; {}", first_byte_diff(got, &want));
         let back = zstd::bulk::decompress(got, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: libzstd: {e}"));
         assert!(back == *block, "{name}: libzstd output differs from input block");
@@ -384,31 +406,40 @@ fn frame_blocks_cover_every_mode() {
 
 #[test]
 fn gpu_frames_identical_no_huffman() {
-    let (ctx, kernels) = setup_frames(false);
-    let blocks = frame_blocks();
-    // All blocks in one batch, then each block alone.
-    check_frames(&ctx, &kernels, &blocks);
-    for b in &blocks {
-        check_frames(&ctx, &kernels, std::slice::from_ref(b));
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, false);
+        let blocks = frame_blocks();
+        // All blocks in one batch, then each block alone.
+        check_frames(&ctx, &kernels, &blocks);
+        for b in &blocks {
+            check_frames(&ctx, &kernels, std::slice::from_ref(b));
+        }
     }
 }
 
 #[test]
 fn gpu_frames_identical_huffman() {
-    let (ctx, kernels) = setup_frames(true);
-    let blocks = frame_blocks();
-    // All blocks in one batch, then each block alone.
-    check_frames(&ctx, &kernels, &blocks);
-    for b in &blocks {
-        check_frames(&ctx, &kernels, std::slice::from_ref(b));
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let blocks = frame_blocks();
+        // All blocks in one batch, then each block alone.
+        check_frames(&ctx, &kernels, &blocks);
+        for b in &blocks {
+            check_frames(&ctx, &kernels, std::slice::from_ref(b));
+        }
     }
 }
 
 #[test]
 fn gpu_frames_batch_of_300_mixed() {
-    let (ctx, kernels) = setup_frames(true);
-    let blocks: Vec<_> = frame_blocks().into_iter().cycle().take(300).collect();
-    check_frames(&ctx, &kernels, &blocks);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let blocks: Vec<_> = frame_blocks().into_iter().cycle().take(300).collect();
+        check_frames(&ctx, &kernels, &blocks);
+    }
 }
 
 #[test]
@@ -508,6 +539,30 @@ fn k4_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+/// With `min_match = 4` a 128K block can hold more than 0x7F00 sequences (`MAX_SEQS` is
+/// `BLOCK_SIZE / 4 + 1`), so K4's 3-byte nbSeq header is reachable: 4 literals then 32767
+/// length-4 matches at offset 4 fill the block exactly. Unreachable below 128K.
+#[cfg(feature = "block-128k")]
+#[test]
+fn k4_nbseq_three_byte_form_matches_cpu() {
+    let n = BLOCK_SIZE / 4 - 1;
+    let mut script = vec![(4, 4, 4)];
+    script.extend(std::iter::repeat_n((0, 4, 4), n - 1));
+    let (block, parse) = scripted(&script, 0x7f00);
+    assert!(parse.sequences.len() >= 0x7F00);
+    // Also next to an ordinary block, so the two frames' seqs regions sit side by side.
+    let (block2, parse2) = scripted(&[(10, 5, 20), (3, 30, 9)], 1);
+    let cases = vec![
+        ("nbseq_3byte".to_string(), block, parse),
+        ("small".to_string(), block2, parse2),
+    ];
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames_for(RUNG1, huffman);
+        check_scripted(&ctx, &kernels, &cases);
+        check_scripted(&ctx, &kernels, &cases[..1]);
+    }
 }
 
 /// Hand-built cases pinning each decision boundary of the mode choice and the block type.

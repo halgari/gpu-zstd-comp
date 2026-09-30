@@ -1,5 +1,9 @@
-// K1: builds hash-chain predecessor arrays for long and short match hashes.
-// Dispatch (n_blocks, 2, 1): workgroup_id.x = block, workgroup_id.y = width (0 long, 1 short).
+// K1: builds the hash-chain predecessor arrays K2 walks (== gzc_core::reference::chains).
+// Dispatch (n_blocks, N_HASHES, 1): workgroup_id.x = block, workgroup_id.y = chain. With
+// N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with N_HASHES == 1
+// (Single) chain 0 is hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected
+// MatchParams (`context::params_wgsl`).
+// Layout: head[(b*N_HASHES + chain) << HASH_BITS ..], pred[(b*N_HASHES + chain)*BLOCK_SIZE ..].
 // pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS (== gzc_core compute_preds).
 // Positions are processed in tiles of 256: each tile is sorted by (hash, lane) so equal hashes
 // are adjacent in position order; the first of a run links to head[], the others to their
@@ -18,17 +22,23 @@ var<workgroup> keys: array<u32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let b = wid.x;
-    let width = wid.y;
+    let chain = wid.y;
     let base = block_base(b);
-    let hbase = (b * 2u + width) << HASH_BITS;
-    let pbase = (b * 2u + width) * BLOCK_SIZE;
+    let hbase = (b * N_HASHES + chain) << HASH_BITS;
+    let pbase = (b * N_HASHES + chain) * BLOCK_SIZE;
 
     for (var tile = 0u; tile < N_TILES; tile++) {
         let t0 = tile * WG;
         let p = t0 + lid;
         var h = 0xFFFFFFu; // sorts after every real hash (HASH_BITS <= 24)
         if (p < HASHED_POSITIONS) {
-            if (width == 0u) { h = hash_long(base, p); } else { h = hash_short(base, p); }
+            if (N_HASHES == 1u) {
+                h = hash_width(base, p, MIN_MATCH);
+            } else if (chain == 0u) {
+                h = hash_long(base, p);
+            } else {
+                h = hash_short(base, p);
+            }
         }
         keys[lid] = (h << 8u) | lid;
         workgroupBarrier();
