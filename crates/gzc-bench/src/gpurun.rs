@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_gpu::compressor::GpuParams;
 use gzc_gpu::context::GpuContext;
-use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
+use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
 use crate::corpus::Corpus;
 use crate::result::{RunResult, per_kind};
@@ -90,7 +90,13 @@ pub fn run_gpu(
 ) -> anyhow::Result<RunResult> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     let mut pipe = Pipeline::new(ctx, &cfg)?;
-    eprintln!("  k3 mode: {:?}", pipe.k3_mode());
+    eprintln!(
+        "  k3 mode: {:?}; direct upload: {}; transfer readback: {}; allocated {} MiB",
+        pipe.k3_mode(),
+        ctx.direct_upload,
+        pipe.transfer_readback(),
+        vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)
+    );
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();
 
     pipe.run_frames(&blocks[..blocks.len().min(cfg.batch as usize)], &mut Discard)?;
@@ -152,7 +158,12 @@ pub fn run_gpu(
     }
     let gpu_ms: f64 = stats.kernel_ms.iter().map(|k| k.1).sum();
     if gpu_ms > 0.0 {
-        eprintln!("    {:<10} {gpu_ms:>10.1} ms total {:>8.2} ms/batch {:>9.1} MB/s", "sum", gpu_ms / batches, mb / (gpu_ms / 1e3));
+        eprintln!(
+            "    {:<10} {gpu_ms:>10.1} ms total {:>8.2} ms/batch {:>9.1} MB/s",
+            "sum",
+            gpu_ms / batches,
+            mb / (gpu_ms / 1e3)
+        );
     }
     // Where the rest of the time goes (see gzc_gpu::pipeline::TRANSFER_NAMES).
     for (name, ms) in &stats.transfer_ms {
@@ -161,12 +172,7 @@ pub fn run_gpu(
 
     Ok(RunResult {
         engine: "gpu".to_string(),
-        config: format!(
-            "{preset} {}b{} i{}",
-            if cfg.params.huffman { "" } else { "rawlit " },
-            cfg.batch,
-            cfg.inflight
-        ),
+        config: format!("{preset} {}b{} i{}", if cfg.params.huffman { "" } else { "rawlit " }, cfg.batch, cfg.inflight),
         threads: Some(writer_threads),
         real_bytes,
         compressed_bytes: sizes.iter().sum(),

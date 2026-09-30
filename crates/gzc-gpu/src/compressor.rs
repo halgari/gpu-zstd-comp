@@ -343,7 +343,8 @@ fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::Bi
 }
 
 fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayout, body: &str) -> wgpu::ComputePipeline {
-    pipeline_from_module(ctx, label, layout, &ctx.shader(label, body), "main")
+    // K2, K4 and K5: loops terminate and indices stay in bounds for any input (`shader_trusted`).
+    pipeline_from_module(ctx, label, layout, &ctx.shader_trusted(label, body), "main")
 }
 
 fn pipeline_from_module(
@@ -573,7 +574,10 @@ impl Kernels {
         let chains = ChainsKernel::new(ctx, &m)?;
         let sorted = SortKernel::new(ctx, &m)?.map(|k1| {
             let body = format!("{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\n{K2_WGSL}\n{K2_WINDOW_WGSL}", finder_wgsl(&m));
-            let module = ctx.shader("k2_window", &body);
+            // Loops: the staging loop steps by 256 below WIN, the walk is j <= DEPTH, and
+            // match_len_capped is bounded by SEARCH_CAP; win/wkey indices DEPTH + lid - j are in
+            // 0..WIN (see `GpuContext::shader_trusted` and the E3 report).
+            let module = ctx.shader_trusted("k2_window", &body);
             (k1, pipeline_from_module(ctx, "k2_window", &best_layout, &module, "main_window"))
         });
         Ok(Self {
@@ -648,6 +652,28 @@ impl Kernels {
         n_blocks: u32,
         queries: Option<&wgpu::QuerySet>,
     ) {
+        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
+        assert_eq!(bufs.n_hashes, self.chains.n_hashes(), "BatchBuffers allocated for other match params");
+        if n_blocks == 0 {
+            return;
+        }
+        self.record_front(ctx, enc, bufs, n_blocks, queries);
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// K1, K2 and K3 of `record_timed` (the pipeline's transfer readback submits K5/K4
+    /// separately). `1 <= n_blocks <= bufs.capacity`.
+    pub(crate) fn record_front(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity, "record_front: n_blocks {n_blocks} not in 1..={}", bufs.capacity);
         let ts = |k: u32| {
             queries.map(|query_set| wgpu::ComputePassTimestampWrites {
                 query_set,
@@ -655,22 +681,13 @@ impl Kernels {
                 end_of_pass_write_index: Some(2 * k + 1),
             })
         };
-        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
-        assert_eq!(bufs.n_hashes, self.chains.n_hashes(), "BatchBuffers allocated for other match params");
-        if n_blocks == 0 {
-            return;
-        }
         self.record_best(ctx, enc, bufs, n_blocks, queries);
         self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
-
-        if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
-        }
     }
 
     /// Records K1 then K2 (timestamps as in `record_timed`) for the first `n_blocks` blocks of
     /// `bufs.data`, leaving the matches in `bufs.best`. `1 <= n_blocks <= bufs.capacity`.
-    fn record_best(
+    pub(crate) fn record_best(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
@@ -712,9 +729,32 @@ impl Kernels {
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
     }
 
+    /// K1 alone, or K2 alone on the chains already in `bufs.pred` (the E3 overlap probe).
+    #[cfg(test)]
+    pub(crate) fn record_k1_or_k2(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n: u32, k2: bool) {
+        assert!(self.sorted.is_none(), "record_k1_or_k2 runs the hash-chain K1/K2 only, not the bucket-sorted finder");
+        if !k2 {
+            self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n, None);
+            return;
+        }
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k2"),
+            layout: &self.best_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.pred.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.best.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: None });
+        pass.set_pipeline(&self.best);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n, 1);
+    }
+
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
     /// first `n_blocks` blocks. `n_blocks` is at least 1 and at most `bufs.capacity`.
-    fn record_parse(
+    pub(crate) fn record_parse(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
@@ -990,13 +1030,21 @@ pub fn frames_from_parses(
         let mut runs = Vec::with_capacity(p.sequences.len() + 1);
         let mut anchor = 0usize;
         for s in &p.sequences {
+            // K4 is built without index clamps (`GpuContext::shader_trusted`); its code tables
+            // assume zstd's sequence invariants, which K3 guarantees but a scripted parse may not:
+            // match_len >= MINMATCH (3) and 1 <= off_base <= BLOCK_SIZE + 3 (an offset within the
+            // block, or a repcode). Lengths are summed in usize (no u32 wrap) and the coverage
+            // check below bounds each of them by BLOCK_SIZE.
+            anyhow::ensure!(s.match_len >= 3, "parse {b}: match_len {} below 3", s.match_len);
+            let ob_ok = s.off_base >= 1 && s.off_base as usize <= BLOCK_SIZE + 3;
+            anyhow::ensure!(ob_ok, "parse {b}: off_base {} out of range", s.off_base);
             runs.push((anchor, s.lit_len as usize));
-            anchor += (s.lit_len + s.match_len) as usize;
+            anchor = anchor.saturating_add(s.lit_len as usize).saturating_add(s.match_len as usize);
         }
         runs.push((anchor, BLOCK_SIZE.saturating_sub(anchor)));
         let mut used = 0usize;
         for (at, len) in runs {
-            let ok = at + len <= BLOCK_SIZE && used + len <= p.literals.len();
+            let ok = at.checked_add(len).is_some_and(|e| e <= BLOCK_SIZE) && used + len <= p.literals.len();
             anyhow::ensure!(ok, "parse {b} does not cover its block");
             lit_blocks[b][at..at + len].copy_from_slice(&p.literals[used..used + len]);
             used += len;
