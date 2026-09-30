@@ -17,6 +17,9 @@ wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
+# The Vulkan types behind wgpu-hal's escape hatches (same version wgpu-hal 30 uses): the ReBAR
+# probe (`context::rebar`) and the extra queues of the multi-queue path.
+ash = "0.38"
 
 [dev-dependencies]
 zstd = { workspace = true }

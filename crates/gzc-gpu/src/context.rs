@@ -17,9 +17,18 @@ pub struct GpuContext {
     /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
     pub subgroups: bool,
     /// True when the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS` (mappable
-    /// buffers may also be storage buffers): only when frame packing was asked for (`GZC_PACK`,
-    /// `with_options`), which frame-path pipelines then do.
+    /// buffers may also be storage buffers): requested for frame packing (`pack_frames`) and for
+    /// the direct upload (`direct_upload`).
     pub mappable_storage: bool,
+    /// Frame-path pipelines pack their frames (`pipeline::PackKernel`): asked for (`GZC_PACK`,
+    /// `with_options`) and `mappable_storage`.
+    pub pack_frames: bool,
+    /// The kernels read each batch straight from its slot's mapped upload buffer, with no upload
+    /// copy (speed-2 E8): `mappable_storage` and the upload buffers land in device-local memory
+    /// (full ReBAR / SAM, see `rebar`). `GZC_DIRECT_UPLOAD=0` turns it off, `=1` forces it on
+    /// whenever `MAPPABLE_PRIMARY_BUFFERS` exists (for measurements: without ReBAR the kernels
+    /// would read the batch over PCIe).
+    pub direct_upload: bool,
 }
 
 impl GpuContext {
@@ -44,9 +53,10 @@ impl GpuContext {
     }
 
     /// Subgroups as in `with_subgroups(allow_subgroups)`; with `mappable`, also the native-only
-    /// `MAPPABLE_PRIMARY_BUFFERS` feature when the adapter has it (`mappable_storage`), with which
+    /// `MAPPABLE_PRIMARY_BUFFERS` feature when the adapter has it (`pack_frames`), with which
     /// frame-path pipelines pack their frames (`pipeline::PackKernel`, opt-in: slower than the
-    /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards).
+    /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards). The feature is also requested
+    /// for the direct upload (`direct_upload`, on by default with full ReBAR).
     pub fn with_options(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -75,8 +85,17 @@ impl GpuContext {
         if subgroups {
             required_features |= wgpu::Features::SUBGROUP;
         }
-        // Native-only feature, requested only when frame packing is wanted (`pipeline::PackKernel`).
-        let mappable_storage = mappable && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        // Native-only feature, requested for frame packing (`pipeline::PackKernel`) and for the
+        // direct upload.
+        let has_mappable = adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        let direct_upload = has_mappable
+            && match std::env::var("GZC_DIRECT_UPLOAD").as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => rebar(&adapter),
+            };
+        let pack_frames = mappable && has_mappable;
+        let mappable_storage = pack_frames || direct_upload;
         if mappable_storage {
             required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         }
@@ -89,7 +108,7 @@ impl GpuContext {
         }))
         .context("request_device")?;
 
-        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups, mappable_storage })
+        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups, mappable_storage, pack_frames, direct_upload })
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
@@ -183,6 +202,27 @@ impl GpuContext {
         staging.unmap();
         out
     }
+}
+
+/// True when host-visible memory is device-local and as large as VRAM (full ReBAR / SAM), so
+/// wgpu's mappable upload buffers (gpu-allocator `CpuToGpu`, which prefers DEVICE_LOCAL |
+/// HOST_VISIBLE) sit in VRAM and kernels read them at VRAM speed. The legacy 256 MiB BAR window
+/// does not count: a batch's upload buffers would spill into host memory. Vulkan only (other
+/// backends: false).
+fn rebar(adapter: &wgpu::Adapter) -> bool {
+    use ash::vk::{MemoryHeapFlags, MemoryPropertyFlags as F};
+    // SAFETY: the raw handles are only used for a read-only property query while `adapter` lives.
+    let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else { return false };
+    let props = unsafe {
+        hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device())
+    };
+    let heaps = &props.memory_heaps[..props.memory_heap_count as usize];
+    let vram = heaps.iter().filter(|h| h.flags.contains(MemoryHeapFlags::DEVICE_LOCAL)).map(|h| h.size).max();
+    let Some(vram) = vram else { return false };
+    props.memory_types[..props.memory_type_count as usize].iter().any(|t| {
+        t.property_flags.contains(F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT)
+            && heaps[t.heap_index as usize].size >= vram / 10 * 9
+    })
 }
 
 /// WGSL `const` declarations mirroring `gzc_core::config` (compile-time block constants,

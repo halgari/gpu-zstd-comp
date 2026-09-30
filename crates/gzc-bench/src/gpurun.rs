@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_gpu::compressor::GpuParams;
 use gzc_gpu::context::GpuContext;
-use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
+use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
 use crate::corpus::Corpus;
 use crate::result::{RunResult, per_kind};
@@ -90,7 +90,12 @@ pub fn run_gpu(
 ) -> anyhow::Result<RunResult> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     let mut pipe = Pipeline::new(ctx, &cfg)?;
-    eprintln!("  k3 mode: {:?}", pipe.k3_mode());
+    eprintln!(
+        "  k3 mode: {:?}; direct upload: {}; allocated {} MiB",
+        pipe.k3_mode(),
+        ctx.direct_upload,
+        vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)
+    );
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();
 
     pipe.run_frames(&blocks[..blocks.len().min(cfg.batch as usize)], &mut Discard)?;

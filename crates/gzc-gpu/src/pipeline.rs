@@ -11,6 +11,10 @@
 //! staging buffer is mapped once. Completed slots are handed to the sink in submission order while
 //! later batches keep the GPU busy.
 //!
+//! Direct upload (`GpuContext::direct_upload`, full ReBAR): there is no shared `data` and no
+//! upload copy; each submission binds its slot's upload buffer (device-local, mapped for the
+//! host between submissions) as `data`.
+//!
 //! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
 //! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
 //!   `seqs` region; the host decodes a `BlockOutput` per block, gathering its literals from the
@@ -171,7 +175,8 @@ struct Job {
 
 struct Slot {
     /// Persistent upload buffer (MAP_WRITE | COPY_SRC, `data_bytes(batch)`): the host writes a
-    /// batch into it while it is mapped, and the submission copies it into the shared `data`.
+    /// batch into it while it is mapped, and the submission copies it into the shared `data` (direct
+    /// upload: MAP_WRITE | STORAGE, bound as `data` itself).
     /// After each submission it is re-mapped; `upload_mapped` receives that map's result (None:
     /// mapped).
     upload: wgpu::Buffer,
@@ -192,9 +197,12 @@ pub struct Pipeline<'a> {
     bufs: BatchBuffers,
     layout: StagingLayout,
     slots: Vec<Slot>,
-    /// Frame path with `GpuContext::mappable_storage` (opt-in, `GZC_PACK`): packs the frames into the
+    /// Frame path with `GpuContext::pack_frames` (opt-in, `GZC_PACK`): packs the frames into the
     /// staging buffer instead of copying the fixed-stride region.
     pack: Option<PackKernel>,
+    /// `GpuContext::direct_upload`: `bufs.data` is the submitting slot's upload buffer (set per
+    /// submission) and there is no upload copy.
+    direct: bool,
 }
 
 /// `pack_frames.wgsl`: after K4, writes a batch's frames contiguously (16-byte aligned) straight
@@ -280,7 +288,7 @@ impl<'a> Pipeline<'a> {
     /// when `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight`
     /// of 0, a batch above `max_batch_blocks`, match params the GPU does not support (see
     /// `Kernels::new`), or a wgpu out-of-memory/validation error. The frame path packs frames
-    /// (`PackKernel`) iff the context has `GpuContext::mappable_storage` (requested only for
+    /// (`PackKernel`) iff the context has `GpuContext::pack_frames` (asked for
     /// packing: `GZC_PACK`, or `GpuContext::with_options`).
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
         let m = cfg.params.matching;
@@ -293,18 +301,30 @@ impl<'a> Pipeline<'a> {
         // Kernels::new validates the match params (`check_matching`) before any buffer is allocated.
         let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames);
-        let pack = (frames && ctx.mappable_storage).then(|| PackKernel::new(ctx, &layout));
+        let pack = (frames && ctx.pack_frames).then(|| PackKernel::new(ctx, &layout));
         let mut staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         if pack.is_some() {
             staging_usage |= wgpu::BufferUsages::STORAGE;
         }
-        let bufs = BatchBuffers::new(ctx, cfg.batch, frames, &m);
-        let slots = (0..cfg.inflight)
+        let direct = ctx.direct_upload;
+        let upload_usage = if direct {
+            // The kernels bind it as `data` (MAPPABLE_PRIMARY_BUFFERS).
+            wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::STORAGE
+        } else {
+            wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC
+        };
+        let mut bufs = BatchBuffers::new(ctx, cfg.batch, frames, &m);
+        if direct {
+            // No shared `data`: each submission binds its slot's upload buffer (see `submit`).
+            // Freed before the slots are allocated, so the peak stays at `vram_bytes_with`.
+            bufs.data.destroy();
+        }
+        let slots: Vec<Slot> = (0..cfg.inflight)
             .map(|_| Slot {
                 upload: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.upload"),
                     size: data_bytes(cfg.batch),
-                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    usage: upload_usage,
                     mapped_at_creation: true,
                 }),
                 upload_mapped: None,
@@ -331,8 +351,11 @@ impl<'a> Pipeline<'a> {
                 job: None,
             })
             .collect();
+        if direct {
+            bufs.data = slots[0].upload.clone();
+        }
         scopes.pop()?;
-        Ok(Self { ctx, cfg: *cfg, kernels, bufs, layout, slots, pack })
+        Ok(Self { ctx, cfg: *cfg, kernels, bufs, layout, slots, pack, direct })
     }
 
     /// How this pipeline's K3 runs (the mode its kernels were built with).
@@ -346,7 +369,10 @@ impl<'a> Pipeline<'a> {
     fn allocated_bytes(&self) -> u64 {
         let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, |b| b.size());
         let s = &self.bufs;
-        let shared = [&s.data, &s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| b.size()).sum::<u64>()
+        // Direct upload: `data` is a slot's upload buffer, counted with the slots.
+        let data = if self.direct { 0 } else { s.data.size() };
+        let shared = data
+            + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| b.size()).sum::<u64>()
             + opt(&s.frames)
             + opt(&s.frame_len);
         let per_slot: u64 = self.slots.iter().map(|slot| slot.upload.size() + slot.staging.size()).sum();
@@ -521,7 +547,11 @@ impl<'a> Pipeline<'a> {
     /// `queue.write_buffer`, which would allocate a fresh staging buffer per call that lives
     /// until the submission completes.
     fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]], prof: &mut Profile) -> anyhow::Result<()> {
-        let (ctx, layout, bufs) = (self.ctx, self.layout, &self.bufs);
+        if self.direct {
+            // The kernels read this slot's upload buffer; the bind groups recorded below hold it.
+            self.bufs.data = self.slots[i].upload.clone();
+        }
+        let (ctx, layout, bufs, direct) = (self.ctx, self.layout, &self.bufs, self.direct);
         let slot = &mut self.slots[i];
         let n = blocks.len() as u32;
         let t0 = Instant::now();
@@ -566,7 +596,9 @@ impl<'a> Pipeline<'a> {
         };
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
         marker(&mut enc, n_queries);
-        enc.copy_buffer_to_buffer(&slot.upload, 0, &bufs.data, 0, bytes as u64 + 4);
+        if !direct {
+            enc.copy_buffer_to_buffer(&slot.upload, 0, &bufs.data, 0, bytes as u64 + 4);
+        }
         // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4), so no
         // kernel processes the stale blocks of a partial batch.
         self.kernels.record_timed(ctx, &mut enc, bufs, n, slot.queries.as_ref().map(|q| &q.0));
@@ -700,10 +732,18 @@ fn per_slot_bytes(batch: u32, frames: bool) -> u64 {
 /// and staging buffers, plus K4's constant tables. K5 has no buffers of its own. Uploads go
 /// through the persistent upload buffers only, so no transient staging adds to this. Timestamp
 /// query sets are not counted.
+/// This is the copy-upload footprint, an upper bound for any context (`vram_bytes_with`).
 pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
+    vram_bytes_with(cfg, false)
+}
+
+/// `vram_bytes` for a context with (`GpuContext::direct_upload`) or without the direct upload,
+/// which has no shared `data` buffer (−`data_bytes(batch)`).
+pub fn vram_bytes_with(cfg: &PipelineConfig, direct_upload: bool) -> u64 {
     let frames = cfg.params.emit_frames;
     scratch_bytes(cfg.batch, &cfg.params.matching)
         + slot_bytes(cfg.batch, frames)
+        - if direct_upload { data_bytes(cfg.batch) } else { 0 }
         + cfg.inflight as u64 * per_slot_bytes(cfg.batch, frames)
         + if frames { k4_tables_bytes() } else { 0 }
 }
@@ -857,6 +897,8 @@ mod tests {
         assert_eq!(one, scratch_bytes(100, &LVL3) + slot_bytes(100, true) + per_slot + k4_tables_bytes());
         // The parse path reads back the fixed-stride seqs instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
+        // The direct upload drops the shared `data` buffer only.
+        assert_eq!(vram_bytes_with(&frames(100, 2), true), vram_bytes(&frames(100, 2)) - data_bytes(100));
         // K5 (Huffman literals) needs no buffers of its own.
         let raw_lits = PipelineConfig { params: GpuParams { huffman: false, ..frames(100, 2).params }, ..frames(100, 2) };
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
@@ -878,7 +920,7 @@ mod tests {
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg = PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
                 let pipe = Pipeline::new(&ctx, &cfg).unwrap();
-                assert_eq!(pipe.allocated_bytes(), vram_bytes(&cfg), "{matching:?} {emit_frames} b{batch} i{inflight}");
+                assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&cfg, ctx.direct_upload), "{matching:?} {emit_frames} b{batch} i{inflight}");
             }
         }
         let scratch = |m: MatchParams| {
@@ -918,7 +960,7 @@ mod tests {
     #[test]
     fn stream_frames_packed_match_cpu() {
         let ctx = GpuContext::with_options(true, true).expect("GPU required for gzc-gpu tests");
-        if !ctx.mappable_storage {
+        if !ctx.pack_frames {
             eprintln!("skipped: no MAPPABLE_PRIMARY_BUFFERS");
             return;
         }
@@ -929,7 +971,7 @@ mod tests {
             let pcfg = PipelineConfig { batch, inflight, params };
             let mut pipe = Pipeline::new(&ctx, &pcfg).unwrap();
             assert!(pipe.pack.is_some());
-            assert_eq!(pipe.allocated_bytes(), vram_bytes(&pcfg), "packing needs no extra memory");
+            assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&pcfg, ctx.direct_upload), "packing needs no extra memory");
             let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
             let mut sink = CollectFrames(vec![None; blocks.len()]);
             pipe.run_frames(&blocks, &mut sink).unwrap();
