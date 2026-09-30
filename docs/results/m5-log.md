@@ -407,3 +407,111 @@ Per 64 KiB of data, that is opt14 58.7 µs and opt16 108.2 µs, against 34.9 and
 - The cover-literal prologue (+1.2 µs, opt14 only) could be cut:
   - unroll or prefetch the candidate-word loads;
   - or compute it in K2opt, which writes those words.
+
+## T3b: K3opt speed port, branch `worktree-agent-ac3bc416894d39a90` (from `m5` d6a6700), 2026-09-30
+
+This task ports the K3opt performance study (`docs/superpowers/m5/k3opt-perf.md`) into the T4 kernel. T4's
+prologue and epilogue, packed histogram, both seeds, cover literals and all pass schedules are unchanged.
+Output is byte-identical to the oracle for every schedule. `gzc-core` was not changed.
+
+`gzc-gpu`:
+
+- `shaders/k3_opt.wgsl`:
+  - **Node payload in global scratch.** Only each DP node's price stays in the ring (`ring_p`, workgroup or
+    private memory). Reps, litlen, mlen and offBase move to a new binding 6 (`scr`): 3 consecutive words per
+    node, 33 nodes per segment lane.
+  - **One loop for seeding and relaxation**, 4 lengths per step. A series start is handled as a relaxation from
+    a virtual node at cur 0 with last_pos 0. The argument is in the kernel comment and in study §4.
+  - **Branch-free helpers:** `ld32` / `match_len_nb` (an unaligned load without the alignment branch), and
+    `ll_price` and `rep_after` as selects.
+  - **u16 literal prices** in workgroup memory (study #2). The histogram is not aliased, because a `HIST_OUT`
+    pass keeps `hist` live through the DP.
+- `k3opt.rs`:
+  - `OptBuffers::new(ctx, m, capacity)` now takes the opt params and allocates `scratch`.
+  - `scratch_bytes_per_block(m)` is 6336 B at 64 KiB and 1584 B at 16 KiB. T5 must add it to `vram_bytes`.
+  - `ring_for(m, cfg, limit)` replaces the inline choice. It returns an error when a forced workgroup ring
+    does not fit, and also when the price tables alone exceed the limit (T4 review Minor 2). Both errors come
+    before any pipeline is created.
+  - `ring_bytes` now counts 4 B per node.
+- `tests/k3opt.rs`:
+  - `k3opt_ring_choice` covers the Workgroup/Private choice at small limits, the clean error, the scratch size,
+    and building the Private fallback.
+  - `k3opt_passes_timing` takes `GZC_K3OPT_SORT` (heavy-first order, measurement only).
+
+### Correctness
+
+All gates are byte-identical to the oracle:
+
+- tests: `opt::cases`, synthetic, 4000-block corpus × the 6 schedules (histograms included), later-pass tables,
+  and single-pass L2/L0 on workgroup and private rings, wg8/16/32;
+- block sizes: 64 KiB and 16 KiB;
+- subgroups: on, and off with `GZC_NO_SUBGROUPS=1`.
+
+The full `gzc-gpu` suite passes. `differential` also passes at 16 KiB and with `GZC_NO_SUBGROUPS=1`. The
+optLevel-2 match + 1 literal path is exercised on 1779 corpus final passes (64K) and 2316 (16K), the same counts
+as T4.
+
+### Time (RTX 5090, 2900 corpus blocks at 64 KiB, wg16, workgroup ring, µs/block, median of 3, GPU idle-gated)
+
+Single-pass columns come from `k3opt_timing` (L2 block-init, L0 buffer). Registers and shared memory come from
+`vkstats` (L2 buffer kernel). Waves are for 2900 blocks. The wave boundary was measured with the final kernel:
+3400 blocks give 8.91 µs, 3570 give 13.27, so one wave holds 20 warps/SM.
+
+| variant | L2 pass | L0 pass | regs | shared B | waves | opt14 | opt16 | kept |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| T4 baseline (d6a6700) | 18.18 | 14.86 | 97 | 11368 | 2 | 34.95 | 64.39 | – |
+| 1. payload → scratch, lanes interleaved per slot | 11.72 (11.70 / 11.72 / 11.73) | 9.84 | 99 | 5032 | 1 | 22.97 (1 run) | 42.50 (1 run) | no (see 1b) |
+| 1b. payload → scratch, 3 consecutive words per node | 11.26 (11.21 / 11.26 / 11.28) | 9.42 | 102 | 5032 | 1 | 22.25 | 40.86 | **yes** |
+| 1c. 16-byte nodes (4 words) | 11.30 (11.30 / 11.30) | 9.52 | – | 5032 | 1 | – | – | no (+0.4 %) |
+| 2. one seeding/relaxation loop, ×4 lengths | 10.86 (10.85 / 10.86 / 10.88) | 9.33 | 96 | 5032 | 1 | 21.52 | 39.98 | **yes** (−3.3 % opt14, −3 regs) |
+| 3. branch-free `ld32`, `ll_price`, `rep_after` | 9.20 (9.21 / 9.20 / 9.20) | 7.73 | 97 (98 in the pass kernels) | 5032 | 1 | 18.50 | 33.94 | **yes** |
+| 4. u16 literal prices | 9.21 (9.24 / 9.21 / 9.18) | 7.74 | 97 | 4520 | 1 | **18.38** | **33.80** | **yes** (neutral at 64K, −27 % at 16K) |
+
+Pass totals, runs (µs/block, DP passes then fix-up):
+
+| | pass 0 | pass 1 | pass 2 | pass 3 | fix-up | total (3 runs) |
+|---|---:|---:|---:|---:|---:|---|
+| opt14 T4 | 16.41 | 18.27 (final) | | | 0.27 | 34.95 |
+| opt14 T3b | 8.96 | 9.14 (final) | | | 0.27 | 18.42 / 18.38 / 18.37 → **18.38 (−47 %)** |
+| opt16 T4 | 15.25 | 15.23 | 15.30 | 18.34 | 0.27 | 64.39 |
+| opt16 T3b | 8.12 | 8.10 | 8.15 | 9.17 | 0.26 | 34.09 / 33.80 / 33.71 → **33.80 (−47 %)** |
+
+The study's targets were L2 8.8 and L0 7.8 µs, measured on the T3 kernel without the T4 prologue/epilogue. T3b
+reaches 9.2 / 7.7 with them.
+
+**16 KiB** (11600 blocks, 3 runs):
+
+| | T4 | after step 3 | T3b final (u16 lit) |
+|---|---:|---:|---:|
+| opt14 | 14.67 | 10.40 / 10.39 / 10.41 | 7.57 / 7.55 / 7.57 |
+| opt16 | 27.05 | 19.68 / 19.66 / 19.68 | 14.07 / 14.08 / 14.06 |
+
+At 16 KiB a wg16 workgroup holds 4 blocks' tables, so it is bound by shared memory: about 13.0 KB before
+the u16 change and 11.0 KB after, which is 7 → 9 workgroups per SM. The first set of 16K runs of step 3 was
+bimodal (3.4–5.2 µs for the same pass, with no other GPU process), so only the stable repeats are listed. 16K
+runs stay noisier than 64K ones.
+
+### Other variants (not kept)
+
+- wg32 L2 buffer: 10.98. wg8: 13.41. wg16 L2 buffer: 9.18. wg16 stays the default.
+- Private-ring fallback (only the prices private): wg16 13.66, wg32 14.32 at L2. It works and is tested;
+  it is slower than the workgroup ring, as expected.
+- Checked loops (`unbounded: false`): 9.64, +5 %.
+- **Heavy-first block order (study #5), measured but not ported.** Blocks were host-sorted by the study's
+  cost proxy in `k3opt_passes_timing`:
+  - 2900 blocks (one wave): no effect (opt14 18.52 → 18.52, opt16 33.81 → 34.06).
+  - 4000 blocks (2 waves): opt14 25.19 → 21.05 (−16 %), opt16 45.07 → 39.30 (−13 %). Unsorted opt16 is
+    bimodal per pass (9.1–11.4).
+  - 16 KiB, 11600 blocks: opt14 7.6–8.0 → 5.6–6.1, opt16 13.6–14.1 → 10.0–11.6. These runs are noisy.
+  - It is not cheap here: in the pipeline the candidate words are GPU-resident, so the order needs a GPU cost
+    pass plus a sort, or a previous pass's cost. That belongs to T5 or later, and matters for multi-wave batches
+    (5090 batches above 3400 blocks, the 16 KiB path, 8 GB cards).
+- Rest-of-loop predication (study #6) and pass fusion (#7) were not attempted (out of scope).
+- A GPU game started during one measurement window (15:10–15:13). The runs in that window were discarded and
+  repeated after it exited.
+
+### Notes for T5
+
+- VRAM: add `scratch_bytes_per_block(m) × capacity` (6336 B/block at 64K, 18.4 MB at 2900 blocks).
+- Keep one K3opt batch at 3400 blocks or fewer on the 5090 (20 warps/SM at ≤ 100 registers, about 4.5 KB
+  shared). Past that, a second wave costs a full heavy-block chain unless the blocks are ordered heavy-first.
