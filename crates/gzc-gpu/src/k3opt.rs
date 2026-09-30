@@ -722,7 +722,8 @@ pub fn parses_from_passes(
 }
 
 /// GPU time (ms, median of `reps` runs after one warm-up) of each DP pass of `p` and of the final
-/// fix-up, on the first `n` blocks of `bufs`: `n_passes() + 1` values. The final pass overwrites part
+/// fix-up, on the first `n` blocks of `bufs`: `n_passes() + 1` values, then the span from the
+/// first pass's start to the fix-up's end (dispatch gaps included). The final pass overwrites part
 /// of the candidate words, so `reupload` runs before every run (outside the timed passes).
 pub fn time_passes(
     ctx: &GpuContext,
@@ -746,7 +747,7 @@ pub fn time_passes(
         mapped_at_creation: false,
     });
     let period = ctx.queue.get_timestamp_period() as f64;
-    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 1];
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 2];
     for r in 0..=reps {
         reupload();
         let mut enc = ctx
@@ -759,9 +760,10 @@ pub fn time_passes(
         ctx.queue.submit([enc.finish()]);
         let t: Vec<u64> = ctx.read_buffer(&resolve, 0, q);
         if r > 0 {
-            for (i, v) in times.iter_mut().enumerate() {
+            for (i, v) in times.iter_mut().take(p.n_passes() + 1).enumerate() {
                 v.push(t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * period / 1e6);
             }
+            times[p.n_passes() + 1].push(t[q - 1].saturating_sub(t[0]) as f64 * period / 1e6);
         }
     }
     Ok(times

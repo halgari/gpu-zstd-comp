@@ -692,18 +692,20 @@ fn k3opt_passes_timing() {
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");
-        let t = time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
+        let mut t = time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
             bufs.upload(&ctx, &refs, &crefs, None).unwrap();
         })
         .expect("time_passes");
+        let span = t.pop().unwrap();
         let per: Vec<String> = t.iter().map(|&ms| format!("{:.2}", us(ms))).collect();
         eprintln!(
-            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup) [{}], total {:.2} us/block ({:.3} ms)",
+            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup) [{}], total {:.2} us/block ({:.3} ms), span {:.2} us/block",
             blocks.len(),
             BLOCK_SIZE / 1024,
             per.join(", "),
             us(t.iter().sum()),
-            t.iter().sum::<f64>()
+            t.iter().sum::<f64>(),
+            us(span)
         );
     }
 }
