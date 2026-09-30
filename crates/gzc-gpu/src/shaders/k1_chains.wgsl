@@ -2,8 +2,9 @@
 // walks (== gzc_core::reference::chains). A task is one chain t = b*N_HASHES + chain: with
 // N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with N_HASHES == 1 (Single)
 // chain 0 is hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected MatchParams
-// (`context::params_wgsl`). pred[t*BLOCK_SIZE + p] = most recent q < p with hash(q) == hash(p),
-// else none (== gzc_core compute_preds), stored as pred words with p's fingerprint (common.wgsl
+// (`context::params_wgsl`); the chains link equal keys, the hash's top MatchParams::hash_bits bits
+// (hash >> KEY_SHIFT, `chains::finder_wgsl`). pred[t*BLOCK_SIZE + p] = most recent q < p with
+// key(q) == key(p), else none (== gzc_core compute_preds), stored as pred words with p's fingerprint (common.wgsl
 // `pred_word`; PRED_NONE in the tail p >= HASHED_POSITIONS); pred is bound to exactly the
 // dispatch's tasks, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
 // Persistent grid (like the subgroup kernel, so both fit the same head buffer, sized for at most
@@ -47,11 +48,11 @@ fn main(
             var h = 0xFFFFFFu; // sorts after every real hash (HASH_BITS <= 24)
             if (p < HASHED_POSITIONS) {
                 if (N_HASHES == 1u) {
-                    h = hash_width(base, p, MIN_MATCH);
+                    h = hash_width(base, p, MIN_MATCH) >> KEY_SHIFT;
                 } else if (chain == 0u) {
-                    h = hash_long(base, p);
+                    h = hash_long(base, p) >> KEY_SHIFT;
                 } else {
-                    h = hash_short(base, p);
+                    h = hash_short(base, p) >> KEY_SHIFT;
                 }
             }
             keys[lid] = (h << 8u) | lid;
