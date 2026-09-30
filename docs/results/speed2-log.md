@@ -203,3 +203,32 @@ Option B (a byte-identical 16-bit radix sort) was not needed.
 `lvl9d16seg` are kept as measured variants, for the controller to prune.
 
 **E2 fix round 1:** the presets were pruned to `lvl9s12`, `lvl9s12seg` and `lvl9s12d16seg`. The rows for lvl9s13, lvl9s13seg, lvl9d16 and lvl9d16seg above record measured variants only. The no-subgroup K1 now fits its workgroup memory exactly: 12-bit keys fit at every block size, and at 128K only the subgroup version runs. At 128K, `lvl9s12d16seg` is 1.35159 on the full corpus, below the L9 floor of 1.3532, so only `lvl9s12seg` (1.35456) qualifies at 128K.
+
+## E3 fix round 1 + merge with E2 (2c18c75): headline numbers, 2026-09-30 11:03–11:07
+
+Setup:
+
+- 64K blocks, `--batch max`, i3.
+- Runs alternated between `speed2` @ 2c18c75 (b5118) and the E3 branch (b5403).
+- Each run was gated on an idle GPU; load average was 2–7.
+- Every E3 run used the direct upload and the transfer readback.
+
+| Preset | speed2 2c18c75 (3 runs) | Median | + E9/E8/E3 (3 runs) | Median | Change | Ratio |
+|---|---|---:|---|---:|---:|---:|
+| lvl9seg | 7009.7 / 7061.2 / 7063.9 | 7061.2 | 9154.4 / 9176.9 / 9138.7 | **9154.4** | +29.6 % | 1.339 |
+| lvl9s12seg | 8085.5 / 8240.1 / 7985.8 | 8085.5 | 10535.9 / 10840.7 / 10742.5 | **10742.5** | +32.9 % | 1.339 |
+| lvl9s12d16seg | 8308.8 / 8535.1 / 8435.0 | 8435.0 | 10821.1 / 10338.9 / 10699.4 | **10699.4** | +26.8 % | 1.339 |
+
+Kernel sum per block, from the median run:
+
+| Preset | speed2 (µs/block) | E3 branch (µs/block) |
+|---|---:|---:|
+| lvl9seg | 6.92 | 6.59 |
+| lvl9s12seg | 5.73 | 5.38 |
+| lvl9s12d16seg | 5.33 | 4.96 |
+
+- `--verify` passed for all three presets.
+- The compressed sizes equal speed2's: 4 848 642 982, 4 848 823 883 and 4 851 213 203 bytes.
+- `k2_window` is now also built unchecked (−2.5 %).
+- **Metric note:** with the transfer readback, `gpu_readback` measures only the main queue's share (K4's end to the
+  batch's end marker), which is about 0. The copy itself runs on the transfer queue and is not timed.
