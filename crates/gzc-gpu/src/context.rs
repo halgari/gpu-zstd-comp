@@ -214,6 +214,11 @@ impl Prepared {
             max_buffer_size: al.max_buffer_size,
             max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
             max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage,
+            // K3opt keeps its DP rings in workgroup memory when the adapter allows more than
+            // wgpu's 16 KiB default (M5; `k3opt::RingMem`). Other kernels are unaffected.
+            max_compute_workgroup_storage_size: al
+                .max_compute_workgroup_storage_size
+                .max(wgpu::Limits::default().max_compute_workgroup_storage_size),
             ..wgpu::Limits::default()
         };
         // GZC_NO_TIMESTAMPS (anything but 0) leaves timestamp queries off, to time runs without them.

@@ -4,6 +4,7 @@ pub mod context;
 pub mod chains;
 pub mod sorted;
 pub mod compressor;
+pub mod k3opt;
 pub mod pipeline;
 pub mod multiqueue;
 pub mod transfer;
