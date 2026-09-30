@@ -440,20 +440,6 @@ impl Kernels {
         n_blocks: u32,
         queries: Option<&wgpu::QuerySet>,
     ) {
-        self.record_timed_with(ctx, enc, bufs, n_blocks, queries, &mut |_| {});
-    }
-
-    /// `record_timed`, calling `after_best` between K2 and K3 so the caller can record commands
-    /// that run alongside K3 (the pipeline's readback copies of the previous batch).
-    pub fn record_timed_with(
-        &self,
-        ctx: &GpuContext,
-        enc: &mut wgpu::CommandEncoder,
-        bufs: &BatchBuffers,
-        n_blocks: u32,
-        queries: Option<&wgpu::QuerySet>,
-        after_best: &mut dyn FnMut(&mut wgpu::CommandEncoder),
-    ) {
         let ts = |k: u32| {
             queries.map(|query_set| wgpu::ComputePassTimestampWrites {
                 query_set,
@@ -464,11 +450,9 @@ impl Kernels {
         assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
         assert_eq!(bufs.n_hashes, self.chains.n_hashes(), "BatchBuffers allocated for other match params");
         if n_blocks == 0 {
-            after_best(enc);
             return;
         }
         self.record_best(ctx, enc, bufs, n_blocks, queries);
-        after_best(enc);
         self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
 
         if self.emits_frames() {

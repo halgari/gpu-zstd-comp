@@ -1,18 +1,23 @@
 //! In-flight streaming submission and GPU timestamp queries.
 //!
-//! `inflight` slots each own an input (`data`) buffer, the kernels' output buffers they read
-//! back and a mappable staging buffer; the kernels' scratch buffers (hash chains, matches, parse)
-//! are shared by all slots, since the queue runs one batch's kernels after another anyway (see
-//! `vram_bytes`). A batch is uploaded into a free slot; the kernels plus copies of their outputs (and resolved timestamps)
-//! into the slot's staging buffer are recorded in one submission, and the staging buffer is
-//! mapped once. Completed slots are handed to the sink in submission order while later batches
-//! keep the GPU busy.
+//! `inflight` slots each own a mappable upload buffer and a mappable staging (readback) buffer.
+//! Every device-side buffer, the kernels' input (`data`), scratch and outputs (`frames`,
+//! `frame_len`) included, is shared by all slots: the queue runs one submission after another
+//! and each submission consumes what it produced (its outputs are copied into the slot's staging
+//! buffer before the next submission's kernels start, which wgpu orders with a barrier), so only
+//! the host-visible buffers need one copy per batch in flight (see `vram_bytes`). A batch is
+//! written into a free slot's upload buffer; the upload copy, the kernels and the readback into
+//! the slot's staging buffer (plus resolved timestamps) are recorded in one submission, and the
+//! staging buffer is mapped once. Completed slots are handed to the sink in submission order while
+//! later batches keep the GPU busy.
 //!
 //! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
 //! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
 //!   `seqs` and `lits` regions; the host decodes a `BlockOutput` per block.
-//! - frames (`run_frames`, `FrameSink`): K1→K2→K3(→K5)→K4, staging holds `frame_len` and the full
-//!   fixed-stride `frames` region; the host only copies each frame's bytes out. K5 (Huffman
+//! - frames (`run_frames`, `FrameSink`): K1→K2→K3(→K5)→K4, staging holds `frame_len` and the
+//!   `frames` region, either as a copy of the fixed-stride buffer or, with `GZC_PACK` (see
+//!   `PackKernel`), packed by a kernel that writes the frames contiguously straight into the
+//!   (mappable) staging buffer; the host only copies each frame's bytes out. K5 (Huffman
 //!   literals, `GpuParams::huffman`) writes into the same `frames` / `frame_len` buffers, so it
 //!   adds no memory.
 use std::collections::VecDeque;
@@ -50,16 +55,16 @@ pub struct PipelineStats {
     /// Number of batches submitted.
     pub batches: u32,
     /// Where the time outside the kernels goes, summed over all batches, in milliseconds (see
-    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (empty without them); the
+    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (left out without them); the
     /// `host_*` ones are wall time on the pipeline thread.
     pub transfer_ms: Vec<(String, f64)>,
 }
 
 /// Names of `PipelineStats::transfer_ms`, in order:
-/// - `gpu_upload_copy`: upload -> data copy (from the batch's start marker to K1's begin).
-/// - `gpu_readback_copy`: output -> staging copies (from the last kernel's end to the end marker).
+/// - `gpu_upload_copy`: the upload -> data copy (the batch's start marker to K1's begin).
+/// - `gpu_readback`: the output -> staging copies, or the pack kernel (K4's end, or K3's on
+///   the parse path, to the batch's end marker).
 /// - `gpu_idle`: gaps between one batch's end marker and the next batch's start marker.
-/// - `gpu_k2_k3_gap`: K3's begin minus K2's end (where the deferred readback copies sit).
 /// - `host_upload_wait`: waiting for a slot's upload buffer to be mapped again.
 /// - `host_upload_write`: writing the blocks into the mapped upload buffer, plus unmap.
 /// - `host_submit`: recording and submitting the batch, plus the map requests.
@@ -68,11 +73,10 @@ pub struct PipelineStats {
 /// - `host_unmap`: unmapping the staging buffer.
 /// - `host_fill`: from the start to the first submission.
 /// - `host_drain`: from the last `device.poll` returning to the end.
-pub const TRANSFER_NAMES: [&str; 12] = [
+pub const TRANSFER_NAMES: [&str; 11] = [
     "gpu_upload_copy",
-    "gpu_readback_copy",
+    "gpu_readback",
     "gpu_idle",
-    "gpu_k2_k3_gap",
     "host_upload_wait",
     "host_upload_write",
     "host_submit",
@@ -89,9 +93,8 @@ struct Profile {
     /// Kernel ticks, per `Kernels::names`.
     ticks: Vec<u64>,
     upload_copy: u64,
-    readback_copy: u64,
+    readback: u64,
     idle: u64,
-    k2_k3_gap: u64,
     /// End marker of the last batch finished (ticks), for `idle`.
     last_end: Option<u64>,
     upload_wait: f64,
@@ -124,7 +127,7 @@ const STAGING_ALIGN: u64 = 256;
 
 /// Byte offsets of one slot's staging buffer, laid out for `cap` blocks. Parse path:
 /// `[counts][seqs][lits][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the
-/// regions keep the GPU buffers' fixed per-block stride.
+/// regions keep the GPU buffers' fixed per-block stride (packed frames need at most that much).
 #[derive(Clone, Copy)]
 struct StagingLayout {
     frames: bool,
@@ -163,16 +166,15 @@ type Deliver<'d> = dyn FnMut(usize, u32, &[u8]) -> anyhow::Result<()> + 'd;
 struct Job {
     first: usize,
     n: u32,
-    /// The submission holding the batch's readback copies and the staging map's result; None
-    /// while those copies are not recorded yet (see `Pipeline::submit`).
-    readback: Option<(wgpu::SubmissionIndex, mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>)>,
+    submission: wgpu::SubmissionIndex,
+    mapped: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
 struct Slot {
-    bufs: BatchBuffers,
     /// Persistent upload buffer (MAP_WRITE | COPY_SRC, `data_bytes(batch)`): the host writes a
-    /// batch into it while it is mapped, and the submission copies it into `bufs.data`. After
-    /// each submission it is re-mapped; `upload_mapped` receives that map's result (None: mapped).
+    /// batch into it while it is mapped, and the submission copies it into the shared `data`.
+    /// After each submission it is re-mapped; `upload_mapped` receives that map's result (None:
+    /// mapped).
     upload: wgpu::Buffer,
     upload_mapped: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     staging: wgpu::Buffer,
@@ -181,25 +183,103 @@ struct Slot {
     job: Option<Job>,
 }
 
-/// Compiled kernels plus `inflight` slots of `batch` blocks, reusable across runs.
+/// Compiled kernels plus the shared device buffers and `inflight` slots of `batch` blocks,
+/// reusable across runs.
 pub struct Pipeline<'a> {
     ctx: &'a GpuContext,
     cfg: PipelineConfig,
     kernels: Kernels,
+    /// Every device-side buffer, shared by all slots (see the module docs).
+    bufs: BatchBuffers,
     layout: StagingLayout,
     slots: Vec<Slot>,
-    /// Record each batch's readback copies into the *next* submission, between its K2 and K3,
-    /// so they overlap that batch's K3 instead of running after this batch's K4 (see `submit`).
-    /// `GZC_READBACK_INLINE` (anything but 0) turns it off.
-    defer_readback: bool,
-    /// The slot whose batch is submitted but whose readback is not recorded yet.
-    pending: Option<usize>,
+    /// Frame path with `GpuContext::mappable_storage` (`GZC_PACK`): packs the frames into the
+    /// staging buffer instead of copying the fixed-stride region.
+    pack: Option<PackKernel>,
+}
+
+/// `pack_frames.wgsl`: after K4, writes a batch's frames contiguously (16-byte aligned) straight
+/// into the slot's mappable staging buffer, so only the frames' bytes cross the bus. Needs
+/// `MAPPABLE_PRIMARY_BUFFERS` (staging is a storage buffer then). Off by default: on the RTX 5090
+/// (PCIe 5 x16) the shader's stores into host memory move ~33 GB/s against the copy engine's
+/// ~50 GB/s, so packing the ~74 % of the bytes that are real takes longer than copying them all.
+struct PackKernel {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+const PACK_WGSL: &str = include_str!("shaders/pack_frames.wgsl");
+
+/// Packed frames start on multiples of this many bytes (`pack_frames.wgsl` stores 16 at once).
+const PACK_ALIGN: usize = 16;
+
+impl PackKernel {
+    fn new(ctx: &GpuContext, staging: &StagingLayout) -> Self {
+        let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pack"),
+            entries: &[entry(0, true), entry(1, true), entry(2, false)],
+        });
+        let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pack"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        const _: () = assert!(FRAME_STRIDE % PACK_ALIGN == 0 && STAGING_ALIGN as usize % PACK_ALIGN == 0);
+        let src = format!(
+            "const FRAME_WORDS: u32 = {}u;\nconst PACK_BASE: u32 = {}u;\n{PACK_WGSL}",
+            FRAME_STRIDE / 4,
+            staging.a / 4
+        );
+        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pack_frames"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pack_frames"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+
+    /// Records the kernel on the first `n` blocks of `bufs` (which must hold frames), into `staging`.
+    fn record(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n: u32, staging: &wgpu::Buffer) {
+        let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
+        // The kernel takes the batch size from the bound length of `frame_len`.
+        let frame_len = wgpu::BufferBinding { buffer: frame_len, offset: 0, size: wgpu::BufferSize::new(frame_len_bytes(n)) };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pack"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(frame_len) },
+                wgpu::BindGroupEntry { binding: 1, resource: frames.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: staging.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pack"), timestamp_writes: None });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n, 1, 1);
+    }
 }
 
 impl<'a> Pipeline<'a> {
-    /// Compiles the kernels and allocates every slot, for the frame path when
-    /// `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight` of 0,
-    /// a batch above `max_batch_blocks`, match params the GPU does not support (see
+    /// Compiles the kernels and allocates the shared buffers and every slot, for the frame path
+    /// when `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight`
+    /// of 0, a batch above `max_batch_blocks`, match params the GPU does not support (see
     /// `Kernels::new`), or a wgpu out-of-memory/validation error.
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
         let m = cfg.params.matching;
@@ -212,14 +292,14 @@ impl<'a> Pipeline<'a> {
         // Kernels::new validates the match params (`check_matching`) before any buffer is allocated.
         let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames);
-        let mut bufs = vec![BatchBuffers::new(ctx, cfg.batch, frames, &m)];
-        for _ in 1..cfg.inflight {
-            bufs.push(BatchBuffers::new_sharing(ctx, &bufs[0], frames));
+        let pack = (frames && ctx.mappable_storage).then(|| PackKernel::new(ctx, &layout));
+        let mut staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        if pack.is_some() {
+            staging_usage |= wgpu::BufferUsages::STORAGE;
         }
-        let slots = bufs
-            .into_iter()
-            .map(|bufs| Slot {
-                bufs,
+        let bufs = BatchBuffers::new(ctx, cfg.batch, frames, &m);
+        let slots = (0..cfg.inflight)
+            .map(|_| Slot {
                 upload: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.upload"),
                     size: data_bytes(cfg.batch),
@@ -230,7 +310,7 @@ impl<'a> Pipeline<'a> {
                 staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.staging"),
                     size: layout.size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    usage: staging_usage,
                     mapped_at_creation: false,
                 }),
                 queries: ctx.timestamps.then(|| {
@@ -251,26 +331,20 @@ impl<'a> Pipeline<'a> {
             })
             .collect();
         scopes.pop()?;
-        let defer_readback = !std::env::var("GZC_READBACK_INLINE").is_ok_and(|v| v != "0");
-        Ok(Self { ctx, cfg: *cfg, kernels, layout, slots, defer_readback, pending: None })
+        Ok(Self { ctx, cfg: *cfg, kernels, bufs, layout, slots, pack })
     }
 
-    /// Bytes of every buffer the pipeline created, the shared scratch buffers once; timestamp
-    /// query sets and their resolve buffers are left out, as in `vram_bytes`.
+    /// Bytes of every buffer the pipeline created; timestamp query sets and their resolve
+    /// buffers are left out, as in `vram_bytes`.
     #[cfg(test)]
     fn allocated_bytes(&self) -> u64 {
         let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, |b| b.size());
-        let s = &self.slots[0].bufs;
-        let scratch = [&s.head, &s.pred, &s.best, &s.seqs, &s.lits, &s.counts].iter().map(|b| b.size()).sum::<u64>();
-        let per_slot: u64 = self
-            .slots
-            .iter()
-            .map(|slot| {
-                let b = &slot.bufs;
-                b.data.size() + opt(&b.frames) + opt(&b.frame_len) + slot.upload.size() + slot.staging.size()
-            })
-            .sum();
-        scratch + per_slot + self.kernels.own_buffer_bytes()
+        let s = &self.bufs;
+        let shared = [&s.data, &s.head, &s.pred, &s.best, &s.seqs, &s.lits, &s.counts].iter().map(|b| b.size()).sum::<u64>()
+            + opt(&s.frames)
+            + opt(&s.frame_len);
+        let per_slot: u64 = self.slots.iter().map(|slot| slot.upload.size() + slot.staging.size()).sum();
+        shared + per_slot + self.kernels.own_buffer_bytes()
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's parse
@@ -304,11 +378,24 @@ impl<'a> Pipeline<'a> {
     pub fn run_frames(&mut self, blocks: &[&[u8]], sink: &mut impl FrameSink) -> anyhow::Result<PipelineStats> {
         anyhow::ensure!(self.layout.frames, "pipeline built without emit_frames: use run");
         let layout = self.layout;
+        let packed = self.pack.is_some();
         self.run_with(blocks, &mut |first, n, view| {
             let lens: &[u32] = bytemuck::cast_slice(&view[..frame_len_bytes(n) as usize]);
             let frames = &view[layout.a as usize..layout.a as usize + n as usize * FRAME_STRIDE];
+            // Packed: each frame starts at the PACK_ALIGN boundary after the previous one, so
+            // (with every length at most FRAME_STRIDE) all of them lie inside `frames`.
+            let mut at = 0usize;
             for (b, &len) in lens.iter().enumerate() {
-                sink.put(first + b, frame_bytes(frames, b, len).with_context(|| format!("block {}", first + b))?);
+                let frame = if packed {
+                    let ok = len > 0 && len as usize <= FRAME_STRIDE;
+                    anyhow::ensure!(ok, "block {}: bad frame length {len}", first + b);
+                    let f = &frames[at..at + len as usize];
+                    at += (len as usize).next_multiple_of(PACK_ALIGN);
+                    f
+                } else {
+                    frame_bytes(frames, b, len).with_context(|| format!("block {}", first + b))?
+                };
+                sink.put(first + b, frame);
             }
             Ok(())
         })
@@ -339,7 +426,7 @@ impl<'a> Pipeline<'a> {
             let ms = |t: u64| t as f64 * period_ns / 1e6;
             (
                 names.iter().zip(&prof.ticks).map(|(name, &t)| (name.to_string(), ms(t))).collect(),
-                vec![ms(prof.upload_copy), ms(prof.readback_copy), ms(prof.idle), ms(prof.k2_k3_gap)],
+                vec![ms(prof.upload_copy), ms(prof.readback), ms(prof.idle)],
             )
         } else {
             (Vec::new(), Vec::new())
@@ -355,10 +442,10 @@ impl<'a> Pipeline<'a> {
             prof.drain,
         ]
         .map(|s| s * 1e3);
-        let transfer_ms = TRANSFER_NAMES[..4]
+        let transfer_ms = TRANSFER_NAMES[..3]
             .iter()
             .zip(gpu_ms)
-            .chain(TRANSFER_NAMES[4..].iter().zip(host_ms))
+            .chain(TRANSFER_NAMES[3..].iter().zip(host_ms))
             .map(|(n, ms)| (n.to_string(), ms))
             .collect();
         Ok(PipelineStats { kernel_ms, wall_s, batches, transfer_ms })
@@ -391,15 +478,8 @@ impl<'a> Pipeline<'a> {
                 batches += 1;
             }
             let Some(&oldest) = busy.front() else { break };
-            // No later batch will carry the pending readback (nothing left to submit, or every
-            // slot is busy and the oldest is the pending one): submit it on its own.
-            if self.pending.is_some()
-                && (next == blocks.len() || self.slots[oldest].job.as_ref().unwrap().readback.is_none())
-            {
-                self.flush()?;
-            }
             // Every slot is busy (or nothing is left to submit): block on the oldest batch...
-            let submission = self.slots[oldest].job.as_ref().unwrap().readback.as_ref().unwrap().0.clone();
+            let submission = self.slots[oldest].job.as_ref().unwrap().submission.clone();
             let t = Instant::now();
             self.ctx
                 .device
@@ -410,8 +490,7 @@ impl<'a> Pipeline<'a> {
             // ...then drain it and every later batch that has also completed.
             let mut waited_for = true;
             while let Some(&i) = busy.front() {
-                let Some((_, mapped)) = &self.slots[i].job.as_ref().unwrap().readback else { break };
-                match mapped.try_recv() {
+                match self.slots[i].job.as_ref().unwrap().mapped.try_recv() {
                     Ok(r) => r.context("map staging buffer")?,
                     Err(mpsc::TryRecvError::Empty) if !waited_for => break,
                     Err(_) => anyhow::bail!("staging map callback not delivered after waiting for its submission"),
@@ -425,140 +504,90 @@ impl<'a> Pipeline<'a> {
         Ok(batches)
     }
 
-    /// Records the copies of slot `slot`'s batch of `n` blocks (outputs and resolved timestamps)
-    /// into its staging buffer.
-    fn record_readback(slot: &Slot, layout: StagingLayout, n_queries: u32, n: u32, enc: &mut wgpu::CommandEncoder) {
-        if layout.frames {
-            let (frames, frame_len) = (slot.bufs.frames.as_ref().unwrap(), slot.bufs.frame_len.as_ref().unwrap());
-            enc.copy_buffer_to_buffer(frame_len, 0, &slot.staging, 0, frame_len_bytes(n));
-            enc.copy_buffer_to_buffer(frames, 0, &slot.staging, layout.a, frames_bytes(n));
-        } else {
-            enc.copy_buffer_to_buffer(&slot.bufs.counts, 0, &slot.staging, 0, counts_bytes(n));
-            enc.copy_buffer_to_buffer(&slot.bufs.seqs, 0, &slot.staging, layout.a, seqs_bytes(n));
-            enc.copy_buffer_to_buffer(&slot.bufs.lits, 0, &slot.staging, layout.b, lits_bytes(n));
-        }
-        if let Some((set, resolve)) = &slot.queries {
-            let q = n_queries + 2;
-            enc.resolve_query_set(set, 0..q, resolve, 0);
-            enc.copy_buffer_to_buffer(resolve, 0, &slot.staging, layout.ts, q as u64 * wgpu::QUERY_SIZE as u64);
-        }
-    }
-
-    /// Maps slot `i`'s staging buffer once `submission` (which holds its readback copies) is done.
-    fn map_readback(&mut self, i: usize, submission: wgpu::SubmissionIndex) {
-        let slot = &mut self.slots[i];
-        let (tx, mapped) = mpsc::channel();
-        slot.staging.map_async(wgpu::MapMode::Read, .., move |r| {
-            let _ = tx.send(r);
-        });
-        slot.job.as_mut().unwrap().readback = Some((submission, mapped));
-    }
-
-    /// Submits the pending batch's readback copies on their own.
-    fn flush(&mut self) -> anyhow::Result<()> {
-        let Some(p) = self.pending.take() else { return Ok(()) };
-        let n_queries = 2 * self.kernels.names().len() as u32;
-        let n = self.slots[p].job.as_ref().unwrap().n;
-        let mut enc =
-            self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline.readback") });
-        Self::record_readback(&self.slots[p], self.layout, n_queries, n, &mut enc);
-        let submission = self.ctx.queue.submit([enc.finish()]);
-        self.map_readback(p, submission);
-        Ok(())
-    }
-
-    /// Uploads `blocks` into slot `i` and submits the kernels, plus the staging copies: this
-    /// batch's own (after K4) without `defer_readback`; with it, the pending previous batch's,
-    /// recorded between this batch's K2 and K3 so the GPU runs them alongside K3 (K3's barrier
-    /// only waits for compute work, and the copies read that batch's own per-slot buffers).
-    /// Uses the slot's persistent upload buffer rather than `queue.write_buffer`, which would
-    /// allocate a fresh staging buffer per call that lives until the submission completes.
+    /// Uploads `blocks` into slot `i` and submits the upload copy, the kernels and the readback
+    /// into the slot's staging buffer (the fixed-stride copies, or the pack kernel), plus the
+    /// resolved timestamps. Uses the slot's persistent upload buffer rather than
+    /// `queue.write_buffer`, which would allocate a fresh staging buffer per call that lives
+    /// until the submission completes.
     fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]], prof: &mut Profile) -> anyhow::Result<()> {
-        let (ctx, layout) = (self.ctx, self.layout);
+        let (ctx, layout, bufs) = (self.ctx, self.layout, &self.bufs);
+        let slot = &mut self.slots[i];
         let n = blocks.len() as u32;
         let t0 = Instant::now();
-        {
-            let slot = &mut self.slots[i];
-            if let Some(rx) = slot.upload_mapped.take() {
-                // Its submission has completed (the slot is free), so the callback is normally in.
-                let r = match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
-                        rx.recv().context("upload map callback dropped")?
-                    }
-                };
-                r.context("map upload buffer")?;
-            }
+        if let Some(rx) = slot.upload_mapped.take() {
+            // Its submission has completed (the slot is free), so the callback is normally in.
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => {
+                    ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
+                    rx.recv().context("upload map callback dropped")?
+                }
+            };
+            r.context("map upload buffer")?;
         }
         let t1 = Instant::now();
         let bytes = n as usize * BLOCK_SIZE;
         {
-            let slot = &mut self.slots[i];
             let mut view = slot.upload.get_mapped_range_mut(..bytes as u64 + 4).context("upload mapped range")?;
             for (k, b) in blocks.iter().enumerate() {
                 view.slice(k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE).copy_from_slice(b);
             }
             // Trailing zero word after the last block (`data` may hold stale blocks beyond it).
             view.slice(bytes..bytes + 4).copy_from_slice(&[0u8; 4]);
-            drop(view);
-            slot.upload.unmap();
         }
+        slot.upload.unmap();
         let t2 = Instant::now();
 
         let n_queries = 2 * self.kernels.names().len() as u32;
-        let pending = if self.defer_readback { self.pending.take() } else { None };
-        let submission = {
-            let slot = &self.slots[i];
-            // Start/end markers: empty passes whose timestamps (written at BOTTOM_OF_PIPE on
-            // Vulkan, i.e. once all earlier commands completed) bracket the batch.
-            let marker = |enc: &mut wgpu::CommandEncoder, index: u32| {
-                if let Some((set, _)) = &slot.queries {
-                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("marker"),
-                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                            query_set: set,
-                            beginning_of_pass_write_index: Some(index),
-                            end_of_pass_write_index: None,
-                        }),
-                    });
-                }
-            };
-            let mut enc =
-                ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
-            marker(&mut enc, n_queries);
-            enc.copy_buffer_to_buffer(&slot.upload, 0, &slot.bufs.data, 0, bytes as u64 + 4);
-            // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4), so
-            // no kernel processes the stale blocks of a partial batch.
-            let slots = &self.slots;
-            self.kernels.record_timed_with(ctx, &mut enc, &slot.bufs, n, slot.queries.as_ref().map(|q| &q.0), &mut |enc| {
-                if let Some(p) = pending {
-                    let pn = slots[p].job.as_ref().unwrap().n;
-                    Self::record_readback(&slots[p], layout, n_queries, pn, enc);
-                }
-            });
-            marker(&mut enc, n_queries + 1);
-            if !self.defer_readback {
-                Self::record_readback(slot, layout, n_queries, n, &mut enc);
+        // Start/end markers: empty passes whose timestamps (written at BOTTOM_OF_PIPE on Vulkan,
+        // i.e. once all earlier commands completed) bracket the batch's copies.
+        let marker = |enc: &mut wgpu::CommandEncoder, index: u32| {
+            if let Some((set, _)) = &slot.queries {
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("marker"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: set,
+                        beginning_of_pass_write_index: Some(index),
+                        end_of_pass_write_index: None,
+                    }),
+                });
             }
-            ctx.queue.submit([enc.finish()])
         };
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
+        marker(&mut enc, n_queries);
+        enc.copy_buffer_to_buffer(&slot.upload, 0, &bufs.data, 0, bytes as u64 + 4);
+        // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4), so no
+        // kernel processes the stale blocks of a partial batch.
+        self.kernels.record_timed(ctx, &mut enc, bufs, n, slot.queries.as_ref().map(|q| &q.0));
+        if let Some(pack) = &self.pack {
+            pack.record(ctx, &mut enc, bufs, n, &slot.staging);
+        } else if layout.frames {
+            let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
+            enc.copy_buffer_to_buffer(frame_len, 0, &slot.staging, 0, frame_len_bytes(n));
+            enc.copy_buffer_to_buffer(frames, 0, &slot.staging, layout.a, frames_bytes(n));
+        } else {
+            enc.copy_buffer_to_buffer(&bufs.counts, 0, &slot.staging, 0, counts_bytes(n));
+            enc.copy_buffer_to_buffer(&bufs.seqs, 0, &slot.staging, layout.a, seqs_bytes(n));
+            enc.copy_buffer_to_buffer(&bufs.lits, 0, &slot.staging, layout.b, lits_bytes(n));
+        }
+        marker(&mut enc, n_queries + 1);
+        if let Some((set, resolve)) = &slot.queries {
+            let q = n_queries + 2;
+            enc.resolve_query_set(set, 0..q, resolve, 0);
+            enc.copy_buffer_to_buffer(resolve, 0, &slot.staging, layout.ts, q as u64 * wgpu::QUERY_SIZE as u64);
+        }
+        let submission = ctx.queue.submit([enc.finish()]);
 
-        let slot = &mut self.slots[i];
+        let (tx, mapped) = mpsc::channel();
+        slot.staging.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
         let (tx, upload_mapped) = mpsc::channel();
         slot.upload.map_async(wgpu::MapMode::Write, .., move |r| {
             let _ = tx.send(r);
         });
         slot.upload_mapped = Some(upload_mapped);
-        slot.job = Some(Job { first, n, readback: None });
-        if self.defer_readback {
-            if let Some(p) = pending {
-                self.map_readback(p, submission);
-            }
-            self.pending = Some(i);
-        } else {
-            self.map_readback(i, submission);
-        }
+        slot.job = Some(Job { first, n, submission, mapped });
         let t3 = Instant::now();
         prof.upload_wait += (t1 - t0).as_secs_f64();
         prof.upload_write += (t2 - t1).as_secs_f64();
@@ -592,10 +621,7 @@ impl<'a> Pipeline<'a> {
                 }
                 let (m0, m1) = (stamps[2 * nk], stamps[2 * nk + 1]);
                 prof.upload_copy += stamps[0].saturating_sub(m0);
-                prof.readback_copy += m1.saturating_sub(stamps[last_kernel_end]);
-                // K3's begin minus K2's end: holds the previous batch's readback with
-                // `defer_readback` if timestamps serialize it.
-                prof.k2_k3_gap += stamps[4].saturating_sub(stamps[3]);
+                prof.readback += m1.saturating_sub(stamps[last_kernel_end]);
                 if let Some(end) = prof.last_end {
                     prof.idle += m0.saturating_sub(end);
                 }
@@ -613,9 +639,8 @@ impl<'a> Pipeline<'a> {
     /// After an error: wait for the GPU and unmap every busy slot so the pipeline stays usable.
     fn abandon(&mut self) {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        self.pending = None;
         for slot in &mut self.slots {
-            if slot.job.take().is_some_and(|job| job.readback.is_some()) {
+            if slot.job.take().is_some() {
                 slot.staging.unmap();
             }
         }
@@ -650,18 +675,23 @@ impl ErrorScopes {
     }
 }
 
-/// Device memory a `Pipeline` for `cfg` allocates: the shared scratch buffers once (their hash
-/// chain buffers sized by `cfg.params.matching`: one chain for single-hash presets, two for
-/// Dfast), and per slot its data/output buffers plus its upload and readback staging buffers
-/// (mappable; counted although drivers may place them in host memory), plus K4's constant
-/// tables. K5 has no buffers of its own. Uploads go through the persistent upload buffers only,
-/// so no transient staging adds to this. Timestamp query sets are not counted.
+/// Bytes a slot owns: its upload buffer and its staging buffer (both mappable; counted although
+/// drivers may place them in host memory).
+fn per_slot_bytes(batch: u32, frames: bool) -> u64 {
+    data_bytes(batch) + StagingLayout::new(batch, frames).size
+}
+
+/// Device memory a `Pipeline` for `cfg` allocates: the shared buffers once (the scratch buffers,
+/// their hash chain buffers sized by `cfg.params.matching`: one chain for single-hash presets, two
+/// for Dfast; plus `data` and, on the frame path, `frames` and `frame_len`), per slot its upload
+/// and staging buffers, plus K4's constant tables. K5 has no buffers of its own. Uploads go
+/// through the persistent upload buffers only, so no transient staging adds to this. Timestamp
+/// query sets are not counted.
 pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
     let frames = cfg.params.emit_frames;
-    let per_slot =
-        slot_bytes(cfg.batch, frames) + data_bytes(cfg.batch) + StagingLayout::new(cfg.batch, frames).size;
     scratch_bytes(cfg.batch, &cfg.params.matching)
-        + cfg.inflight as u64 * per_slot
+        + slot_bytes(cfg.batch, frames)
+        + cfg.inflight as u64 * per_slot_bytes(cfg.batch, frames)
         + if frames { k4_tables_bytes() } else { 0 }
 }
 
@@ -810,9 +840,9 @@ mod tests {
         let one = vram_bytes(&frames(100, 1));
         let per_slot = vram_bytes(&frames(100, 2)) - one;
         assert_eq!(vram_bytes(&frames(100, 4)), one + 3 * per_slot);
-        assert_eq!(per_slot, slot_bytes(100, true) + data_bytes(100) + StagingLayout::new(100, true).size);
-        assert_eq!(one, scratch_bytes(100, &LVL3) + per_slot + k4_tables_bytes());
-        assert!(one > scratch_bytes(100, &LVL3) + per_slot, "scratch counted once, plus the K4 tables");
+        // A slot owns only its upload and staging buffers; data, frames and frame_len are shared.
+        assert_eq!(per_slot, data_bytes(100) + StagingLayout::new(100, true).size);
+        assert_eq!(one, scratch_bytes(100, &LVL3) + slot_bytes(100, true) + per_slot + k4_tables_bytes());
         // The parse path reads back the fixed-stride seqs and lits instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
         // K5 (Huffman literals) needs no buffers of its own.
@@ -820,10 +850,10 @@ mod tests {
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
         #[cfg(feature = "block-128k")]
         {
-            // ~2.5 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
+            // ~2.5 MiB of scratch per block, ~0.25 MiB per block per slot on the frame path.
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
             assert!((2.4..2.6).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
-            assert!((0.49..0.51).contains(&mib(per_slot)), "{}", mib(per_slot));
+            assert!((0.24..0.26).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
     }
 

@@ -15,6 +15,9 @@ pub struct GpuContext {
     /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
     /// otherwise the workgroup-sort fallback.
     pub subgroups: bool,
+    /// True when the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS` (mappable
+    /// buffers may also be storage buffers).
+    pub mappable_storage: bool,
 }
 
 impl GpuContext {
@@ -58,6 +61,13 @@ impl GpuContext {
         if subgroups {
             required_features |= wgpu::Features::SUBGROUP;
         }
+        // GZC_PACK (anything but 0): lets the pipeline pack frames straight into its mappable
+        // readback buffers (`pipeline::PackKernel`; slower than the copy on an RTX 5090).
+        let mappable_storage = adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+            && std::env::var("GZC_PACK").is_ok_and(|v| v != "0");
+        if mappable_storage {
+            required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gzc"),
@@ -67,7 +77,7 @@ impl GpuContext {
         }))
         .context("request_device")?;
 
-        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups })
+        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups, mappable_storage })
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
