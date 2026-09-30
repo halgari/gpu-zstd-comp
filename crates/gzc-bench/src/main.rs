@@ -9,6 +9,8 @@ mod gpurun;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use gzc_gpu::compressor::GpuParams;
+use gzc_gpu::pipeline::PipelineConfig;
 
 use corpus::{Corpus, LoadOpts};
 
@@ -25,7 +27,9 @@ enum Command {
     Cpu(CpuArgs),
     /// CPU reference compressor (the algorithm the GPU mirrors).
     Ref(RefArgs),
-    /// Every engine (cpu-libzstd, cpu-ref, and gpu once T9 lands) into one report.
+    /// Streaming GPU compressor (level-3 greedy parse on the GPU, frames written on the CPU).
+    Gpu(GpuArgs),
+    /// Every engine (cpu-libzstd, cpu-ref, gpu) into one report.
     All(AllArgs),
 }
 
@@ -77,6 +81,34 @@ struct RefArgs {
 }
 
 #[derive(Args)]
+struct GpuSweepArgs {
+    /// Comma-separated blocks per GPU batch.
+    #[arg(long, value_delimiter = ',', default_value = "512")]
+    batch: Vec<u32>,
+    /// Comma-separated number of batches in flight.
+    #[arg(long, value_delimiter = ',', default_value = "3")]
+    inflight: Vec<u32>,
+    /// Comma-separated number of CPU frame-writer threads.
+    #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
+    writer_threads: Vec<usize>,
+}
+
+#[derive(Args)]
+struct GpuArgs {
+    #[command(flatten)]
+    corpus: CorpusArgs,
+    #[command(flatten)]
+    sweep: GpuSweepArgs,
+    /// Decompress every produced frame with libzstd after the timed pass and
+    /// error on any mismatch against the original block.
+    #[arg(long)]
+    verify: bool,
+    /// Output directory for the JSON/HTML reports.
+    #[arg(long, default_value = "out")]
+    out: PathBuf,
+}
+
+#[derive(Args)]
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
@@ -86,7 +118,9 @@ struct AllArgs {
     /// Comma-separated thread counts, used by both cpu-libzstd and cpu-ref.
     #[arg(long, value_delimiter = ',', default_value = "1,8,16,32")]
     threads: Vec<usize>,
-    /// Decompress every cpu-ref frame with libzstd after the timed pass and
+    #[command(flatten)]
+    gpu: GpuSweepArgs,
+    /// Decompress every cpu-ref and gpu frame with libzstd after the timed pass and
     /// error on any mismatch against the original block.
     #[arg(long)]
     verify: bool,
@@ -100,6 +134,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Cpu(args) => run_cpu_cmd(args),
         Command::Ref(args) => run_ref_cmd(args),
+        Command::Gpu(args) => run_gpu_cmd(args),
         Command::All(args) => run_all_cmd(args),
     }
 }
@@ -163,13 +198,36 @@ fn run_ref_cmd(args: RefArgs) -> anyhow::Result<()> {
     write_reports(&results, &args.out)
 }
 
+/// Runs every (batch, inflight, writer_threads) combination, appending to `results`.
+fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &mut Vec<result::RunResult>) -> anyhow::Result<()> {
+    for &batch in &sweep.batch {
+        for &inflight in &sweep.inflight {
+            for &writers in &sweep.writer_threads {
+                let cfg = PipelineConfig { batch, inflight, params: GpuParams { depth: 1 } };
+                eprintln!("running gpu lvl3-greedy b{batch} i{inflight} @ {writers} writer threads (verify={verify})...");
+                results.push(gpurun::run_gpu(corpus, &cfg, writers, verify)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_gpu_cmd(args: GpuArgs) -> anyhow::Result<()> {
+    let corpus = load_corpus(&args.corpus)?;
+    log_corpus(&corpus);
+
+    let mut results = Vec::new();
+    run_gpu_sweep(&corpus, &args.sweep, args.verify, &mut results)?;
+
+    write_reports(&results, &args.out)
+}
+
 fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
     // One Vec<RunResult> holds every engine's runs so `write_reports` produces
-    // a single combined report. T9 (gpu engine) appends its RunResults here
-    // too, before `write_reports` is called.
+    // a single combined report.
     let mut results = Vec::new();
 
     for &threads in &args.threads {
@@ -183,6 +241,8 @@ fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
         eprintln!("running cpu-ref lvl3-greedy @ {threads} threads (verify={})...", args.verify);
         results.push(refrun::run_ref(&corpus, threads, args.verify)?);
     }
+
+    run_gpu_sweep(&corpus, &args.gpu, args.verify, &mut results)?;
 
     write_reports(&results, &args.out)
 }

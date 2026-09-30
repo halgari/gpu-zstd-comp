@@ -18,6 +18,12 @@ pub const MAX_SEQS: u32 = (BLOCK_SIZE / MIN_MATCH) as u32 + 1;
 /// the device limits would allow more.
 const COMPRESS_BATCH_CAP: u32 = 256;
 
+/// Kernel names, in dispatch order, as reported in timing breakdowns.
+pub const KERNEL_NAMES: [&str; 3] = ["k1_chains", "k2_best", "k3_parse"];
+
+/// Timestamp queries `Kernels::record_timed` writes: a begin/end pair per kernel.
+pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
+
 /// Match-finder tuning for the GPU path. Level 3: `depth: 1` (== `reference::LVL3`).
 #[derive(Clone, Copy, Debug)]
 pub struct GpuParams {
@@ -168,11 +174,31 @@ impl Kernels {
     /// Precondition: `n_blocks <= bufs.capacity` (asserted); `BatchBuffers::new` guarantees
     /// `capacity <= max_batch_blocks`, which keeps every dispatch and u32 index in range.
     pub fn record(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+        self.record_timed(ctx, enc, bufs, n_blocks, None);
+    }
+
+    /// `record`, with each kernel in its own compute pass writing begin/end timestamps into
+    /// `queries` (at least `KERNEL_QUERIES` entries): K1 at 0/1, K2 at 2/3, K3 at 4/5.
+    pub fn record_timed(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
         assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
         if n_blocks == 0 {
             return;
         }
-        self.chains.record(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks);
+        self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
 
         let k2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k2"),
@@ -197,13 +223,13 @@ impl Kernels {
             ],
         });
 
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: ts(1) });
         pass.set_pipeline(&self.best);
         pass.set_bind_group(0, &k2, &[]);
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
         drop(pass);
 
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes: ts(2) });
         pass.set_pipeline(&self.parse);
         pass.set_bind_group(0, &k3, &[]);
         pass.dispatch_workgroups(n_blocks.div_ceil(64), 1, 1);
