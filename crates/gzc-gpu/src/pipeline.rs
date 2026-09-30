@@ -11,8 +11,10 @@
 //! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
 //! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
 //!   `seqs` and `lits` regions; the host decodes a `BlockOutput` per block.
-//! - frames (`run_frames`, `FrameSink`): K1→K2→K3→K4, staging holds `frame_len` and the full
-//!   fixed-stride `frames` region; the host only copies each frame's bytes out.
+//! - frames (`run_frames`, `FrameSink`): K1→K2→K3(→K5)→K4, staging holds `frame_len` and the full
+//!   fixed-stride `frames` region; the host only copies each frame's bytes out. K5 (Huffman
+//!   literals, `GpuParams::huffman`) writes into the same `frames` / `frame_len` buffers, so it
+//!   adds no memory.
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -40,8 +42,8 @@ pub struct PipelineConfig {
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
     /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
-    /// "k4_entropy" on the frame path), in milliseconds; empty when the device has no timestamp
-    /// queries.
+    /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals), in milliseconds;
+    /// empty when the device has no timestamp queries.
     pub kernel_ms: Vec<(String, f64)>,
     /// Wall time from the first upload to the last block handed to the sink.
     pub wall_s: f64,
@@ -323,7 +325,7 @@ impl<'a> Pipeline<'a> {
 
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
         enc.copy_buffer_to_buffer(&slot.upload, 0, &slot.bufs.data, 0, bytes as u64 + 4);
-        // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K4), so no
+        // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4), so no
         // kernel processes the stale blocks of a partial batch.
         self.kernels.record_timed(ctx, &mut enc, &slot.bufs, n, slot.queries.as_ref().map(|q| &q.0));
         if layout.frames {
@@ -424,9 +426,9 @@ impl ErrorScopes {
 
 /// Device memory a `Pipeline` for `cfg` allocates: the shared scratch buffers once, and per slot
 /// its data/output buffers plus its upload and readback staging buffers (mappable; counted
-/// although drivers may place them in host memory), plus K4's constant tables. Uploads go
-/// through the persistent upload buffers only, so no transient staging adds to this. Timestamp
-/// query sets are not counted.
+/// although drivers may place them in host memory), plus K4's constant tables. K5 has no buffers
+/// of its own. Uploads go through the persistent upload buffers only, so no transient staging
+/// adds to this. Timestamp query sets are not counted.
 pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
     let frames = cfg.params.emit_frames;
     let per_slot =
@@ -445,8 +447,8 @@ pub fn compress_stream(
     Pipeline::new(ctx, cfg)?.run(blocks, sink)
 }
 
-/// Builds a frame-path `Pipeline` for `cfg` (`emit_frames` is forced on) and streams `blocks`
-/// through it (see `Pipeline::run_frames`).
+/// Builds a frame-path `Pipeline` for `cfg` (`emit_frames` is forced on; `huffman` is kept) and
+/// streams `blocks` through it (see `Pipeline::run_frames`).
 pub fn compress_stream_frames(
     ctx: &GpuContext,
     cfg: &PipelineConfig,
@@ -465,8 +467,6 @@ mod tests {
     use gzc_core::frame::write_frame;
     use gzc_core::synth::test_cases;
 
-    use crate::compressor::K4_FRAME_OPTIONS;
-
     struct Collect(Vec<Option<BlockOutput>>);
 
     impl BlockSink for Collect {
@@ -477,7 +477,7 @@ mod tests {
     }
 
     fn cfg(batch: u32, inflight: u32) -> PipelineConfig {
-        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false } }
+        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false, huffman: true } }
     }
 
     #[test]
@@ -550,13 +550,15 @@ mod tests {
         test_cases().into_iter().flat_map(|(_, bytes)| chunk_file(&bytes)).map(|b| b.data).collect()
     }
 
-    fn cpu_frame(block: &[u8]) -> Vec<u8> {
-        write_frame(block, &compress_block(block, LVL3), K4_FRAME_OPTIONS)
+    fn cpu_frame(block: &[u8], params: GpuParams) -> Vec<u8> {
+        write_frame(block, &compress_block(block, LVL3), params.frame_options())
     }
 
     #[test]
     fn vram_counts_scratch_once_and_slots_per_inflight() {
-        let frames = |batch, inflight| PipelineConfig { params: GpuParams { depth: 1, emit_frames: true }, ..cfg(batch, inflight) };
+        let frames = |batch, inflight| {
+            PipelineConfig { params: GpuParams { depth: 1, emit_frames: true, huffman: true }, ..cfg(batch, inflight) }
+        };
         let one = vram_bytes(&frames(100, 1));
         let per_slot = vram_bytes(&frames(100, 2)) - one;
         assert_eq!(vram_bytes(&frames(100, 4)), one + 3 * per_slot);
@@ -565,6 +567,9 @@ mod tests {
         assert!(one > scratch_bytes(100) + per_slot, "scratch counted once, plus the K4 tables");
         // The parse path reads back the fixed-stride seqs and lits instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
+        // K5 (Huffman literals) needs no buffers of its own.
+        let raw_lits = PipelineConfig { params: GpuParams { huffman: false, ..frames(100, 2).params }, ..frames(100, 2) };
+        assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
         #[cfg(feature = "block-128k")]
         {
             // ~2.9 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
@@ -578,7 +583,8 @@ mod tests {
     fn stream_frames_match_cpu_every_index_once() {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
-        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b)).collect();
+        // Huffman literals (cfg's default).
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, cfg(1, 1).params)).collect();
         // 1000 = 15 * 64 + 40: the last batch is partial and reuses a slot holding stale blocks.
         let blocks: Vec<&[u8]> = (0..1000).map(|i| distinct[i % distinct.len()].as_slice()).collect();
 
@@ -593,24 +599,26 @@ mod tests {
         assert_eq!(stats.batches, 16);
         if ctx.timestamps {
             let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy"]);
+            assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"]);
             assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{:?}", stats.kernel_ms);
         }
     }
 
     #[test]
     fn stream_frames_odd_batch_single_slot_and_reuse() {
+        // Raw literals (no K5): the huffman: false frame path stays covered end to end.
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = distinct.iter().map(|b| b.as_slice()).collect();
-        let frames_cfg = PipelineConfig { params: GpuParams { depth: 1, emit_frames: true }, ..cfg(7, 1) };
+        let params = GpuParams { depth: 1, emit_frames: true, huffman: false };
+        let frames_cfg = PipelineConfig { params, ..cfg(7, 1) };
         let mut pipe = Pipeline::new(&ctx, &frames_cfg).unwrap();
         for _ in 0..2 {
             let mut sink = CollectFrames(vec![None; blocks.len()]);
             let stats = pipe.run_frames(&blocks, &mut sink).unwrap();
             assert_eq!(stats.batches as usize, blocks.len().div_ceil(7));
             for (i, got) in sink.0.into_iter().enumerate() {
-                assert!(got.unwrap() == cpu_frame(blocks[i]), "index {i}");
+                assert!(got.unwrap() == cpu_frame(blocks[i], params), "index {i}");
             }
         }
         // The frame pipeline has no parse output, and the parse pipeline no frames.

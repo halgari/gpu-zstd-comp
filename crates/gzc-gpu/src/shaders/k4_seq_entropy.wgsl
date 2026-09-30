@@ -1,12 +1,16 @@
 // K4: sequence entropy coding + block assembly. One workgroup of 64 threads per block turns K3's
 // parse into the block's complete zstd frame, byte-identical to
-// gzc_core::frame::write_frame(block, parse, FrameOptions { checksum: false, huffman: false }):
+// gzc_core::frame::write_frame(block, parse, FrameOptions { checksum: false, huffman: HUFFMAN }):
 //   frame header, then one block that is
 //   - RLE (every byte equal), else
-//   - Compressed: raw literals section + sequences section (gzc_core::seqenc::
+//   - Compressed: literals section + sequences section (gzc_core::seqenc::
 //     write_sequences_section_auto: per-stream predefined / RLE / computed FSE table), if the
 //     content is smaller than BLOCK_SIZE, else
 //   - Raw.
+// The literals section is Raw (copied here from `lits`) unless HUFFMAN and K5 already wrote an RLE
+// or Compressed section into the frame at byte HDR_LEN + 3: then frame_len[b] holds its length on
+// entry (RAW_SECTION otherwise) and K4 keeps K5's bytes, writing only the headers below it and the
+// sequences section after it.
 // Threads cooperate on the RLE check, the code histograms, the literal copy and the raw copy;
 // thread 0 makes the mode decisions, writes the table descriptions, builds the FSE tables in
 // workgroup memory and runs the (inherently sequential) backward sequence encode.
@@ -15,8 +19,9 @@
 // size. Outputs per block b:
 //   frames[b*FRAME_WORDS ..]  frame bytes, packed little-endian (bytes past frame_len are junk)
 //   frame_len[b]              frame length in bytes
-// Prepended by the host: MAX_SEQS, FRAME_WORDS, HDR_LEN / HDR_W0..2 (frame header bytes) and the
-// TAB_* offsets into `tab` (code tables, FRAC, predefined distributions from gzc_core).
+// Prepended by the host: MAX_SEQS, FRAME_WORDS, HDR_LEN / HDR_W0..2 (frame header bytes), HUFFMAN,
+// RAW_SECTION and the TAB_* offsets into `tab` (code tables, FRAC, predefined distributions from
+// gzc_core).
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> seqs: array<u32>;
@@ -348,6 +353,19 @@ fn prefix_word(w: u32, bh: u32, extra: u32, extra_len: u32, src: u32, from_data:
     return v;
 }
 
+// Frame word w with its bytes below the literals section (frame + block header, block header
+// `bh`) set, keeping the bytes K5 wrote from HDR_LEN + 3 on.
+fn prefix_word_over_section(w: u32, bh: u32) -> u32 {
+    var v = frames[fbase + w];
+    for (var i = 0u; i < 4u; i++) {
+        let k = 4u * w + i;
+        if (k < HDR_LEN + 3u) {
+            v = (v & ~(0xFFu << (8u * i))) | (prefix_byte(k, bh, 0u, 0u, 0u, false) << (8u * i));
+        }
+    }
+    return v;
+}
+
 // Funnel-shifted word of `src` words starting at byte offset i (bytes i .. i+3).
 fn lit_word(src: u32, i: u32) -> u32 {
     let a = src + (i >> 2u);
@@ -375,6 +393,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let n_lit = counts[2u * b + 1u];
     let sbase = b * MAX_SEQS * 3u;
     let lbase = b * (BLOCK_SIZE / 4u);
+    // K5's literals section length, read before thread 0 overwrites frame_len[b].
+    var section = RAW_SECTION;
+    if (HUFFMAN) { section = frame_len[b]; }
+    let in_frame = section != RAW_SECTION;
 
     // ---- histograms and the RLE-block check ----
     for (var i = lid; i < H_ALL; i += WG) { atomicStore(&hist[i], 0u); }
@@ -408,9 +430,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let lit_hdr_len = select(select(3u, 2u, n_lit < 4096u), 1u, n_lit < 32u);
     let lit_hdr = select(select(0xCu | (n_lit << 4u), 0x4u | (n_lit << 4u), n_lit < 4096u), n_lit << 3u, n_lit < 32u);
     let lit_start = HDR_LEN + 3u + lit_hdr_len; // frame byte of literal 0
-    let seq_start = lit_start + n_lit; // frame byte of the sequences section
-    for (var w = PREFIX_WORDS + lid; w < seq_start / 4u; w += WG) {
-        frames[fbase + w] = lit_word(lbase, 4u * w - lit_start);
+    // frame byte of the sequences section
+    let seq_start = select(lit_start + n_lit, HDR_LEN + 3u + section, in_frame);
+    if (!in_frame) {
+        for (var w = PREFIX_WORDS + lid; w < seq_start / 4u; w += WG) {
+            frames[fbase + w] = lit_word(lbase, 4u * w - lit_start);
+        }
     }
 
     // ---- sequences section (thread 0) ----
@@ -418,6 +443,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         acc = 0u;
         cnt = (seq_start & 3u) * 8u;
         wpos = seq_start / 4u;
+        if (in_frame && cnt > 0u) {
+            // Keep the literals-section bytes of the first sequences word.
+            acc = frames[fbase + wpos] & ((1u << cnt) - 1u);
+        }
         if (n_seq < 128u) {
             put(n_seq, 8u);
         } else if (n_seq < 0x7F00u) {
@@ -519,12 +548,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             let bh = 1u | (2u << 1u) | (content << 3u);
             let first_seq_word = seq_start / 4u;
             for (var w = 0u; w < min(PREFIX_WORDS, first_seq_word); w++) {
-                frames[fbase + w] = prefix_word(w, bh, lit_hdr, lit_hdr_len, lbase, false);
+                if (in_frame) {
+                    frames[fbase + w] = prefix_word_over_section(w, bh);
+                } else {
+                    frames[fbase + w] = prefix_word(w, bh, lit_hdr, lit_hdr_len, lbase, false);
+                }
             }
             // The first sequences-section word starts with prefix / literal bytes.
             let keep = (seq_start & 3u) * 8u;
             if (keep > 0u) {
-                let low = prefix_word(first_seq_word, bh, lit_hdr, lit_hdr_len, lbase, false) & ((1u << keep) - 1u);
+                var low: u32;
+                if (in_frame) {
+                    low = prefix_word_over_section(first_seq_word, bh);
+                } else {
+                    low = prefix_word(first_seq_word, bh, lit_hdr, lit_hdr_len, lbase, false);
+                }
+                low &= (1u << keep) - 1u;
                 frames[fbase + first_seq_word] = (frames[fbase + first_seq_word] & ~((1u << keep) - 1u)) | low;
             }
             frame_len[b] = end;

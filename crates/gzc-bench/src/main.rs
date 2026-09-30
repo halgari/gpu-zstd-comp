@@ -27,8 +27,8 @@ enum Command {
     Cpu(CpuArgs),
     /// CPU reference compressor (the algorithm the GPU mirrors).
     Ref(RefArgs),
-    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames on the GPU;
-    /// literals stay raw until the GPU does Huffman).
+    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames, Huffman
+    /// literals included, on the GPU).
     Gpu(GpuArgs),
     /// Every engine (cpu-libzstd, cpu-ref, gpu) into one report.
     All(AllArgs),
@@ -221,7 +221,9 @@ fn check_vram(cfg: &PipelineConfig, budget_mb: u64) -> anyhow::Result<u64> {
 /// Runs every (batch, inflight, writer_threads) combination, appending to `results`. Every
 /// config is checked against the VRAM budget before anything runs.
 fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &mut Vec<result::RunResult>) -> anyhow::Result<()> {
-    let cfg = |batch, inflight| PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true } };
+    let cfg = |batch, inflight| {
+        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true, huffman: true } }
+    };
     for &batch in &sweep.batch {
         for &inflight in &sweep.inflight {
             check_vram(&cfg(batch, inflight), sweep.vram_budget_mb)?;
@@ -283,7 +285,7 @@ mod tests {
 
     #[test]
     fn vram_budget_rejects_configs_that_do_not_fit() {
-        let cfg = PipelineConfig { batch: 64, inflight: 2, params: GpuParams { depth: 1, emit_frames: false } };
+        let cfg = PipelineConfig { batch: 64, inflight: 2, params: GpuParams { depth: 1, emit_frames: false, huffman: true } };
         let mib = check_vram(&cfg, 1 << 20).unwrap();
         assert!(mib > 0);
         assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
