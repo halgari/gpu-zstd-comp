@@ -98,8 +98,10 @@ parameters (`gzc_core::params::PRESETS`), one run per preset:
 | `rung2` | single 4 B | 4 | 8 | lazy | L6 |
 | `lvl9` | single 4 B | 4 | 32 | lazy2 | L9 |
 
-Only `lvl3` is implemented so far; any other preset fails before work starts
-(`preset 'lvl9' is not implemented yet on cpu`).
+All four presets run on both `cpu-ref` and the GPU. See
+`docs/results/2026-09-29-m4.md` for the full M4 measurement; the headline: GPU
+`lvl9` reaches ratio 1.3549 at 1611 MB/s, against libzstd L9 at 8 threads'
+1.3532 at 669 MB/s — matching L9's ratio at 2.4x its throughput.
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -110,13 +112,18 @@ cargo run --release -p gzc-bench -- ref \
 ```
 
 `gzc-bench gpu` runs the streaming GPU compressor (engine `gpu`, config
-`<preset> b<batch> i<inflight>`, e.g. `lvl3 b1388 i3`): the GPU runs the whole parse and emits
+`<preset> b<batch> i<inflight>`, e.g. `lvl9 b1638 i3`): the GPU runs the whole parse and emits
 complete zstd frames (Huffman literals included), byte-identical to `cpu-ref`;
 the host only uploads blocks and copies finished frames out. Each comma-separated
 list is swept:
 
 - `--preset P` match presets (default `lvl3`; see above).
-- `--batch N` blocks per GPU batch (default 512).
+- `--batch N` blocks per GPU batch (default 512), or `max`: the largest batch that
+  fits `--vram-budget-mb` at a given preset and `--inflight` (capped by the
+  device's own limit), resolved separately per preset — the max batch depends on
+  how much scratch memory the preset's hash chains need per block, so it is not
+  the same number for every preset. Lists can mix the two, e.g. `--batch 512,max`.
+  The resolved number is what shows up in the run's config label.
 - `--inflight K` batches in flight (default 3).
 - `--writer-threads W` CPU threads that receive finished frames (default 0: the
   pipeline thread does it).
@@ -124,14 +131,15 @@ list is swept:
   (batch, inflight) config must fit, checked before anything runs.
 - `--verify` decompresses every frame with libzstd after the timed pass.
 
-The headline config, `--batch 1388 --inflight 3`, is the largest batch that fits
-6144 MiB with 3 batches in flight:
+At the default 6144 MiB budget and `--inflight 3`, `--batch max` resolves to
+b1365 for `lvl3` (its two hash chains cost more scratch per block) and b1638 for
+the single-hash presets (`rung1`, `rung2`, `lvl9`):
 
 ```sh
 cargo run --release -p gzc-bench -- gpu --synthetic --verify   # smoke run
 
 cargo run --release -p gzc-bench -- gpu \
-  --input data/corpus --ext dds,nif --batch 1388 --inflight 3 --verify --out out
+  --input data/corpus --ext dds,nif --preset lvl9 --batch max --inflight 3 --verify --out out
 ```
 
 `gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`), cpu-ref
@@ -143,6 +151,6 @@ fails, the CPU results are still written.
 ```sh
 cargo run --release -p gzc-bench -- all \
   --input data/corpus --ext dds,nif --max-bytes 2000000000 \
-  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --batch 1388 --inflight 3 \
-  --verify --out out
+  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --preset lvl3,rung1,rung2,lvl9 \
+  --batch max --inflight 3 --verify --out out
 ```

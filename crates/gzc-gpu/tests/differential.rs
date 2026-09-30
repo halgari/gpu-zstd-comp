@@ -579,6 +579,109 @@ fn k4_nbseq_three_byte_form_matches_cpu() {
     }
 }
 
+/// Composes `perm` with itself `k` times (`perm^k`).
+#[cfg(feature = "block-128k")]
+fn compose_pow(perm: &[usize], k: usize) -> Vec<usize> {
+    let l = perm.len();
+    let mut cur: Vec<usize> = (0..l).collect();
+    for _ in 0..k {
+        cur = cur.iter().map(|&i| perm[i]).collect();
+    }
+    cur
+}
+
+/// A permutation of `0..l` whose powers `perm^1..=perm^max_k` all avoid "successions"
+/// (`perm^k[i+1] == perm^k[i] + 1`): a hash-chain match found up to `max_k` generations back (the
+/// deepest a `depth`-limited chain walk can reach) always caps at exactly 4 bytes, whichever
+/// generation it lands on, rather than accidentally continuing into the next chunk. Fisher-Yates,
+/// then fix up violations (any power, any `i`) with random swaps until none remain.
+#[cfg(feature = "block-128k")]
+fn no_succession_at_any_depth_perm(seed: u64, l: usize, max_k: usize) -> Vec<usize> {
+    let mut r = Lcg(seed);
+    let mut perm: Vec<usize> = (0..l).collect();
+    for i in (1..l).rev() {
+        let j = r.below((i + 1) as u32) as usize;
+        perm.swap(i, j);
+    }
+    for _pass in 0..10_000 {
+        let mut fixed_any = false;
+        for k in 1..=max_k {
+            let pk = compose_pow(&perm, k);
+            if let Some(i) = (0..l - 1).find(|&i| pk[i + 1] == pk[i] + 1) {
+                let j = r.below(l as u32) as usize;
+                perm.swap(i + 1, j);
+                fixed_any = true;
+            }
+        }
+        if !fixed_any {
+            return perm;
+        }
+    }
+    panic!("no_succession_at_any_depth_perm: did not converge for l={l} max_k={max_k}");
+}
+
+/// A block that `RUNG1` parses into more than `0x7F00` sequences, found by the *real* hash-chain
+/// match finder (not scripted): `l` unique 4-byte seed values (byte 0 = the value's own index, so
+/// two different values can never share a first byte — whenever a candidate match's successor is
+/// a *different* value, the byte right after the match differs immediately, capping it at exactly
+/// 4 bytes instead of drifting a few bytes into the next chunk), then repeated "generations" each
+/// a fixed permutation (`perm`, applied again each generation) of the previous generation's 4-byte
+/// values. Every generation's chunk is a genuine offset match against the previous generation
+/// (found by K1's real hash chains), and `perm`'s powers avoid successions up to RUNG1's `depth`
+/// (8), so a chain walk landing on any of the last 8 generations still caps at 4 bytes: every
+/// generation is `l` separate `len == 4` sequences, not one long one. `(l, seed) = (72, 3)` was
+/// found by a small search over both and confirmed with the CPU oracle (`reference::compress_block`).
+#[cfg(feature = "block-128k")]
+fn over_0x7f00_sequences_block() -> Vec<u8> {
+    let l = 72usize;
+    let gens = BLOCK_SIZE / 4 / l - 1;
+    let seed = 3u64;
+    let mut r = Lcg(seed);
+    let seed_vals: Vec<[u8; 4]> =
+        (0..l).map(|k| [k as u8, r.next() as u8, r.next() as u8, r.next() as u8]).collect();
+    let perm = no_succession_at_any_depth_perm(seed ^ 0x5EED, l, 8);
+
+    let mut block = Vec::with_capacity(BLOCK_SIZE);
+    for v in &seed_vals {
+        block.extend_from_slice(v);
+    }
+    let mut cur = seed_vals;
+    for _ in 0..gens {
+        let next: Vec<[u8; 4]> = (0..l).map(|i| cur[perm[i]]).collect();
+        for v in &next {
+            block.extend_from_slice(v);
+        }
+        cur = next;
+    }
+    // Fill the remainder (the block doesn't divide evenly by `l`) with incompressible bytes.
+    while block.len() < BLOCK_SIZE {
+        block.push(r.next() as u8);
+    }
+    assert_eq!(block.len(), BLOCK_SIZE);
+    block
+}
+
+/// A block whose RUNG1 parse (found by the real K1/K2/K3 pipeline, not scripted) has more than
+/// `0x7F00` sequences: the GPU frame (K1→K2→K3→K5→K4, the full real pipeline via
+/// `compress_frames`) must still equal the CPU reference frame byte for byte and decode. Only
+/// reachable at 128K (`over_0x7f00_sequences_block`'s doc, and `k4_nbseq_three_byte_form_matches_cpu`).
+#[cfg(feature = "block-128k")]
+#[test]
+fn gpu_frames_match_cpu_over_0x7f00_sequences() {
+    let block = over_0x7f00_sequences_block();
+    let cpu_parse = compress_block(&block, RUNG1);
+    assert!(cpu_parse.sequences.len() >= 0x7F00, "only {} sequences", cpu_parse.sequences.len());
+
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames_for(RUNG1, huffman);
+        let want = write_frame(&block, &cpu_parse, kernels.frame_options());
+        let got = &compress_frames(&ctx, &kernels, &[&block]).expect("compress_frames")[0];
+        assert!(*got == want, "GPU frame != CPU frame; {}", first_byte_diff(got, &want));
+        let back = zstd::bulk::decompress(got, BLOCK_SIZE).expect("libzstd decode");
+        assert_eq!(back, block, "libzstd output differs from the input block");
+    }
+}
+
 /// The 3 bytes starting the sequences section of a one-block frame whose block is Compressed
 /// (asserted) with a Raw or RLE literals section (asserted).
 #[cfg(feature = "block-128k")]
@@ -1013,7 +1116,7 @@ fn gpu_matches_reference_lazy_variants() {
 #[test]
 fn k3_lazy_hand_built_best_matches_cpu() {
     let cases = lazy_test_cases();
-    assert_eq!(cases.len(), 20);
+    assert_eq!(cases.len(), 21);
     for params in [RUNG2, LVL9] {
         let (ctx, kernels) = setup_frames_for(params, true);
         let check = |cases: &[&LazyCase]| {

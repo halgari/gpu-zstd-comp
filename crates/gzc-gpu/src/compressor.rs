@@ -738,6 +738,32 @@ fn submit_from_best(
             "best[] {b} has {} entries, not in PARSE_END..=BLOCK_SIZE",
             best.len()
         );
+        // Every non-empty (len > 0) scripted entry must be a match the K3 kernels could actually
+        // have produced: a live source before `ip` and a match that stays inside the block.
+        // K3 does not itself bounds-check `best[]` (it trusts K2's output), so a bad scripted
+        // entry from a test would otherwise read/write out of bounds on the GPU.
+        for (ip, entry) in best.iter().enumerate() {
+            if entry.len == 0 {
+                continue;
+            }
+            anyhow::ensure!(entry.offset > 0, "best[] {b}[{ip}] has len {} but offset 0", entry.len);
+            anyhow::ensure!(
+                entry.offset as usize <= ip,
+                "best[] {b}[{ip}] offset {} is past ip {ip}",
+                entry.offset
+            );
+            anyhow::ensure!(
+                ip + entry.len as usize <= BLOCK_SIZE,
+                "best[] {b}[{ip}] ip {ip} + len {} > BLOCK_SIZE {BLOCK_SIZE}",
+                entry.len
+            );
+            anyhow::ensure!(
+                entry.len <= m.search_cap,
+                "best[] {b}[{ip}] len {} > search_cap {}",
+                entry.len,
+                m.search_cap
+            );
+        }
         let mut words: Vec<u32> = best.iter().flat_map(|m| [m.offset, m.len]).collect();
         words.resize(2 * BLOCK_SIZE, 0);
         ctx.queue.write_buffer(&bufs.best, b as u64 * best_bytes(1), bytemuck::cast_slice(&words));

@@ -122,11 +122,60 @@ struct RefArgs {
     out: PathBuf,
 }
 
+/// A `--batch` list entry: an exact block count, or `max` (the largest batch that fits
+/// `--vram-budget-mb` at a given preset and `--inflight`, capped by the device's own limit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchSpec {
+    N(u32),
+    Max,
+}
+
+/// `--batch` value parser: an unsigned integer, or `max` (case-insensitive).
+fn parse_batch_spec(s: &str) -> Result<BatchSpec, String> {
+    if s.eq_ignore_ascii_case("max") {
+        return Ok(BatchSpec::Max);
+    }
+    s.parse::<u32>().map(BatchSpec::N).map_err(|e| format!("'{s}': {e} (expected a number or 'max')"))
+}
+
+/// Resolves `BatchSpec::Max` to the largest batch that fits `budget_mb` at `inflight` for match
+/// params `m`, capped by `device_max` (`gzc_gpu::compressor::max_batch_blocks`). `vram_bytes` is
+/// non-decreasing in `batch` (every buffer it counts scales with `batch`, at fixed `inflight`), so
+/// this binary searches rather than scanning every batch size.
+fn resolve_max_batch(m: MatchParams, inflight: u32, vram_budget_mb: u64, device_max: u32) -> anyhow::Result<u32> {
+    let fits = |batch: u32| vram_bytes(&sweep_cfg(m, batch, inflight)).div_ceil(1 << 20) <= vram_budget_mb;
+    anyhow::ensure!(
+        device_max >= 1 && fits(1),
+        "--batch max: even batch 1 at inflight {inflight} does not fit {vram_budget_mb} MiB (--vram-budget-mb) \
+         or this device's limits"
+    );
+    if fits(device_max) {
+        return Ok(device_max);
+    }
+    let (mut lo, mut hi) = (1u32, device_max); // fits(lo) held, fits(hi) does not.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) { lo = mid } else { hi = mid }
+    }
+    Ok(lo)
+}
+
+/// `spec` as an exact batch count: `N` as is, `Max` resolved via `resolve_max_batch`.
+fn resolve_batch(spec: BatchSpec, m: MatchParams, inflight: u32, vram_budget_mb: u64, device_max: u32) -> anyhow::Result<u32> {
+    match spec {
+        BatchSpec::N(n) => Ok(n),
+        BatchSpec::Max => resolve_max_batch(m, inflight, vram_budget_mb, device_max),
+    }
+}
+
 #[derive(Args)]
 struct GpuSweepArgs {
-    /// Comma-separated blocks per GPU batch.
-    #[arg(long, value_delimiter = ',', default_value = "512")]
-    batch: Vec<u32>,
+    /// Comma-separated blocks per GPU batch, or `max` (the largest batch fitting
+    /// `--vram-budget-mb` for a given preset and `--inflight`, capped by the device's own limit;
+    /// resolved per preset, so `lvl3` and the single-hash presets can resolve to different
+    /// numbers). Mixed lists like `512,max` are allowed.
+    #[arg(long, value_delimiter = ',', default_value = "512", value_parser = parse_batch_spec)]
+    batch: Vec<BatchSpec>,
     /// Comma-separated number of batches in flight.
     #[arg(long, value_delimiter = ',', default_value = "3")]
     inflight: Vec<u32>,
@@ -284,35 +333,46 @@ fn sweep_cfg(matching: MatchParams, batch: u32, inflight: u32) -> PipelineConfig
     PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames: true, huffman: true } }
 }
 
-/// Checks every preset is implemented on the GPU and validates every (preset, batch, inflight)
-/// config of `sweep` against the VRAM budget, then opens the GPU and checks each batch against
-/// the device's limit. Run before any timed work so a bad config or a missing adapter fails fast.
+/// Checks every preset is implemented on the GPU and validates every explicit (preset, batch,
+/// inflight) config of `sweep` against the VRAM budget (an `N` entry needs no device, so this
+/// much fails before opening one); then opens the GPU, resolves every `max` entry (per preset and
+/// `--inflight`, since a batch fitting the budget depends on both) and checks every resolved
+/// batch against the device's own limit and the VRAM budget again. Run before any timed work so a
+/// bad config or a missing adapter fails fast.
 fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
     check_presets(presets, false, true)?;
+    anyhow::ensure!(sweep.inflight.iter().all(|&i| i >= 1), "--inflight must be at least 1");
     for p in presets {
-        for &batch in &sweep.batch {
-            for &inflight in &sweep.inflight {
-                anyhow::ensure!(inflight >= 1, "--inflight must be at least 1");
-                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+        for &spec in &sweep.batch {
+            if let BatchSpec::N(batch) = spec {
+                for &inflight in &sweep.inflight {
+                    check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+                }
             }
         }
     }
     let ctx = GpuContext::new()?;
     for p in presets {
         let max = max_batch_blocks(&ctx.device.limits(), &p.params);
-        for &batch in &sweep.batch {
-            anyhow::ensure!(
-                batch >= 1 && batch <= max,
-                "--batch {batch} not in 1..={max} for preset '{}' on this device",
-                p.name
-            );
+        for &spec in &sweep.batch {
+            for &inflight in &sweep.inflight {
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max)?;
+                anyhow::ensure!(
+                    batch >= 1 && batch <= max,
+                    "--batch {batch} not in 1..={max} for preset '{}' on this device",
+                    p.name
+                );
+                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+            }
         }
     }
     Ok(ctx)
 }
 
 /// Runs every (preset, batch, inflight, writer_threads) combination on `ctx`, appending to
-/// `results`. Configs must have passed `gpu_preflight`.
+/// `results`. Configs must have passed `gpu_preflight`. `--batch max` is re-resolved here (cheap:
+/// no GPU dispatch) rather than threaded through from `gpu_preflight`, so the two stay in sync by
+/// construction.
 fn run_gpu_sweep(
     ctx: &GpuContext,
     corpus: &Corpus,
@@ -322,8 +382,10 @@ fn run_gpu_sweep(
     results: &mut Vec<result::RunResult>,
 ) -> anyhow::Result<()> {
     for p in presets {
-        for &batch in &sweep.batch {
+        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max)?;
                 for &writers in &sweep.writer_threads {
                     let cfg = sweep_cfg(p.params, batch, inflight);
                     let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
@@ -394,6 +456,88 @@ mod tests {
         assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
         let err = check_vram(&cfg, mib - 1).unwrap_err().to_string();
         assert!(err.contains("--vram-budget-mb") && err.contains("b64 i2"), "{err}");
+    }
+
+    #[test]
+    fn batch_spec_parses_numbers_and_max_case_insensitively() {
+        assert_eq!(parse_batch_spec("512"), Ok(BatchSpec::N(512)));
+        assert_eq!(parse_batch_spec("0"), Ok(BatchSpec::N(0)));
+        assert_eq!(parse_batch_spec("max"), Ok(BatchSpec::Max));
+        assert_eq!(parse_batch_spec("Max"), Ok(BatchSpec::Max));
+        assert_eq!(parse_batch_spec("MAX"), Ok(BatchSpec::Max));
+        let err = parse_batch_spec("bogus").unwrap_err();
+        assert!(err.contains("bogus") && err.contains("max"), "{err}");
+        assert!(parse_batch_spec("-1").is_err());
+        assert!(parse_batch_spec("").is_err());
+    }
+
+    #[test]
+    fn batch_flag_parses_mixed_number_and_max_lists() {
+        for cmd in ["gpu", "all"] {
+            let batches = |extra: &[&str]| -> Result<Vec<BatchSpec>, clap::Error> {
+                let argv = [&["gzc-bench", cmd, "--synthetic"], extra].concat();
+                Ok(match Cli::try_parse_from(argv)?.command {
+                    Command::Gpu(a) => a.sweep.batch,
+                    Command::All(a) => a.gpu.batch,
+                    _ => unreachable!(),
+                })
+            };
+            assert_eq!(batches(&[]).unwrap(), [BatchSpec::N(512)], "{cmd}: default");
+            assert_eq!(
+                batches(&["--batch", "256,max,1024"]).unwrap(),
+                [BatchSpec::N(256), BatchSpec::Max, BatchSpec::N(1024)],
+                "{cmd}"
+            );
+            assert_eq!(batches(&["--batch", "max"]).unwrap(), [BatchSpec::Max], "{cmd}");
+            assert!(batches(&["--batch", "bogus"]).is_err(), "{cmd}");
+        }
+    }
+
+    /// `resolve_max_batch` binary-searches `vram_bytes`; a linear scan over every batch from
+    /// `device_max` down to 1 must land on the same answer (the largest batch that fits).
+    #[test]
+    fn resolve_max_batch_matches_linear_scan() {
+        let m = gzc_core::params::LVL3;
+        for (budget_mb, inflight, device_max) in [(64u64, 1u32, 64u32), (128, 2, 200), (6144, 3, 4000)] {
+            let want = (1..=device_max)
+                .rev()
+                .find(|&b| vram_bytes(&sweep_cfg(m, b, inflight)).div_ceil(1 << 20) <= budget_mb);
+            let got = resolve_max_batch(m, inflight, budget_mb, device_max).ok();
+            assert_eq!(got, want, "budget_mb={budget_mb} inflight={inflight} device_max={device_max}");
+        }
+    }
+
+    #[test]
+    fn resolve_max_batch_returns_device_max_when_it_fits() {
+        let m = gzc_core::params::LVL3;
+        let mib = vram_bytes(&sweep_cfg(m, 8, 1)).div_ceil(1 << 20);
+        assert_eq!(resolve_max_batch(m, 1, mib, 8).unwrap(), 8, "device_max itself fits: use it");
+        assert_eq!(resolve_max_batch(m, 1, mib + 1_000_000, 8).unwrap(), 8, "a huge budget: still capped at device_max");
+    }
+
+    #[test]
+    fn resolve_max_batch_errors_when_even_batch_1_does_not_fit() {
+        let m = gzc_core::params::LVL3;
+        let err = resolve_max_batch(m, 1, 0, 4096).unwrap_err().to_string();
+        assert!(err.contains("--batch max") && err.contains("--vram-budget-mb"), "{err}");
+    }
+
+    #[test]
+    fn resolve_batch_passes_through_n_and_resolves_max() {
+        let m = gzc_core::params::LVL3;
+        assert_eq!(resolve_batch(BatchSpec::N(77), m, 1, 1, 1).unwrap(), 77, "N is never validated by resolve_batch itself");
+        let mib = vram_bytes(&sweep_cfg(m, 16, 2)).div_ceil(1 << 20);
+        assert_eq!(resolve_batch(BatchSpec::Max, m, 2, mib, 16).unwrap(), 16);
+    }
+
+    /// Different presets can resolve `max` to different numbers at the same budget/inflight:
+    /// LVL3's two hash chains cost more scratch memory per block than a single-hash preset's one.
+    #[test]
+    fn resolve_max_batch_differs_per_preset() {
+        let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
+        let lvl3 = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max).unwrap();
+        let rung1 = resolve_max_batch(gzc_core::params::RUNG1, inflight, budget_mb, device_max).unwrap();
+        assert!(lvl3 < rung1, "lvl3 {lvl3} should resolve smaller than rung1 {rung1} at the same budget");
     }
 
     #[test]

@@ -656,6 +656,24 @@ pub mod cases {
         vec![case("depth0_tie_keeps_repcode_at_parse_end", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
     }
 
+    /// RUNG2 with `min_match` raised to 6: the repcode check at ip+1 only needs 4 bytes
+    /// (`rep_len`'s hardcoded floor) whatever `min_match` is, so a byte run of exactly 6 equal
+    /// bytes at the block start (with no explicit match, `best[]` entirely empty) is still
+    /// caught by the offset_1 = 1 repeat at ip+1: `match_length` 4 covering positions 2..6,
+    /// `start` stays at ip+1 = 2 (the depth-0 first search at ip = 1 finds nothing, since
+    /// `best[1]` is empty and every other `best[]` entry too), so the store is `(ll 2, rep1, 4)`
+    /// — pinned by running the CPU oracle (`lazy_parse`) directly, not derived by hand.
+    pub fn rung2_min_match6_byte_run_at_start() -> Vec<LazyCase> {
+        let mut block = background(101);
+        block[0..6].fill(0x77);
+        block[6] = !0x77u8; // guaranteed different from the run byte
+        let best = empty_best();
+        let params = MatchParams { min_match: 6, ..RUNG2 };
+        assert_eq!(match_len(&block, 2, 1), 4, "the offset-1 run at ip+1 is exactly 4 bytes");
+        let want = vec![seq(2, 4, 1)];
+        vec![case("rung2_min_match6_byte_run_at_start", block, best, vec![(params, want)])]
+    }
+
     /// Every hand-built case above, in order.
     pub fn lazy_test_cases() -> Vec<LazyCase> {
         [
@@ -674,6 +692,7 @@ pub mod cases {
             dedup_store_at_block_start_byte_run,
             lazy2_chained_deferral_uses_step1_rule,
             lazy2_step2_win_continues,
+            rung2_min_match6_byte_run_at_start,
         ]
         .into_iter()
         .flat_map(|f| f())
@@ -780,11 +799,16 @@ mod tests {
         check(cases::lazy2_step2_win_continues());
     }
 
+    #[test]
+    fn rung2_min_match6_byte_run_at_start() {
+        check(cases::rung2_min_match6_byte_run_at_start());
+    }
+
     /// `lazy_test_cases` (what the GPU tests replay) is exactly the union of the cases above.
     #[test]
     fn lazy_test_cases_lists_every_case() {
         let all = cases::lazy_test_cases();
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 21);
         let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         names.sort();
         names.dedup();
