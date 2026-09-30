@@ -15,8 +15,11 @@
 //     `continue`) so that the lanes' get_all_matches calls run together; each trip issues its
 //     position's loads (data, candidate words) first.
 //   - The DP nodes live in a ring of RING_N = sufficient_len + 1 slots per lane (position pos of
-//     the series in slot pos % RING_N), in workgroup memory or in private memory (the fallback
-//     when the adapter's workgroup storage is too small); both declared by the host (rix).
+//     the series in slot pos % RING_N). Only the prices (ring_p) are in workgroup memory, or in
+//     private memory (the fallback when the adapter's workgroup storage is too small), both
+//     declared by the host (rix); the rest of each node is in the global scratch `scr` (M5 T3b:
+//     workgroup memory bounds K3opt's residency, and 4 B per node lets a 2900-block batch run in
+//     one wave on an RTX 5090).
 //   - `trace` (the dead K1 pred buffer, 2 words per position) gets (mlen | litlen << 8, offBase)
 //     of every node when it becomes final; the backward trace reads it, never the ring. The entry
 //     at iend (a node at the segment end) is never read and not written (it would be the next
@@ -58,7 +61,7 @@
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
 // (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
 // (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
-// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the ring declarations (ring_p/a/b/c, rix).
+// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the price ring's declaration (ring_p, rix).
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;
@@ -117,6 +120,9 @@ const_assert MIN_MATCH == 3u;
 // PRICE_MODE 1: opt::Prices per block; PRICE_MODE 3 / HIST_OUT: opt::Hist per block (the
 // previous pass's, replaced by this pass's). PRICE_WORDS == HIST_WORDS words per block.
 @group(0) @binding(5) var<storage, read_write> prices: array<u32>;
+// The DP nodes' payload (reps, litlen, mlen, offBase): 3 words per node, RING_N nodes per lane,
+// interleaved over the block's NSEG lanes (see six). Only the price stays in ring_p.
+@group(0) @binding(6) var<storage, read_write> scr: array<u32>;
 
 // zstd LL_Code for lit_len < 64 (codes::ll_code).
 const LL_CODE: array<u32, 64> = array<u32, 64>(
@@ -147,6 +153,7 @@ var<private> base: u32;
 var<private> cbase: u32;
 var<private> tbase: u32;
 var<private> wbase: u32;
+var<private> sbase: u32;
 
 // Records of the last get_all_matches: (offBase, length), strictly increasing length.
 var<private> m_ob: array<u32, 5>;
@@ -205,8 +212,8 @@ fn new_rep(r: vec3<u32>, ob: u32, ll0: bool) -> vec3<u32> {
     return rep_after(r, ob, select(1u, 0u, ll0));
 }
 
-// A DP node (opt::Node). In the ring: ring_p = price, ring_a = rep0 | rep1 << 16,
-// ring_b = rep2 | litlen << 16, ring_c = mlen | offBase << 8 (mlen <= SUFF, reps < 65536).
+// A DP node (opt::Node). ring_p = price; payload words (scr, six): rep0 | rep1 << 16,
+// rep2 | litlen << 16, mlen | offBase << 8 (mlen <= SUFF, reps < 65536).
 struct Node {
     price: i32,
     r: vec3<u32>,
@@ -217,12 +224,17 @@ struct Node {
 
 fn slot(pos: u32) -> u32 { return pos % RING_N; }
 
+// The payload words of the lane's slot s: scr[six(s)], scr[six(s) + SF], scr[six(s) + 2 SF].
+const SF: u32 = RING_N * NSEG;
+fn six(s: u32) -> u32 { return sbase + s * NSEG; }
+
 fn ld(pos: u32) -> Node {
-    let i = rix(slot(pos));
-    let a = ring_a[i];
-    let b = ring_b[i];
-    let c = ring_c[i];
-    return Node(ring_p[i], vec3<u32>(a & 0xFFFFu, a >> 16u, b & 0xFFFFu), b >> 16u, c & 0xFFu, c >> 8u);
+    let s = slot(pos);
+    let j = six(s);
+    let a = scr[j];
+    let b = scr[j + SF];
+    let c = scr[j + 2u * SF];
+    return Node(ring_p[rix(s)], vec3<u32>(a & 0xFFFFu, a >> 16u, b & 0xFFFFu), b >> 16u, c & 0xFFu, c >> 8u);
 }
 
 fn ld_price(pos: u32) -> i32 {
@@ -230,18 +242,20 @@ fn ld_price(pos: u32) -> i32 {
 }
 
 fn st(pos: u32, n: Node) {
-    let i = rix(slot(pos));
-    ring_p[i] = n.price;
-    ring_a[i] = n.r.x | (n.r.y << 16u);
-    ring_b[i] = n.r.z | (n.litlen << 16u);
-    ring_c[i] = n.mlen | (n.ob << 8u);
+    let s = slot(pos);
+    let j = six(s);
+    ring_p[rix(s)] = n.price;
+    scr[j] = n.r.x | (n.r.y << 16u);
+    scr[j + SF] = n.r.z | (n.litlen << 16u);
+    scr[j + 2u * SF] = n.mlen | (n.ob << 8u);
 }
 
 // The relaxation's fill: price MAX, litlen 1, the rest left as it was.
 fn fill(pos: u32) {
-    let i = rix(slot(pos));
-    ring_p[i] = MAXP;
-    ring_b[i] = (ring_b[i] & 0xFFFFu) | (1u << 16u);
+    let s = slot(pos);
+    let j = six(s) + SF;
+    ring_p[rix(s)] = MAXP;
+    scr[j] = (scr[j] & 0xFFFFu) | (1u << 16u);
 }
 
 fn push_match(ob: u32, len: u32) {
@@ -622,6 +636,7 @@ fn dp(b: u32, k: u32) {
     cbase = 2u * b * BLOCK_SIZE;
     tbase = cbase;
     wbase = cbase + k * SEG_WORDS;
+    sbase = b * (3u * SF) + k;
     let s = k * SEG;
     let iend = s + SEG;
     let ilimit = iend - 8u;

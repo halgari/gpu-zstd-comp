@@ -427,7 +427,7 @@ fn k3opt_timing() {
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
-    let bufs = OptBuffers::new(&ctx, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
     // (wg, ring, level, prices, unbounded loops)
     let table: [(u32, RingMem, u8, PriceSrc, bool); 13] = [
         (16, RingMem::Workgroup, 2, PriceSrc::BlockInit, true),
@@ -688,7 +688,7 @@ fn k3opt_passes_timing() {
     let cands = cands_of(&blocks);
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
-    let bufs = OptBuffers::new(&ctx, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");
