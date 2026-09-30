@@ -15,7 +15,7 @@
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, HASH_BITS, LOG2_BLOCK, NO_POS};
-use gzc_core::params::MatchParams;
+use gzc_core::params::{Hashes, MatchParams};
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
 const K1_SG_WGSL: &str = include_str!("shaders/k1_chains_sg.wgsl");
@@ -49,10 +49,31 @@ pub fn pred_fp(block: &[u8], p: usize) -> u32 {
     ((lo.wrapping_mul(0x85EB_CA6B) >> 25) << 17) | ((block[p + 4] as u32) << 24)
 }
 
-/// `params_wgsl(p)` plus the finder's key constant: `KEY_SHIFT = HASH_BITS - p.hash_bits`, so a
-/// kernel's key is `hash >> KEY_SHIFT` (== `gzc_core::hash::key`).
+/// Fingerprint bits K1 stores in the pred words of the `Opt3` h3 chain (chain 1 of `opt` params;
+/// common.wgsl `pred_fp3`) for position `p < HASHED_POSITIONS`: bits 17..24 hash bytes p..p+3,
+/// bits 24..32 are byte p + 3. A differing hash field means a match shorter than 3 bytes, a
+/// differing byte field one of at most 3.
+pub fn pred_fp3(block: &[u8], p: usize) -> u32 {
+    let lo = u32::from_le_bytes(block[p..p + 4].try_into().unwrap());
+    ((((lo & 0xFF_FFFF).wrapping_mul(0x85EB_CA6B)) >> 25) << 17) | (lo & 0xFF00_0000)
+}
+
+/// The fingerprint of `p` in chain `chain`'s pred words under `params`: `pred_fp3` on the `Opt3`
+/// h3 chain, `pred_fp` everywhere else.
+pub fn chain_fp(params: &MatchParams, chain: usize, block: &[u8], p: usize) -> u32 {
+    if params.hashes == Hashes::Opt3 && chain == 1 { pred_fp3(block, p) } else { pred_fp(block, p) }
+}
+
+/// `params_wgsl(p)` plus the finder's constants: `KEY_SHIFT = HASH_BITS - p.hash_bits`, so a
+/// kernel's key is `hash >> KEY_SHIFT` (== `gzc_core::hash::key`), and `OPT3` (the `Opt3` chains:
+/// chain 0 `hash_width(.., 4)`, chain 1 `hash3` with `pred_fp3` fingerprints).
 pub fn finder_wgsl(p: &MatchParams) -> String {
-    format!("{}const KEY_SHIFT: u32 = {}u;\n", params_wgsl(p), HASH_BITS - p.hash_bits)
+    format!(
+        "{}const KEY_SHIFT: u32 = {}u;\nconst OPT3: bool = {};\n",
+        params_wgsl(p),
+        HASH_BITS - p.hash_bits,
+        p.hashes == Hashes::Opt3
+    )
 }
 
 /// Bytes of one head table (2^HASH_BITS u32 entries).
@@ -153,8 +174,6 @@ impl ChainsKernel {
     /// `new` with explicit options.
     pub fn with_options(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions) -> anyhow::Result<Self> {
         params.validate().map_err(|e| anyhow::anyhow!("invalid match params {params:?}: {e}"))?;
-        // M5: the Opt3 chains (h4 + h3) are not built on the GPU yet (T2).
-        anyhow::ensure!(params.opt.is_none(), "K1 does not build Opt3 chains yet: {params:?}");
         // The subgroup kernel splits its 256-lane tiles into 32-lane chunks, each inside one
         // subgroup, and reads ballots of up to 128 lanes.
         let info = &ctx.adapter_info;
@@ -258,12 +277,13 @@ impl ChainsKernel {
             .map(|(block, chains)| {
                 chains
                     .iter()
-                    .map(|chain| {
+                    .enumerate()
+                    .map(|(c, chain)| {
                         (0..BLOCK_SIZE)
                             .map(|p| {
                                 if p < HASHED_POSITIONS {
                                     let pr = chain[p];
-                                    (if pr == NO_POS { PRED_POS } else { pr }) | pred_fp(block, p)
+                                    (if pr == NO_POS { PRED_POS } else { pr }) | chain_fp(params, c, block, p)
                                 } else {
                                     PRED_POS
                                 }
@@ -355,7 +375,7 @@ impl ChainsKernel {
     /// data: packed blocks; head: at least `head_bytes(n_blocks, n_hashes)`, per-dispatch scratch
     /// (each workgroup clears its table in-kernel; nothing is carried between dispatches); pred:
     /// at least `pred_bytes(n_blocks, n_hashes)`, layout [block][chain][pos] (Dfast: chain 0 long,
-    /// 1 short; Single: chain 0 over `hash_width(min_match)`).
+    /// 1 short; Single: chain 0 over `hash_width(min_match)`; Opt3: chain 0 h4, 1 h3).
     ///
     /// Precondition: `n_blocks <= max_blocks_per_batch(&ctx.device.limits(), n_hashes)`. That
     /// keeps every buffer within the binding/buffer limits and `n_blocks * n_hashes <= 2^(32 -

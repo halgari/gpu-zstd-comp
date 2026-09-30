@@ -43,6 +43,10 @@ fn hash_width(base: u32, p: u32, width: u32) -> u32 {
     return mix(load_u32_at(base, p), load_u32_at(base, p + 4u) & mask);
 }
 
+// == gzc_core::hash::hash3 (zstd's ZSTD_hash3Ptr, 16 bits): the 3 bytes at p (byte p + 3 is
+// shifted out). The Opt3 short chain's key.
+fn hash3(base: u32, p: u32) -> u32 { return ((load_u32_at(base, p) << 8u) * 506832829u) >> (32u - HASH_BITS); }
+
 // Length of the common prefix of block[p..] and block[q..] for q < p, bounded by
 // min(BLOCK_SIZE - p, cap): == gzc_core::reference::match_len with cap = 0xFFFFFFFFu, and
 // == match_len_capped with cap = SEARCH_CAP. Compares 4 bytes at a time only while
@@ -75,6 +79,12 @@ const PRED_FP_LO: u32 = 0x7Fu << 17u;
 const_assert LOG2_BLOCK <= 17u;
 fn pred_fp(lo: u32, hi: u32) -> u32 {
     return (((lo * 0x85EBCA6Bu) >> 25u) << 17u) | ((hi & 0xFFu) << 24u);
+}
+// The Opt3 h3 chain's fingerprint (chain 1 of Opt3 params, `chains::pred_fp3`): bits 17..24
+// are 7 bits of a hash of the 3 bytes p..p+3, bits 24..32 byte p + 3 (lo = the 4 bytes at p).
+// A differing lo field means len < 3, a differing byte field len <= 3.
+fn pred_fp3(lo: u32) -> u32 {
+    return ((((lo & 0xFFFFFFu) * 0x85EBCA6Bu) >> 25u) << 17u) | (lo & 0xFF000000u);
 }
 // A pred word for predecessor pr (NO_POS = none) and fingerprint fp.
 fn pred_word(pr: u32, fp: u32) -> u32 {
