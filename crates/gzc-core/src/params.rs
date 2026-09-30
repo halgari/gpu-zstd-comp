@@ -1,5 +1,5 @@
 //! Runtime match-finder / parse parameters and the named presets shared by CPU, GPU and CLI.
-use crate::config::MATCH_SEARCH_CAP;
+use crate::config::{HASH_BITS, MATCH_SEARCH_CAP};
 
 /// Which hash chains the match finder walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,13 +22,18 @@ pub struct MatchParams {
     pub lazy: u32,
     /// Bytes compared per candidate; the parse extends matches that hit the cap.
     pub search_cap: u32,
+    /// Bits of the match-finder hash key (`hash::key`: the 16-bit hash's top `hash_bits` bits).
+    /// 16 for the chain presets; 13 for `lvl9s13`, whose GPU finder bucket-sorts candidates by
+    /// the key in workgroup memory (2^13 counters). Candidates, and so `find_best`, are the same
+    /// hash chains either way, over this key.
+    pub hash_bits: u32,
 }
 
 impl MatchParams {
     /// Ok when every field is in its supported range: min_match 4..=8, depth 1..=64,
-    /// lazy 0..=2, search_cap 8..=256, and Dfast only with min_match 5.
+    /// lazy 0..=2, search_cap 8..=256, hash_bits 11..=16, and Dfast only with min_match 5.
     pub fn validate(&self) -> Result<(), String> {
-        let MatchParams { hashes, min_match, depth, lazy, search_cap } = *self;
+        let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits } = *self;
         if !(4..=8).contains(&min_match) {
             return Err(format!("min_match {min_match} not in 4..=8"));
         }
@@ -40,6 +45,9 @@ impl MatchParams {
         }
         if !(8..=256).contains(&search_cap) {
             return Err(format!("search_cap {search_cap} not in 8..=256"));
+        }
+        if !(11..=HASH_BITS).contains(&hash_bits) {
+            return Err(format!("hash_bits {hash_bits} not in 11..={HASH_BITS}"));
         }
         if hashes == Hashes::Dfast && min_match != 5 {
             return Err(format!("Dfast hashes need min_match 5, got {min_match}"));
@@ -65,19 +73,37 @@ impl MatchParams {
 
 /// Level-3 calibration (the M3 output, byte for byte): dfast chains, depth 1, greedy.
 pub const LVL3: MatchParams =
-    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32 };
+    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
 /// Single 4-byte hash, depth 8, greedy (compare against libzstd L5).
 pub const RUNG1: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
 /// Rung 1 with a lazy parse (compare against libzstd L6).
 pub const RUNG2: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
 /// Single 4-byte hash, depth 32, lazy2 (compare against libzstd L9).
 pub const LVL9: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
+
+/// `lvl9` with a 13-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
+/// bucket-sorted array (a counting sort over 2^13 keys in workgroup memory) instead of 16-bit hash
+/// chains. Ratio -0.004 % vs lvl9 in the R5 sample.
+pub const LVL9S13: MatchParams = MatchParams { hash_bits: 13, ..LVL9 };
+/// `lvl9s13` with a 12-bit key: at 64 KiB blocks as dense as 13 bits at 128 KiB, and half the
+/// sorted K1's workgroup memory (8 KiB).
+pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
+/// `lvl9` walking 16 candidates instead of 32 (speed2 E4): K2 -25 %, ratio -0.026 % (R5 sample).
+pub const LVL9D16: MatchParams = MatchParams { depth: 16, ..LVL9 };
 
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 4] = [("lvl3", LVL3), ("rung1", RUNG1), ("rung2", RUNG2), ("lvl9", LVL9)];
+pub const PRESETS: [(&str, MatchParams); 7] = [
+    ("lvl3", LVL3),
+    ("rung1", RUNG1),
+    ("rung2", RUNG2),
+    ("lvl9", LVL9),
+    ("lvl9s13", LVL9S13),
+    ("lvl9s12", LVL9S12),
+    ("lvl9d16", LVL9D16),
+];
 
 /// The preset called `name`; an unknown name is an error listing the valid ones.
 pub fn preset(name: &str) -> Result<MatchParams, String> {
@@ -101,11 +127,13 @@ mod tests {
     #[test]
     fn presets_validate() {
         // The spec's preset table, verbatim.
-        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64 };
+        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16 };
         assert_eq!(LVL3, m(Hashes::Dfast, 5, 1, 0));
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
         assert_eq!(RUNG2, m(Hashes::Single, 4, 8, 1));
         assert_eq!(LVL9, m(Hashes::Single, 4, 32, 2));
+        assert_eq!(LVL9S13, MatchParams { hash_bits: 13, ..m(Hashes::Single, 4, 32, 2) });
+        assert_eq!(LVL9D16, m(Hashes::Single, 4, 16, 2));
         for (name, p) in PRESETS {
             assert_eq!(p.validate(), Ok(()), "{name}");
             assert_eq!(preset(name), Ok(p), "{name}");
@@ -141,6 +169,8 @@ mod tests {
             MatchParams { search_cap: 7, ..single },
             MatchParams { search_cap: 257, ..single },
             MatchParams { min_match: 4, ..LVL3 },
+            MatchParams { hash_bits: 10, ..single },
+            MatchParams { hash_bits: 17, ..single },
         ];
         for p in bad {
             assert!(p.validate().is_err(), "{p:?} accepted");

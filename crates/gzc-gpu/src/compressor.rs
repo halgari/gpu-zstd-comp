@@ -13,6 +13,8 @@
 //! (`decode_output`).
 use crate::chains::{self, ChainsKernel, head_bytes, pred_bytes};
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
+use crate::chains::finder_wgsl;
+use crate::sorted::SortKernel;
 use anyhow::{Context as _, anyhow};
 use gzc_core::codes::{
     LL_BASE, LL_BITS, LL_DEFAULT_NORM, ML_BASE, ML_BITS, ML_DEFAULT_NORM, OF_DEFAULT_NORM, ll_code, ml_code,
@@ -25,6 +27,7 @@ use gzc_core::reference::Match;
 use gzc_core::seq::{BlockOutput, Sequence};
 
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
+const K2_WINDOW_WGSL: &str = include_str!("shaders/k2_window.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
@@ -232,6 +235,9 @@ struct HuffmanKernel {
 /// The K1, K2 and K3 pipelines (plus K5 and K4 with `emit_frames`), built once.
 pub struct Kernels {
     chains: ChainsKernel,
+    /// The bucket-sorted K1 and the window K2 (`sorted::sorted_params` presets, when the device
+    /// runs them), used instead of `chains` and `best`.
+    sorted: Option<(SortKernel, wgpu::ComputePipeline)>,
     best: wgpu::ComputePipeline,
     best_layout: wgpu::BindGroupLayout,
     parse: wgpu::ComputePipeline,
@@ -520,8 +526,14 @@ impl Kernels {
         });
         let params = GpuParams { huffman, ..params };
         let chains = ChainsKernel::new(ctx, &m)?;
+        let sorted = SortKernel::new(ctx, &m)?.map(|k1| {
+            let body = format!("{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\n{K2_WGSL}\n{K2_WINDOW_WGSL}", finder_wgsl(&m));
+            let module = ctx.shader("k2_window", &body);
+            (k1, pipeline_from_module(ctx, "k2_window", &best_layout, &module, "main_window"))
+        });
         Ok(Self {
             chains,
+            sorted,
             best,
             best_layout,
             parse,
@@ -542,6 +554,11 @@ impl Kernels {
     /// The match params the kernels were built for.
     pub fn matching(&self) -> MatchParams {
         self.params.matching
+    }
+
+    /// True when K1/K2 run the bucket-sorted finder (`sorted`), false for the hash chains.
+    pub fn uses_sorted_finder(&self) -> bool {
+        self.sorted.is_some()
     }
 
     /// How K3 runs (see `k3_mode`).
@@ -622,7 +639,16 @@ impl Kernels {
             })
         };
         debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity);
-        self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
+        let best = match &self.sorted {
+            Some((k1, k2)) => {
+                k1.record_timed(ctx, enc, &bufs.data, &bufs.pred, &bufs.best, n_blocks, ts(0));
+                k2
+            }
+            None => {
+                self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
+                &self.best
+            }
+        };
 
         let k2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k2"),
@@ -634,7 +660,7 @@ impl Kernels {
             ],
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: ts(1) });
-        pass.set_pipeline(&self.best);
+        pass.set_pipeline(best);
         pass.set_bind_group(0, &k2, &[]);
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
     }

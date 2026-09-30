@@ -251,3 +251,66 @@ fn pack_blocks_appends_zero_word() {
     assert_eq!(packed[0], 0x0101_0101);
     assert_eq!(*packed.last().unwrap(), 0);
 }
+
+/// The chains of a short key (`MatchParams::hash_bits`), from both K1 kernels.
+#[test]
+fn chains_over_short_keys() {
+    for ctx in contexts() {
+        for params in [MatchParams { hash_bits: 13, ..LVL9 }, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }] {
+            let blocks = all_blocks();
+            let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+            let preds = gpu_preds(&ctx, &refs, &params).unwrap();
+            for ((name, block), got) in blocks.iter().zip(&preds) {
+                compare(name, got, block, &params);
+            }
+        }
+    }
+}
+
+/// The bucket-sorted K1 (speed2 E2): every slot equals `gzc_core::hash::bucket_sort` (position
+/// and fingerprint bits), for 11..=13-bit keys and min_match 4 and 6, in one batch and block by
+/// block. It is selected for the sorted presets whenever the device has >= 32-lane subgroups and
+/// the table fits its workgroup memory, and never without subgroups or for 16-bit keys.
+#[test]
+fn sorted_k1_matches_bucket_sort() {
+    use gzc_core::params::{LVL9S12, LVL9S13};
+    use gzc_gpu::sorted::{SortKernel, sorted_words, table_bytes};
+    let blocks = all_blocks();
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let fallback = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
+    assert!(SortKernel::new(&fallback, &LVL9S13).unwrap().is_none(), "sorted K1 without subgroups");
+    assert!(SortKernel::new(&ctx, &LVL9).unwrap().is_none(), "sorted K1 for a 16-bit key");
+    for params in [LVL9S13, LVL9S12, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }] {
+        let usable = ctx.subgroups
+            && ctx.adapter_info.subgroup_min_size >= 32
+            && ctx.device.limits().max_compute_workgroup_storage_size >= table_bytes(&params);
+        let Some(k1) = SortKernel::new(&ctx, &params).unwrap() else {
+            assert!(!usable, "{params:?}: sorted K1 not selected on a device that supports it");
+            eprintln!("{params:?}: sorted K1 unavailable on this device");
+            continue;
+        };
+        let n = blocks.len() as u32;
+        let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+        let packed = pack_blocks(&refs);
+        let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
+        ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
+        let sorted = ctx.storage_buffer("test.sorted", pred_bytes(n, 1), true);
+        let rank = ctx.storage_buffer("test.rank", pred_bytes(n, 1), false);
+        let got = k1.run(&ctx, &data, &sorted, &rank, n);
+        for (b, (name, block)) in blocks.iter().enumerate() {
+            let want = sorted_words(block, &params);
+            let g = &got[b * BLOCK_SIZE..][..HASHED_POSITIONS];
+            if let Some(s) = (0..HASHED_POSITIONS).find(|&s| g[s] != want[s]) {
+                panic!("{params:?} {name}: slot {s} gpu {:#x} cpu {:#x}", g[s], want[s]);
+            }
+        }
+        // Block by block: a lone block's words past its end come from the buffer's last word.
+        for (name, block) in blocks.iter().step_by(3) {
+            let packed = pack_blocks(&[block.as_slice()]);
+            let data = ctx.storage_buffer("test.data1", (packed.len() * 4) as u64, false);
+            ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
+            let got = k1.run(&ctx, &data, &sorted, &rank, 1);
+            assert!(got[..HASHED_POSITIONS] == sorted_words(block, &params)[..HASHED_POSITIONS], "{params:?} {name} alone");
+        }
+    }
+}

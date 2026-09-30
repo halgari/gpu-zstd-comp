@@ -10,7 +10,7 @@ use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases};
 use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
+use gzc_core::params::{LVL3, LVL9, LVL9D16, LVL9S12, LVL9S13, MatchParams, RUNG1, RUNG2};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -46,7 +46,15 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
 }
 
 /// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 4] = [("lvl3", LVL3), ("rung1", RUNG1), ("rung2", RUNG2), ("lvl9", LVL9)];
+const GPU_PRESETS: [(&str, MatchParams); 7] = [
+    ("lvl3", LVL3),
+    ("rung1", RUNG1),
+    ("rung2", RUNG2),
+    ("lvl9", LVL9),
+    ("lvl9s13", LVL9S13),
+    ("lvl9s12", LVL9S12),
+    ("lvl9d16", LVL9D16),
+];
 
 /// LVL3 with a deeper chain walk.
 const DEPTH4: MatchParams = MatchParams { depth: 4, ..LVL3 };
@@ -1219,17 +1227,21 @@ fn literals_are_the_uncovered_block_bytes() {
 // ---- K2 ----
 
 /// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
-/// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), and a Single
-/// chain with a small cap.
-const K2_VARIANTS: [MatchParams; 6] = [
+/// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), a Single
+/// chain with a small cap, and short keys (the bucket-sorted finder, k1_sort_sg / k2_window) with
+/// deep walks and min_match > 4.
+const K2_VARIANTS: [MatchParams; 9] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16 },
     // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
     // skips only against a best of >= 4) and 6.
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 16 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 11 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13 },
 ];
 
 /// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
@@ -1391,7 +1403,7 @@ fn k2_dfast_nearer_short_chain_candidate() {
 /// and a small `search_cap`, so the parse extends many capped `best[]` entries.
 const LAZY_VARIANTS: [MatchParams; 2] = [
     MatchParams { min_match: 6, ..RUNG2 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16 },
 ];
 
 #[test]

@@ -49,6 +49,12 @@ pub fn pred_fp(block: &[u8], p: usize) -> u32 {
     ((lo.wrapping_mul(0x85EB_CA6B) >> 25) << 17) | ((block[p + 4] as u32) << 24)
 }
 
+/// `params_wgsl(p)` plus the finder's key constant: `KEY_SHIFT = HASH_BITS - p.hash_bits`, so a
+/// kernel's key is `hash >> KEY_SHIFT` (== `gzc_core::hash::key`).
+pub fn finder_wgsl(p: &MatchParams) -> String {
+    format!("{}const KEY_SHIFT: u32 = {}u;\n", params_wgsl(p), HASH_BITS - p.hash_bits)
+}
+
 /// Bytes of one head table (2^HASH_BITS u32 entries).
 const TABLE_BYTES: u64 = (1u64 << HASH_BITS) * 4;
 
@@ -200,14 +206,14 @@ impl ChainsKernel {
             // naga (wgpu 30) takes subgroup operations from Features::SUBGROUP and rejects the
             // `enable subgroups;` directive.
             let wide = opts.wide_masks || ctx.adapter_info.subgroup_max_size > 32;
-            let mut src = format!("{}{}", params_wgsl(params), K1_SG_WGSL)
+            let mut src = format!("{}{}", finder_wgsl(params), K1_SG_WGSL)
                 .replace("K1_BALLOT_WORD", if wide { "[word]" } else { ".x" });
             if opts.break_subgroup_kernel {
                 src = src.replace("firstLeadingBit(lower)", "firstTrailingBit(lower)");
             }
             ctx.shader("k1_chains_sg", &src)
         } else {
-            ctx.shader("k1_chains", &format!("{}{K1_WGSL}", params_wgsl(params)))
+            ctx.shader("k1_chains", &format!("{}{K1_WGSL}", finder_wgsl(params)))
         };
         let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("k1_chains"),
