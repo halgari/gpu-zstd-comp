@@ -1,8 +1,9 @@
 // K1, subgroup kernel (needs Features::SUBGROUP and subgroups of 32..=128 lanes, and passes a
 // self-test at ChainsKernel::new; otherwise the fallback k1_chains.wgsl runs). Same output as the
-// fallback: pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS (== gzc_core
-// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..]. pred is bound to exactly this
-// dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
+// fallback: pred[p] = most recent q < p with hash(q) == hash(p), else none (== gzc_core
+// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..], stored as pred words with p's
+// fingerprint (common.wgsl `pred_word`; the tail p >= HASHED_POSITIONS holds PRED_NONE). pred is
+// bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
 //
 // Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
 // builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].

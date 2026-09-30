@@ -13,8 +13,21 @@
 // shares p's first 8 bytes, hence p's long hash, so it is on the long chain above best_q, i.e.
 // the long walk reached it before best_q, found len == SEARCH_CAP there and stopped at it:
 // best_q >= q', a contradiction. So the whole walk can stop at the first cap-length candidate.
+// Fingerprint skips (S8), also byte-identical. The result is the largest (len, q) over the
+// visited candidates (lexicographic: longer wins, a tie goes to the larger q), or none if that
+// len < MIN_MATCH; so a candidate can be skipped whenever its (len, q) is below the current
+// (best_len, best_q) or its len is below MIN_MATCH. The pred word loaded for a candidate q (to get
+// the next one) also holds q's fingerprint (common.wgsl `pred_fp`), compared with p's:
+// - the hash bits of bytes 0..4 differ: the first 4 bytes differ, len < 4 <= MIN_MATCH: skip;
+// - otherwise, byte 4 differs: len <= 4 (max >= 8), skip if MIN_MATCH > 4, or best_len > 4, or
+//   best_len == 4 and q < best_q (q == best_q, the same q on both Dfast chains, cannot update
+//   either).
+// A skipped candidate still counts toward DEPTH, and never has len == SEARCH_CAP (>= 8), so the
+// walk and its cap early-out are unchanged. Skips cut K2's data reads: 58 % of lvl9 candidates on
+// the corpus are skipped before any of their bytes is loaded.
 // MIN_MATCH, SEARCH_CAP, DEPTH and N_HASHES come from the MatchParams the host injects per
-// Kernels (`context::params_wgsl`). pred layout (K1): [block][chain][pos], N_HASHES chains per block.
+// Kernels (`context::params_wgsl`). pred layout (K1): [block][chain][pos], N_HASHES chains per
+// block, as pred words (predecessor | fingerprint, see common.wgsl).
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> pred: array<u32>;
@@ -91,6 +104,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var q = pred[pb + p] & PRED_POS;
         for (var d = 0u; d < DEPTH; d++) {
             if (q == PRED_NONE) { break; }
+            // q's successor and q's fingerprint; compare q only if the fingerprint allows it to
+            // win (see the header).
             let wq = pred[pb + q];
             let x = (wq ^ fpp) & ~PRED_POS;
             if ((x & PRED_FP_LO) == 0u

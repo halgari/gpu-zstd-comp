@@ -254,7 +254,8 @@ impl ChainsKernel {
     }
 
     /// Records K1 on `data` into `head`/`pred` for `n_blocks`, submits it and reads `pred` back:
-    /// per block, one BLOCK_SIZE-long pred array per chain. `pred` needs COPY_SRC.
+    /// per block, one BLOCK_SIZE-long pred array per chain (`pred_of_word` of K1's words).
+    /// `pred` needs COPY_SRC.
     pub fn run(
         &self,
         ctx: &GpuContext,
@@ -263,13 +264,25 @@ impl ChainsKernel {
         pred: &wgpu::Buffer,
         n_blocks: u32,
     ) -> Vec<Vec<Vec<u32>>> {
+        let per_block = self.n_hashes as usize * BLOCK_SIZE;
+        let all: Vec<u32> = self.run_words(ctx, data, head, pred, n_blocks).into_iter().map(pred_of_word).collect();
+        all.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect()
+    }
+
+    /// `run`, returning K1's raw pred words (predecessor and fingerprint, see `pred_fp`),
+    /// layout `[block][chain][pos]`.
+    pub fn run_words(
+        &self,
+        ctx: &GpuContext,
+        data: &wgpu::Buffer,
+        head: &wgpu::Buffer,
+        pred: &wgpu::Buffer,
+        n_blocks: u32,
+    ) -> Vec<u32> {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1") });
         self.record(ctx, &mut enc, data, head, pred, n_blocks);
         ctx.queue.submit([enc.finish()]);
-        let per_block = self.n_hashes as usize * BLOCK_SIZE;
-        let all: Vec<u32> = ctx.read_buffer(pred, 0, per_block * n_blocks as usize);
-        let all: Vec<u32> = all.into_iter().map(pred_of_word).collect();
-        all.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect()
+        ctx.read_buffer(pred, 0, self.n_hashes as usize * BLOCK_SIZE * n_blocks as usize)
     }
 
     /// data: packed blocks; head: at least `head_bytes(n_blocks, n_hashes)`, per-dispatch scratch

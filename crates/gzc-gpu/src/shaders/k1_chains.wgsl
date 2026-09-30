@@ -3,8 +3,9 @@
 // N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with N_HASHES == 1 (Single)
 // chain 0 is hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected MatchParams
 // (`context::params_wgsl`). pred[t*BLOCK_SIZE + p] = most recent q < p with hash(q) == hash(p),
-// else NO_POS (== gzc_core compute_preds); pred is bound to exactly the dispatch's tasks, so
-// n_tasks = arrayLength(pred) / BLOCK_SIZE.
+// else none (== gzc_core compute_preds), stored as pred words with p's fingerprint (common.wgsl
+// `pred_word`; PRED_NONE in the tail p >= HASHED_POSITIONS); pred is bound to exactly the
+// dispatch's tasks, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
 // Persistent grid (like the subgroup kernel, so both fit the same head buffer, sized for at most
 // chains::HEAD_TABLES tables): workgroup w of G builds tasks w, w + G, .. in table
 // head[w << HASH_BITS ..], which it clears before each task.
