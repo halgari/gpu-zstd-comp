@@ -10,9 +10,10 @@
 // K5 has already written the literals section (Raw, RLE or Compressed) into the frame at byte
 // HDR_LEN + 3, and frame_len[b] holds its length on entry: K4 keeps K5's bytes, writing only the
 // headers below it and the sequences section after it.
-// Threads cooperate on the RLE check, the code histograms and the raw copy;
-// thread 0 makes the mode decisions, writes the table descriptions, builds the FSE tables in
-// workgroup memory and runs the (inherently sequential) backward sequence encode.
+// Threads cooperate on the RLE check, the code histograms, the FSE table builds (in workgroup
+// memory) and the raw copy; thread 0 makes the mode decisions and writes the table descriptions.
+// The backward sequence encode runs in chunks: only the FSE state transitions are sequential
+// (one thread per stream), the bit counts and the bit placement are parallel.
 //
 // The host binds exactly n_blocks words of `frame_len`, so arrayLength(&frame_len) is the batch
 // size. Outputs per block b:
@@ -50,12 +51,44 @@ var<workgroup> norm: array<i32, H_ALL>;
 var<workgroup> tt_dfs: array<i32, H_ALL>;
 var<workgroup> tt_dnb: array<u32, H_ALL>;
 var<workgroup> st: array<u32, S_ALL>;
-var<workgroup> spread: array<u32, 512>;
 var<workgroup> cumul: array<u32, 54>;
 var<workgroup> not_rle: atomic<u32>;
 var<workgroup> rle_flag: u32;
 var<workgroup> raw_flag: u32;
 var<workgroup> section_wg: u32;
+
+// ---- chunked backward sequence encode ----
+// Sequences are encoded in chunks of C, last chunk first. Per chunk:
+//   1. all threads: the chunk's codes into sbuf[r] (r = rank in coding order, i.e. sequence
+//      hi - 1 - r), packed LL | OF << 8 | ML << 16; thread t handles ranks [t * PER, t * PER + PER)
+//      in steps 1 and 3 and holds their sequences in registers, loaded one chunk ahead;
+//   2. threads 0..2 (one per stream k: LL, OF, ML): the FSE state chain, recording for each
+//      sequence the bits its step emits, value | nbits << 16, into sbuf[(k + 1) * C + r];
+//   3. all threads: per-sequence bit counts, a workgroup prefix sum, and the bits placed with
+//      atomicOr into the staging words `stg` (bit 0 of stg[0] = frame bit pos_wg & ~31);
+//   4. all threads: the complete staging words out to the frame; the partial last word carries
+//      over as the next chunk's stg[0].
+const C: u32 = 256u;
+const PER: u32 = C / WG;
+// Longest sequence: 27 state bits + 16 + 16 + 17 extra bits = 76 (offset codes stay below 18
+// for BLOCK_SIZE <= 128K); + one word for the carry offset + one of slack.
+const STG: u32 = (C * 76u + 31u) / 32u + 2u;
+// sbuf: codes [0, C), emitted state bits [C, 4C).
+var<workgroup> sbuf: array<u32, 1024>;
+var<workgroup> stg: array<atomic<u32>, STG>;
+var<workgroup> scan4: array<vec4<u32>, WG / 4u>;
+var<workgroup> nseq_wg: u32;
+var<workgroup> pos_wg: u32;
+var<workgroup> carry_wg: u32;
+// pos_wg once the sequences cannot fit: the block goes out Raw.
+const STOP: u32 = 0xFFFFFFFFu;
+var<workgroup> fin: array<u32, 3>;
+// build_table: the spread, one symbol per byte (tables up to 512 cells); visit starts per symbol;
+// the tables to build (per stream 0, or len | log << 8); the number of -1 symbols.
+var<workgroup> sp: array<atomic<u32>, 128>;
+var<workgroup> vcum: array<u32, 54>;
+var<workgroup> bld: array<u32, 3>;
+var<workgroup> nlow_wg: u32;
 
 // ---- stream parameters (k: 0 = LL, 1 = OF, 2 = ML) ----
 
@@ -240,59 +273,126 @@ fn ncount(h: u32, len: u32, tl: u32, emit: bool) -> u32 {
     return bytes + tail;
 }
 
-// == FseCTable::from_normalized for stream k, from norm[h_off(k) ..] (dflt: k's predefined
-// distribution), into st[s_off(k) ..] and tt_*[h_off(k) ..].
-fn build_table(k: u32, len: u32, tl: u32, dflt: bool) {
+// Exclusive prefix sum of v over the workgroup's threads (x) and the total (y); all threads call
+// it. A barrier must separate two calls.
+fn wg_scan(lid: u32, v: u32) -> vec2<u32> {
+    scan4[lid >> 2u][lid & 3u] = v;
+    workgroupBarrier();
+    var pre = 0u;
+    var tot = 0u;
+    for (var i = 0u; i < WG / 4u; i++) {
+        let q = scan4[i];
+        let b = 4u * i;
+        pre += select(0u, q.x, b < lid) + select(0u, q.y, b + 1u < lid) + select(0u, q.z, b + 2u < lid)
+            + select(0u, q.w, b + 3u < lid);
+        tot += q.x + q.y + q.z + q.w;
+    }
+    return vec2<u32>(pre, tot);
+}
+
+// == FseCTable::from_normalized for stream k (len symbols, table log tl), from norm[h_off(k) ..]
+// into st[s_off(k) ..] and tt_*[h_off(k) ..]. All threads call it (uniformly):
+//   - thread 0: cumul[s] (first state-table slot of s, a -1 symbol counting 1), vcum[s] (first
+//     spread visit of s, -1 symbols not visiting), and the -1 symbols in the top cells;
+//   - the spread: visit j of the sequential walk lands on the j-th t in 0, 1, .. whose
+//     (t * step) & mask is <= high (the walk is that sequence with the top cells skipped), so a
+//     thread takes a range of t, counts its visits and places them after a prefix sum (none is
+//     needed without -1 symbols: visit j is t = j);
+//   - thread s: symbol s's transform and its state-table slots, its cells in increasing order.
+// The spread holds one symbol per byte in `sp`.
+fn build_table(k: u32, len: u32, tl: u32, lid: u32) {
     let h = h_off(k);
     let so = s_off(k);
     let size = 1u << tl;
     let mask = size - 1u;
     let stp = (size >> 1u) + (size >> 3u) + 3u;
-    var high = size - 1u;
-    cumul[0] = 0u;
-    for (var s = 0u; s < len; s++) {
-        var n: i32;
-        if (dflt) { n = def_norm(k, s); } else { n = norm[h + s]; }
-        if (dflt) { norm[h + s] = n; }
-        if (n == -1) {
-            cumul[s + 1u] = cumul[s] + 1u;
-            spread[high] = s;
-            high -= 1u;
-        } else {
-            cumul[s + 1u] = cumul[s] + u32(n);
+    for (var i = lid; i < size / 4u; i += WG) { atomicStore(&sp[i], 0u); }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var c = 0u;
+        var v = 0u;
+        var high = size - 1u;
+        for (var s = 0u; s < len; s++) {
+            let n = norm[h + s];
+            cumul[s] = c;
+            vcum[s] = v;
+            if (n == -1) {
+                atomicOr(&sp[high >> 2u], s << ((high & 3u) * 8u));
+                high -= 1u;
+                c += 1u;
+            } else {
+                c += u32(n);
+                v += u32(n);
+            }
+        }
+        vcum[len] = v;
+        nlow_wg = size - 1u - high;
+    }
+    let nlow = workgroupUniformLoad(&nlow_wg);
+    let high = size - 1u - nlow;
+    let per = (size + WG - 1u) / WG;
+    let t0 = min(lid * per, size);
+    let t1 = min(t0 + per, size);
+    var j = t0;
+    if (nlow > 0u) {
+        var nv = 0u;
+        for (var t = t0; t < t1; t++) {
+            if (((t * stp) & mask) <= high) { nv += 1u; }
+        }
+        j = wg_scan(lid, nv).x;
+    }
+    let visits = size - nlow;
+    if (j < visits && t0 < t1) {
+        // Symbol of visit j: the first s with vcum[s + 1] > j.
+        var lo = 0u;
+        var hi = len - 1u;
+        while (lo < hi) {
+            let mid = (lo + hi) >> 1u;
+            if (vcum[mid + 1u] > j) { hi = mid; } else { lo = mid + 1u; }
+        }
+        var s = lo;
+        for (var t = t0; t < t1; t++) {
+            let u = (t * stp) & mask;
+            if (u > high) { continue; }
+            while (vcum[s + 1u] <= j) { s++; }
+            atomicOr(&sp[u >> 2u], s << ((u & 3u) * 8u));
+            j++;
         }
     }
-    var pos = 0u;
-    for (var s = 0u; s < len; s++) {
+    workgroupBarrier();
+    if (lid < len) {
+        let s = lid;
         let n = norm[h + s];
-        for (var i = 0; i < n; i++) {
-            spread[pos] = s;
-            pos = (pos + stp) & mask;
-            while (pos > high) { pos = (pos + stp) & mask; }
-        }
-    }
-    for (var u = 0u; u < size; u++) {
-        let s = spread[u];
-        st[so + cumul[s]] = size + u;
-        cumul[s] += 1u;
-    }
-    var total = 0;
-    for (var s = 0u; s < len; s++) {
-        let n = norm[h + s];
+        let c0 = cumul[s];
         if (n == 0) {
             tt_dfs[h + s] = 0;
             tt_dnb[h + s] = ((tl + 1u) << 16u) - size;
         } else if (n == -1 || n == 1) {
-            tt_dfs[h + s] = total - 1;
+            tt_dfs[h + s] = i32(c0) - 1;
             tt_dnb[h + s] = (tl << 16u) - size;
-            total += 1;
         } else {
             let mbo = tl - highbit(u32(n) - 1u);
-            tt_dfs[h + s] = total - n;
+            tt_dfs[h + s] = i32(c0) - n;
             tt_dnb[h + s] = (mbo << 16u) - (u32(n) << mbo);
-            total += n;
+        }
+        if (n == -1) {
+            // The -1 symbols before s (c0 - vcum[s]) took the cells above s's.
+            st[so + c0] = size + size - 1u - (c0 - vcum[s]);
+        } else if (n > 0) {
+            var c = c0;
+            let c1 = c0 + u32(n);
+            for (var w = 0u; w < size / 4u && c < c1; w++) {
+                let word = atomicLoad(&sp[w]);
+                for (var i = 0u; i < 4u; i++) {
+                    if (((word >> (8u * i)) & 0xFFu) == s) {
+                        st[so + c] = size + 4u * w + i;
+                        c++;
+                    }
+                }
+            }
         }
     }
+    workgroupBarrier();
 }
 
 // == FseCTable::rle: one state, no bits for `sym`.
@@ -310,18 +410,24 @@ fn fse_init(k: u32, sym: u32) -> u32 {
     return st[s_off(k) + u32(i32(v >> nb) + tt_dfs[h_off(k) + sym])];
 }
 
-// == FseState::encode; returns the next state.
-fn fse_encode(k: u32, state: u32, sym: u32) -> u32 {
-    let nb = (state + tt_dnb[h_off(k) + sym]) >> 16u;
-    put(state, nb);
-    return st[s_off(k) + u32(i32(state >> nb) + tt_dfs[h_off(k) + sym])];
-}
+// A sequence's codes, packed LL | OF << 8 | ML << 16.
+fn seq_codes(ll: u32, ml: u32, ob: u32) -> u32 { return ll_code(ll) | (highbit(ob) << 8u) | (ml_code(ml) << 16u); }
 
-// Extra bits of one sequence in decoder order (LL, ML, OF).
-fn put_extras(ll: u32, llc: u32, ml: u32, mlc: u32, ob: u32, ofc: u32) {
-    put(ll - tab[TAB_LL_BASE + llc], tab[TAB_LL_BITS + llc]);
-    put(ml - tab[TAB_ML_BASE + mlc], tab[TAB_ML_BITS + mlc]);
-    put(ob - (1u << ofc), ofc);
+// Staging writer (phase 3): the same bit writer as `put`, OR-ing words into stg (a thread's
+// first and last words may be shared with its neighbours).
+fn put_s(v: u32, n: u32) {
+    if (n == 0u) { return; }
+    let m = v & ((1u << n) - 1u);
+    acc |= m << cnt;
+    let total = cnt + n;
+    if (total >= 32u) {
+        atomicOr(&stg[wpos], acc);
+        wpos += 1u;
+        acc = m >> (32u - cnt);
+        cnt = total - 32u;
+    } else {
+        cnt = total;
+    }
 }
 
 // ---- frame prefix bytes ----
@@ -390,18 +496,31 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
     // ---- histograms and the RLE-block check ----
     for (var i = lid; i < H_ALL; i += WG) { atomicStore(&hist[i], 0u); }
+    if (lid < 3u) { bld[lid] = 0u; }
     if (lid == 0u) { atomicStore(&not_rle, 0u); }
     workgroupBarrier();
-    let first = data[base] & 0xFFu;
-    let first4 = first * 0x01010101u;
-    var diff = 0u;
-    for (var w = lid; w < BLOCK_SIZE / 4u; w += WG) { diff |= data[base + w] ^ first4; }
-    if (diff != 0u) { atomicOr(&not_rle, 1u); }
     for (var i = lid; i < n_seq; i += WG) {
         let s = sbase + i * 3u;
         atomicAdd(&hist[H_LL + ll_code(seqs[s])], 1u);
         atomicAdd(&hist[H_ML + ml_code(seqs[s + 1u])], 1u);
         atomicAdd(&hist[H_OF + highbit(seqs[s + 2u])], 1u);
+    }
+    // The RLE check runs in rounds of 8 words per thread and stops after the first round that
+    // finds a byte differing from the first (most blocks: the first round).
+    let first = data[base] & 0xFFu;
+    let first4 = first * 0x01010101u;
+    var w0 = 0u;
+    loop {
+        var diff = 0u;
+        for (var q = 0u; q < 8u; q++) {
+            let w = w0 + q * WG + lid;
+            if (w < BLOCK_SIZE / 4u) { diff |= data[base + w] ^ first4; }
+        }
+        if (diff != 0u) { atomicOr(&not_rle, 1u); }
+        workgroupBarrier();
+        if (lid == 0u) { rle_flag = atomicLoad(&not_rle); }
+        w0 += 8u * WG;
+        if (workgroupUniformLoad(&rle_flag) != 0u || w0 >= BLOCK_SIZE / 4u) { break; }
     }
     workgroupBarrier();
     if (lid == 0u) { rle_flag = atomicLoad(&not_rle); }
@@ -419,7 +538,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     // frame byte of the sequences section
     let seq_start = HDR_LEN + 3u + section;
 
-    // ---- sequences section (thread 0) ----
+    // ---- sequences section: header and tables (thread 0) ----
+    var tlog: array<u32, 3>;
     if (lid == 0u) {
         acc = 0u;
         cnt = (seq_start & 3u) * 8u;
@@ -440,7 +560,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         if (n_seq > 0u) {
             // Mode choice per stream (== StreamTable::choose).
             var mode: array<u32, 3>;
-            var tlog: array<u32, 3>;
             var len: array<u32, 3>;
             var sym: array<u32, 3>;
             for (var k = 0u; k < 3u; k++) {
@@ -478,51 +597,197 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                 if (mode[k] == MODE_RLE) {
                     put(sym[k], 8u);
                     build_rle(k, sym[k]);
+                    tlog[k] = 0u;
+                    bld[k] = 0u;
                 } else if (mode[k] == MODE_COMPRESSED) {
                     ncount(h_off(k), len[k], tlog[k], true);
-                    build_table(k, len[k], tlog[k], false);
+                    bld[k] = len[k] | (tlog[k] << 8u);
                 } else {
                     tlog[k] = def_log(k);
-                    build_table(k, def_len(k), tlog[k], true);
+                    for (var s = 0u; s < def_len(k); s++) { norm[h_off(k) + s] = def_norm(k, s); }
+                    bld[k] = def_len(k) | (tlog[k] << 8u);
                 }
-                if (mode[k] == MODE_RLE) { tlog[k] = 0u; }
             }
+        }
+        pos_wg = wpos * 32u + cnt;
+        carry_wg = acc;
+        nseq_wg = n_seq;
+    }
 
-            // Backward encode (== write_sequences_section_with).
-            var s = sbase + (n_seq - 1u) * 3u;
-            var ll = seqs[s];
-            var ml = seqs[s + 1u];
-            var ob = seqs[s + 2u];
-            var llc = ll_code(ll);
-            var mlc = ml_code(ml);
-            var ofc = highbit(ob);
-            var ml_state = fse_init(2u, mlc);
-            var of_state = fse_init(1u, ofc);
-            var ll_state = fse_init(0u, llc);
-            put_extras(ll, llc, ml, mlc, ob, ofc);
-            for (var i = n_seq - 1u; i > 0u; i--) {
-                if (wpos >= FRAME_WORDS) { break; } // cannot fit: the block goes out Raw
-                s -= 3u;
-                ll = seqs[s];
-                ml = seqs[s + 1u];
-                ob = seqs[s + 2u];
-                llc = ll_code(ll);
-                mlc = ml_code(ml);
-                ofc = highbit(ob);
-                of_state = fse_encode(1u, of_state, ofc);
-                ml_state = fse_encode(2u, ml_state, mlc);
-                ll_state = fse_encode(0u, ll_state, llc);
-                put_extras(ll, llc, ml, mlc, ob, ofc);
+    // ---- FSE tables (all threads) ----
+    for (var k = 0u; k < 3u; k++) {
+        let bk = workgroupUniformLoad(&bld[k]);
+        if (bk != 0u) { build_table(k, bk & 0xFFu, bk >> 8u, lid); }
+    }
+
+    // ---- backward sequence encode (== write_sequences_section_with), chunked ----
+    let nseq = workgroupUniformLoad(&nseq_wg);
+    for (var j = lid; j < STG; j += WG) { atomicStore(&stg[j], 0u); }
+    workgroupBarrier();
+    if (lid == 0u) { atomicStore(&stg[0], carry_wg); }
+    var hi = nseq;
+    var chain = 0u; // threads 0..2: the FSE state of stream lid
+    // Thread t's sequences (ranks [t * PER, t * PER + PER)) of the current chunk, loaded one chunk
+    // ahead so that the loads' latency hides behind the previous chunk's work.
+    var q_ll: array<u32, PER>;
+    var q_ml: array<u32, PER>;
+    var q_ob: array<u32, PER>;
+    for (var q = 0u; q < PER; q++) {
+        let r = lid * PER + q;
+        if (r < min(hi, C)) {
+            let s = sbase + (hi - 1u - r) * 3u;
+            q_ll[q] = seqs[s];
+            q_ml[q] = seqs[s + 1u];
+            q_ob[q] = seqs[s + 2u];
+        }
+    }
+    loop {
+        let pos = workgroupUniformLoad(&pos_wg);
+        if (hi == 0u || pos == STOP) { break; }
+        let lo = select(0u, hi - C, hi > C);
+        let n = hi - lo;
+        // 1. codes
+        for (var q = 0u; q < PER; q++) {
+            let r = lid * PER + q;
+            if (r < n) { sbuf[r] = seq_codes(q_ll[q], q_ml[q], q_ob[q]); }
+        }
+        workgroupBarrier();
+        // The next chunk's sequences.
+        var x_ll: array<u32, PER>;
+        var x_ml: array<u32, PER>;
+        var x_ob: array<u32, PER>;
+        for (var q = 0u; q < PER; q++) {
+            let r = lid * PER + q;
+            if (r < min(lo, C)) {
+                let s = sbase + (lo - 1u - r) * 3u;
+                x_ll[q] = seqs[s];
+                x_ml[q] = seqs[s + 1u];
+                x_ob[q] = seqs[s + 2u];
             }
-            put(ml_state, tlog[2]);
-            put(of_state, tlog[1]);
-            put(ll_state, tlog[0]);
+        }
+        // 2. state chains (== FseState::init / encode)
+        if (lid < 3u) {
+            let k = lid;
+            let h = h_off(k);
+            let so = s_off(k);
+            let sh = 8u * k;
+            let eo = (k + 1u) * C;
+            var r = 0u;
+            if (hi == nseq) {
+                // The last sequence initializes the states and emits no state bits.
+                chain = fse_init(k, (sbuf[0] >> sh) & 0xFFu);
+                sbuf[eo] = 0u;
+                r = 1u;
+            }
+            // Four steps at a time: the table loads, which do not depend on the state, go first.
+            for (; r + 4u <= n; r += 4u) {
+                let s0 = h + ((sbuf[r] >> sh) & 0xFFu);
+                let s1 = h + ((sbuf[r + 1u] >> sh) & 0xFFu);
+                let s2 = h + ((sbuf[r + 2u] >> sh) & 0xFFu);
+                let s3 = h + ((sbuf[r + 3u] >> sh) & 0xFFu);
+                let d0 = tt_dnb[s0];
+                let d1 = tt_dnb[s1];
+                let d2 = tt_dnb[s2];
+                let d3 = tt_dnb[s3];
+                let f0 = i32(so) + tt_dfs[s0];
+                let f1 = i32(so) + tt_dfs[s1];
+                let f2 = i32(so) + tt_dfs[s2];
+                let f3 = i32(so) + tt_dfs[s3];
+                var nb = (chain + d0) >> 16u;
+                sbuf[eo + r] = (chain & ((1u << nb) - 1u)) | (nb << 16u);
+                chain = st[u32(i32(chain >> nb) + f0)];
+                nb = (chain + d1) >> 16u;
+                sbuf[eo + r + 1u] = (chain & ((1u << nb) - 1u)) | (nb << 16u);
+                chain = st[u32(i32(chain >> nb) + f1)];
+                nb = (chain + d2) >> 16u;
+                sbuf[eo + r + 2u] = (chain & ((1u << nb) - 1u)) | (nb << 16u);
+                chain = st[u32(i32(chain >> nb) + f2)];
+                nb = (chain + d3) >> 16u;
+                sbuf[eo + r + 3u] = (chain & ((1u << nb) - 1u)) | (nb << 16u);
+                chain = st[u32(i32(chain >> nb) + f3)];
+            }
+            for (; r < n; r++) {
+                let sym = (sbuf[r] >> sh) & 0xFFu;
+                let nb = (chain + tt_dnb[h + sym]) >> 16u;
+                sbuf[eo + r] = (chain & ((1u << nb) - 1u)) | (nb << 16u);
+                chain = st[so + u32(i32(chain >> nb) + tt_dfs[h + sym])];
+            }
+            fin[k] = chain;
+        }
+        workgroupBarrier();
+        // 3. bit counts, prefix sum, placement. Thread t owns ranks [t * PER, t * PER + PER).
+        let r0 = lid * PER;
+        let r1 = min(r0 + PER, n);
+        var bits = 0u;
+        for (var r = r0; r < r1; r++) {
+            let c = sbuf[r];
+            let llc = c & 0xFFu;
+            let ofc = (c >> 8u) & 0xFFu;
+            let mlc = c >> 16u;
+            bits += (sbuf[C + r] >> 16u) + (sbuf[2u * C + r] >> 16u) + (sbuf[3u * C + r] >> 16u)
+                + tab[TAB_LL_BITS + llc] + tab[TAB_ML_BITS + mlc] + ofc;
+        }
+        let sc = wg_scan(lid, bits);
+        let p = (pos & 31u) + sc.x;
+        acc = 0u;
+        cnt = p & 31u;
+        wpos = p >> 5u;
+        for (var q = 0u; q < PER; q++) {
+            let r = r0 + q;
+            if (r >= r1) { break; }
+            let c = sbuf[r];
+            let llc = c & 0xFFu;
+            let ofc = (c >> 8u) & 0xFFu;
+            let mlc = c >> 16u;
+            let e_ll = sbuf[C + r];
+            let e_of = sbuf[2u * C + r];
+            let e_ml = sbuf[3u * C + r];
+            put_s(e_of & 0xFFFFu, e_of >> 16u);
+            put_s(e_ml & 0xFFFFu, e_ml >> 16u);
+            put_s(e_ll & 0xFFFFu, e_ll >> 16u);
+            put_s(q_ll[q] - tab[TAB_LL_BASE + llc], tab[TAB_LL_BITS + llc]);
+            put_s(q_ml[q] - tab[TAB_ML_BASE + mlc], tab[TAB_ML_BITS + mlc]);
+            put_s(q_ob[q] - (1u << ofc), ofc);
+        }
+        if (cnt > 0u) { atomicOr(&stg[wpos], acc); }
+        workgroupBarrier();
+        // 4. complete words out; the partial last one carries over.
+        let total = sc.y;
+        let nf = ((pos & 31u) + total) >> 5u;
+        let w0 = pos >> 5u;
+        for (var j = lid; j < nf; j += WG) { store_word(w0 + j, atomicLoad(&stg[j])); }
+        if (lid == 0u) {
+            carry_wg = atomicLoad(&stg[nf]);
+            pos_wg = pos + total;
+            // Past a Raw block's size: the block goes out Raw, stop encoding.
+            if ((pos + total) / 8u >= HDR_LEN + 3u + BLOCK_SIZE) { pos_wg = STOP; }
+        }
+        workgroupBarrier();
+        // Only words [0, nf] were written.
+        for (var j = lid; j <= nf; j += WG) { atomicStore(&stg[j], select(0u, carry_wg, j == 0u)); }
+        q_ll = x_ll;
+        q_ml = x_ml;
+        q_ob = x_ob;
+        hi = lo;
+    }
+    storageBarrier();
+
+    // ---- final states, end mark, block header (thread 0) ----
+    if (lid == 0u) {
+        let pos = pos_wg;
+        acc = carry_wg;
+        cnt = pos & 31u;
+        wpos = pos >> 5u;
+        if (n_seq > 0u) {
+            put(fin[2], tlog[2]);
+            put(fin[1], tlog[1]);
+            put(fin[0], tlog[0]);
             put(1u, 1u); // end mark
         }
         let end = put_end();
         put_flush();
         let content = end - (HDR_LEN + 3u);
-        if (wpos >= FRAME_WORDS || content >= BLOCK_SIZE) {
+        if (pos == STOP || wpos >= FRAME_WORDS || content >= BLOCK_SIZE) {
             raw_flag = 1u;
         } else {
             raw_flag = 0u;
