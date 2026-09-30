@@ -5,7 +5,7 @@ version.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["block-128k"]
+default = ["block-64k"]
 block-16k = []
 block-32k = []
 block-64k = []

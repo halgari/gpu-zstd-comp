@@ -56,7 +56,7 @@ is K3 31.0, K1 16.0, K2 10.4, K5 5.4 and K4 2.6 ms, plus 9 ms of serial copies.
 | E7 | K5 residency / serial-chain fix | R1, R7 | identical | +5 % / +10–15 % | M |
 | E8 | Skip the upload copy (read the ReBAR upload buffer directly) | R1, R6, R8 | identical | +3 % / +1–8 % | S |
 | E9 | WGSL bounds checks off (unchecked shader modules) | R2 | identical | unknown, free test | S |
-| E10 | Multi-block frames with a sliding window | R10 | **format change: needs user OK** | +2–4.7 % ratio, or rung1-level speed at > L9 ratio | L |
+| E10 | ~~Multi-block frames with a sliding window~~ | R10 | **rejected by user**: blocks stay independent and ≤ 64 KiB | – | – |
 | E11 | CUDA K3 proof of concept | R2 | identical | 1.1–1.8× K3 (after E1, likely moot) | M |
 | E13 | **Per-format preset `lvl9dds`**: selected per block from the DDS header. DXT1 hashes/searches only phase {0,4} mod 8 at depth 2; DXT5 depth 8; NIF depth 8 | R9 | new preset, **ratio 1.3582** (> lvl9) | K2 walk 0.29–0.38×, K1 inserts 0.78× (≈ −13–15 % GPU) | M |
 | E12 | Optimal parse beyond L9 (btopt-class) | R8 | new preset | +3 % ratio (L19), free on 7z-bound installs | L |
@@ -69,7 +69,9 @@ Parallel tracks on branch `speed2` touch disjoint files. Each is measured with t
 - **Track B (K1/K2):** E2 bucket-sorted finder, then E4, then E13 (per-format preset; same kernels).
 - **Track C (host/queues):** E3 multi-queue + E8 + E9.
 - **After A–C merge:** E6, E7, E5 (E5 needs the proxy mode; the defaults touch `chains.rs` after B).
-- **Needs a user decision first:** E10.
+- **Rejected (user, 2026-09-30):** E10. Blocks stay independent and **at most 64 KiB**. From now on, block-64k is
+  the default and the primary benchmark. The ratio target is libzstd L9 on 64 KiB blocks: **1.3379** on the full
+  corpus (DDS 1.3277, NIF 1.6016); our CPU lvl9 at 64 KiB gives 1.3393.
 - **Deferred:** E11, E12.
 
 New presets are combined at the end into one fast preset. E1+E2 (+E4) is checked for ratio ≥ L9 on the full
