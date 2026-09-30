@@ -219,8 +219,7 @@ Batch scaling (wg16, workgroup ring, level 2):
     serially).
 - Raise residency:
   - u16 price tables (−0.8 KiB per block);
-  - at 16 KiB, share tables across a workgroup's blocks only when they are equal (they are not, per block);
-  - otherwise fewer blocks per workgroup there.
+  - at 16 KiB, a smaller workgroup (4 blocks' tables per wg16 today; wg8 would halve that).
 - A profiler (Nsight Compute is not installed on this machine) would settle how the trip time splits.
 - Concern: during one of the experiments a kernel was killed with Xid 109 (CTX SWITCH TIMEOUT). The cause was an
   experiment build that skipped the trailer, so `main_fixup` ran on garbage counts; the shipped kernel always writes
