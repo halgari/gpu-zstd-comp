@@ -102,11 +102,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var chain = 0u; chain < N_HASHES && best_len < SEARCH_CAP; chain++) {
         let pb = (b * N_HASHES + chain) * BLOCK_SIZE;
         var q = pred[pb + p] & PRED_POS;
+        var wq = 0u;
+        if (q != PRED_NONE) { wq = pred[pb + q]; }
         for (var d = 0u; d < DEPTH; d++) {
             if (q == PRED_NONE) { break; }
-            // q's successor and q's fingerprint; compare q only if the fingerprint allows it to
-            // win (see the header).
-            let wq = pred[pb + q];
+            // wq: q's successor and q's fingerprint; compare q only if the fingerprint allows it
+            // to win (see the header). The successor's word is loaded before the compare.
+            let qn = wq & PRED_POS;
+            var wn = 0u;
+            if (qn != PRED_NONE && d + 1u < DEPTH) { wn = pred[pb + qn]; }
             let x = (wq ^ fpp) & ~PRED_POS;
             if ((x & PRED_FP_LO) == 0u
                 && (x == 0u || (MIN_MATCH <= 4u && (best_len < 4u || (best_len == 4u && q > best_q))))) {
@@ -117,7 +121,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (len == SEARCH_CAP) { break; }
                 }
             }
-            q = wq & PRED_POS;
+            q = qn;
+            wq = wn;
         }
     }
     best[o] = select(0u, (best_len << BEST_OFF_BITS) | (p - best_q), best_len >= MIN_MATCH);
