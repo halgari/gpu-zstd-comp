@@ -171,6 +171,34 @@ var<private> ml_sum: u32;
 var<private> lbase: u32;
 var<private> n_series: u32;
 
+// load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
+// are loaded, the high one masked when aligned (data[w + 1] is in bounds, see load_u32_at).
+fn ld32(base: u32, byte_off: u32) -> u32 {
+    let w = base + (byte_off >> 2u);
+    let sh = (byte_off & 3u) * 8u;
+    let hi = data[w + 1u] << ((32u - sh) & 31u);
+    return (data[w] >> sh) | select(hi, 0u, sh == 0u);
+}
+
+// match_len on ld32.
+fn match_len_nb(base: u32, p: u32, q: u32, cap: u32) -> u32 {
+    let max = min(BLOCK_SIZE - p, cap);
+    var n = 0u;
+    // Terminates: n rises by 4 to max.
+    loop {
+        if (n + 4u > max) { break; }
+        let x = ld32(base, p + n) ^ ld32(base, q + n);
+        if (x != 0u) { return n + (countTrailingZeros(x) >> 3u); }
+        n += 4u;
+    }
+    // Terminates: n rises to max.
+    loop {
+        if (n >= max || load_byte(base, p + n) != load_byte(base, q + n)) { break; }
+        n += 1u;
+    }
+    return n;
+}
+
 // opt::frac_weight
 fn frac_weight(raw: u32) -> u32 {
     let stat = raw + 1u;
@@ -178,9 +206,11 @@ fn frac_weight(raw: u32) -> u32 {
     return hb * 256u + ((stat << 8u) >> hb);
 }
 
+// Branch-free: both tables read, the code index clamped (litlen <= 65536: code <= 35).
 fn ll_price(litlen: u32) -> i32 {
-    if (litlen < 64u) { return p_lls[pb * 64u + litlen]; }
-    return p_llc[pb * 36u + firstLeadingBit(litlen) + 19u];
+    let a = p_lls[pb * 64u + min(litlen, 63u)];
+    let b = p_llc[pb * 36u + min(firstLeadingBit(litlen | 64u) + 19u, 35u)];
+    return select(b, a, litlen < 64u);
 }
 
 // Literal price of byte value `c`.
@@ -197,15 +227,15 @@ fn match_price(ob: u32, mlen: u32) -> i32 {
 }
 
 // seq::apply_off_base on a history value: the reps after offBase `ob` with `ll` literals.
+// Branch-free: idx 0: r; 1: (r1, r0, r2); 2: (r2, r0, r1); 3: (r0 - 1, r0, r1);
+// ob > 3: (ob - 3, r0, r1).
 fn rep_after(r: vec3<u32>, ob: u32, ll: u32) -> vec3<u32> {
-    if (ob > 3u) { return vec3<u32>(ob - 3u, r.x, r.y); }
     let idx = ob - 1u + select(0u, 1u, ll == 0u);
-    switch (idx) {
-        case 0u: { return r; }
-        case 1u: { return vec3<u32>(r.y, r.x, r.z); }
-        case 2u: { return vec3<u32>(r.z, r.x, r.y); }
-        default: { return vec3<u32>(r.x - 1u, r.x, r.y); }
-    }
+    let rep = ob <= 3u;
+    let keep = rep && idx == 0u;
+    let first = select(select(select(r.x - 1u, r.z, idx == 2u), r.y, idx == 1u), ob - 3u, !rep);
+    let third = select(select(r.y, r.z, rep && idx == 1u), r.z, keep);
+    return vec3<u32>(select(first, r.x, keep), select(r.x, r.y, keep), third);
 }
 
 // opt::new_rep (ZSTD_newRep).
@@ -282,7 +312,7 @@ fn rep_probe(p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, be
     if (!valid || (d & 0xFFFFFFu) != 0u) { return false; }
     // lim >= 8 at every searched position (p <= ilimit = iend - 8).
     var rl = 3u;
-    if (d == 0u) { rl = 4u + match_len(base, p + 4u, p - ro + 4u, lim - 4u); }
+    if (d == 0u) { rl = 4u + match_len_nb(base, p + 4u, p - ro + 4u, lim - 4u); }
     if (rl <= *bestl) { return false; }
     *bestl = rl;
     push_match(ob, rl);
@@ -303,9 +333,9 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
     let v0 = ro0 - 1u < p;
     let v1 = ro1 - 1u < p;
     let v2 = ro2 - 1u < p;
-    let y0 = load_u32_at(base, p - select(0u, ro0, v0));
-    let y1 = load_u32_at(base, p - select(0u, ro1, v1));
-    let y2 = load_u32_at(base, p - select(0u, ro2, v2));
+    let y0 = ld32(base, p - select(0u, ro0, v0));
+    let y1 = ld32(base, p - select(0u, ro1, v1));
+    let y2 = ld32(base, p - select(0u, ro2, v2));
     if (rep_probe(p, lim, 1u, ro0, v0, x, y0, &bestl)) { return; }
     if (rep_probe(p, lim, 2u, ro1, v1, x, y1, &bestl)) { return; }
     if (rep_probe(p, lim, 3u, ro2, v2, x, y2, &bestl)) { return; }
@@ -314,7 +344,7 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
         let len = select(w0 >> 24u, (w0 >> 16u) & 0xFFu, j == 0u);
         if (len == 0u) { continue; }
         var l = min(len, lim);
-        if (len == SEARCH_CAP) { l = match_len(base, p, p - off, lim); }
+        if (len == SEARCH_CAP) { l = match_len_nb(base, p, p - off, lim); }
         if (l > bestl) {
             bestl = l;
             push_match(off + 3u, l);
@@ -678,7 +708,7 @@ fn dp(b: u32, k: u32) {
         // series may reach iend, where nothing is searched and x is unused).
         let p = select(st_ip, sip + cur, in_series);
         let pc = min(p, iend - 1u);
-        let x = load_u32_at(base, pc);
+        let x = ld32(base, pc);
         let xprev = load_byte(base, p - 1u);
         let ci = cbase + 2u * pc;
         let w0 = best[ci];
