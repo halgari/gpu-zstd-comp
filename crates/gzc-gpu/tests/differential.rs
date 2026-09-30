@@ -551,6 +551,47 @@ fn k4_random_scripts_match_cpu() {
     check_scripted(&ctx, &kernels, &cases);
 }
 
+/// K4 encodes the sequences in chunks of 256, last chunk first: sequence counts on both sides of
+/// chunk multiples (so the chunk holding the initializing last sequence is full or partial), wide
+/// code palettes (bit counts per sequence varying across the staging words), and sequences with
+/// 16-bit literal-length, match-length and offset extra fields next to each other.
+#[test]
+fn k4_chunk_boundaries_match_cpu() {
+    let mut r = Lcg(0xc4c);
+    let mut cases = Vec::new();
+    for (i, &n_seq) in [1usize, 2, 4, 5, 255, 256, 257, 259, 511, 512, 513, 1000, 1024, 1025].iter().enumerate() {
+        let mut script = Vec::new();
+        let mut pos = 0u32;
+        let budget = BLOCK_SIZE as u32 - 1024;
+        for _ in 0..n_seq {
+            let ll = [0, r.below(4), r.below(12)][r.below(3) as usize].max((pos == 0) as u32);
+            let ml = 3 + [r.below(2), r.below(8), r.below(30)][r.below(3) as usize];
+            let off = (1 + [r.below(4), r.below(200), r.below(20000)][r.below(3) as usize]).min(pos + ll);
+            if pos + ll + ml > budget {
+                break;
+            }
+            script.push((ll, off, ml));
+            pos += ll + ml;
+        }
+        assert_eq!(script.len(), n_seq, "script {i} did not fit");
+        let (block, parse) = scripted(&script, 0x100 + i as u64);
+        cases.push((format!("chunks{n_seq}"), block, parse));
+    }
+    // Wide fields (128K blocks): 16-bit literal-length and offset and 15-bit match-length extra
+    // bits in one sequence, a 16-bit offset in another, short sequences between them.
+    if BLOCK_SIZE >= 1 << 17 {
+        let mut script = vec![(65600, 65550, 33000)];
+        script.extend((0..300).map(|i| (i % 5, 1 + (i * 37) % 900, 4 + i % 11)));
+        script.push((0, 90000, 20000));
+        let (block, parse) = scripted(&script, 0x16);
+        cases.push(("wide_fields".to_string(), block, parse));
+    }
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames(huffman);
+        check_scripted(&ctx, &kernels, &cases);
+    }
+}
+
 /// With `min_match = 4` a 128K block can hold more than 0x7F00 sequences (`MAX_SEQS` is
 /// `BLOCK_SIZE / 4 + 1`), so K4's 3-byte nbSeq header is reachable: 4 literals then 32767
 /// length-4 matches at offset 4 fill the block exactly. Unreachable below 128K.
