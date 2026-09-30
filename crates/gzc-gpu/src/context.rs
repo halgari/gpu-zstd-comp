@@ -83,7 +83,8 @@ impl GpuContext {
     pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
         let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
-        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates.
+        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates (the K3
+        // modules' argument is at their call site in `Kernels::new`).
         unsafe {
             self.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },

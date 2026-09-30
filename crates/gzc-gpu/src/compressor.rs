@@ -492,9 +492,17 @@ impl Kernels {
         // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
         let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}");
         // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
-        // naga adds so the driver may not assume termination): every K3 loop provably ends (each
-        // iteration advances ip, n, moved or i), and the counter costs 4 % (lazy2, cooperative),
-        // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090.
+        // naga adds so the driver may not assume termination; it costs 4 % (lazy2, cooperative),
+        // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090). Every K3 loop
+        // provably ends, whatever best[] holds:
+        // - k3_coop.wgsl: each loop has a `// Terminates:` note (variant and bound); the only
+        //   subtraction that could wrap, coop_push_lits' end - start, is clamped.
+        // - k3_parse.wgsl / k3_lazy.wgsl: the parse loops advance p / ip below PARSE_END (a store
+        //   by >= 1 byte, a skip by step >= 1, the deferral by 1-2, the immediate loop by ml >= 4);
+        //   match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE); the catch-up's start
+        //   falls toward anchor; push_lits' `for i in start..end` is empty when start >= end.
+        // Bounds checks stay on. A new K3 loop must come with the same argument, or use
+        // `ctx.shader` instead.
         let parse =
             pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main");
         let k3_mode = k3_mode(ctx)?;
@@ -504,9 +512,13 @@ impl Kernels {
                 let (mx, my) = lane_mask(w);
                 // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
                 let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
+                // Test-only: GZC_K3_FORCE_FALLBACK=1 makes every workgroup take the in-kernel
+                // sequential fallback (the path a failed lane-layout guard takes).
+                let force_fallback = std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1");
                 let body = format!(
                     "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
-                     const REP_HI_MASK: u32 = {rep_hi}u;\n{k3_body}\n{K3_COOP_WGSL}"
+                     const REP_HI_MASK: u32 = {rep_hi}u;\nconst K3_FORCE_FALLBACK: bool = {force_fallback};\n\
+                     {k3_body}\n{K3_COOP_WGSL}"
                 );
                 // Subgroup built-ins need Features::SUBGROUP on the device (naga 30 rejects
                 // `enable subgroups;`).
@@ -911,6 +923,7 @@ fn submit_from_best(
     blocks: &[&[u8]],
     bests: &[Vec<Match>],
     frames: bool,
+    allow_past_end: bool,
 ) -> anyhow::Result<BatchBuffers> {
     anyhow::ensure!(blocks.len() == bests.len(), "one best[] table per block");
     anyhow::ensure!(!blocks.is_empty(), "no blocks");
@@ -940,7 +953,7 @@ fn submit_from_best(
                 entry.offset
             );
             anyhow::ensure!(
-                ip + entry.len as usize <= BLOCK_SIZE,
+                allow_past_end || ip + entry.len as usize <= BLOCK_SIZE,
                 "best[] {b}[{ip}] ip {ip} + len {} > BLOCK_SIZE {BLOCK_SIZE}",
                 entry.len
             );
@@ -992,7 +1005,7 @@ pub fn frames_from_best(
         return Ok(Vec::new());
     }
     with_error_scopes(ctx, || {
-        let bufs = submit_from_best(ctx, kernels, blocks, bests, true)?;
+        let bufs = submit_from_best(ctx, kernels, blocks, bests, true, false)?;
         let n = blocks.len() as u32;
         let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
         let words = read_regions(ctx, &[(frame_len, 0, n as u64), (frames, 0, frames_bytes(n) / 4)])?;
@@ -1014,7 +1027,26 @@ pub fn parses_from_best(
         return Ok(Vec::new());
     }
     with_error_scopes(ctx, || {
-        let bufs = submit_from_best(ctx, kernels, blocks, bests, false)?;
+        let bufs = submit_from_best(ctx, kernels, blocks, bests, false, false)?;
+        let mut out = Vec::with_capacity(blocks.len());
+        read_outputs(ctx, &bufs, blocks.len() as u32, &mut out)?;
+        Ok(out)
+    })
+}
+
+/// Test-only: `parses_from_best` without the check that a scripted match ends inside the block
+/// (K2 never writes such an entry). Lets tests check that K3 still terminates when an anchor
+/// lands past BLOCK_SIZE; the parse it returns (or the error from its garbage counts) has no
+/// CPU reference.
+#[doc(hidden)]
+pub fn parses_from_best_unchecked(
+    ctx: &GpuContext,
+    kernels: &Kernels,
+    blocks: &[&[u8]],
+    bests: &[Vec<Match>],
+) -> anyhow::Result<Vec<BlockOutput>> {
+    with_error_scopes(ctx, || {
+        let bufs = submit_from_best(ctx, kernels, blocks, bests, false, true)?;
         let mut out = Vec::with_capacity(blocks.len());
         read_outputs(ctx, &bufs, blocks.len() as u32, &mut out)?;
         Ok(out)

@@ -190,6 +190,11 @@ impl<'a> Pipeline<'a> {
         Ok(Self { ctx, cfg: *cfg, kernels, layout, slots })
     }
 
+    /// How this pipeline's K3 runs (the mode its kernels were built with).
+    pub fn k3_mode(&self) -> crate::compressor::K3Mode {
+        self.kernels.k3_mode()
+    }
+
     /// Bytes of every buffer the pipeline created, the shared scratch buffers once; timestamp
     /// query sets and their resolve buffers are left out, as in `vram_bytes`.
     #[cfg(test)]

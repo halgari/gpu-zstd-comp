@@ -13,6 +13,12 @@
 // cooperative primitive returns exactly what its sequential counterpart returns, for any W >= 1,
 // so the output never depends on W (see the equivalence notes per function).
 //
+// Termination (the host builds this module without naga's forced loop bounding): every loop below
+// carries a `// Terminates:` note naming a variable that strictly increases (or decreases) each
+// iteration and the bound that ends it. None of the bounds relies on best[] being sane: a best[]
+// word may claim a match past the block end (K2 never writes one, tests can), and the loops still
+// end (anchors past BLOCK_SIZE end the parse; coop_push_lits clamps its start).
+//
 // If the lane layout is not the assumed one (subgroup smaller than W, lane ids not equal to the
 // local index, ballot not exactly W bits), lane 0 runs the sequential lazy_parse instead: the
 // output is still exact, only slower.
@@ -59,6 +65,9 @@ fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32, mode: u32) -> u32
     // counts as differing at its byte 0. Candidates grow with k (4k + b < 4(k + 1)), so the
     // minimum is the first lane that differs or is invalid; which of the two it is follows from
     // its lane index m / 4.
+    // Terminates: p < BLOCK_SIZE at every call (callers keep ip <= PARSE_END), so max <= BLOCK_SIZE;
+    // n grows by 4W per full step, and a step whose lanes reach n + 4k + 4 > max has an invalid lane,
+    // so m != NO_DIFF and the loop returns or breaks.
     loop {
         let o = n + 4u * k;
         let valid = o + 4u <= max;
@@ -75,6 +84,7 @@ fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32, mode: u32) -> u32
         }
         n += 4u * W;
     }
+    // Terminates: n increases by 1 up to max (at most 3 iterations after the word loop).
     loop {
         if (n >= max || load_byte(base, p + n) != load_byte(base, q + n)) { break; }
         n += 1u;
@@ -112,6 +122,8 @@ fn coop_search_max_w(base: u32, w: u32, ip: u32, k: u32) -> vec2<u32> {
 // tests at iteration moved + k; the loop runs for the leading run of true predicates.
 fn coop_catch_up(base: u32, start0: u32, anchor: u32, off: u32, k: u32) -> u32 {
     var moved = 0u;
+    // Terminates: a full step (cnt == W) needs lane W - 1 in bounds, i.e. start0 - moved - (W - 1)
+    // > anchor >= 0, so moved grows by W while staying below start0; any other step breaks.
     loop {
         let s = start0 - moved;
         let sk = s - min(k, s);
@@ -133,12 +145,17 @@ fn coop_catch_up(base: u32, start0: u32, anchor: u32, off: u32, k: u32) -> u32 {
 // `total / 4` complete words, W at a time. The last total % 4 bytes become the new accumulator.
 // start >= acc_n (the pending bytes came from earlier positions); every load that matters stays
 // in [start, end), and nothing reads `lits`, so which lane stores a word does not matter.
-fn coop_push_lits(base: u32, start: u32, end: u32, k: u32) {
+// start > end (a final push from an anchor past BLOCK_SIZE, only reachable with a best[] word that
+// claims a match past the block end) pushes nothing, as the sequential byte loop does; unclamped,
+// end - start would wrap to ~2^32 bytes.
+fn coop_push_lits(base: u32, start_in: u32, end: u32, k: u32) {
+    let start = min(start_in, end);
     let len = end - start;
     n_lit += len;
     let total = acc_n + len;
     let full = total >> 2u;
     let sh = acc_n * 8u;
+    // Terminates: t grows by W up to full <= (3 + BLOCK_SIZE) / 4 (len <= BLOCK_SIZE after the clamp).
     for (var t = 0u; t < full; t += W) {
         let j = t + k;
         let jc = min(j, full - 1u);
@@ -211,6 +228,10 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     var offset_1 = select(0u, r0, r0 <= 1u);
     var offset_2 = select(0u, r1, r1 <= 1u);
 
+    // Terminates: every iteration ends with a larger ip, bounded by PARSE_END. A miss adds
+    // n_valid * step >= 1 (lane 0 is always valid: ip < PARSE_END); the fallback adds step >= 1; a
+    // store sets ip = anchor = start + match_length >= (the hit position) + 4, and the immediate
+    // loop only adds to it.
     while (ip < PARSE_END) {
         // Literal scan: the sequential loop body `continue`s (skips ip) exactly when neither the
         // rep probe at ip + 1 (rep_len > 0 <=> the first 4 bytes match, as BLOCK_SIZE - (ip + 1)
@@ -265,6 +286,7 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
             continue;
         }
 
+        // Terminates: ip increases by 1 or 2 per iteration and the loop breaks at ip + 1 >= PARSE_END.
         loop {
             if (ip + 1u >= PARSE_END) { break; }
             ip += 1u;
@@ -334,6 +356,7 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         anchor = start + match_length;
         ip = anchor;
 
+        // Terminates: ml >= 4 on every continuing iteration, so ip grows until ip > PARSE_END.
         while (ip <= PARSE_END && offset_2 > 0u) {
             let ml = coop_rep_len(base, ip, offset_2, k);
             if (ml == 0u) { break; }
@@ -358,6 +381,8 @@ fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     var n_seq = 0u;
     var p = 0u;
     var anchor = 0u;
+    // Terminates: p grows each iteration (a miss by n_valid * step >= 1, a store by len >= 1, the
+    // fallback by step >= 1) and the loop ends at PARSE_END.
     while (p < PARSE_END) {
         let step = ((p - anchor) >> 8u) + 1u;
         let cand = p + k * step;
@@ -432,7 +457,8 @@ fn main_coop(
 
     // Lane-layout guard: this block's W lanes are one subgroup whose lane ids are 0..W-1.
     let m = subgroupBallot(true);
-    let lanes_ok = sg_size >= W && sid == li && m.x == W_MASK_X && m.y == W_MASK_Y;
+    // K3_FORCE_FALLBACK (host-injected, test-only) takes the sequential branch below on purpose.
+    let lanes_ok = !K3_FORCE_FALLBACK && sg_size >= W && sid == li && m.x == W_MASK_X && m.y == W_MASK_Y;
     var n_seq = 0u;
     if (subgroupAll(lanes_ok)) {
         if (LAZY == 0u) {

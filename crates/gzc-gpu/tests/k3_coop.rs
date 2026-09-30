@@ -9,7 +9,9 @@ use gzc_core::lazy::lazy_parse;
 use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
 use gzc_core::reference::{Match, compress_block, greedy_parse};
 use gzc_core::seq::BlockOutput;
-use gzc_gpu::compressor::{GpuParams, K3Mode, Kernels, compress_batch, parses_from_best, probe_lanes};
+use gzc_gpu::compressor::{
+    GpuParams, K3Mode, Kernels, compress_batch, parses_from_best, parses_from_best_unchecked, probe_lanes,
+};
 use gzc_gpu::context::GpuContext;
 
 const WIDTHS: [usize; 3] = [8, 16, 32];
@@ -184,6 +186,103 @@ fn match_shorter_than_its_repeat() {
     check(RUNG2, &cases);
     check(RUNG1, &cases);
     check(LVL3, &cases);
+}
+
+/// A scan that restarts mid-regime: a capped best[] entry on the skip sequence whose real repeat
+/// is shorter than 4 bytes (0 or 2) sends the parse on by one step without a store, so the next
+/// scan window starts at an odd place and the step-2 -> step-3 boundary (512 from anchor 0) falls
+/// inside a window. Planted matches before and after the boundary must be found exactly when the
+/// oracle visits them.
+#[test]
+fn scan_restarts_mid_regime() {
+    let mut cases = Vec::new();
+    for restart in [300usize, 302, 450, 480, 494, 496, 508, 510] {
+        for real in [0usize, 2] {
+            for target in [511usize, 512, 513, 514, 515, 516, 518, 521] {
+                let mut c = Case::random(format!("restart@{restart} real {real} target@{target}"), (restart * 1000 + real * 100 + target) as u64);
+                c.repeat(restart, 70, real);
+                c.best[restart] = Match { offset: 70, len: CAP };
+                c.explicit(target, 45, 8, 8);
+                cases.push((real, c.done()));
+            }
+        }
+    }
+    let all: Vec<Case> = cases.iter().map(|(_, c)| Case { name: c.name.clone(), block: c.block.clone(), best: c.best.clone() }).collect();
+    check(LVL9, &all);
+    check(RUNG2, &all);
+    // The greedy oracle emits a capped entry's extension whatever its length, and never advances
+    // on a 0-byte one (outside its domain; the GPU kernels skip it): greedy gets the 2-byte cases,
+    // which it stores as a match (so the restart there is not mid-regime, only the lazy one is).
+    let two: Vec<Case> = cases.into_iter().filter(|(real, _)| *real == 2).map(|(_, c)| c).collect();
+    check(RUNG1, &two);
+    check(LVL3, &two);
+}
+
+/// A best[] entry that claims a match past the block end (K2 never writes one) puts the anchor
+/// past BLOCK_SIZE. K3 must still terminate (no GPU hang; the device stays usable). The
+/// cooperative K3 pushes no trailing literals then; the sequential one reports garbage counts,
+/// which `read_outputs` rejects, so only the cooperative result is checked in detail.
+#[test]
+fn anchor_past_block_end_terminates() {
+    let mut cases = Vec::new();
+    for (ip, len) in [(PARSE_END - 1, 40u32), (PARSE_END - 30, 63), (BLOCK_SIZE - 60, 62)] {
+        let mut c = Case::random(format!("match at {ip} len {len}"), ip as u64);
+        c.chain_to(ip).best[ip] = Match { offset: 20, len };
+        cases.push(c.done());
+    }
+    for m in [LVL9, RUNG2, RUNG1, LVL3] {
+        let (ctx, kernels) = setup(m);
+        let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
+        let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
+        let got = parses_from_best_unchecked(&ctx, &kernels, &blocks, &bests);
+        if matches!(kernels.k3_mode(), K3Mode::Coop { .. }) {
+            let got = got.expect("cooperative K3 on a match past the block end");
+            for (c, got) in cases.iter().zip(&got) {
+                let last = got.sequences.last().unwrap_or_else(|| panic!("{}: no sequence", c.name));
+                let covered: usize = got.sequences.iter().map(|q| (q.lit_len + q.match_len) as usize).sum();
+                assert!(covered > BLOCK_SIZE, "{}: the last match should run past the block end", c.name);
+                assert_eq!(got.literals.len(), got.sequences.iter().map(|q| q.lit_len as usize).sum::<usize>(), "{}", c.name);
+                assert!(last.match_len >= 4, "{}", c.name);
+            }
+        } else {
+            eprintln!("sequential K3: {:?}", got.as_ref().map(|v| v.len()));
+        }
+        // The device survived: a normal scripted case still parses exactly.
+        let normal = [Case::random("after", 1).explicit(1000, 33, 8, 8).done()];
+        let blocks: Vec<&[u8]> = normal.iter().map(|c| c.block.as_slice()).collect();
+        let bests: Vec<Vec<Match>> = normal.iter().map(|c| c.best.clone()).collect();
+        let after = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("device still usable");
+        let want = if m.lazy == 0 { greedy_parse(&normal[0].block, &normal[0].best, &m) } else { lazy_parse(&normal[0].block, &normal[0].best, &m) };
+        assert!(after[0] == want);
+    }
+}
+
+/// Literal words must stay inside their block's region: a block that is literals only (its region
+/// completely full) next to blocks whose first literal word is written early (a byte, then a run
+/// to the end: one fast long match). A store one word past a block's literals would land on the
+/// neighbour's first word.
+#[test]
+fn full_literal_region_next_to_other_blocks() {
+    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut r = Lcg(99);
+    for i in 0..8 {
+        let lits: Vec<u8> = (0..BLOCK_SIZE).map(|_| r.next() as u8).collect();
+        blocks.push((format!("all literals {i}"), lits));
+        let mut run = vec![(i * 37 + 5) as u8; BLOCK_SIZE];
+        for (j, x) in run.iter_mut().take(1 + i % 5).enumerate() {
+            *x = (j * 91 + i) as u8;
+        }
+        blocks.push((format!("short head + run {i}"), run));
+    }
+    for m in [LVL9, RUNG2, RUNG1, LVL3] {
+        let (ctx, kernels) = setup(m);
+        let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+        let got = compress_batch(&ctx, &kernels, &refs).expect("compress_batch");
+        for ((name, b), got) in blocks.iter().zip(&got) {
+            let want = compress_block(b, m);
+            assert!(*got == want, "{name}: GPU != compress_block; {}", first_diff(got, &want));
+        }
+    }
 }
 
 /// T1, MIN_MATCH 6: planted best lengths 4 and 5 are no match, 6 is.
@@ -443,10 +542,25 @@ fn probe_and_mode_selection() {
         let w = 2 * ctx.adapter_info.subgroup_max_size;
         assert!(!probe_lanes(&ctx, w, 1).unwrap(), "probe accepted two subgroups (W = {w})");
     }
+    // BPW = 2 (stage E, opt-in) is only offered when every subgroup has exactly W lanes.
+    let max = ctx.adapter_info.subgroup_max_size;
+    if min == max && (4..=32).contains(&min) {
+        assert!(probe_lanes(&ctx, min, 2).unwrap(), "probe failed for W = {min}, 2 blocks per workgroup");
+    }
     let kernels = Kernels::new(&ctx, GpuParams { matching: LVL9, emit_frames: false, huffman: false }).unwrap();
+    // The default W is the minimum subgroup size clamped to 8..=64; on a device with smaller
+    // subgroups (a W of 8 spans two of them) the probe fails and K3 stays sequential.
+    let default_w = {
+        let w = min.clamp(8, 64);
+        1 << (31 - w.leading_zeros())
+    };
+    let forced_w = std::env::var("GZC_K3_W").ok().map(|v| v.parse::<u32>().unwrap());
+    let bpw = if std::env::var("GZC_K3_BPW").as_deref() == Ok("2") { 2 } else { 1 };
+    let w = forced_w.unwrap_or(default_w);
     match std::env::var("GZC_K3_MODE").as_deref() {
         Ok("seq") => assert_eq!(kernels.k3_mode(), K3Mode::Seq),
-        _ => assert!(matches!(kernels.k3_mode(), K3Mode::Coop { .. }), "{:?}", kernels.k3_mode()),
+        _ if probe_lanes(&ctx, w, bpw).unwrap() => assert_eq!(kernels.k3_mode(), K3Mode::Coop { w, bpw }),
+        _ => assert_eq!(kernels.k3_mode(), K3Mode::Seq),
     }
     let greedy = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: false, huffman: false }).unwrap();
     assert_eq!(greedy.k3_mode(), kernels.k3_mode());
