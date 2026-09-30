@@ -82,7 +82,7 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
 - Prices are static per block per pass, in 1/256-bit units: `WEIGHT(sum) − WEIGHT(count)` from the previous
   pass's own literal histogram and LL/ML/OF histograms, with `off_base` taken under the decoder reps.
 - Pass 0 is seeded either from zstd's block initialisation (`BlockInit`) or from a prior (`Prior`): constant
-  LL/ML/OF tables in `codes.rs`, **trained on blocks disjoint from the 1/50 evaluation sample**, plus a
+  LL/ML/OF tables in `codes.rs`, **trained on blocks block-disjoint from the 1/50 evaluation sample**, plus a
   "cover-literal" histogram of the bytes no candidate covers.
 - Every pass prices with the same fractional `ZSTD_fracWeight` arithmetic (`opt::frac_weight`); `ZSTD_bitWeight`
   is used nowhere. Intermediate ("cheap") passes differ from the final pass only in their control flow,
