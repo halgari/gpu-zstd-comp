@@ -1,6 +1,6 @@
 // K3 greedy / lazy / lazy2 parse, subgroup-cooperative (speed phase S3, design .superpowers/speed/s3-design.md).
 // Appended by the host after k3_parse.wgsl and k3_lazy.wgsl (whose bindings, rep history, literal
-// accumulator, off_base_for / apply_off_base, highbit and sequential lazy_parse it reuses), and
+// count, off_base_for / apply_off_base, highbit and sequential lazy_parse it reuses), and
 // compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
 // subgroup size, or GZC_K3_W) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
 // `main_coop`, one block per W lanes, which form one (possibly partial) subgroup; BPW (1 or 2)
@@ -17,7 +17,7 @@
 // carries a `// Terminates:` note naming a variable that strictly increases (or decreases) each
 // iteration and the bound that ends it. None of the bounds relies on best[] being sane: a best[]
 // word may claim a match past the block end (K2 never writes one, tests can), and the loops still
-// end (anchors past BLOCK_SIZE end the parse; coop_push_lits clamps its start).
+// end (anchors past BLOCK_SIZE end the parse; push_lits counts nothing for them).
 //
 // If the lane layout is not the assumed one (subgroup smaller than W, lane ids not equal to the
 // local index, ballot not exactly W bits), lane 0 runs the sequential lazy_parse instead: the
@@ -138,51 +138,11 @@ fn coop_catch_up(base: u32, start0: u32, anchor: u32, off: u32, k: u32) -> u32 {
     return moved;
 }
 
-// == push_lits (k3_parse.wgsl): the same bytes packed into the same words. The literal stream
-// continues with the acc_n (< 4) pending bytes in acc followed by block[start..end), total bytes
-// in all. Stream word j >= 1 is the unaligned block word at start + 4j - acc_n, word 0 is acc with
-// the block word at start shifted in above its acc_n bytes; lane k stores word t + k for the
-// `total / 4` complete words, W at a time. The last total % 4 bytes become the new accumulator.
-// start >= acc_n (the pending bytes came from earlier positions); every load that matters stays
-// in [start, end), and nothing reads `lits`, so which lane stores a word does not matter.
-// start > end (a final push from an anchor past BLOCK_SIZE, only reachable with a best[] word that
-// claims a match past the block end) pushes nothing, as the sequential byte loop does; unclamped,
-// end - start would wrap to ~2^32 bytes.
-fn coop_push_lits(base: u32, start_in: u32, end: u32, k: u32) {
-    let start = min(start_in, end);
-    let len = end - start;
-    n_lit += len;
-    let total = acc_n + len;
-    let full = total >> 2u;
-    let sh = acc_n * 8u;
-    // Terminates: t grows by W up to full <= (3 + BLOCK_SIZE) / 4 (len <= BLOCK_SIZE after the clamp).
-    for (var t = 0u; t < full; t += W) {
-        let j = t + k;
-        let jc = min(j, full - 1u);
-        let w = load_u32_nb(base, select(start + 4u * jc - acc_n, start, jc == 0u));
-        let v = select(w, acc | (w << sh), jc == 0u);
-        if (j < full) { lits[lit_w + j] = v; }
-    }
-    let rem = total & 3u;
-    if (full == 0u) {
-        if (len > 0u) {
-            acc |= (load_u32_nb(base, start) & ((1u << (8u * len)) - 1u)) << sh;
-        }
-    } else {
-        acc = 0u;
-        if (rem > 0u) {
-            acc = load_u32_nb(base, start + 4u * full - acc_n) & ((1u << (8u * rem)) - 1u);
-        }
-    }
-    lit_w += full;
-    acc_n = rem;
-}
-
 // == store_seq (k3_lazy.wgsl), seqs written by lane 0.
 fn coop_store_seq(base: u32, sbase: u32, n_seq: u32, anchor: u32, ll: u32, offset: u32, ml: u32, k: u32) -> u32 {
     let ob = off_base_for(offset, ll);
     apply_off_base(ob, ll);
-    coop_push_lits(base, anchor, anchor + ll, k);
+    push_lits(anchor, anchor + ll);
     if (k == 0u) {
         let s = sbase + n_seq * 3u;
         seqs[s] = ll;
@@ -368,11 +328,11 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
             anchor = ip;
         }
     }
-    coop_push_lits(base, anchor, BLOCK_SIZE, k);
+    push_lits(anchor, BLOCK_SIZE);
     return n_seq;
 }
 
-// == greedy_parse (k3_parse.wgsl) with the cooperative literal scan, match_len and literal copy.
+// == greedy_parse (k3_parse.wgsl) with the cooperative literal scan and match_len.
 // The sequential loop skips p exactly when neither the rep test (p > anchor, p >= r0 and
 // match_len(p, p - r0) >= MIN_MATCH, i.e. its first MIN_MATCH bytes match: BLOCK_SIZE - p > 8)
 // nor best[p] (len >= MIN_MATCH) holds; the scan is the lazy one's with that predicate at p.
@@ -426,7 +386,7 @@ fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         p += len;
         anchor = p;
     }
-    coop_push_lits(base, anchor, BLOCK_SIZE, k);
+    push_lits(anchor, BLOCK_SIZE);
     return n_seq;
 }
 
@@ -450,9 +410,6 @@ fn main_coop(
     r0 = 1u;
     r1 = 4u;
     r2 = 8u;
-    acc = 0u;
-    acc_n = 0u;
-    lit_w = b * (BLOCK_SIZE / 4u);
     n_lit = 0u;
 
     // Lane-layout guard: this block's W lanes are one subgroup whose lane ids are 0..W-1.
@@ -476,9 +433,6 @@ fn main_coop(
         }
     }
     if (li == 0u) {
-        if (acc_n > 0u) {
-            lits[lit_w] = acc;
-        }
         counts[b * 2u] = n_seq;
         counts[b * 2u + 1u] = n_lit;
     }
