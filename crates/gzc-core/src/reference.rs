@@ -102,6 +102,11 @@ pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
 /// reaches `min(search_cap, BLOCK_SIZE - p)` (no later `q` can beat it). Lengths are capped: a
 /// stored 64 (`search_cap`) means "at least 64", extended by the parse. Positions `>= PARSE_END`
 /// are zero. Requires `Opt3` chains (`chains(block, params)`).
+///
+/// Fingerprint caveat (for GPU filters): an `h4`-chain entry whose first 4 bytes differ from
+/// `p`'s (a 16-bit hash collision) can still share 3 bytes and is then a valid 3-byte record, so
+/// a 4-byte fingerprint mismatch may skip the compare only once `best >= 3` (or when the first 3
+/// bytes differ too).
 pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<CandWords> {
     assert_eq!(params.hashes, Hashes::Opt3, "find_cands: Opt3 chains only");
     assert_eq!(chains.len(), 2);

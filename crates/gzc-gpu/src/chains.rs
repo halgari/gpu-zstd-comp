@@ -153,6 +153,8 @@ impl ChainsKernel {
     /// `new` with explicit options.
     pub fn with_options(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions) -> anyhow::Result<Self> {
         params.validate().map_err(|e| anyhow::anyhow!("invalid match params {params:?}: {e}"))?;
+        // M5: the Opt3 chains (h4 + h3) are not built on the GPU yet (T2).
+        anyhow::ensure!(params.opt.is_none(), "K1 does not build Opt3 chains yet: {params:?}");
         // The subgroup kernel splits its 256-lane tiles into 32-lane chunks, each inside one
         // subgroup, and reads ballots of up to 128 lanes.
         let info = &ctx.adapter_info;

@@ -271,6 +271,15 @@ struct Dp<'a> {
     stamp: Vec<u32>,
     #[cfg(debug_assertions)]
     series: u32,
+    /// `Engine::Ring`: `target_length + 1` nodes, series position `pos` in slot
+    /// `pos % ring.len()`.
+    ring: Vec<Node>,
+    /// `Engine::Ring`: (mlen, litlen, offBase) of every block position's node, written when the
+    /// node becomes final (the GPU's trace buffer).
+    trace: Vec<[u32; 3]>,
+    /// Debug: the series position each ring slot holds.
+    #[cfg(debug_assertions)]
+    ring_pos: Vec<usize>,
 }
 
 impl Dp<'_> {
@@ -554,6 +563,217 @@ impl Dp<'_> {
             st.ip = st.anchor + last.litlen as usize;
         }
     }
+
+    /// Ring slot of series position `pos`.
+    #[inline]
+    fn slot(&self, pos: usize) -> usize {
+        pos % self.ring.len()
+    }
+
+    /// Debug: records that `pos` now owns its slot.
+    #[inline]
+    fn own(&mut self, _pos: usize) {
+        #[cfg(debug_assertions)]
+        {
+            let s = self.slot(_pos);
+            self.ring_pos[s] = _pos;
+        }
+    }
+
+    /// Debug: `pos` must still own its slot (not aliased by a later position).
+    #[inline]
+    fn owns(&self, _pos: usize) {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.ring_pos[self.slot(_pos)], _pos, "ring slot of {_pos} was overwritten");
+    }
+
+    /// `segment` in ring form (`Engine::Ring`, the GPU K3opt spec; see `Engine`).
+    fn segment_ring(&mut self, seg: &Seg, out: &mut Vec<RawSeq>) -> usize {
+        let (iend, ilimit) = (seg.iend, seg.ilimit);
+        let pr = self.prices;
+        let block = self.block;
+        let mut st = SegState { ip: seg.ip0, anchor: seg.anchor0, rep: seg.reps0, seq_reps: seg.reps0 };
+        while st.ip < ilimit {
+            let ip = st.ip;
+            let litlen = (ip - st.anchor) as u32;
+            let rep = st.rep;
+            self.get_all_matches(ip, &rep, litlen == 0, iend);
+            if self.matches.is_empty() {
+                st.ip += 1;
+                continue;
+            }
+            let n0 = Node { mlen: 0, litlen, price: pr.ll_price(litlen), off: 0, rep };
+            #[cfg(debug_assertions)]
+            self.ring_pos.fill(usize::MAX);
+            self.ring[0] = n0;
+            self.own(0);
+            self.trace[ip] = [0, litlen, 0];
+            let (max_off, max_ml) = *self.matches.last().unwrap();
+            if max_ml as usize > self.sufficient {
+                let ls = Node { litlen: 0, mlen: max_ml, off: max_off, price: 0, rep: new_rep(rep, max_off, litlen == 0) };
+                self.commit_ring(ls, ip, max_ml as usize, &mut st, out);
+                continue;
+            }
+            let mut pos = 1usize;
+            while pos < MIN_MATCH {
+                let s = self.slot(pos);
+                self.ring[s] = Node { price: MAX_PRICE, mlen: 0, litlen: litlen + pos as u32, off: 0, rep: [0; 3] };
+                self.own(pos);
+                pos += 1;
+            }
+            for mi in 0..self.matches.len() {
+                let (ob, end) = self.matches[mi];
+                let mrep = new_rep(rep, ob, litlen == 0);
+                while pos <= end as usize {
+                    let price = n0.price + pr.match_price(ob, pos as u32) + pr.ll_price(0);
+                    let s = self.slot(pos);
+                    self.ring[s] = Node { mlen: pos as u32, off: ob, litlen: 0, price, rep: mrep };
+                    self.own(pos);
+                    pos += 1;
+                }
+            }
+            let mut last_pos = pos - 1;
+            let mut early: Option<Node> = None;
+            let mut cur = 1usize;
+            while cur <= last_pos {
+                let inr = ip + cur;
+                self.owns(cur - 1);
+                self.owns(cur);
+                let (sp, sc) = (self.slot(cur - 1), self.slot(cur));
+                let prev = self.ring[sp];
+                let litlen = prev.litlen + 1;
+                let price = prev.price + pr.lit_price(block[ip + cur - 1]) + (pr.ll_price(litlen) - pr.ll_price(litlen - 1));
+                if price <= self.ring[sc].price {
+                    let prev_match = self.ring[sc];
+                    self.ring[sc] = Node { litlen, price, ..prev };
+                    let ll_inc1 = pr.ll_price(1) - pr.ll_price(0);
+                    if self.level >= 1 && prev_match.litlen == 0 && ll_inc1 < 0 && ip + cur < iend {
+                        let next_lit = pr.lit_price(block[ip + cur]);
+                        let with1 = prev_match.price + next_lit + ll_inc1;
+                        let with_more = price + next_lit + (pr.ll_price(litlen + 1) - pr.ll_price(litlen));
+                        // virtual sentinel: positions past last_pos cost MAX_PRICE
+                        let next_price = if cur < last_pos {
+                            self.owns(cur + 1);
+                            self.ring[self.slot(cur + 1)].price
+                        } else {
+                            MAX_PRICE
+                        };
+                        if with1 < with_more && with1 < next_price {
+                            // prev_match.rep was computed when it was relaxed
+                            let s = self.slot(cur + 1);
+                            self.ring[s] = Node { litlen: 1, price: with1, ..prev_match };
+                            self.own(cur + 1);
+                            if last_pos < cur + 1 {
+                                last_pos = cur + 1;
+                            }
+                        }
+                    }
+                }
+                let n = self.ring[sc];
+                self.trace[inr] = [n.mlen, n.litlen, n.off];
+                if inr > ilimit {
+                    cur += 1;
+                    continue;
+                }
+                if cur == last_pos {
+                    break;
+                }
+                if self.level == 0 {
+                    self.owns(cur + 1);
+                    if self.ring[self.slot(cur + 1)].price <= n.price + (BITCOST_MULTIPLIER / 2) as i32 {
+                        cur += 1;
+                        continue;
+                    }
+                }
+                let ll0 = n.litlen == 0;
+                let base_price = n.price + pr.ll_price(0);
+                self.get_all_matches(inr, &n.rep, ll0, iend);
+                if self.matches.is_empty() {
+                    cur += 1;
+                    continue;
+                }
+                let (max_off, longest) = *self.matches.last().unwrap();
+                let longest = longest as usize;
+                if longest > self.sufficient || cur + longest >= OPT_NUM || ip + cur + longest >= iend {
+                    early = Some(Node { mlen: longest as u32, off: max_off, litlen: 0, price: 0, rep: new_rep(n.rep, max_off, ll0) });
+                    last_pos = cur + longest;
+                    break;
+                }
+                for mi in 0..self.matches.len() {
+                    let (ob, last_ml) = self.matches[mi];
+                    let start_ml = if mi > 0 { self.matches[mi - 1].1 + 1 } else { MIN_MATCH as u32 };
+                    let mrep = new_rep(n.rep, ob, ll0);
+                    let mut mlen = last_ml;
+                    while mlen >= start_ml {
+                        let pos = cur + mlen as usize;
+                        debug_assert!(pos - cur < self.ring.len());
+                        let price = base_price + pr.match_price(ob, mlen);
+                        let improves = pos > last_pos || {
+                            self.owns(pos);
+                            price < self.ring[self.slot(pos)].price
+                        };
+                        if improves {
+                            while last_pos < pos {
+                                last_pos += 1;
+                                let s = self.slot(last_pos);
+                                self.ring[s].price = MAX_PRICE;
+                                self.ring[s].litlen = 1;
+                                self.own(last_pos);
+                            }
+                            let s = self.slot(pos);
+                            self.ring[s] = Node { mlen, off: ob, litlen: 0, price, rep: mrep };
+                        } else if self.level == 0 {
+                            break;
+                        }
+                        mlen -= 1;
+                    }
+                }
+                cur += 1;
+            }
+            let last = match early {
+                Some(ls) => ls,
+                None => {
+                    self.owns(last_pos);
+                    self.ring[self.slot(last_pos)]
+                }
+            };
+            self.commit_ring(last, ip, last_pos, &mut st, out);
+        }
+        st.anchor
+    }
+
+    /// `commit` in ring form: the next series' reps are the last stretch's own (computed when
+    /// its match was relaxed, or with the immediate encoding), and the backward trace reads the
+    /// per-position `trace` (mlen, litlen, offBase), written when each node became final.
+    fn commit_ring(&mut self, last: Node, ip: usize, last_pos: usize, st: &mut SegState, out: &mut Vec<RawSeq>) {
+        if last.mlen == 0 {
+            st.ip += last_pos;
+            return;
+        }
+        st.rep = last.rep;
+        let mut stretch_pos = last_pos - last.mlen as usize - last.litlen as usize;
+        let first = out.len();
+        let (mut mlen, mut off) = (last.mlen, last.off);
+        loop {
+            let [nm, nl, no] = self.trace[ip + stretch_pos];
+            out.push((nl, mlen, off));
+            if nm == 0 {
+                break;
+            }
+            (mlen, off) = (nm, no);
+            stretch_pos -= (nl + nm) as usize;
+        }
+        out[first..].reverse();
+        for s in &mut out[first..] {
+            s.2 = apply_off_base(&mut st.seq_reps, s.2, s.0);
+            st.anchor += (s.0 + s.1) as usize;
+            st.ip = st.anchor;
+        }
+        debug_assert_eq!(st.rep, st.seq_reps, "ring reps differ from the stored sequences' reps");
+        if last.litlen > 0 {
+            st.ip = st.anchor + last.litlen as usize;
+        }
+    }
 }
 
 /// A segment's running parse state: zstd's `ip`, `anchor`, `rep`, and the rep history of the
@@ -565,9 +785,54 @@ struct SegState {
     seq_reps: Reps,
 }
 
+/// How the DP stores its nodes. Both engines give identical output (tested on every synthetic
+/// block and a corpus sample, all variants).
+///
+/// - `Linear`: zstd's layout, statement by statement: `opt[0 ..= ZSTD_OPT_NUM]`, a match node's
+///   reps computed when the node is *visited* (`ZSTD_newRep(opt[cur - mlen].rep, ..)`), the
+///   sentinel `opt[last_pos + 1].price = MAX` written, the backward trace over `opt[]`.
+/// - `Ring`: **the GPU K3opt spec**. Nodes live in a ring of `target_length + 1` (33) slots,
+///   position `pos` of the series in slot `pos % 33`. At the visit of `cur` the live positions
+///   are `cur - 1 ..= cur + 32` (34 of them): the literal extension reads `cur - 1` first, and
+///   only then may a relaxation to `cur + 32` reuse its slot. To make that sufficient:
+///   1. a match node's reps are computed when it is *relaxed* (or seeded at the series start),
+///      from the source node `cur`, which is final then: `rep = ZSTD_newRep(node[cur].rep, off,
+///      node[cur].litlen == 0)`, stored with the node. The visit-time rep update disappears;
+///      the match + 1 literal node takes `prevMatch.rep` as is; the immediate encoding computes
+///      `newRep(node[cur].rep, off, ll0)` itself, and the commit uses `lastStretch.rep`.
+///   2. no sentinel is written: `price(pos) = MAX_PRICE` for every `pos > last_pos` (only the
+///      match + 1 literal check reads there, at `cur + 1`); the relaxation's fill loop still
+///      writes `price = MAX, litlen = 1` into each slot it claims.
+///   3. when node `cur` is final (after its literal extension), its (mlen, litlen, offBase) go
+///      to `trace[ip + cur]` (8 B per position on the GPU); the series start writes
+///      `trace[ip] = (0, litlen, 0)`. The backward trace walks `trace`, never the ring. A node
+///      can sit at `iend` itself (a match reaching the segment end); its entry is written but
+///      never read (the walk starts at `last_pos - mlen - litlen < iend`), so the GPU may drop
+///      that write and keep 4096 entries per segment.
+///
+///   Debug builds assert that every ring read finds the position it expects in its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Linear,
+    Ring,
+}
+
 /// One DP pass over the block at optLevel `level` with static `prices`: every segment parsed
 /// on its own, literals carried across segments, offsets encoded with the true decoder reps.
 pub fn dp_pass(block: &[u8], cands: &[CandWords], params: &MatchParams, prices: &Prices, level: u8, target_length: u32) -> BlockOutput {
+    dp_pass_with(block, cands, params, prices, level, target_length, Engine::Linear)
+}
+
+/// `dp_pass` with an explicit `Engine`.
+pub fn dp_pass_with(
+    block: &[u8],
+    cands: &[CandWords],
+    params: &MatchParams,
+    prices: &Prices,
+    level: u8,
+    target_length: u32,
+    engine: Engine,
+) -> BlockOutput {
     assert_eq!(block.len(), BLOCK_SIZE);
     assert_eq!(cands.len(), BLOCK_SIZE);
     let log2 = params.segment_log2;
@@ -584,6 +849,10 @@ pub fn dp_pass(block: &[u8], cands: &[CandWords], params: &MatchParams, prices: 
         stamp: vec![0; OPT_NUM + 3],
         #[cfg(debug_assertions)]
         series: 0,
+        ring: vec![Node::default(); (target_length as usize).min(OPT_NUM - 1) + 1],
+        trace: if engine == Engine::Ring { vec![[0; 3]; BLOCK_SIZE + 1] } else { Vec::new() },
+        #[cfg(debug_assertions)]
+        ring_pos: vec![usize::MAX; (target_length as usize).min(OPT_NUM - 1) + 1],
     };
     let mut raw: Vec<RawSeq> = Vec::new();
     let mut prev_end = 0usize;
@@ -591,7 +860,10 @@ pub fn dp_pass(block: &[u8], cands: &[CandWords], params: &MatchParams, prices: 
     for k in 0..BLOCK_SIZE >> log2 {
         let seg = Seg::new(k, log2);
         part.clear();
-        let end = dp.segment(&seg, &mut part);
+        let end = match engine {
+            Engine::Linear => dp.segment(&seg, &mut part),
+            Engine::Ring => dp.segment_ring(&seg, &mut part),
+        };
         if let Some(first) = part.first_mut() {
             first.0 += (seg.anchor0 - prev_end) as u32;
             prev_end = end;
@@ -628,13 +900,18 @@ pub fn passes(block: &[u8], cands: &[CandWords], params: &MatchParams) -> Vec<Pa
 
 /// The optimal parse of `block` from its `find_cands` words: the final pass of `passes`.
 pub fn parse(block: &[u8], cands: &[CandWords], params: &MatchParams) -> BlockOutput {
+    parse_with(block, cands, params, Engine::Linear)
+}
+
+/// `parse` with an explicit `Engine` (every pass runs on it).
+pub fn parse_with(block: &[u8], cands: &[CandWords], params: &MatchParams, engine: Engine) -> BlockOutput {
     let o: OptParams = params.opt.expect("opt::parse: params.opt is None");
     let mut prices = seed_prices(block, cands, o.seed);
     for _ in 0..o.passes {
-        let out = dp_pass(block, cands, params, &prices, 0, o.target_length);
+        let out = dp_pass_with(block, cands, params, &prices, 0, o.target_length, engine);
         prices = Prices::from_hist(&Hist::of_output(&out));
     }
-    dp_pass(block, cands, params, &prices, o.level, o.target_length)
+    dp_pass_with(block, cands, params, &prices, o.level, o.target_length, engine)
 }
 
 /// Hand-built blocks with scripted candidate words and the exact sequences the optimal parse
@@ -647,7 +924,7 @@ pub fn parse(block: &[u8], cands: &[CandWords], params: &MatchParams) -> BlockOu
 /// pass-0 prologue); with `prices: None`, the full `parse` of `params` (seed and passes).
 /// Every case fits the first four 4 KiB segments, so it runs at 16, 32 and 64 KiB blocks.
 pub mod cases {
-    use super::{dp_pass, parse, Prices, BITCOST_MULTIPLIER};
+    use super::{dp_pass_with, parse_with, Engine, Prices, BITCOST_MULTIPLIER};
     use crate::config::BLOCK_SIZE;
     use crate::params::{MatchParams, OptParams, OPT14, OPT16};
     use crate::reference::{match_len, pack_cands, Cand, CandWords};
@@ -662,14 +939,14 @@ pub mod cases {
         pub expect: Vec<(MatchParams, Option<Prices>, Vec<Sequence>)>,
     }
 
-    /// The output of one `expect` entry of a case (see the module doc).
-    pub fn run_case(block: &[u8], cands: &[CandWords], params: &MatchParams, prices: Option<&Prices>) -> BlockOutput {
+    /// The output of one `expect` entry of a case (see the module doc), on `engine`.
+    pub fn run_case(block: &[u8], cands: &[CandWords], params: &MatchParams, prices: Option<&Prices>, engine: Engine) -> BlockOutput {
         match prices {
             Some(p) => {
                 let o = params.opt.expect("opt case params");
-                dp_pass(block, cands, params, p, o.level, o.target_length)
+                dp_pass_with(block, cands, params, p, o.level, o.target_length, engine)
             }
-            None => parse(block, cands, params),
+            None => parse_with(block, cands, params, engine),
         }
     }
 
@@ -1060,6 +1337,66 @@ pub mod cases {
         vec![case("presets_commit_long_matches", block, cands, vec![(OPT14, None, want.clone()), (OPT16, None, want)])]
     }
 
+    /// After a series whose last stretch ends in literals, the next series starts *after* them
+    /// (`ip = anchor + litlen`, the documented deviation from zstd 1.5.7, whose `} {` typo
+    /// restarts at the anchor). Level 0, literals cost 100: the `+128` skip leaves `p + 5`
+    /// unsearched inside the series, and the literal extension at `p + 6` beats R0's 6th byte,
+    /// so the series ends as R0 (5 bytes) + 1 literal. The 20-byte match at `p + 5` is then
+    /// never seen (restarting at the anchor would take it).
+    pub fn tail_literals_are_not_reparsed() -> Vec<OptCase> {
+        let p = 10000;
+        let mut block = synth::random(116, BLOCK_SIZE);
+        plant(&mut block, p, 1000, 6);
+        plant(&mut block, p + 5, 400, 20);
+        real(&block, p, 1000, 6);
+        real(&block, p + 5, 400, 20);
+        let mut cands = empty();
+        cands[p] = one(1000, 6);
+        cands[p + 5] = one(400, 20);
+        let mut pr = flat();
+        pr.lit = [100; 256];
+        pr.of[oc(1000)] = 0;
+        pr.of[oc(400)] = 0;
+        pr.ml[3] = 110; // match length 6 costs 110 more than 5
+        let want = vec![seq(p as u32, 5, 1003)];
+        vec![case("tail_literals_are_not_reparsed", block, cands, vec![(pass(0), Some(pr), want)])]
+    }
+
+    /// A series that ends in a match commits it and the next series starts right there with
+    /// `ll0`: its rep candidates come from `opt[0].rep` (the committed reps) with zstd's `ll0`
+    /// numbering. After 300 then 900 (each its own series), the match at offset 300 (= rep[1])
+    /// and then at 299 (= rep[0] - 1) start series of their own, with no explicit candidate.
+    pub fn rep_candidates_at_series_start() -> Vec<OptCase> {
+        let p = 11000;
+        let mut block = synth::random(117, BLOCK_SIZE);
+        plant(&mut block, p, 300, 6);
+        plant(&mut block, p + 6, 900, 5);
+        plant(&mut block, p + 11, 300, 7);
+        plant(&mut block, p + 18, 299, 5);
+        real(&block, p, 300, 6);
+        real(&block, p + 6, 900, 5);
+        real(&block, p + 11, 300, 7);
+        real(&block, p + 18, 299, 5);
+        let mut cands = empty();
+        cands[p] = one(300, 6);
+        cands[p + 6] = one(900, 5);
+        let want = vec![seq(p as u32, 6, 303), seq(0, 5, 903), seq(0, 7, 1), seq(0, 5, 3)];
+        vec![case("rep_candidates_at_series_start", block, cands, vec![(pass(2), Some(flat()), want.clone()), (pass(0), Some(flat()), want)])]
+    }
+
+    /// The last segment ends at the block end (`ilimit = PARSE_END`): a 12-byte match starting
+    /// 12 bytes before it is priced through a DP series whose last node sits at `iend` itself.
+    pub fn last_segment_match_to_block_end() -> Vec<OptCase> {
+        let p = BLOCK_SIZE - 12;
+        let mut block = synth::random(118, BLOCK_SIZE);
+        plant(&mut block, p, 600, 12);
+        real(&block, p, 600, 12);
+        let mut cands = empty();
+        cands[p] = one(600, 12);
+        let want = vec![seq(p as u32, 12, 603)];
+        vec![case("last_segment_match_to_block_end", block, cands, vec![(pass(2), Some(flat()), want.clone()), (pass(0), Some(flat()), want)])]
+    }
+
     /// Every case above, in order.
     pub fn opt_test_cases() -> Vec<OptCase> {
         [
@@ -1078,6 +1415,9 @@ pub mod cases {
             seg_true_reps_across_segments,
             seg_capped_candidate_extended,
             presets_commit_long_matches,
+            tail_literals_are_not_reparsed,
+            rep_candidates_at_series_start,
+            last_segment_match_to_block_end,
         ]
         .into_iter()
         .flat_map(|f| f())
@@ -1128,6 +1468,22 @@ mod tests {
                     let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE)
                         .unwrap_or_else(|e| panic!("{params:?} {name}[{i}]: libzstd rejected frame: {e}"));
                     assert_eq!(dec, blk.data, "{params:?} {name}[{i}]: frame mismatch");
+                }
+            }
+        }
+    }
+
+    /// The ring engine (GPU spec) equals the zstd-layout engine on every synthetic block, for
+    /// every variant.
+    #[test]
+    fn ring_engine_matches_linear_synthetic() {
+        for params in variants() {
+            for (name, bytes) in synth::test_cases() {
+                for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                    let cands = find_cands(&blk.data, &chains(&blk.data, &params), &params);
+                    let a = parse_with(&blk.data, &cands, &params, Engine::Linear);
+                    let b = parse_with(&blk.data, &cands, &params, Engine::Ring);
+                    assert!(a == b, "{params:?} {name}[{i}]: ring engine differs");
                 }
             }
         }
@@ -1194,7 +1550,8 @@ mod tests {
 
     /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (every
     /// `total / 4000`-th .dds/.nif block in path order) round-trip through libzstd for every
-    /// variant.
+    /// variant, and every other one of them (2000, i.e. every ~50th block at 64 KiB) gives the
+    /// same output on the ring engine.
     /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
     #[test]
     #[ignore]
@@ -1232,7 +1589,11 @@ mod tests {
                     let Some(b) = sample.get(i) else { break };
                     let cands = find_cands(b, &chains(b, &OPT16), &OPT16);
                     for params in &vars {
-                        let frame = write_frame(b, &parse(b, &cands, params), FrameOptions::default());
+                        let out = parse(b, &cands, params);
+                        if i.is_multiple_of(2) {
+                            assert!(parse_with(b, &cands, params, Engine::Ring) == out, "block {i} {params:?}: ring engine differs");
+                        }
+                        let frame = write_frame(b, &out, FrameOptions::default());
                         let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE).expect("libzstd rejected an opt frame");
                         assert!(dec == *b, "block {i} {params:?}: round trip mismatch");
                     }
@@ -1247,7 +1608,9 @@ mod tests {
         let mut failed = Vec::new();
         for c in cases::opt_test_cases() {
             for (i, (params, prices, want)) in c.expect.iter().enumerate() {
-                let out = run_case(&c.block, &c.cands, params, prices.as_ref());
+                let out = run_case(&c.block, &c.cands, params, prices.as_ref(), Engine::Linear);
+                let ring = run_case(&c.block, &c.cands, params, prices.as_ref(), Engine::Ring);
+                assert_eq!(ring, out, "{} [{i}]: ring engine differs", c.name);
                 assert_eq!(reconstruct(&out).expect("reconstruct"), c.block, "{} [{i}]: output does not reconstruct", c.name);
                 if out.sequences != *want {
                     failed.push(format!("{} [{i}] level {}: got {:?}\n    want {:?}", c.name, params.opt.unwrap().level, out.sequences, want));

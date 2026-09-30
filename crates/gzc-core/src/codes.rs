@@ -46,8 +46,8 @@ pub const OF_DEFAULT_NORM: [i16; 29] = [
 pub const OF_DEFAULT_LOG: u32 = 5;
 
 /// Prior LL-code frequencies for the optimal parse's `Seed::Prior` (`opt::seed_prices`, preset
-/// `opt14`). Trained on blocks disjoint from the m5-opt-design evaluation sample (which is every
-/// 50th block, offset 0): the summed LL/ML/OF code histograms of `opt16`'s output over every 50th
+/// `opt14`). Trained on blocks block-disjoint from the m5-opt-design 1/50 evaluation sample
+/// (every 50th block, offset 0): the summed LL/ML/OF code histograms of `opt16`'s output over every 50th
 /// 64 KiB block at offset 25 of `data/corpus` (`--ext dds,nif` order, 2015 blocks), each table
 /// scaled to 65536 (round to nearest), produced by
 /// `cargo run --release -p gzc-core --example opt_sample -- train data/corpus 50 25`.

@@ -37,7 +37,7 @@ every factor both measured; where its numbers are used they are cited.
     3-byte hash 4 deep**, both with K2's 64-byte compare cap; the DP run **one lane per 4 KiB segment**
     exactly like `lvl9seg` (cost −0.06 % vs the whole block), rep history **exact per DP node**, zstd's series
     structure with `targetLength 32` (live price table = a **33-entry ring** per lane); **static prices per
-    block per pass**, iterated: pass 0 priced from zstd's block init, then 2 cheap (btopt-arithmetic) passes and
+    block per pass**, iterated: pass 0 priced from zstd's block init, then 2 cheap (optLevel-0 control flow, same fractional prices) passes and
     one btultra final pass, each priced from the previous pass's own histogram. Converged static prices beat
     zstd's sequential adaptive statistics (+0.17 %).
   - **`opt14`: 1.37127 = above L14 (+0.16 %), −0.03 % under L16, with two DP passes**: the same candidates,
@@ -212,6 +212,9 @@ sort. (An optional third `h8` chain buys +0.03 %.)
    nearer". Only two registers survive: `A` = the first record (nearest match of >= 3 bytes) and `B` = the
    last (longest, nearest on ties). The prototype merged the visited positions by offset; running the h3 walk
    first and the h4 walk after with `A`/`B` carried across is equivalent if the merge order is kept.
+   Fingerprint caveat: an `h4`-chain entry whose 4-byte fingerprint differs (a 16-bit hash collision) can still
+   share 3 bytes with `p` and is then a valid 3-byte record, so the fingerprint may skip the compare only once
+   `best >= 3` (or when the first 3 bytes differ as well).
 2. output two words per position: `word0 = offA:16 | lenA:8 | lenB:8`, `word1 = offB:16 | 0` (16 spare bits;
    `lenA = 0` = no candidate; lengths are capped values, the DP extends a length of 64 exactly as `search_max`
    does today). 8 B per position = 512 KiB per block.
@@ -326,9 +329,11 @@ previous pass's own output: literal byte histogram, LL/ML/OF code histograms wit
 reps. This is the fixed-point iteration btultra2 does once; it converges in three passes and lands **above**
 the sequential adaptive statistics, because for a single-block frame the final histogram *is* the cost.
 Seeding from the lazy parse converges slower (its histograms have no 3-byte matches and different LL codes),
-so the seed is zstd's own block init — or better, a prior (next paragraph). Intermediate passes can use the
-btopt arithmetic (whole-bit weights, early abort, the `+128` skip: 32 K relaxations instead of 52 K per block)
-at −0.01 %; an optLevel 0 *final* pass costs −0.05 %.
+so the seed is zstd's own block init — or better, a prior (next paragraph). Intermediate passes can use
+btopt's *control flow* (optLevel 0: early abort, the `+128` skip, no match + 1 literal check; 32 K relaxations
+instead of 52 K per block) at −0.01 %; an optLevel 0 *final* pass costs −0.05 %. **Every pass, cheap or final,
+prices with the same fractional `ZSTD_fracWeight` arithmetic; `ZSTD_bitWeight` (whole bits) is used nowhere**
+(the prototype, and every number in this document, priced this way; amended after T1).
 
 **Seeding with a prior** (recipe finder: h4 32 + h3 chain 4, K 2, seg4k, targetLength 32, cheap intermediate
 passes; the prior is the summed LL/ML/OF histogram of the recipe's own output over the sample — in-sample, but

@@ -52,6 +52,9 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
   merged by position. It uses the fingerprint filter and the 64-byte capped compare. It records a candidate
   whenever the capped length strictly beats the best so far, starting at length 3, and keeps
   `A` = the first record (the nearest ≥ 3) and `B` = the last record (the longest; ties go to the nearer).
+- **Fingerprint caveat.** Entries on the `h4` chain whose first 4 bytes differ (16-bit hash collisions) can
+  still share 3 bytes with `p`, and such an entry is a valid 3-byte record. A 4-byte fingerprint mismatch may
+  therefore skip the compare only once `best >= 3`, or when the first 3 bytes also differ.
 - Output is two u32 words per position (8 B): `offA:16|lenA:8|lenB:8`, `offB:16|0`.
 - The CPU oracle is `reference::find_cands`, with identical order and tie rules.
 - The sorted finder (speed2 E2) is optional follow-up work (S5). S1 uses the chain K1.
@@ -64,7 +67,9 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
 - Per segment: a port of `ZSTD_compressBlock_opt_generic`, integer-only, statement by statement. That covers
   series, `sufficient_len = target_length`, forward relaxation, the backward trace, and exact per-node rep
   history (3 × u16 per node, `ZSTD_newRep`).
-- It uses a ring of `target_length + 1 = 33` nodes per lane. The ring lives in workgroup memory (≈ 23 KiB per
+- It uses a ring of `target_length + 1 = 33` nodes per lane, following the oracle's `opt::Engine::Ring`
+  exactly: match-node reps are computed at relaxation, the `last_pos + 1` sentinel is virtual, and the backward
+  trace reads a per-position trace, never the ring. The ring lives in workgroup memory (≈ 23 KiB per
   32-lane workgroup), which needs the adapter limit (≥ 32 KiB; 48 KiB on NVIDIA and 64 KiB on AMD). The
   fallback is `var<private>` when the limit is below that. The trace is 8 B per position in the dead `pred`
   buffer.
@@ -77,10 +82,12 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
 - Prices are static per block per pass, in 1/256-bit units: `WEIGHT(sum) − WEIGHT(count)` from the previous
   pass's own literal histogram and LL/ML/OF histograms, with `off_base` taken under the decoder reps.
 - Pass 0 is seeded either from zstd's block initialisation (`BlockInit`) or from a prior (`Prior`): constant
-  LL/ML/OF tables in `codes.rs`, **trained on blocks disjoint from the evaluation sample**, plus a
+  LL/ML/OF tables in `codes.rs`, **trained on blocks disjoint from the 1/50 evaluation sample**, plus a
   "cover-literal" histogram of the bytes no candidate covers.
-- Intermediate passes use btopt arithmetic (optLevel 0). The final pass uses optLevel 2 (btultra's fractional
-  prices).
+- Every pass prices with the same fractional `ZSTD_fracWeight` arithmetic (`opt::frac_weight`); `ZSTD_bitWeight`
+  is used nowhere. Intermediate ("cheap") passes differ from the final pass only in their control flow,
+  optLevel 0: the relaxation's early abort, the `+128` skip, and no match + 1 literal check. The final pass
+  runs optLevel 2. (The measured recipe, 1.37211, was built this way.)
 - On the GPU, pass n histograms its own output in the workgroup epilogue (about 1.5 KiB per block), and pass
   n+1's prologue turns that into u16 price tables. This needs no extra dispatch.
 
