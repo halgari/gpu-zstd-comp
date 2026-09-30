@@ -13,7 +13,7 @@ pub struct GpuContext {
     pub timestamps: bool,
     /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
     /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
-    /// otherwise the workgroup-sort fallback. Lazy K3 runs its cooperative kernel
+    /// otherwise the workgroup-sort fallback. K3 runs its cooperative kernel
     /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
     pub subgroups: bool,
 }

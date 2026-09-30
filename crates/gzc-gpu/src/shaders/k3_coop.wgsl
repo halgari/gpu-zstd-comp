@@ -1,4 +1,4 @@
-// K3 lazy / lazy2 parse, subgroup-cooperative (speed phase S3, design .superpowers/speed/s3-design.md).
+// K3 greedy / lazy / lazy2 parse, subgroup-cooperative (speed phase S3, design .superpowers/speed/s3-design.md).
 // Appended by the host after k3_parse.wgsl and k3_lazy.wgsl (whose bindings, rep history, literal
 // accumulator, off_base_for / apply_off_base, highbit and sequential lazy_parse it reuses), and
 // compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
@@ -349,6 +349,62 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     return n_seq;
 }
 
+// == greedy_parse (k3_parse.wgsl) with the cooperative literal scan, match_len and literal copy.
+// The sequential loop skips p exactly when neither the rep test (p > anchor, p >= r0 and
+// match_len(p, p - r0) >= MIN_MATCH, i.e. its first MIN_MATCH bytes match: BLOCK_SIZE - p > 8)
+// nor best[p] (len >= MIN_MATCH) holds; the scan is the lazy one's with that predicate at p.
+// REP_HI_MASK (host-injected) masks the second word to its MIN_MATCH - 4 bytes.
+fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
+    var n_seq = 0u;
+    var p = 0u;
+    var anchor = 0u;
+    while (p < PARSE_END) {
+        let step = ((p - anchor) >> 8u) + 1u;
+        let cand = p + k * step;
+        let valid = (((cand - anchor) >> 8u) + 1u == step) && (cand < PARSE_END);
+        let c = select(p, cand, valid);
+        let bw = best[bbase + c];
+        let usable = c > anchor && c >= r0;
+        let src = select(c, c - r0, usable);
+        let x0 = load_u32_nb(base, c) ^ load_u32_nb(base, src);
+        let x1 = (load_u32_nb(base, c + 4u) ^ load_u32_nb(base, src + 4u)) & REP_HI_MASK;
+        let rep_ok = usable && x0 == 0u && x1 == 0u;
+        let hit = valid && (rep_ok || best_len_of(bw) >= MIN_MATCH);
+        let h = first_lane(subgroupBallot(hit));
+        if (h == W) {
+            p += first_lane(subgroupBallot(!valid)) * step;
+            continue;
+        }
+        p += h * step;
+        let p_bw = subgroupShuffle(bw, h);
+        let p_rep = subgroupShuffle(select(0u, 1u, rep_ok), h) != 0u;
+
+        var off = 0u;
+        var len = 0u;
+        if (p_rep) {
+            off = r0;
+            len = coop_match_len(base, p, p - r0, 0xFFFFFFFFu, k, MATCH_FIRST_EQ);
+        } else {
+            off = best_off_of(p_bw);
+            len = best_len_of(p_bw);
+            if (len == SEARCH_CAP) {
+                // K2 stopped comparing at the cap: extend to the full length.
+                len = coop_match_len(base, p, p - off, 0xFFFFFFFFu, k, MATCH_WIDE);
+            }
+        }
+        if (len == 0u) {
+            // Only when a capped best[p] extends to nothing (a scripted best[] in a test).
+            p += step;
+            continue;
+        }
+        n_seq = coop_store_seq(base, sbase, n_seq, anchor, p - anchor, off, len, k);
+        p += len;
+        anchor = p;
+    }
+    coop_push_lits(base, anchor, BLOCK_SIZE, k);
+    return n_seq;
+}
+
 @compute @workgroup_size(W * BPW)
 fn main_coop(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -379,11 +435,19 @@ fn main_coop(
     let lanes_ok = sg_size >= W && sid == li && m.x == W_MASK_X && m.y == W_MASK_Y;
     var n_seq = 0u;
     if (subgroupAll(lanes_ok)) {
-        n_seq = coop_lazy_parse(base, sbase, bbase, k);
+        if (LAZY == 0u) {
+            n_seq = coop_greedy_parse(base, sbase, bbase, k);
+        } else {
+            n_seq = coop_lazy_parse(base, sbase, bbase, k);
+        }
     } else {
         // Unexpected lane layout: the exact sequential parse on one lane.
         if (li != 0u) { return; }
-        n_seq = lazy_parse(base, sbase, bbase);
+        if (LAZY == 0u) {
+            n_seq = greedy_parse(base, sbase, bbase);
+        } else {
+            n_seq = lazy_parse(base, sbase, bbase);
+        }
     }
     if (li == 0u) {
         if (acc_n > 0u) {

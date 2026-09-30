@@ -258,7 +258,7 @@ pub struct Kernels {
     best_layout: wgpu::BindGroupLayout,
     parse: wgpu::ComputePipeline,
     parse_layout: wgpu::BindGroupLayout,
-    /// The subgroup-cooperative lazy K3 (`K3Mode::Coop`), used instead of `parse` when present.
+    /// The subgroup-cooperative K3 (`K3Mode::Coop`), used instead of `parse` when present.
     parse_coop: Option<wgpu::ComputePipeline>,
     k3_mode: K3Mode,
     entropy: Option<EntropyKernel>,
@@ -362,7 +362,7 @@ fn pipeline_from_module(
 /// How K3 runs the lazy / lazy2 parse (speed phase S3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum K3Mode {
-    /// `k3_parse.wgsl` + `k3_lazy.wgsl`: one lane per block. Always used for the greedy parse.
+    /// `k3_parse.wgsl` + `k3_lazy.wgsl`: one lane per block.
     Seq,
     /// `k3_coop.wgsl`: one subgroup of `w` lanes per block (needs `Features::SUBGROUP`), `bpw`
     /// blocks per workgroup.
@@ -378,21 +378,21 @@ fn lane_mask(w: u32) -> (u32, u32) {
     }
 }
 
-/// The K3 mode for `m` on `ctx`. Greedy presets and devices without subgroups use `Seq`.
+/// The K3 mode on `ctx`. Devices without subgroups use `Seq`.
 /// Otherwise `Coop` with W = the adapter's minimum subgroup size (clamped to 8..=64, a power of
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
 /// ids 0..W-1 (else `Seq`; `GZC_NO_SUBGROUPS` makes the context subgroup-less, see
 /// `GpuContext::new`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
 /// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size) and `GZC_K3_BPW=1|2` (blocks per
 /// workgroup; 2 needs minimum == maximum subgroup size == W). The output never depends on them.
-pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
+pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
     let forced = std::env::var("GZC_K3_MODE").ok();
     match forced.as_deref() {
         None | Some("") | Some("coop") | Some("seq") => {}
         Some(v) => anyhow::bail!("GZC_K3_MODE={v}: expected seq or coop"),
     }
     let force_coop = forced.as_deref() == Some("coop");
-    if m.lazy == 0 || forced.as_deref() == Some("seq") {
+    if forced.as_deref() == Some("seq") {
         return Ok(K3Mode::Seq);
     }
     let min = ctx.adapter_info.subgroup_min_size;
@@ -497,13 +497,16 @@ impl Kernels {
         // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090.
         let parse =
             pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main");
-        let k3_mode = k3_mode(ctx, &m)?;
+        let k3_mode = k3_mode(ctx)?;
         let parse_coop = match k3_mode {
             K3Mode::Seq => None,
             K3Mode::Coop { w, bpw } => {
                 let (mx, my) = lane_mask(w);
+                // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
+                let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
                 let body = format!(
-                    "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n{k3_body}\n{K3_COOP_WGSL}"
+                    "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
+                     const REP_HI_MASK: u32 = {rep_hi}u;\n{k3_body}\n{K3_COOP_WGSL}"
                 );
                 // Subgroup built-ins need Features::SUBGROUP on the device (naga 30 rejects
                 // `enable subgroups;`).

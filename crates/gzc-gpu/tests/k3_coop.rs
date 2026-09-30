@@ -6,8 +6,8 @@
 //! for W = 8, 16 and 32 are always all included).
 use gzc_core::config::{BLOCK_SIZE, PARSE_END};
 use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL9, MatchParams, RUNG2};
-use gzc_core::reference::{Match, compress_block};
+use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
+use gzc_core::reference::{Match, compress_block, greedy_parse};
 use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{GpuParams, K3Mode, Kernels, compress_batch, parses_from_best, probe_lanes};
 use gzc_gpu::context::GpuContext;
@@ -96,7 +96,8 @@ fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
     format!("literals: first diff {i:?}, lengths gpu {} cpu {}", got.literals.len(), want.literals.len())
 }
 
-/// K3 on the scripted tables (in batches) must equal lazy_parse for every case.
+/// K3 on the scripted tables (in batches) must equal lazy_parse (greedy_parse for lazy 0) for
+/// every case.
 fn check(m: MatchParams, cases: &[Case]) {
     let (ctx, kernels) = setup(m);
     for chunk in cases.chunks(128) {
@@ -104,8 +105,8 @@ fn check(m: MatchParams, cases: &[Case]) {
         let bests: Vec<Vec<Match>> = chunk.iter().map(|c| c.best.clone()).collect();
         let got = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("parses_from_best");
         for (c, got) in chunk.iter().zip(&got) {
-            let want = lazy_parse(&c.block, &c.best, &m);
-            assert!(*got == want, "{}: K3 != lazy_parse; {}", c.name, first_diff(got, &want));
+            let want = if m.lazy == 0 { greedy_parse(&c.block, &c.best, &m) } else { lazy_parse(&c.block, &c.best, &m) };
+            assert!(*got == want, "{} (lazy {}): K3 != CPU parse; {}", c.name, m.lazy, first_diff(got, &want));
         }
     }
     eprintln!("{} cases equal", cases.len());
@@ -144,6 +145,8 @@ fn scan_finds_exactly_the_skip_sequence() {
     }
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// A hit found by a scan with step 2 or 3 (the scan lanes are not consecutive positions and must
@@ -160,19 +163,41 @@ fn deferral_after_a_wide_step_scan() {
     }
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
+}
+
+/// best[] entries shorter than their real repeat: the repeat goes on at the new anchor, where the
+/// greedy parse must not test the rep offset (it only does for p > anchor).
+#[test]
+fn match_shorter_than_its_repeat() {
+    let mut cases = Vec::new();
+    for blen in [4u32, 5, 6, 8, 12] {
+        for real in [blen as usize + 4, blen as usize + 5, 40] {
+            let mut c = Case::random(format!("best len {blen}, repeat {real}"), (blen as u64) * 100 + real as u64);
+            c.repeat(500, 37, real);
+            c.best[500] = Match { offset: 37, len: blen };
+            cases.push(c.done());
+        }
+    }
+    check(LVL9, &cases);
+    check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// T1, MIN_MATCH 6: planted best lengths 4 and 5 are no match, 6 is.
 #[test]
 fn scan_respects_min_match() {
-    let m = MatchParams { min_match: 6, ..RUNG2 };
     let mut cases = Vec::new();
     for p in scan_positions(0).into_iter().step_by(3) {
         for len in [4u32, 5, 6] {
             cases.push(Case::random(format!("len{len}@{p}"), p as u64 * 7 + len as u64).explicit(p, 9.min(p), len as usize, len).done());
         }
     }
-    check(m, &cases);
+    check(MatchParams { min_match: 6, ..RUNG2 }, &cases);
+    check(MatchParams { min_match: 6, ..RUNG1 }, &cases);
+    check(MatchParams { min_match: 8, ..RUNG1 }, &cases);
 }
 
 /// T2: scans and matches at PARSE_END, with poisoned best[] entries at and past it.
@@ -215,6 +240,8 @@ fn scan_and_matches_at_parse_end() {
     cases.push(c.done());
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// T3: capped best[] entries extended to their true length, for every (p & 3, q & 3), lengths
@@ -247,6 +274,7 @@ fn capped_extension_geometry() {
         }
     }
     check(LVL9, &cases);
+    check(RUNG1, &cases);
 }
 
 /// T4: rep1 repeats at ip + 1 of lengths around the lane windows; immediate offset_2 chains.
@@ -279,6 +307,8 @@ fn rep_lengths_and_immediate_chains() {
     }
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// T5: catch-up runs across the lane windows, bounded by the anchor, by position 0 of the
@@ -323,6 +353,8 @@ fn catch_up_bounds() {
     cases.push(c.done());
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// T6: literal runs of every length class at every accumulator phase.
@@ -358,6 +390,8 @@ fn literal_packing() {
     }
     check(LVL9, &cases);
     check(RUNG2, &cases);
+    check(RUNG1, &cases);
+    check(LVL3, &cases);
 }
 
 /// T8: flat and periodic blocks through K1/K2/K3 (long extensions to the block end, every lane
@@ -381,7 +415,7 @@ fn flat_and_periodic_blocks() {
         b[BLOCK_SIZE - d] = 1;
         blocks.push((format!("zeros, byte at end-{d}"), b));
     }
-    for m in [LVL9, RUNG2] {
+    for m in [LVL9, RUNG2, RUNG1, LVL3] {
         let (ctx, kernels) = setup(m);
         let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
         let got = compress_batch(&ctx, &kernels, &refs).expect("compress_batch");
@@ -393,7 +427,7 @@ fn flat_and_periodic_blocks() {
 }
 
 /// T9: the lane probe accepts every W up to the minimum subgroup size and rejects a workgroup
-/// of two subgroups; lazy presets use the cooperative K3 by default when subgroups exist.
+/// of two subgroups; every preset uses the cooperative K3 by default when subgroups exist.
 #[test]
 fn probe_and_mode_selection() {
     let ctx = GpuContext::new().expect("GPU required");
@@ -414,6 +448,6 @@ fn probe_and_mode_selection() {
         Ok("seq") => assert_eq!(kernels.k3_mode(), K3Mode::Seq),
         _ => assert!(matches!(kernels.k3_mode(), K3Mode::Coop { .. }), "{:?}", kernels.k3_mode()),
     }
-    let greedy = Kernels::new(&ctx, GpuParams { matching: gzc_core::params::LVL3, emit_frames: false, huffman: false }).unwrap();
-    assert_eq!(greedy.k3_mode(), K3Mode::Seq);
+    let greedy = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: false, huffman: false }).unwrap();
+    assert_eq!(greedy.k3_mode(), kernels.k3_mode());
 }
