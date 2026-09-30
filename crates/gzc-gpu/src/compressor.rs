@@ -1,10 +1,11 @@
-//! Host side of the K2 (best match), K3 (parse) and K4 (entropy + frame assembly) kernels;
-//! compress_batch / compress_frames entry points.
+//! Host side of the K2 (best match), K3 (parse), K5 (Huffman literals) and K4 (entropy + frame
+//! assembly) kernels; compress_batch / compress_frames entry points.
 //!
 //! K1 (hash chains) → K2 (`find_best`) → K3 (`greedy_parse`) reproduce
-//! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K4 turns
-//! each parse into its complete zstd frame, byte-identical to `gzc_core::frame::write_frame`
-//! with `FrameOptions { checksum: false, huffman: false }`.
+//! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K5 writes each
+//! block's literals section into its frame and K4 completes the frame, byte-identical to
+//! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
+//! (`FrameOptions::default()`) with `huffman`, raw literals (K4 alone) without.
 use crate::chains::{self, ChainsKernel, head_bytes, pred_bytes};
 use crate::context::{GpuContext, pack_blocks};
 use anyhow::{Context as _, anyhow};
@@ -19,9 +20,7 @@ use gzc_core::seq::{BlockOutput, Sequence};
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
-
-/// The frame options K4 reproduces.
-pub const K4_FRAME_OPTIONS: FrameOptions = FrameOptions { checksum: false, huffman: false };
+const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
 /// Bytes reserved per block in the `frames` buffer: a Raw frame (header + 3 + BLOCK_SIZE) is the
 /// largest K4 emits.
@@ -34,9 +33,10 @@ pub const MAX_SEQS: u32 = (BLOCK_SIZE / MIN_MATCH) as u32 + 1;
 /// the device limits would allow more.
 const COMPRESS_BATCH_CAP: u32 = 256;
 
-/// Kernel names, in dispatch order, as reported in timing breakdowns (`k4_entropy` only runs
-/// with `GpuParams::emit_frames`; see `Kernels::names`).
-pub const KERNEL_NAMES: [&str; 4] = ["k1_chains", "k2_best", "k3_parse", "k4_entropy"];
+/// Kernel names, in timestamp-query order, as reported in timing breakdowns (`k4_entropy` only
+/// runs with `GpuParams::emit_frames`; `k5_huffman` also needs `huffman` and is dispatched before
+/// K4; see `Kernels::names`).
+pub const KERNEL_NAMES: [&str; 5] = ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"];
 
 /// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
 pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
@@ -45,8 +45,18 @@ pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
 #[derive(Clone, Copy, Debug)]
 pub struct GpuParams {
     pub depth: u32,
-    /// Also run K4, which turns each block's parse into its complete zstd frame (raw literals).
+    /// Also run K4, which turns each block's parse into its complete zstd frame.
     pub emit_frames: bool,
+    /// With `emit_frames`: also run K5, which Huffman-codes the literals (`FrameOptions::default()`);
+    /// without it the frames keep raw literals (`huffman: false`).
+    pub huffman: bool,
+}
+
+impl GpuParams {
+    /// The `write_frame` options the frames equal (checksums stay CPU-only).
+    pub fn frame_options(&self) -> FrameOptions {
+        FrameOptions { checksum: false, huffman: self.huffman }
+    }
 }
 
 /// Bytes of the packed `data` buffer for `n_blocks` (blocks plus one trailing zero word).
@@ -190,7 +200,13 @@ struct EntropyKernel {
     tables: wgpu::Buffer,
 }
 
-/// The K1, K2 and K3 pipelines (plus K4 with `emit_frames`), built once.
+/// K5 pipeline (no tables of its own).
+struct HuffmanKernel {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// The K1, K2 and K3 pipelines (plus K4 with `emit_frames`, and K5 with `huffman` too), built once.
 pub struct Kernels {
     chains: ChainsKernel,
     best: wgpu::ComputePipeline,
@@ -198,6 +214,8 @@ pub struct Kernels {
     parse: wgpu::ComputePipeline,
     parse_layout: wgpu::BindGroupLayout,
     entropy: Option<EntropyKernel>,
+    huffman: Option<HuffmanKernel>,
+    params: GpuParams,
 }
 
 /// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
@@ -206,6 +224,9 @@ pub struct Kernels {
 pub fn k4_tables_bytes() -> u64 {
     k4_tables().0.len() as u64 * 4
 }
+
+/// Frame-header options: the header does not depend on `huffman`.
+const HEADER_OPTIONS: FrameOptions = FrameOptions { checksum: false, huffman: true };
 
 fn k4_tables() -> (Vec<u32>, String) {
     let mut tab: Vec<u32> = Vec::new();
@@ -226,7 +247,7 @@ fn k4_tables() -> (Vec<u32>, String) {
     add("OF_NORM", norm(&OF_DEFAULT_NORM));
     add("ML_NORM", norm(&ML_DEFAULT_NORM));
 
-    let hdr = frame_header(K4_FRAME_OPTIONS);
+    let hdr = frame_header(HEADER_OPTIONS);
     // K4 writes frame words [0, 4) byte by byte: header + block header + a literals header of up
     // to 3 bytes must fit in 16 bytes.
     assert!(hdr.len() <= 10, "frame header longer than K4 expects");
@@ -241,6 +262,8 @@ fn k4_tables() -> (Vec<u32>, String) {
         w(2)
     );
     consts += &format!("const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst FRAME_WORDS: u32 = {}u;\n", FRAME_STRIDE / 4);
+    // K5 -> K4: frame_len[b] marker for "the literals section is Raw; K4 copies it".
+    consts += "const RAW_SECTION: u32 = 0xFFFFFFFFu;\n";
     (tab, consts)
 }
 
@@ -291,15 +314,27 @@ impl Kernels {
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
         let parse =
             compute_pipeline(ctx, "k3_parse", &parse_layout, &format!("const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}"));
+        let (tab, consts) = k4_tables();
+        let huffman = params.emit_frames && params.huffman;
         let entropy = params.emit_frames.then(|| {
             let layout = storage_layout(ctx, "k4", &[true, true, true, true, true, false, false]);
-            let (tab, consts) = k4_tables();
-            let pipeline = compute_pipeline(ctx, "k4_entropy", &layout, &format!("{consts}{K4_WGSL}"));
+            let pipeline = compute_pipeline(
+                ctx,
+                "k4_entropy",
+                &layout,
+                &format!("{consts}const HUFFMAN: bool = {huffman};\n{K4_WGSL}"),
+            );
             let tables = ctx.storage_buffer("k4.tables", (tab.len() * 4) as u64, false);
             ctx.queue.write_buffer(&tables, 0, bytemuck::cast_slice(&tab));
             EntropyKernel { pipeline, layout, tables }
         });
-        Self { chains: ChainsKernel::new(ctx), best, best_layout, parse, parse_layout, entropy }
+        let huffman = huffman.then(|| {
+            let layout = storage_layout(ctx, "k5", &[true, true, true, false, false]);
+            let pipeline = compute_pipeline(ctx, "k5_huffman", &layout, &format!("{consts}{K5_WGSL}"));
+            HuffmanKernel { pipeline, layout }
+        });
+        let params = GpuParams { huffman: huffman.is_some(), ..params };
+        Self { chains: ChainsKernel::new(ctx), best, best_layout, parse, parse_layout, entropy, huffman, params }
     }
 
     /// True when K4 runs (built with `GpuParams::emit_frames`).
@@ -307,13 +342,25 @@ impl Kernels {
         self.entropy.is_some()
     }
 
+    /// The `write_frame` options the emitted frames equal (Huffman literals iff K5 runs).
+    pub fn frame_options(&self) -> FrameOptions {
+        self.params.frame_options()
+    }
+
     /// Names of the kernels `record_timed` runs, in timestamp order.
     pub fn names(&self) -> &'static [&'static str] {
-        &KERNEL_NAMES[..if self.emits_frames() { 4 } else { 3 }]
+        let n = if self.huffman.is_some() {
+            5
+        } else if self.emits_frames() {
+            4
+        } else {
+            3
+        };
+        &KERNEL_NAMES[..n]
     }
 
     /// Upload is done by the caller (queue.write_buffer into bufs.data). Records K1→K2→K3, and
-    /// K4 when emitting frames (then `bufs` must have been allocated with frames).
+    /// (K5→) K4 when emitting frames (then `bufs` must have been allocated with frames).
     ///
     /// Precondition: `n_blocks <= bufs.capacity` (asserted); `BatchBuffers::new` guarantees
     /// `capacity <= max_batch_blocks`, which keeps every dispatch and u32 index in range.
@@ -322,7 +369,8 @@ impl Kernels {
     }
 
     /// `record`, with each kernel in its own compute pass writing begin/end timestamps into
-    /// `queries` (at least `KERNEL_QUERIES` entries): K1 at 0/1, K2 at 2/3, K3 at 4/5, K4 at 6/7.
+    /// `queries` (at least `KERNEL_QUERIES` entries): K1 at 0/1, K2 at 2/3, K3 at 4/5, K4 at 6/7,
+    /// K5 at 8/9.
     pub fn record_timed(
         &self,
         ctx: &GpuContext,
@@ -380,21 +428,29 @@ impl Kernels {
         drop(pass);
 
         if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, ts(3));
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
         }
     }
 
-    /// Records K4 alone, on whatever parse (`seqs`, `lits`, `counts`) and blocks (`data`) `bufs`
-    /// holds for its first `n_blocks` blocks. Panics unless built with `emit_frames` and `bufs`
-    /// has frames and `n_blocks <= bufs.capacity`.
+    /// Records K5 (with `huffman`) then K4, on whatever parse (`seqs`, `lits`, `counts`) and
+    /// blocks (`data`) `bufs` holds for its first `n_blocks` blocks; timestamps as in
+    /// `record_timed`. Panics unless built with `emit_frames` and `bufs` has frames and
+    /// `n_blocks <= bufs.capacity`.
     pub fn record_entropy(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
         bufs: &BatchBuffers,
         n_blocks: u32,
-        timestamp_writes: Option<wgpu::ComputePassTimestampWrites>,
+        queries: Option<&wgpu::QuerySet>,
     ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
         assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
         if n_blocks == 0 {
             return;
@@ -403,9 +459,27 @@ impl Kernels {
         let (Some(frames), Some(frame_len)) = (&bufs.frames, &bufs.frame_len) else {
             panic!("K4 needs BatchBuffers allocated with frames");
         };
-        // K4 derives the batch size from the bound length of `frame_len`.
+        // K5 and K4 derive the batch size from the bound length of `frame_len`.
         let frame_len =
             wgpu::BufferBinding { buffer: frame_len, offset: 0, size: wgpu::BufferSize::new(frame_len_bytes(n_blocks)) };
+        if let Some(k5) = &self.huffman {
+            let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("k5"),
+                layout: &k5.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bufs.lits.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bufs.counts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: frames.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Buffer(frame_len.clone()) },
+                ],
+            });
+            let mut pass =
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k5"), timestamp_writes: ts(4) });
+            pass.set_pipeline(&k5.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_blocks, 1, 1);
+        }
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k4"),
             layout: &k4.layout,
@@ -419,7 +493,7 @@ impl Kernels {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Buffer(frame_len) },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k4"), timestamp_writes });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k4"), timestamp_writes: ts(3) });
         pass.set_pipeline(&k4.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);

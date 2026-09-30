@@ -71,10 +71,10 @@ impl FrameSink for Discard {
 }
 
 /// Compresses every block of `corpus` with the streaming GPU pipeline on the frame path: the GPU
-/// emits each block's complete zstd frame (raw literals; no Huffman on the GPU yet) and the host
-/// only copies the bytes out of the staging buffer. With `writer_threads == 0` the pipeline thread
-/// records each frame itself; with N > 0 it hands copies to N writer threads over a bounded channel
-/// (capacity `batch * inflight`). One untimed warmup batch runs first on the same pipeline; the
+/// emits each block's complete zstd frame (Huffman literals with `cfg.params.huffman`, else raw)
+/// and the host only copies the bytes out of the staging buffer. With `writer_threads == 0` the
+/// pipeline thread records each frame itself; with N > 0 it hands copies to N writer threads over
+/// a bounded channel (capacity `batch * inflight`). One untimed warmup batch runs first on the same pipeline; the
 /// timed region spans from the first upload to the last frame recorded. With `verify`, every frame
 /// is then decompressed with libzstd and compared with its padded block. `kernel_ms` holds the
 /// timed run's summed per-kernel GPU time (when the device supports timestamps); a per-batch
@@ -149,7 +149,12 @@ pub fn run_gpu(corpus: &Corpus, cfg: &PipelineConfig, writer_threads: usize, ver
 
     Ok(RunResult {
         engine: "gpu".to_string(),
-        config: format!("lvl3-greedy rawlit b{} i{}", cfg.batch, cfg.inflight),
+        config: format!(
+            "lvl3-greedy {}b{} i{}",
+            if cfg.params.huffman { "" } else { "rawlit " },
+            cfg.batch,
+            cfg.inflight
+        ),
         threads: Some(writer_threads),
         real_bytes,
         compressed_bytes: sizes.iter().sum(),
@@ -168,21 +173,24 @@ mod tests {
     #[test]
     fn gpu_run_synthetic_verifies() {
         let corpus = Corpus::synthetic();
-        // Same parse and frame writer as the CPU reference with raw literals: identical sizes.
-        let opts = FrameOptions { checksum: false, huffman: false };
-        let cpu_bytes: u64 =
-            corpus.blocks.iter().map(|b| write_frame(&b.data, &compress_block(&b.data, LVL3), opts).len() as u64).sum();
-        for writers in [0, 2] {
-            let cfg = PipelineConfig { batch: 4, inflight: 2, params: GpuParams { depth: 1, emit_frames: false } };
+        // Same parse and frame writer as the CPU reference: identical sizes, with Huffman
+        // literals and with raw ones.
+        let cpu_bytes = |huffman| -> u64 {
+            let opts = FrameOptions { checksum: false, huffman };
+            corpus.blocks.iter().map(|b| write_frame(&b.data, &compress_block(&b.data, LVL3), opts).len() as u64).sum()
+        };
+        for (writers, huffman) in [(0, true), (2, true), (0, false)] {
+            let params = GpuParams { depth: 1, emit_frames: false, huffman };
+            let cfg = PipelineConfig { batch: 4, inflight: 2, params };
             let r = run_gpu(&corpus, &cfg, writers, true).unwrap();
             assert_eq!(r.engine, "gpu");
-            assert_eq!(r.config, "lvl3-greedy rawlit b4 i2");
+            assert_eq!(r.config, if huffman { "lvl3-greedy b4 i2" } else { "lvl3-greedy rawlit b4 i2" });
             assert_eq!(r.threads, Some(writers));
             assert_eq!(r.real_bytes, corpus.real_bytes());
             assert!(r.ratio() > 1.0, "ratio was {}", r.ratio());
             let kind_sum: u64 = r.per_kind.iter().map(|k| k.compressed_bytes).sum();
             assert_eq!(kind_sum, r.compressed_bytes);
-            assert_eq!(r.compressed_bytes, cpu_bytes);
+            assert_eq!(r.compressed_bytes, cpu_bytes(huffman));
         }
     }
 }
