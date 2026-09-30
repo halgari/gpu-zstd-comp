@@ -595,8 +595,8 @@ mod tests {
     /// `--batch max` for the optimal parse under the 6 GiB budget at `--inflight 3`: its larger
     /// per-block footprint (8 B of candidates and of trace per position, `MAX_SEQS_OPT` seqs,
     /// K3opt's prices and scratch, all in `vram_bytes`) resolves to a smaller batch than
-    /// lvl9s12seg: 1.82 MiB per block at 64 KiB with three slots' upload and staging buffers
-    /// (spec §3.5 estimated ≈ 1.35 MiB / ≈ 2900 blocks), so 3458 blocks (copy upload).
+    /// lvl9s12seg: about 1.78 MiB per block at 64 KiB at b3458 with three slots' upload and staging
+    /// buffers (≈ 1.82 at b1000, where the `head` tables weigh more), so 3458 blocks (copy upload).
     #[test]
     fn resolve_max_batch_shrinks_for_opt() {
         use gzc_core::params::{LVL9S12SEG, OPT14, OPT16};
