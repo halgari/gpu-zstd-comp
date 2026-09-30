@@ -148,3 +148,5 @@ Option B (a byte-identical 16-bit radix sort) was not needed.
 
 **Kept:** `lvl9s12seg` (+17 %) and `lvl9s12d16seg` (+22 %). `lvl9s13`, `lvl9s12`, `lvl9d16`, `lvl9s13seg` and
 `lvl9d16seg` are kept as measured variants, for the controller to prune.
+
+**E2 fix round 1:** the presets were pruned to `lvl9s12`, `lvl9s12seg` and `lvl9s12d16seg`. The rows for lvl9s13, lvl9s13seg, lvl9d16 and lvl9d16seg above record measured variants only. The no-subgroup K1 now fits its workgroup memory exactly: 12-bit keys fit at every block size, and at 128K only the subgroup version runs. At 128K, `lvl9s12d16seg` is 1.35159 on the full corpus, below the L9 floor of 1.3532, so only `lvl9s12seg` (1.35456) qualifies at 128K.
