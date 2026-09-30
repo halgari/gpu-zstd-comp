@@ -202,6 +202,11 @@ pub struct Kernels {
 
 /// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
 /// comes from gzc_core, so the GPU mirrors the CPU tables exactly.
+/// Bytes of K4's constant table buffer.
+pub fn k4_tables_bytes() -> u64 {
+    k4_tables().0.len() as u64 * 4
+}
+
 fn k4_tables() -> (Vec<u32>, String) {
     let mut tab: Vec<u32> = Vec::new();
     let mut consts = String::new();
@@ -222,7 +227,9 @@ fn k4_tables() -> (Vec<u32>, String) {
     add("ML_NORM", norm(&ML_DEFAULT_NORM));
 
     let hdr = frame_header(K4_FRAME_OPTIONS);
-    assert!(hdr.len() <= 12, "frame header longer than K4 expects");
+    // K4 writes frame words [0, 4) byte by byte: header + block header + a literals header of up
+    // to 3 bytes must fit in 16 bytes.
+    assert!(hdr.len() <= 10, "frame header longer than K4 expects");
     let mut hw = [0u8; 12];
     hw[..hdr.len()].copy_from_slice(&hdr);
     let w = |i: usize| u32::from_le_bytes(hw[4 * i..4 * i + 4].try_into().unwrap());
