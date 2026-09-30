@@ -6,7 +6,7 @@
 use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash_long, hash_short, hash_width, key};
-use crate::lazy::lazy_parse;
+use crate::lazy::{lazy_parse, lazy_parse_segmented};
 use crate::params::{cpu_supports, Hashes, MatchParams};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
@@ -140,10 +140,13 @@ pub fn find_best(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec
 }
 
 /// Parse a block from its best matches: the greedy parse for `lazy == 0`, otherwise the
-/// libzstd lazy/lazy2 port (`lazy::lazy_parse`).
+/// libzstd lazy/lazy2 port (`lazy::lazy_parse`, or `lazy::lazy_parse_segmented` with
+/// `segment_log2 > 0`).
 pub fn parse(block: &[u8], best: &[Match], p: &MatchParams) -> BlockOutput {
     if p.lazy == 0 {
         greedy_parse(block, best, p)
+    } else if p.segment_log2 > 0 {
+        lazy_parse_segmented(block, best, p)
     } else {
         lazy_parse(block, best, p)
     }

@@ -1,5 +1,5 @@
 //! Runtime match-finder / parse parameters and the named presets shared by CPU, GPU and CLI.
-use crate::config::{HASH_BITS, MATCH_SEARCH_CAP};
+use crate::config::{HASH_BITS, LOG2_BLOCK, MATCH_SEARCH_CAP};
 
 /// Which hash chains the match finder walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,13 +27,18 @@ pub struct MatchParams {
     /// the key in workgroup memory (2^13 counters). Candidates, and so `find_best`, are the same
     /// hash chains either way, over this key.
     pub hash_bits: u32,
+    /// 0: the lazy parse runs over the whole block. Otherwise log2 of the parse segment
+    /// (`lazy::lazy_parse_segmented`): segments of `1 << segment_log2` bytes are parsed
+    /// independently (empty rep state, matches clamped to the segment, no skip acceleration),
+    /// then the offsets are re-encoded with the block's true rep history. Needs `lazy > 0`.
+    pub segment_log2: u32,
 }
 
 impl MatchParams {
     /// Ok when every field is in its supported range: min_match 4..=8, depth 1..=64,
     /// lazy 0..=2, search_cap 8..=256, hash_bits 11..=16, and Dfast only with min_match 5.
     pub fn validate(&self) -> Result<(), String> {
-        let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits } = *self;
+        let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits, segment_log2 } = *self;
         if !(4..=8).contains(&min_match) {
             return Err(format!("min_match {min_match} not in 4..=8"));
         }
@@ -51,6 +56,9 @@ impl MatchParams {
         }
         if hashes == Hashes::Dfast && min_match != 5 {
             return Err(format!("Dfast hashes need min_match 5, got {min_match}"));
+        }
+        if segment_log2 != 0 && !(lazy > 0 && (10..=LOG2_BLOCK).contains(&segment_log2)) {
+            return Err(format!("segment_log2 {segment_log2} needs lazy > 0 and 10..={LOG2_BLOCK}"));
         }
         Ok(())
     }
@@ -73,16 +81,21 @@ impl MatchParams {
 
 /// Level-3 calibration (the M3 output, byte for byte): dfast chains, depth 1, greedy.
 pub const LVL3: MatchParams =
-    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
+    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
 /// Single 4-byte hash, depth 8, greedy (compare against libzstd L5).
 pub const RUNG1: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
 /// Rung 1 with a lazy parse (compare against libzstd L6).
 pub const RUNG2: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
 /// Single 4-byte hash, depth 32, lazy2 (compare against libzstd L9).
 pub const LVL9: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
+
+/// lvl9 with the parse split into independent 4 KiB segments (speed-2 E1): same match finder,
+/// a parse that runs one GPU lane per segment. Ratio ~0.01 % below lvl9, above libzstd L9.
+pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
+
 
 /// `lvl9` with a 13-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^13 keys in workgroup memory) instead of 16-bit hash
@@ -93,9 +106,12 @@ pub const LVL9S13: MatchParams = MatchParams { hash_bits: 13, ..LVL9 };
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
 /// `lvl9` walking 16 candidates instead of 32 (speed2 E4): K2 -25 %, ratio -0.026 % (R5 sample).
 pub const LVL9D16: MatchParams = MatchParams { depth: 16, ..LVL9 };
+/// The bucket-sorted finders with the segmented parse (E1 + E2).
+pub const LVL9S13SEG: MatchParams = MatchParams { hash_bits: 13, ..LVL9SEG };
+pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
 
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 7] = [
+pub const PRESETS: [(&str, MatchParams); 10] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
@@ -103,6 +119,9 @@ pub const PRESETS: [(&str, MatchParams); 7] = [
     ("lvl9s13", LVL9S13),
     ("lvl9s12", LVL9S12),
     ("lvl9d16", LVL9D16),
+    ("lvl9seg", LVL9SEG),
+    ("lvl9s13seg", LVL9S13SEG),
+    ("lvl9s12seg", LVL9S12SEG),
 ];
 
 /// The preset called `name`; an unknown name is an error listing the valid ones.
@@ -127,13 +146,15 @@ mod tests {
     #[test]
     fn presets_validate() {
         // The spec's preset table, verbatim.
-        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16 };
+        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16, segment_log2: 0 };
         assert_eq!(LVL3, m(Hashes::Dfast, 5, 1, 0));
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
         assert_eq!(RUNG2, m(Hashes::Single, 4, 8, 1));
         assert_eq!(LVL9, m(Hashes::Single, 4, 32, 2));
         assert_eq!(LVL9S13, MatchParams { hash_bits: 13, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9D16, m(Hashes::Single, 4, 16, 2));
+        assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
+        assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {
             assert_eq!(p.validate(), Ok(()), "{name}");
             assert_eq!(preset(name), Ok(p), "{name}");
@@ -171,6 +192,9 @@ mod tests {
             MatchParams { min_match: 4, ..LVL3 },
             MatchParams { hash_bits: 10, ..single },
             MatchParams { hash_bits: 17, ..single },
+            MatchParams { segment_log2: 12, ..RUNG1 },
+            MatchParams { segment_log2: 9, ..LVL9 },
+            MatchParams { segment_log2: LOG2_BLOCK + 1, ..LVL9 },
         ];
         for p in bad {
             assert!(p.validate().is_err(), "{p:?} accepted");
