@@ -1,0 +1,227 @@
+// K1, subgroup kernel (needs Features::SUBGROUP + IMMEDIATES and subgroups of 32..=128 lanes;
+// otherwise the fallback k1_chains.wgsl runs). Same output as the fallback: pred[p] = most recent
+// q < p with hash(q) == hash(p), else NO_POS (== gzc_core compute_preds), layout
+// pred[(b*N_HASHES + chain)*BLOCK_SIZE ..].
+//
+// Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
+// builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].
+// G is kept small enough for the G live tables (256 KiB each) to stay in L2: with one table per
+// block (1638 x 256 KiB live) K1 was DRAM-bound. Table entries are (tag << LOG2_BLOCK) | (pos + 1)
+// with tag = imm.gen + (task ordinal within the workgroup), and only entries of the current tag
+// count (pos + 1 <= HASHED_POSITIONS < BLOCK_SIZE fits LOG2_BLOCK bits), so tables are never
+// cleared per block or per batch: the host gives every dispatch on a head buffer fresh tags
+// (`chains::next_gen`) and clears the buffer only when they run out.
+//
+// A task walks its block in tiles of T = 256 positions, one per invocation. The tile-local index
+// li = subgroup_id * subgroup_size + subgroup_invocation_id (position t0 + li) splits the tile
+// into 8 chunks of 32 lanes, each inside one subgroup:
+// 1. Each chunk matches equal hashes by bit-slicing the hash through ballots (a subgroup "match
+//    any") and publishes its 16 bit-ballots plus its live ballot to workgroup memory. A lane with
+//    an equal lane below it in its chunk links to the highest one.
+// 2. After a barrier, every lane compares its hash against the published ballots of all 8 chunks:
+//    a chunk-first lane links to the highest equal lane of the highest earlier chunk; with none it
+//    is the first of its hash in the tile, links to head[h] and stores the tile's last position of
+//    h (highest equal lane of the highest chunk) into head[h].
+// That is exactly the sequential chain build, for any subgroup size in 32..=128.
+// head[] is accessed with relaxed atomics (so the speculative load below never races with the
+// tile-first lane's store) and a storageBarrier ends every tile, which orders one tile's head
+// stores before the next tile's loads. The published ballots are double-buffered by tile parity:
+// tile k + 2 overwrites tile k's buffer only after tile k + 1's middle barrier, which every read
+// of tile k precedes. So a tile has two barriers (the fallback's bitonic sort has 38).
+//
+// Assumes a workgroup's subgroups are full and equally sized (256 is a multiple of the subgroup
+// size), so li covers 0..256 exactly once.
+
+@group(0) @binding(0) var<storage, read> data: array<u32>;
+@group(0) @binding(1) var<storage, read_write> head: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> pred_out: array<u32>;
+
+struct K1Immediates {
+    gen: u32,
+    n_tasks: u32,
+    pad0: u32,
+    pad1: u32,
+}
+var<immediate> imm: K1Immediates;
+
+const T: u32 = 256u;
+const CHUNKS: u32 = T / 32u;
+const POS_MASK: u32 = (1u << LOG2_BLOCK) - 1u;
+
+// Per parity and chunk, 5 vec4: the 16 hash-bit ballots (bit i at [i / 4][i % 4]), then the live
+// ballot in [4].x.
+var<workgroup> bal: array<vec4<u32>, 2u * CHUNKS * 5u>;
+
+const_assert HASH_BITS == 16u;
+
+// The chain's hash at p from the words w = data[base + p / 4 ..][0..3] (lo and hi are
+// load_u32_at(base, p) and load_u32_at(base, p + 4)): == hash_width(base, p, MIN_MATCH) for Single,
+// hash_long / hash_short for Dfast chain 0 / 1.
+fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
+    let sh = (p & 3u) * 8u;
+    var lo = w.x;
+    var hi = w.y;
+    if (sh != 0u) {
+        lo = (w.x >> sh) | (w.y << (32u - sh));
+        hi = (w.y >> sh) | (w.z << (32u - sh));
+    }
+    if (N_HASHES == 1u) {
+        let k = MIN_MATCH - 4u;
+        var mask = 0xFFFFFFFFu;
+        if (k == 0u) {
+            mask = 0u;
+        } else if (k < 4u) {
+            mask = (1u << (8u * k)) - 1u;
+        }
+        return mix(lo, hi & mask);
+    } else if (chain == 0u) {
+        return mix(lo, hi);
+    }
+    return mix(lo, hi & 0xFFu);
+}
+
+// The words chain_hash_words needs at p (zeros, without loading, if p is not hashed).
+fn load_words(base: u32, p: u32) -> vec3<u32> {
+    var w = vec3<u32>(0u);
+    if (p < HASHED_POSITIONS) {
+        let i = base + (p >> 2u);
+        w = vec3<u32>(data[i], data[i + 1u], data[i + 2u]);
+    }
+    return w;
+}
+
+// Ballot of bit i of h over this lane's chunk (ballot word `word`; K1_BALLOT_WORD is `.x` for
+// subgroups of at most 32 lanes, else `[word]`, host-generated), published by the chunk's lane i
+// at bal[at ..]; returns the lanes whose bit i equals this lane's.
+fn publish_bit(h: u32, i: u32, word: u32, cl: u32, at: u32) -> u32 {
+    let bit = (h >> i) & 1u;
+    let m = subgroupBallot(bit != 0u)K1_BALLOT_WORD;
+    if (cl == i) { bal[at + (i >> 2u)][i & 3u] = m; }
+    return m ^ (bit - 1u);
+}
+
+// Publishes this chunk's ballots at bal[at ..] and returns its live lanes holding hash h. Written
+// out: naga's loop bounding keeps a loop over the bits rolled, which made the ballots several
+// times slower.
+fn publish(h: u32, live: bool, word: u32, cl: u32, at: u32) -> u32 {
+    let lv = subgroupBallot(live)K1_BALLOT_WORD;
+    if (cl == 16u) { bal[at + 4u].x = lv; }
+    return lv
+        & publish_bit(h, 0u, word, cl, at) & publish_bit(h, 1u, word, cl, at)
+        & publish_bit(h, 2u, word, cl, at) & publish_bit(h, 3u, word, cl, at)
+        & publish_bit(h, 4u, word, cl, at) & publish_bit(h, 5u, word, cl, at)
+        & publish_bit(h, 6u, word, cl, at) & publish_bit(h, 7u, word, cl, at)
+        & publish_bit(h, 8u, word, cl, at) & publish_bit(h, 9u, word, cl, at)
+        & publish_bit(h, 10u, word, cl, at) & publish_bit(h, 11u, word, cl, at)
+        & publish_bit(h, 12u, word, cl, at) & publish_bit(h, 13u, word, cl, at)
+        & publish_bit(h, 14u, word, cl, at) & publish_bit(h, 15u, word, cl, at);
+}
+
+// Lanes of the chunk published at bal[at ..] that are live and hold the hash whose bits are
+// nb = (bit i of h) - 1 (4 vec4, bit i at [i / 4][i % 4]).
+fn match_published(at: u32, nb0: vec4<u32>, nb1: vec4<u32>, nb2: vec4<u32>, nb3: vec4<u32>) -> u32 {
+    let a = (bal[at] ^ nb0) & (bal[at + 1u] ^ nb1) & (bal[at + 2u] ^ nb2) & (bal[at + 3u] ^ nb3);
+    return bal[at + 4u].x & a.x & a.y & a.z & a.w;
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(subgroup_size) sg_size: u32,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+) {
+    let li = sg_id * sg_size + sg_lane;
+    let chunk = li >> 5u;
+    let cl = li & 31u;
+    let word = sg_lane >> 5u;
+    let below = (1u << cl) - 1u;
+    let hb = wid.x << HASH_BITS;
+    var parity = 0u;
+
+    for (var j = 0u; ; j++) {
+        let t = wid.x + nwg.x * j;
+        if (t >= imm.n_tasks) { break; }
+        let b = t / N_HASHES;
+        let chain = t % N_HASHES;
+        let base = block_base(b);
+        let pb = t * BLOCK_SIZE;
+        let tag = (imm.gen + j) << LOG2_BLOCK;
+        // This lane's data words for the current tile; the next tile's are loaded a tile ahead.
+        var words = load_words(base, li);
+
+        for (var t0 = 0u; t0 < HASHED_POSITIONS; t0 += T) {
+            let mb = parity * CHUNKS * 5u;
+            parity ^= 1u;
+
+            let p = t0 + li;
+            let live = p < HASHED_POSITIONS;
+            let cur = words;
+            words = load_words(base, p + T);
+            var h = 0u;
+            if (live) { h = chain_hash_words(cur, p, chain); }
+            let eq = publish(h, live, word, cl, mb + chunk * 5u);
+            let lower = eq & below;
+            let chunk_first = live && lower == 0u;
+            // A chunk-first lane may be its hash's first in the tile: load head[h] now so the load
+            // overlaps the barrier and the matching; it is only used (and head[h] only written)
+            // by the tile-first lane, after the barrier.
+            var old = 0u;
+            if (chunk_first) { old = atomicLoad(&head[hb + h]); }
+            workgroupBarrier();
+
+            // e[c] = lanes of chunk c holding h. Skipped by subgroups without a chunk-first lane.
+            var e = array<u32, 8>();
+            if (subgroupAny(chunk_first)) {
+                let hv = vec4<u32>(h, h >> 1u, h >> 2u, h >> 3u);
+                let one = vec4<u32>(1u);
+                let nb0 = (hv & one) - one;
+                let nb1 = ((hv >> vec4<u32>(4u)) & one) - one;
+                let nb2 = ((hv >> vec4<u32>(8u)) & one) - one;
+                let nb3 = ((hv >> vec4<u32>(12u)) & one) - one;
+                e[0] = match_published(mb, nb0, nb1, nb2, nb3);
+                e[1] = match_published(mb + 5u, nb0, nb1, nb2, nb3);
+                e[2] = match_published(mb + 10u, nb0, nb1, nb2, nb3);
+                e[3] = match_published(mb + 15u, nb0, nb1, nb2, nb3);
+                e[4] = match_published(mb + 20u, nb0, nb1, nb2, nb3);
+                e[5] = match_published(mb + 25u, nb0, nb1, nb2, nb3);
+                e[6] = match_published(mb + 30u, nb0, nb1, nb2, nb3);
+                e[7] = match_published(mb + 35u, nb0, nb1, nb2, nb3);
+            }
+            if (live) {
+                var pr = t0 + 32u * chunk + firstLeadingBit(lower);
+                if (lower == 0u) {
+                    let nz = select(0u, 1u, e[0] != 0u) | select(0u, 2u, e[1] != 0u)
+                        | select(0u, 4u, e[2] != 0u) | select(0u, 8u, e[3] != 0u)
+                        | select(0u, 16u, e[4] != 0u) | select(0u, 32u, e[5] != 0u)
+                        | select(0u, 64u, e[6] != 0u) | select(0u, 128u, e[7] != 0u);
+                    let earlier = nz & ((1u << chunk) - 1u);
+                    // Highest earlier chunk holding h, else the highest chunk (h's last in the tile).
+                    let c2 = firstLeadingBit(select(nz, earlier, earlier != 0u));
+                    var ec = e[0];
+                    if (c2 == 1u) { ec = e[1]; }
+                    if (c2 == 2u) { ec = e[2]; }
+                    if (c2 == 3u) { ec = e[3]; }
+                    if (c2 == 4u) { ec = e[4]; }
+                    if (c2 == 5u) { ec = e[5]; }
+                    if (c2 == 6u) { ec = e[6]; }
+                    if (c2 == 7u) { ec = e[7]; }
+                    let q = t0 + 32u * c2 + firstLeadingBit(ec);
+                    if (earlier != 0u) {
+                        pr = q;
+                    } else {
+                        atomicStore(&head[hb + h], tag | (q + 1u));
+                        pr = select(NO_POS, (old & POS_MASK) - 1u, (old & ~POS_MASK) == tag);
+                    }
+                }
+                pred_out[pb + p] = pr;
+            }
+            storageBarrier();
+        }
+
+        if (li < BLOCK_SIZE - HASHED_POSITIONS) {
+            pred_out[pb + HASHED_POSITIONS + li] = NO_POS;
+        }
+    }
+}

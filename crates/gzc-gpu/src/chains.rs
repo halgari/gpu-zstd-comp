@@ -1,9 +1,25 @@
 //! Host side of the K1 hash-chain build kernel.
-use crate::context::{GpuContext, pack_blocks, params_wgsl};
+//!
+//! Two kernels build the same chains from the same `head` and `pred` buffers:
+//! - with subgroups (`GpuContext::subgroups`, subgroup sizes 32..=128) `k1_chains_sg.wgsl`: a
+//!   persistent grid of `DEFAULT_GROUPS` workgroups, each reusing one L2-resident head table for
+//!   its blocks, with tag-stamped entries so `head` is never cleared per batch, and ballot-matched
+//!   tiles with 2 barriers per 256 positions;
+//! - otherwise the original `k1_chains.wgsl`: one workgroup and head table per chain, a bitonic
+//!   sort per 256-position tile (38 barriers), `head` cleared per batch.
+use crate::context::{GpuContext, K1_IMMEDIATE_BYTES, pack_blocks, params_wgsl};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, LOG2_BLOCK};
 use gzc_core::params::MatchParams;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
+const K1_SG_WGSL: &str = include_str!("shaders/k1_chains_sg.wgsl");
+
+/// Largest gen the subgroup kernel's `head` tags can hold: entries are
+/// `(gen << LOG2_BLOCK) | (pos + 1)` in a u32.
+pub const MAX_GEN: u32 = (1u32 << (32 - LOG2_BLOCK)) - 1;
 
 /// Bytes of the `head` buffer K1 needs for `n_blocks` with `n_hashes` chains per block
 /// (`MatchParams::n_hashes`).
@@ -46,18 +62,63 @@ pub fn gpu_preds(ctx: &GpuContext, blocks: &[&[u8]], params: &MatchParams) -> an
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         let head = ctx.storage_buffer("k1.head", head_bytes(n, nh), false);
         let pred = ctx.storage_buffer("k1.pred", pred_bytes(n, nh), true);
-
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1") });
-        kernel.record(ctx, &mut enc, &data, &head, &pred, n);
-        ctx.queue.submit([enc.finish()]);
-
-        let per_block = nh as usize * BLOCK_SIZE;
-        let all: Vec<u32> = ctx.read_buffer(&pred, 0, per_block * batch.len());
-        for block in all.chunks_exact(per_block) {
-            out.push(block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect());
-        }
+        out.extend(kernel.run(ctx, &data, &head, &pred, n));
     }
     Ok(out)
+}
+
+/// Options of the subgroup kernel (ignored by the fallback). `Default` is what `ChainsKernel::new`
+/// uses.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainsOptions {
+    /// Largest gen handed out before the `head` buffer is cleared and gens restart at 1 (at most
+    /// `MAX_GEN`; tests lower it to exercise the wrap).
+    pub max_gen: u32,
+    /// Workgroups (= live head tables) per dispatch; `None` = `DEFAULT_GROUPS`. Environment
+    /// override: `GZC_K1_GROUPS`. Raised when needed so a dispatch uses at most `max_gen` tags.
+    pub groups: Option<u32>,
+    /// Pick each lane's ballot word at run time even for subgroups of at most 32 lanes (tests use
+    /// it to cover the code path of wider subgroups).
+    pub wide_masks: bool,
+}
+
+impl Default for ChainsOptions {
+    fn default() -> Self {
+        let groups = std::env::var("GZC_K1_GROUPS").ok().and_then(|v| v.parse().ok()).filter(|&g| g > 0);
+        Self { max_gen: MAX_GEN, groups, wide_masks: false }
+    }
+}
+
+/// Default workgroups of the subgroup kernel: 256 head tables of 256 KiB (64 MiB) is what stays
+/// L2-resident enough on the RTX 5090 (96 MB L2); more tables made K1 DRAM-bound.
+pub const DEFAULT_GROUPS: u32 = 256;
+
+/// Last gen (tag) handed out per `head` buffer, keyed by the buffer's hash. Invariant: a key's
+/// value is at least the largest tag in its buffer (every entry of a buffer carries a tag handed
+/// out for it, or 0). A new buffer is zeroed; a key shared by two buffers (hash collision, or a
+/// dropped buffer's id reused) only makes the value larger than needed; a wrap clears the buffer.
+/// So a dispatch's fresh tags never match a stale entry.
+static GENS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+
+/// Advances `last` (the last tag handed out) by `count` tags: returns the first of them and
+/// whether the buffer must be cleared first because tags `last + 1 ..= last + count` would pass
+/// `max_gen` (tags then restart at 1). Needs `1 <= count <= max_gen`.
+fn advance_gen(last: &mut u32, count: u32, max_gen: u32) -> (u32, bool) {
+    assert!((1..=max_gen).contains(&count), "{count} tags per dispatch, max {max_gen}");
+    if max_gen - count < *last {
+        *last = count;
+        (1, true)
+    } else {
+        *last += count;
+        (*last - count + 1, false)
+    }
+}
+
+/// `advance_gen` for the tags of `head` (see `GENS`).
+fn next_gen(head: &wgpu::Buffer, count: u32, max_gen: u32) -> (u32, bool) {
+    let mut h = std::hash::DefaultHasher::new();
+    head.hash(&mut h);
+    advance_gen(GENS.lock().unwrap().entry(h.finish()).or_insert(0), count, max_gen)
 }
 
 /// K1 pipeline, built for one `MatchParams`' chains; `record` lets later stages run it on their
@@ -66,13 +127,22 @@ pub struct ChainsKernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     n_hashes: u32,
+    /// Some (with its options): the subgroup kernel; None: the fallback.
+    sg: Option<ChainsOptions>,
 }
 
 impl ChainsKernel {
     /// Builds K1 for the chains of `params` (its `N_HASHES` and `MIN_MATCH` are injected as WGSL
-    /// constants). Errors if `params` is invalid.
+    /// constants): the subgroup kernel when `ctx.subgroups`, else the fallback. Errors if `params`
+    /// is invalid.
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Self> {
+        Self::with_options(ctx, params, ChainsOptions::default())
+    }
+
+    /// `new` with explicit subgroup-kernel options.
+    pub fn with_options(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions) -> anyhow::Result<Self> {
         params.validate().map_err(|e| anyhow::anyhow!("invalid match params {params:?}: {e}"))?;
+        anyhow::ensure!((1..=MAX_GEN).contains(&opts.max_gen), "max_gen {} not in 1..={MAX_GEN}", opts.max_gen);
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -87,12 +157,28 @@ impl ChainsKernel {
             label: Some("k1"),
             entries: &[entry(0, true), entry(1, false), entry(2, false)],
         });
+        // The subgroup kernel splits its 256-lane tiles into 32-lane chunks, each inside one
+        // subgroup, and reads ballots of up to 128 lanes.
+        let info = &ctx.adapter_info;
+        let sg_ok = ctx.subgroups && info.subgroup_min_size >= 32 && info.subgroup_max_size <= 128;
+        let sg = sg_ok.then_some(opts);
         let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("k1"),
             bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
+            immediate_size: if sg.is_some() { K1_IMMEDIATE_BYTES } else { 0 },
         });
-        let module = ctx.shader("k1_chains", &format!("{}{K1_WGSL}", params_wgsl(params)));
+        let module = match &sg {
+            // naga (wgpu 30) takes subgroup operations from Features::SUBGROUP and rejects the
+            // `enable subgroups;` directive.
+            Some(o) => ctx.shader(
+                "k1_chains_sg",
+                &format!("{}{}", params_wgsl(params), K1_SG_WGSL).replace(
+                    "K1_BALLOT_WORD",
+                    if o.wide_masks || info.subgroup_max_size > 32 { "[word]" } else { ".x" },
+                ),
+            ),
+            None => ctx.shader("k1_chains", &format!("{}{K1_WGSL}", params_wgsl(params))),
+        };
         let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("k1_chains"),
             layout: Some(&pipeline_layout),
@@ -101,7 +187,7 @@ impl ChainsKernel {
             compilation_options: Default::default(),
             cache: None,
         });
-        Ok(Self { pipeline, layout, n_hashes: params.n_hashes() })
+        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), sg })
     }
 
     /// Chains per block (`MatchParams::n_hashes`) this kernel builds.
@@ -109,9 +195,35 @@ impl ChainsKernel {
         self.n_hashes
     }
 
-    /// data: packed blocks; head: `head_bytes(n_blocks, n_hashes)` (cleared by this call via
-    /// encoder.clear_buffer); pred: `pred_bytes(n_blocks, n_hashes)`, layout [block][chain][pos]
-    /// (Dfast: chain 0 long, 1 short; Single: chain 0 over `hash_width(min_match)`).
+    /// True when this is the subgroup kernel (`GpuContext::subgroups`), false for the fallback.
+    pub fn uses_subgroups(&self) -> bool {
+        self.sg.is_some()
+    }
+
+    /// Records K1 on `data` into `head`/`pred` for `n_blocks`, submits it and reads `pred` back:
+    /// per block, one BLOCK_SIZE-long pred array per chain. `pred` needs COPY_SRC.
+    pub fn run(
+        &self,
+        ctx: &GpuContext,
+        data: &wgpu::Buffer,
+        head: &wgpu::Buffer,
+        pred: &wgpu::Buffer,
+        n_blocks: u32,
+    ) -> Vec<Vec<Vec<u32>>> {
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1") });
+        self.record(ctx, &mut enc, data, head, pred, n_blocks);
+        ctx.queue.submit([enc.finish()]);
+        let per_block = self.n_hashes as usize * BLOCK_SIZE;
+        let all: Vec<u32> = ctx.read_buffer(pred, 0, per_block * n_blocks as usize);
+        all.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect()
+    }
+
+    /// data: packed blocks; head: at least `head_bytes(n_blocks, n_hashes)` (the fallback clears
+    /// it via encoder.clear_buffer; the subgroup kernel uses its first min(n_blocks * n_hashes,
+    /// groups) tables, tags their entries with fresh per-buffer tags instead and clears the whole
+    /// buffer only when tags run out, once per ~32767 blocks per table); pred:
+    /// `pred_bytes(n_blocks, n_hashes)`, layout [block][chain][pos] (Dfast: chain 0 long, 1 short;
+    /// Single: chain 0 over `hash_width(min_match)`).
     ///
     /// Precondition: `n_blocks <= max_blocks_per_batch(&ctx.device.limits(), n_hashes)`. That
     /// keeps every buffer within the binding/buffer limits, the dispatch within the workgroup
@@ -144,7 +256,23 @@ impl ChainsKernel {
         if n_blocks == 0 {
             return;
         }
-        enc.clear_buffer(head, 0, Some(head_bytes(n_blocks, self.n_hashes)));
+        let mut generation = 0;
+        let mut dispatch_groups = 0;
+        match &self.sg {
+            None => enc.clear_buffer(head, 0, Some(head_bytes(n_blocks, self.n_hashes))),
+            Some(o) => {
+                // Workgroup w builds chains w, w + groups, .. (one head table, one tag per chain).
+                let n_tasks = n_blocks * self.n_hashes;
+                let max_wg = ctx.device.limits().max_compute_workgroups_per_dimension;
+                let groups = o.groups.unwrap_or(DEFAULT_GROUPS).max(n_tasks.div_ceil(o.max_gen));
+                dispatch_groups = groups.min(n_tasks).min(max_wg);
+                let clear;
+                (generation, clear) = next_gen(head, n_tasks.div_ceil(dispatch_groups), o.max_gen);
+                if clear {
+                    enc.clear_buffer(head, 0, None);
+                }
+            }
+        }
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k1"),
             layout: &self.layout,
@@ -157,7 +285,13 @@ impl ChainsKernel {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k1"), timestamp_writes });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(n_blocks, self.n_hashes, 1);
+        match &self.sg {
+            None => pass.dispatch_workgroups(n_blocks, self.n_hashes, 1),
+            Some(_) => {
+                pass.set_immediates(0, bytemuck::cast_slice(&[generation, n_blocks * self.n_hashes, 0, 0]));
+                pass.dispatch_workgroups(dispatch_groups, 1, 1);
+            }
+        }
     }
 }
 
@@ -208,6 +342,23 @@ mod tests {
             let n = max_blocks_per_batch(&limits(u64::MAX, u64::MAX, u32::MAX), nh);
             assert_eq!(n as u64 * nh as u64, 1u64 << (32 - HASH_BITS.max(LOG2_BLOCK)));
         }
+    }
+
+    #[test]
+    fn tags_advance_and_wrap_with_a_clear() {
+        let mut last = 0;
+        assert_eq!(advance_gen(&mut last, 2, 5), (1, false));
+        assert_eq!(advance_gen(&mut last, 2, 5), (3, false));
+        // 5..=6 would pass 5: clear, restart at 1.
+        assert_eq!(advance_gen(&mut last, 2, 5), (1, true));
+        assert_eq!(advance_gen(&mut last, 3, 5), (3, false));
+        assert_eq!(last, 5);
+        assert_eq!(advance_gen(&mut last, 1, 5), (1, true));
+        assert_eq!(advance_gen(&mut last, 5, 5), (1, true));
+        // A key's value above max_gen (another kernel's larger max_gen) also wraps.
+        let mut last = 9;
+        assert_eq!(advance_gen(&mut last, 1, 5), (1, true));
+        assert_eq!(MAX_GEN as u64 * (1u64 << LOG2_BLOCK) + (1u64 << LOG2_BLOCK) - 1, u32::MAX as u64);
     }
 
     #[test]
