@@ -47,7 +47,7 @@ use crate::compressor::{
     slot_bytes,
 };
 use crate::context::GpuContext;
-use crate::transfer::{Commands, RawBuffer, Timeline, TransferQueue};
+use crate::transfer::{Commands, RawBuffer, StreamingGuard, Timeline, TransferQueue};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineConfig {
@@ -242,6 +242,9 @@ struct Xfer {
     t_done: Timeline,
     /// `seq` of the next batch (timeline values only grow, across runs).
     next_seq: u64,
+    /// This pipeline's exclusive claim on the transfer queue (one transfer-readback `Pipeline`
+    /// per context, see `GpuContext::transfer`); released when the pipeline drops.
+    _streaming: StreamingGuard,
     /// Declared last: the objects above go first.
     tq: std::sync::Arc<TransferQueue>,
 }
@@ -405,6 +408,8 @@ impl<'a> Pipeline<'a> {
         // early error return the imports (declared later) drop first.
         let xfer = match tq {
             Some(tq) => Some(Xfer {
+                // First, so a second transfer-readback pipeline errors before allocating anything.
+                _streaming: tq.begin_streaming()?,
                 frames: tq.buffer(frames_bytes(cfg.batch), shared, false)?,
                 frame_len: tq.buffer(frame_len_bytes(cfg.batch), shared, false)?,
                 cmds: tq.commands(cfg.inflight)?,
@@ -415,27 +420,6 @@ impl<'a> Pipeline<'a> {
             }),
             None => None,
         };
-        let mut bufs = BatchBuffers::new(ctx, cfg.batch, frames, &m);
-        if direct {
-            // No shared `data`: each submission binds its slot's upload buffer (see `submit`).
-            // Freed before the slots are allocated, so the peak stays at `vram_bytes_with`.
-            bufs.data.destroy();
-        }
-        if let Some(x) = &xfer {
-            // frames / frame_len move to buffers both queue families may use.
-            for b in [&bufs.frames, &bufs.frame_len].into_iter().flatten() {
-                b.destroy();
-            }
-            let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-            // SAFETY: `ctx.device` lives on the transfer queue's VkDevice; the buffers were created
-            // STORAGE | TRANSFER_SRC | TRANSFER_DST and CONCURRENT over families 0 and the
-            // transfer family; `xfer` outlives every GPU use (`Pipeline`'s Drop waits for both
-            // queues and `xfer` is declared after `bufs`).
-            unsafe {
-                bufs.frames = Some(x.frames.import(&ctx.device, "batch.frames", usage));
-                bufs.frame_len = Some(x.frame_len.import(&ctx.device, "batch.frame_len", usage));
-            }
-        }
         let mut slots = Vec::with_capacity(cfg.inflight as usize);
         for _ in 0..cfg.inflight {
             let staging = match &xfer {
@@ -490,9 +474,20 @@ impl<'a> Pipeline<'a> {
                 job: None,
             });
         }
-        if direct {
-            bufs.data = slots[0].upload.clone();
-        }
+        // Direct upload: no shared `data`, each submission binds its slot's upload buffer (see
+        // `submit`). Transfer readback: frames / frame_len are buffers both queue families may use.
+        // Neither is allocated in wgpu then, so the allocations add up to `vram_bytes_with`.
+        let data = direct.then(|| slots[0].upload.clone());
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        // SAFETY: `ctx.device` lives on the transfer queue's VkDevice; the buffers were created
+        // STORAGE | TRANSFER_SRC | TRANSFER_DST and CONCURRENT over families 0 and the transfer
+        // family; `xfer` outlives every GPU use (`Pipeline`'s Drop waits for both queues and `xfer`
+        // is declared after `bufs`, here and in `Pipeline`).
+        let frame_bufs = xfer.as_ref().map(|x| unsafe {
+            let frames = x.frames.import(&ctx.device, "batch.frames", usage);
+            (frames, x.frame_len.import(&ctx.device, "batch.frame_len", usage))
+        });
+        let bufs = BatchBuffers::with_parts(ctx, cfg.batch, frames, &m, data, frame_bufs);
         scopes.pop()?;
         Ok(Self {
             ctx,
@@ -801,7 +796,10 @@ impl<'a> Pipeline<'a> {
                 // K1–K3, then K5/K4 in a second submission that waits for the previous batch's
                 // readback (it overwrites `frames`) and signals `k_done`.
                 self.kernels.record_front(ctx, &mut enc, bufs, n, queries);
-                ctx.queue.submit([enc.finish()]);
+                // Through `submit_wgpu` too (nothing staged), so it holds the same lock as the
+                // second submission and can never pick up semaphores staged for it.
+                // SAFETY: nothing is staged.
+                unsafe { x.tq.submit_wgpu(&ctx.queue, enc.finish(), None, None)? };
                 let mut enc =
                     ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
                 self.kernels.record_entropy(ctx, &mut enc, bufs, n, queries);
@@ -931,7 +929,9 @@ impl<'a> Pipeline<'a> {
                 staging.unmap();
                 r
             }
-            Staging::Host(staging) => use_view(staging.mapped()),
+            // SAFETY: the transfer queue's copy into it completed (`stream` waited for t_done >=
+            // job.seq) and the slot's next copy is only submitted after this delivery.
+            Staging::Host(staging) => use_view(unsafe { staging.mapped() }),
         };
         let t2 = Instant::now();
         prof.deliver += (t1 - t0).as_secs_f64();
@@ -944,9 +944,11 @@ impl<'a> Pipeline<'a> {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(x) = &self.xfer {
             x.tq.idle();
-            // A batch whose readback was never submitted leaves t_done behind: catch the
+            // A batch whose readback was never submitted leaves t_done behind (and one whose second
+            // submission failed leaves k_done behind: `submit_wgpu` unstaged its signal): catch the
             // timelines up so the next batch's waits hold.
-            // SAFETY: both queues are idle (waited for just above), so nothing signals them.
+            // SAFETY: both queues are idle (waited for just above), so nothing signals them, and
+            // nothing is left staged on the wgpu queue (`submit_wgpu` unstages on failure).
             unsafe {
                 let _ = x.tq.catch_up(&x.k_done, x.next_seq - 1);
                 let _ = x.tq.catch_up(&x.t_done, x.next_seq - 1);
@@ -1071,7 +1073,7 @@ mod tests {
     use crate::chains::{head_bytes, pred_bytes};
     use gzc_core::block::chunk_file;
     use gzc_core::frame::write_frame;
-    use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
@@ -1205,6 +1207,13 @@ mod tests {
             assert!((2.3..2.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
             assert!((0.24..0.26).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
+        #[cfg(feature = "block-64k")]
+        {
+            // ~1.44 MiB of scratch per block, ~0.125 MiB per block per slot on the frame path.
+            let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
+            assert!((1.4..1.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
+            assert!((0.12..0.13).contains(&mib(per_slot)), "{}", mib(per_slot));
+        }
     }
 
     /// `vram_bytes` equals the bytes of every buffer a `Pipeline` actually creates (shared scratch
@@ -1310,28 +1319,66 @@ mod tests {
         out
     }
 
-    /// Every upload/readback mode delivers the CPU's frames, over partial batches and reuse.
+    /// Every upload/readback mode delivers the CPU's frames, over partial batches and reuse, for
+    /// the chain finder (lvl9) and the bucket-sorted finder with the segmented parse (lvl9s12seg).
     #[test]
     fn stream_frames_every_mode_matches_cpu() {
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..200).map(|i| distinct[i % distinct.len()].as_slice()).collect();
-        let params = GpuParams { matching: LVL9, emit_frames: true, huffman: true };
-        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
         let modes = mode_contexts();
         assert!(modes.iter().any(|(_, c)| c.transfer.is_none() && !c.direct_upload), "the fallback mode always exists");
-        for (name, ctx) in &modes {
-            let pcfg = PipelineConfig { batch: 23, inflight: 3, params };
-            let mut pipe = Pipeline::new(ctx, &pcfg).unwrap();
-            assert_eq!(pipe.transfer_readback(), ctx.transfer.is_some(), "{name}");
-            assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&pcfg, ctx.direct_upload), "{name}");
-            for _ in 0..2 {
-                let mut sink = CollectFrames(vec![None; blocks.len()]);
-                pipe.run_frames(&blocks, &mut sink).unwrap();
-                for (i, got) in sink.0.into_iter().enumerate() {
-                    assert!(got.unwrap() == want[i % distinct.len()], "{name}: index {i}");
+        for matching in [LVL9, LVL9S12SEG] {
+            let params = GpuParams { matching, emit_frames: true, huffman: true };
+            let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+            for (name, ctx) in &modes {
+                let pcfg = PipelineConfig { batch: 23, inflight: 3, params };
+                let mut pipe = Pipeline::new(ctx, &pcfg).unwrap();
+                assert_eq!(pipe.transfer_readback(), ctx.transfer.is_some(), "{name}");
+                assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&pcfg, ctx.direct_upload), "{name}");
+                for _ in 0..2 {
+                    let mut sink = CollectFrames(vec![None; blocks.len()]);
+                    pipe.run_frames(&blocks, &mut sink).unwrap();
+                    for (i, got) in sink.0.into_iter().enumerate() {
+                        assert!(got.unwrap() == want[i % distinct.len()], "{name} {matching:?}: index {i}");
+                    }
                 }
             }
         }
+    }
+
+    /// One transfer-readback pipeline per context (`GpuContext::transfer`): a second one errors
+    /// while the first is alive, and works once it is dropped. Pipelines that do not use the
+    /// transfer queue (the parse path) are not affected.
+    #[test]
+    fn second_transfer_pipeline_errors() {
+        let Some((name, ctx)) = mode_contexts().into_iter().find(|(_, c)| c.transfer.is_some()) else {
+            eprintln!("no transfer queue on this adapter: skipped");
+            return;
+        };
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = distinct.iter().map(|b| b.as_slice()).collect();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let pcfg = PipelineConfig { params, ..cfg(7, 2) };
+        let mut first = Pipeline::new(&ctx, &pcfg).unwrap();
+        assert!(first.transfer_readback(), "{name}");
+        let e = Pipeline::new(&ctx, &pcfg).err().expect("a second transfer pipeline must error");
+        assert!(e.to_string().contains("another transfer-readback Pipeline"), "{name}: {e}");
+        // The parse path does not touch the transfer queue.
+        let mut parse_pipe = Pipeline::new(&ctx, &cfg(7, 1)).unwrap();
+        parse_pipe.run(&blocks, &mut Collect(vec![None; blocks.len()])).unwrap();
+        drop(parse_pipe);
+        // The refused attempt left the first pipeline intact.
+        let mut sink = CollectFrames(vec![None; blocks.len()]);
+        first.run_frames(&blocks, &mut sink).unwrap();
+        for (i, got) in sink.0.into_iter().enumerate() {
+            assert!(got.unwrap() == cpu_frame(blocks[i], params), "{name}: index {i}");
+        }
+        drop(first);
+        let mut second = Pipeline::new(&ctx, &pcfg).expect("the queue is free again once the first pipeline dropped");
+        assert!(second.transfer_readback());
+        let mut sink = CollectFrames(vec![None; blocks.len()]);
+        second.run_frames(&blocks, &mut sink).unwrap();
+        assert!(sink.0.iter().all(|f| f.is_some()));
     }
 
     /// A delivery that fails mid-stream, with batches still in flight (and, where supported, on the

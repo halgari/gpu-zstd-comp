@@ -445,6 +445,10 @@ mod tests {
         // at most 64 MiB.
         #[cfg(feature = "block-128k")]
         assert_eq!((n2, n1), (128, 256));
+        #[cfg(feature = "block-64k")]
+        assert_eq!((n2, n1), (256, 512));
+        #[cfg(feature = "block-32k")]
+        assert_eq!((n2, n1), (512, 1024));
         #[cfg(feature = "block-16k")]
         assert_eq!((n2, n1), (1024, 2048));
         assert!(fits(n2, 2, 128 * MIB) && !fits(n2 + 1, 2, 128 * MIB));

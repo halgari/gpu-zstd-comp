@@ -107,7 +107,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -210,7 +210,7 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
@@ -228,7 +228,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -586,6 +586,18 @@ mod tests {
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
+    }
+
+    #[test]
+    fn preset_help_lists_every_preset() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        for cmd in ["ref", "gpu", "all"] {
+            let help = cli.find_subcommand_mut(cmd).unwrap().render_long_help().to_string();
+            for (name, _) in PRESETS {
+                assert!(help.contains(name), "{cmd} --help does not list {name}");
+            }
+        }
     }
 
     #[test]

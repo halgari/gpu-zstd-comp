@@ -17,6 +17,7 @@
 //! the last of them (and the wgpu device) is gone and keeps the Vulkan instance alive until then.
 //! GPU-side lifetimes (a buffer or semaphore must outlive the submissions using it) are the
 //! caller's: the entry points that create such uses are `unsafe` or `pub(crate)`.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, anyhow};
@@ -59,13 +60,42 @@ pub struct TransferQueue {
     /// submission is made (`submit_wgpu`), so no other submission through this crate picks them
     /// up.
     wgpu_submit: Mutex<()>,
+    /// Set while a transfer-readback `Pipeline` exists (`StreamingGuard`): the transfer path
+    /// assumes a single submitter per context, so a second one is refused.
+    streaming: AtomicBool,
+}
+
+/// Exclusive use of a `TransferQueue` by one streaming `Pipeline` (`TransferQueue::begin_streaming`);
+/// released on drop.
+pub(crate) struct StreamingGuard {
+    tq: Arc<TransferQueue>,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.tq.streaming.store(false, Ordering::Release);
+    }
 }
 
 impl TransferQueue {
     pub(crate) fn new(owner: Arc<DeviceOwner>, family: u32, memory: vk::PhysicalDeviceMemoryProperties) -> Self {
         // SAFETY: the device was created with one queue of `family`.
         let queue = unsafe { owner.device.get_device_queue(family, 0) };
-        Self { owner, queue: Mutex::new(queue), family, memory, wgpu_submit: Mutex::new(()) }
+        let (wgpu_submit, streaming) = (Mutex::new(()), AtomicBool::new(false));
+        Self { owner, queue: Mutex::new(queue), family, memory, wgpu_submit, streaming }
+    }
+
+    /// Claims the queue for one transfer-readback `Pipeline` for as long as the guard lives
+    /// (try-lock: never blocks). Errors when another transfer-readback `Pipeline` on the same
+    /// context is still alive: its staged semaphores and timelines assume it is the only one
+    /// submitting.
+    pub(crate) fn begin_streaming(self: &Arc<Self>) -> anyhow::Result<StreamingGuard> {
+        anyhow::ensure!(
+            self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            "another transfer-readback Pipeline is alive on this GpuContext (one per context: drop it first, \
+             or open this context with GpuOptions::transfer_queue off / GZC_TRANSFER_QUEUE=0)"
+        );
+        Ok(StreamingGuard { tq: self.clone() })
     }
 
     fn device(&self) -> &ash::Device {
@@ -116,7 +146,12 @@ impl TransferQueue {
                     ],
                 )
             } else {
-                self.memory_type(req.memory_type_bits, &[&|f| f.contains(F::DEVICE_LOCAL)])
+                // Plain VRAM first: a DEVICE_LOCAL | HOST_VISIBLE (ReBAR) type would spend the
+                // BAR window on buffers the host never maps.
+                self.memory_type(
+                    req.memory_type_bits,
+                    &[&|f| f.contains(F::DEVICE_LOCAL) && !f.contains(F::HOST_VISIBLE), &|f| f.contains(F::DEVICE_LOCAL)],
+                )
             };
             let Some((type_index, coherent)) = pick else {
                 d.destroy_buffer(buffer, None);
@@ -250,10 +285,17 @@ impl TransferQueue {
     /// Submits `cmd` on `wgpu_queue` (the wgpu queue of this queue's device) with a wait for
     /// `wait` and a signal of `signal` attached (timeline values), and returns its submission
     /// index. The staging and the submission happen under one lock, so no other submission made
-    /// through this function picks up the semaphores. Code submitting to the same `wgpu::Queue`
-    /// from another thread while this runs could still pick them up: every `Pipeline` submits
-    /// from the thread that runs it, and nothing else in the crate submits to a context a
-    /// streaming pipeline is using.
+    /// through this function picks up the semaphores. Every submission a transfer-readback
+    /// `Pipeline` makes goes through here (with `None`/`None` when it stages nothing), and only
+    /// one such pipeline may exist per context (`begin_streaming`). Code submitting to the same
+    /// `wgpu::Queue` directly from another thread while this runs could still pick the semaphores
+    /// up: see `GpuContext::transfer` for that rule.
+    ///
+    /// If wgpu does not hand the submission to the hal queue (a validation error, or a panic in
+    /// the error handler), the staged semaphores are removed again (`remove_wait_semaphore` /
+    /// `remove_signal_semaphore`, also while unwinding), so no later submission waits for or
+    /// signals a stale value; the function then errors. A removed signal leaves the timeline
+    /// below the value the caller counted on, which `Pipeline::abandon` catches up from the host.
     ///
     /// # Safety
     /// `wait` and `signal` outlive the submission (the caller waits for it before dropping them).
@@ -264,7 +306,7 @@ impl TransferQueue {
         wait: Option<(&Timeline, u64)>,
         signal: Option<(&Timeline, u64)>,
     ) -> anyhow::Result<wgpu::SubmissionIndex> {
-        let _guard = self.wgpu_submit.lock().unwrap();
+        let _guard = self.wgpu_submit.lock().unwrap_or_else(|e| e.into_inner());
         {
             // SAFETY: see the contract; the hal queue is only used to stage the semaphores.
             let hal = unsafe { wgpu_queue.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -276,7 +318,39 @@ impl TransferQueue {
                 hal.add_signal_semaphore(t.sem, Some(v));
             }
         }
-        Ok(wgpu_queue.submit([cmd]))
+        /// Unstages whatever the submission did not consume (a no-op after a successful one).
+        struct Unstage<'q> {
+            queue: &'q wgpu::Queue,
+            wait: Option<vk::Semaphore>,
+            signal: Option<vk::Semaphore>,
+        }
+        impl Unstage<'_> {
+            /// True when a staged semaphore was still pending (the submission never reached hal).
+            fn run(&mut self) -> bool {
+                let (wait, signal) = (self.wait.take(), self.signal.take());
+                if wait.is_none() && signal.is_none() {
+                    return false;
+                }
+                // SAFETY: only used to unstage semaphores this call staged.
+                let Some(hal) = (unsafe { self.queue.as_hal::<wgpu::hal::api::Vulkan>() }) else { return false };
+                let w = wait.is_some_and(|s| hal.remove_wait_semaphore(s));
+                let s = signal.is_some_and(|s| hal.remove_signal_semaphore(s));
+                w || s
+            }
+        }
+        impl Drop for Unstage<'_> {
+            fn drop(&mut self) {
+                self.run();
+            }
+        }
+        let mut unstage =
+            Unstage { queue: wgpu_queue, wait: wait.map(|(t, _)| t.sem), signal: signal.map(|(t, _)| t.sem) };
+        let index = wgpu_queue.submit([cmd]);
+        anyhow::ensure!(
+            !unstage.run(),
+            "wgpu submission did not reach the queue (validation error?); its staged semaphores were removed"
+        );
+        Ok(index)
     }
 
     /// Blocks until `t` reaches `value`.
@@ -295,11 +369,13 @@ impl TransferQueue {
         unsafe { self.device().get_semaphore_counter_value(t.sem) }.context("vkGetSemaphoreCounterValue")
     }
 
-    /// Signals `t` to `value` from the host if it is below.
+    /// Signals `t` to `value` from the host if it is below (checked with `value` first, so it
+    /// never moves the timeline backwards).
     ///
     /// # Safety
-    /// No submission that signals `t` is pending (both queues are idle), so the host signal
-    /// cannot race a GPU one or move the value backwards.
+    /// No submission that signals `t` is pending (both queues are idle) and none is staged on the
+    /// wgpu queue (`submit_wgpu` unstages its semaphores when a submission fails), so the host
+    /// signal cannot race a GPU one or be followed by a signal of a smaller value.
     pub(crate) unsafe fn catch_up(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
         if self.value(t)? < value {
             // SAFETY: the caller's contract; `value` is larger than the current value.
@@ -329,15 +405,19 @@ pub(crate) struct RawBuffer {
     coherent: bool,
 }
 
-// SAFETY: the mapping is only read through `&self` after the GPU finished writing it; the handles
-// are plain Vulkan handles.
+// SAFETY: the mapping is only read through `mapped`, whose contract rules out concurrent GPU
+// writes; the handles are plain Vulkan handles.
 unsafe impl Send for RawBuffer {}
 unsafe impl Sync for RawBuffer {}
 
 impl RawBuffer {
-    /// The mapped bytes of a host buffer (after the GPU writes to them completed: invalidates
-    /// non-coherent memory first).
-    pub fn mapped(&self) -> &[u8] {
+    /// The mapped bytes of a host buffer (invalidates non-coherent memory first).
+    ///
+    /// # Safety
+    /// Every GPU write to the buffer has completed (the caller waited for the submission that
+    /// wrote it, e.g. its timeline value), and none is pending while the slice lives: the GPU may
+    /// otherwise change bytes behind a shared reference.
+    pub unsafe fn mapped(&self) -> &[u8] {
         assert!(!self.ptr.is_null(), "not a host buffer");
         if !self.coherent {
             let range = vk::MappedMemoryRange::default().memory(self.memory).offset(0).size(vk::WHOLE_SIZE);

@@ -63,7 +63,7 @@ impl SortKernel {
     /// subgroups have at least 32 lanes and its self-test passes; otherwise the workgroup-memory
     /// version (whose failed build or self-test, reported on stderr, also gives `None`).
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
-        if !sorted_params(params) || std::env::var("GZC_SORTED").is_ok_and(|v| v == "0") {
+        if !sorted_params(params) || crate::context::env_off("GZC_SORTED") {
             return Ok(None);
         }
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;

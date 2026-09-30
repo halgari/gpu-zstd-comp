@@ -187,20 +187,44 @@ impl BatchBuffers {
     /// Panics unless `1 <= capacity <= max_batch_blocks(&ctx.device.limits(), m)`. `frames`
     /// allocates K4's outputs (needed when the kernels emit frames).
     pub fn new(ctx: &GpuContext, capacity: u32, frames: bool, m: &MatchParams) -> Self {
+        Self::with_parts(ctx, capacity, frames, m, None, None)
+    }
+
+    /// `new`, taking `data` and (with `frames`) the `frames` / `frame_len` pair from the caller
+    /// when given, so only the missing buffers are allocated: `Pipeline` brings a slot's upload
+    /// buffer as `data` (direct upload) and buffers shared with the transfer queue as the frame
+    /// outputs (transfer readback). The given buffers must be at least `data_bytes(capacity)`,
+    /// `frames_bytes(capacity)` and `frame_len_bytes(capacity)` bytes.
+    pub(crate) fn with_parts(
+        ctx: &GpuContext,
+        capacity: u32,
+        frames: bool,
+        m: &MatchParams,
+        data: Option<wgpu::Buffer>,
+        frame_bufs: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    ) -> Self {
         let max = max_batch_blocks(&ctx.device.limits(), m);
         assert!(capacity >= 1 && capacity <= max, "BatchBuffers capacity {capacity} not in 1..={max}");
         let n_hashes = m.n_hashes();
+        let (frames, frame_len) = match (frames, frame_bufs) {
+            (false, _) => (None, None),
+            (true, Some((f, l))) => (Some(f), Some(l)),
+            (true, None) => (
+                Some(ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
+                Some(ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
+            ),
+        };
         Self {
             capacity,
             n_hashes,
-            data: ctx.storage_buffer("batch.data", data_bytes(capacity), false),
+            data: data.unwrap_or_else(|| ctx.storage_buffer("batch.data", data_bytes(capacity), false)),
             head: ctx.storage_buffer("batch.head", head_bytes(capacity, n_hashes), false),
             pred: ctx.storage_buffer("batch.pred", pred_bytes(capacity, n_hashes), true),
             best: ctx.storage_buffer("batch.best", best_bytes(capacity), true),
             seqs: ctx.storage_buffer("batch.seqs", seqs_bytes(capacity), true),
             counts: ctx.storage_buffer("batch.counts", counts_bytes(capacity), true),
-            frames: frames.then(|| ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
-            frame_len: frames.then(|| ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
+            frames,
+            frame_len,
         }
     }
 }
@@ -577,6 +601,14 @@ impl Kernels {
             // Loops: the staging loop steps by 256 below WIN, the walk is j <= DEPTH, and
             // match_len_capped is bounded by SEARCH_CAP; win/wkey indices DEPTH + lid - j are in
             // 0..WIN (see `GpuContext::shader_trusted` and the E3 report).
+            // Premise for the data-dependent indices: K1 (k1_sort / k1_sort_sg, run before this
+            // in the same submission) wrote each block's `pred` slots 0..HASHED_POSITIONS as a
+            // permutation of the positions 0..HASHED_POSITIONS (plus fingerprint bits above
+            // PRED_POS). So every p = w & PRED_POS is < HASHED_POSITIONS <= BLOCK_SIZE, and
+            // `best[sb + p]` and the byte loads at p and at q < p stay inside the block. The
+            // sorted K1's self-test (against `gzc_core::hash::bucket_sort`, a permutation) and the
+            // differential tests check it; a `pred` not written by the sorted K1 (e.g. chain-K1
+            // output) breaks it, so K2 window must only ever run right after the sorted K1.
             let module = ctx.shader_trusted("k2_window", &body);
             (k1, pipeline_from_module(ctx, "k2_window", &best_layout, &module, "main_window"))
         });
@@ -1402,6 +1434,11 @@ mod tests {
         // 128K: pred 1 MiB per block with two chains; one chain: pred/best 512 KiB.
         #[cfg(feature = "block-128k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 256));
+        // 64K (default) and 32K: pred 512 / 256 KiB per block with two chains.
+        #[cfg(feature = "block-64k")]
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (256, 512));
+        #[cfg(feature = "block-32k")]
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (512, 1024));
         // 16K: pred 128 KiB per block with two chains, pred/best 64 KiB with one (head is capped at
         // chains::HEAD_TABLES tables).
         #[cfg(feature = "block-16k")]

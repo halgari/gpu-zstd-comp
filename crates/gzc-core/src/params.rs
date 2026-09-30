@@ -89,21 +89,35 @@ pub const RUNG1: MatchParams =
 pub const RUNG2: MatchParams =
     MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
 /// Single 4-byte hash, depth 32, lazy2 (compare against libzstd L9).
+///
+/// Full-corpus ratios (`gzc-bench ref`, byte-identical to the GPU; `--ext dds,nif`) against
+/// libzstd L9 on the same blocks, for this and the speed-2 presets below:
+///
+/// | block | L9 | lvl9 | lvl9seg | lvl9s12 | lvl9s12seg | lvl9s12d16seg |
+/// |---|---|---|---|---|---|---|
+/// | 16 KiB | 1.30009 | 1.30024 | 1.30042 | 1.30023 | 1.30040 | 1.30017 |
+/// | 32 KiB | 1.31996 | 1.32131 | 1.32140 | 1.32128 | 1.32137 | 1.32107 |
+/// | 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
+/// | 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | **1.35159** (below L9) |
 pub const LVL9: MatchParams =
     MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
 
 /// lvl9 with the parse split into independent 4 KiB segments (speed-2 E1): same match finder,
-/// a parse that runs one GPU lane per segment. Ratio ~0.01 % below lvl9, above libzstd L9.
+/// a parse that runs one GPU lane per segment. Validated >= libzstd L9 at 16, 32, 64 and 128 KiB
+/// blocks (table at `LVL9`).
 pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
 /// `lvl9` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
-/// instead of 16-bit hash chains. Full corpus at 64 KiB: 1.33927 (lvl9 1.33932).
+/// instead of 16-bit hash chains. Validated >= libzstd L9 at 16, 32, 64 and 128 KiB blocks
+/// (table at `LVL9`).
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
-/// `lvl9s12` with the segmented parse (E2 + E1): 1.33926 at 64 KiB, 1.35456 at 128 KiB.
+/// `lvl9s12` with the segmented parse (E2 + E1). Validated >= libzstd L9 at 16, 32, 64 and
+/// 128 KiB blocks (table at `LVL9`).
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4): 1.33860 at 64 KiB (above libzstd L9,
-/// 1.3379). Validated for blocks of at most 64 KiB only: at 128 KiB it gives 1.35159, below L9 (1.3532).
+/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4). Validated >= libzstd L9 at
+/// 16, 32 and 64 KiB blocks only (at 16 KiB by just +0.006 %); at 128 KiB it is below L9 (table
+/// at `LVL9`).
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
 /// Every named preset, in CLI order.

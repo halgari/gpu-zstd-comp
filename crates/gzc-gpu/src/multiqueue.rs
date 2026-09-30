@@ -39,7 +39,9 @@ pub(crate) fn queue_families(adapter: &wgpu::Adapter) -> Vec<QueueFamily> {
 }
 
 /// The queue family the transfer readback can use on `adapter`: Vulkan with a family that is
-/// transfer-only (neither compute nor graphics; never family 0, wgpu's) and has a queue, on a
+/// transfer-only (neither compute nor graphics; never family 0, wgpu's) and has a queue,
+/// preferring one whose flags are exactly TRANSFER (ignoring SPARSE_BINDING and PROTECTED: a
+/// dedicated copy engine) over transfer families with extra capabilities (video, optical flow), on a
 /// device and instance of Vulkan 1.2 or later with `timelineSemaphore` (the pipeline orders the
 /// two queues with timeline semaphores through the 1.2 core entry points). None otherwise.
 pub(crate) fn transfer_family(adapter: &wgpu::Adapter) -> Option<u32> {
@@ -59,16 +61,15 @@ pub(crate) fn transfer_family(adapter: &wgpu::Adapter) -> Option<u32> {
         return None;
     }
     drop(hal);
-    queue_families(adapter)
+    use vk::QueueFlags as Q;
+    let usable: Vec<QueueFamily> = queue_families(adapter)
         .into_iter()
-        .find(|f| {
-            use vk::QueueFlags as Q;
-            f.index != 0
-                && f.flags.contains(Q::TRANSFER)
-                && !f.flags.intersects(Q::COMPUTE | Q::GRAPHICS)
-                && f.count > 0
+        .filter(|f| {
+            f.index != 0 && f.flags.contains(Q::TRANSFER) && !f.flags.intersects(Q::COMPUTE | Q::GRAPHICS) && f.count > 0
         })
-        .map(|f| f.index)
+        .collect();
+    let pure = |f: &&QueueFamily| (f.flags & !(Q::SPARSE_BINDING | Q::PROTECTED)) == Q::TRANSFER;
+    usable.iter().find(pure).or(usable.first()).map(|f| f.index)
 }
 
 /// A `VkDevice` created with family 0 queue 0 plus extra queues, before any wgpu device wraps it.

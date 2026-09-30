@@ -13,6 +13,17 @@ pub struct GpuContext {
     /// `GpuOptions::transfer_queue` is off or frame packing is on. The queue and the wgpu device
     /// share one `transfer::DeviceOwner`, which destroys the `VkDevice` after both are gone and
     /// keeps the Vulkan instance alive until then, so the field order does not matter.
+    ///
+    /// Single submitter: the transfer path stages timeline-semaphore waits/signals on `queue` for
+    /// its next submission (`TransferQueue::submit_wgpu`, under a lock that every submission of a
+    /// transfer-readback `Pipeline` takes). While such a pipeline exists, **nothing else may
+    /// submit to `queue` concurrently with it** (from another thread: `queue.submit`,
+    /// `write_buffer`, `read_buffer`, the one-shot `compressor` functions, another pipeline's
+    /// `run`), or that submission could take the staged semaphores. Only one transfer-readback
+    /// `Pipeline` may exist per context: `Pipeline::new` errors on a second one while the first is
+    /// alive (it does not fall back to the main-queue readback, which would still submit to the
+    /// same queue). Other pipelines (parse path, packed frames) and other work on the same thread
+    /// are fine. Open a context with `GpuOptions::transfer_queue` off for anything else.
     pub transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -65,18 +76,30 @@ impl Default for GpuOptions {
 impl GpuOptions {
     /// The defaults with the `GZC_*` environment overrides applied.
     pub fn from_env() -> Self {
-        let set = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
         Self {
-            subgroups: !set("GZC_NO_SUBGROUPS"),
-            pack_frames: set("GZC_PACK"),
+            subgroups: !env_on("GZC_NO_SUBGROUPS"),
+            pack_frames: env_on("GZC_PACK"),
             direct_upload: match std::env::var("GZC_DIRECT_UPLOAD").as_deref() {
                 Ok("0") => Some(false),
                 Ok("1") => Some(true),
                 _ => None,
             },
-            transfer_queue: !std::env::var("GZC_TRANSFER_QUEUE").is_ok_and(|v| v == "0"),
+            transfer_queue: !env_off("GZC_TRANSFER_QUEUE"),
         }
     }
+}
+
+/// Boolean `GZC_*` knobs follow one convention: a knob that is off by default (`GZC_PACK`,
+/// `GZC_NO_SUBGROUPS`, `GZC_NO_TIMESTAMPS`, `GZC_CHECKED_SHADERS`) is turned on by any value but
+/// `0` (this function); one that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is turned
+/// off by `0` only (`env_off`). `GZC_DIRECT_UPLOAD` is tri-state (unset: auto).
+pub(crate) fn env_on(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v != "0")
+}
+
+/// A default-on knob set to `0` (see `env_on`).
+pub(crate) fn env_off(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v == "0")
 }
 
 impl GpuContext {
@@ -195,7 +218,7 @@ impl Prepared {
         };
         // GZC_NO_TIMESTAMPS (anything but 0) leaves timestamp queries off, to time runs without them.
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
-            && !std::env::var("GZC_NO_TIMESTAMPS").is_ok_and(|v| v != "0");
+            && !env_on("GZC_NO_TIMESTAMPS");
         let mut required_features = wgpu::Features::empty();
         if timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
@@ -255,7 +278,7 @@ impl GpuContext {
     /// `shader_unbounded_loops` (the index clamps cost it nothing).
     /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
     pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
-        let checks = if std::env::var("GZC_CHECKED_SHADERS").is_ok_and(|v| v != "0") {
+        let checks = if env_on("GZC_CHECKED_SHADERS") {
             wgpu::ShaderRuntimeChecks::checked()
         } else {
             wgpu::ShaderRuntimeChecks {
