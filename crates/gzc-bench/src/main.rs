@@ -298,9 +298,15 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
         }
     }
     let ctx = GpuContext::new()?;
-    let max = max_batch_blocks(&ctx.device.limits());
-    for &batch in &sweep.batch {
-        anyhow::ensure!(batch >= 1 && batch <= max, "--batch {batch} not in 1..={max} for this device");
+    for p in presets {
+        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        for &batch in &sweep.batch {
+            anyhow::ensure!(
+                batch >= 1 && batch <= max,
+                "--batch {batch} not in 1..={max} for preset '{}' on this device",
+                p.name
+            );
+        }
     }
     Ok(ctx)
 }
