@@ -270,3 +270,140 @@ Batch scaling (wg16, workgroup ring, level 2):
 - Concern: during one of the experiments a kernel was killed with Xid 109 (CTX SWITCH TIMEOUT). The cause was an
   experiment build that skipped the trailer, so `main_fixup` ran on garbage counts; the shipped kernel always writes
   the trailer. No hang otherwise.
+
+## T4: K3opt passes (stage S3), branch `worktree-agent-ae29833b5f305bfaa` (from `m5` af45a3d), 2026-09-30
+
+`gzc-gpu`:
+
+- `k3opt.rs`: `OptPasses` runs a preset's whole `opt::passes` schedule with one dispatch per pass.
+  - Pass 0's kernel is priced by the seed: `PriceSrc::BlockInit`, or `PriceSrc::Prior` (the prior tables
+    plus the cover literals, taken from the resident candidate words).
+  - Each cheap pass (optLevel 0, `hist_out`) writes its histogram. The next pass's prologue reads it
+    (`PriceSrc::Hist`).
+  - Only the final pass writes its parse into `best` and runs the fix-up.
+  - Host harnesses: `parses_from_passes` (it can read every cheap pass's histogram back), `read_hists` and
+    `time_passes`.
+- `shaders/k3_opt.wgsl`: the new prologue modes are `PRICE_MODE` 2 (prior) and 3 (from the histogram), plus the
+  `HIST_OUT` epilogue.
+  - The DP body moved into `fn dp` unchanged.
+  - The `prices` binding is now read_write. It holds `Prices` (mode 1) or a `Hist` (mode 3 / `HIST_OUT`),
+    377 words per block either way.
+- **What is histogrammed:** exactly what the oracle's `Hist::of_output(&dp_pass(..))` counts, i.e. the
+  fixed-up block parse (`lazy::encode_raw` output), not each segment's raw DP output. Concretely:
+  - every literal byte of the block, including the block's last literals;
+  - each sequence's LL code, including the literal carry on a segment's first sequence;
+  - its ML code;
+  - its OF code, taken from `off_base` under the block's true decoder reps.
+
+  The GPU gets this in three steps:
+  - Each lane counts its own raw sequences with its own `off_base`s, plus its literal bytes (literal ranges and
+    the tail after its last match).
+  - The block's segment-0 lane then walks the segments exactly as `main_fixup` does. It moves the first
+    sequence's LL count by the carry, and moves the OF code of every sequence that the re-encode changes.
+  - The block's lanes write the 377 words.
+- **Deviations from the design text (§2.4, §2.2):**
+  - A `HIST_OUT` pass does write its raw sequences. They go to the segment's series-log words of `seqs`,
+    written last-first from the end of the region, which never overwrites an unread log entry (see `LOG_SEQS`).
+    The OF fix needs them in order. The candidate words stay intact.
+  - The design's separate 1.5 KiB shared-memory counters are not used; see the rejected variants below.
+  - The price tables stay i32, as in T3 (u16 tables belong to the K3opt performance study).
+- Prior-seed and `hist_out` kernels need a block's segments in one workgroup (`wg % 16 == 0` at 64 KiB). Both
+  wg16 and wg32 qualify.
+- T3 review minors:
+  - later-pass Buffer-price configs: opt16's pass-1 tables at L2 and L0 on synthetic and corpus blocks;
+  - the `context.rs` limit comment now names `SortKernel::new`;
+  - a forced workgroup ring over the adapter limit is skipped with a message (`runs_here`);
+  - the k3opt corpus sampler is now uniform over (file, block) and skips when the corpus is missing.
+
+### Correctness (byte-identical to `opt::passes`: the final parse and every cheap pass's histogram)
+
+Schedules: cheap passes {0, 1, 3} × seeds {BlockInit, Prior}, final pass at optLevel 2. BlockInit×3 is opt16 and
+Prior×1 is opt14.
+
+| gate | 64 KiB | 16 KiB |
+|---|---|---|
+| every `opt::cases` block (18, scripted candidates) × 6 schedules | pass | pass |
+| synthetic blocks (15) × 6 schedules; opt16 / opt14 on the private ring and at wg32 | pass | pass |
+| 4000 corpus blocks (every 25th / 99th (file, block)) × 6 schedules | pass | pass |
+| later-pass Buffer tables at L2 and L0: synthetic (15) and 4000 corpus | pass | pass |
+| the same k3opt tests with `GZC_NO_SUBGROUPS=1` | pass | pass |
+| full `gzc-gpu` suite; `differential` with `GZC_NO_SUBGROUPS=1` and at 16K | pass | pass (differential) |
+
+The optLevel-2 match + 1 literal path (`ll_inc1 < 0`) is exercised:
+
+- final passes with `ll[1] < ll[0]`: 12 synthetic, 1779 corpus (64K), 2316 (16K), summed over the schedules;
+- later-pass tables: 3 of 15 synthetic blocks, 787 of 4000 corpus blocks (837 at 16K).
+
+The synthetic test asserts that the count is above zero.
+
+Commands:
+
+- `cargo test --release -p gzc-gpu --test k3opt`;
+- `GZC_CORPUS=… cargo test --release -p gzc-gpu --test k3opt -- --include-ignored --skip timing`;
+- the same with `GZC_NO_SUBGROUPS=1`, and with `--no-default-features --features block-16k`
+  (`CARGO_TARGET_DIR=target/b16`).
+
+### Time (RTX 5090, 2900 corpus blocks at 64 KiB / 11600 at 16 KiB, one batch, wg16, workgroup ring)
+
+`k3opt_passes_timing` reports the timestamp medians of 5 reps. The tables give the median of 3 runs, all
+GPU-idle-gated: runs where another agent's GPU job appeared were discarded and repeated. Load average was
+2–20 (CPU only).
+
+| 64 KiB, µs/block | pass 0 | pass 1 | pass 2 | pass 3 (final) | fix-up | **total** | span (with dispatch gaps) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| opt14 (Prior, 1 cheap) runs | 16.41 / 16.35 / 16.41 | 18.27 / 18.26 / 18.27 (final) | | | 0.27 | 34.94 / 34.88 / 34.95 | 34.94 |
+| opt14 median | 16.41 | 18.27 | | | 0.27 | **34.94** | 34.94 |
+| opt16 (BlockInit, 3 cheap) runs | 15.24 / 15.15 / 15.18 | 15.28 / 15.25 / 15.22 | 15.34 / 15.34 / 15.28 | 18.31 / 18.33 / 18.34 | 0.26 | 64.43 / 64.33 / 64.28 | 64.34 |
+| opt16 median | 15.18 | 15.25 | 15.34 | 18.33 | 0.26 | **64.33** | 64.34 |
+
+The same runs gave these T3 single-pass references:
+
+- wg16 L2 block-init: 18.08 / 18.16 / 18.17;
+- wg16 L0 buffer: 14.88 / 14.85 / 14.92.
+
+Pass costs against those references:
+
+- A cheap pass with its histogram costs 15.2 µs, against 14.85 without it: +0.35 µs (+2.4 %).
+- The final pass priced from the histogram costs 18.33, against 18.16.
+- The Prior seed's cover-literal prologue costs 16.41 − 15.2 ≈ +1.2 µs, where the design projected 0.3. It is a
+  serial 4096-position scan per lane over the candidate words.
+
+| 16 KiB, µs/block (3 runs) | passes (DP…) | fix-up | total |
+|---|---|---:|---:|
+| opt14 | 6.86, 7.78 | 0.04 | 14.67 / 14.67 / 14.69 |
+| opt16 | 6.24, 6.49, 6.48, 7.81 | 0.04 | 27.05 / 27.08 / 27.06 |
+
+Per 64 KiB of data, that is opt14 58.7 µs and opt16 108.2 µs, against 34.9 and 64.3 µs at 64 KiB.
+
+### Decisions and rejected variants (64 KiB, clean runs)
+
+- **Workgroup memory is the cliff.** The first epilogue kept LL/ML/OF counters and per-lane segment summaries in
+  their own workgroup arrays, about 870 B more per wg16 workgroup. Cheap passes took 20.7–22.2 µs.
+  - Ablations did not explain the gap: skipping the literal counts cut about 0.5 µs from pass 0; skipping all histogram work
+    and the epilogue still left pass 0 at 20.1 µs (with the same block-init prices as T3's 14.9 µs pass).
+  - The cause: T3's unchanged kernels with those arrays merely allocated ran at L2 24.26 / 24.29 (vs 18.1)
+    and L0 20.14 / 20.17 (vs 14.9) µs, i.e. +33 %, in 2 clean runs.
+  - **Kept:** the code counts share the prologue's `hist` words (literal count in the low 17 bits, since it is at
+    most 65536; code count in the high 15 bits, since it is below 32768). The segment summary goes in the
+    segment's dead trace words. There is zero extra workgroup memory: cheap passes 15.2 µs.
+- **One dispatch per pass (kept) vs an in-kernel pass loop (rejected).** Tried with `LOOP_PASSES` and a runtime
+  prologue mode.
+  - Fused, opt16's 3 cheap passes took 45.85 / 46.02 / 46.01 µs in one dispatch. One dispatch per pass on the
+    kept kernel took 45.7 µs (15.18 + 15.25 + 15.34). So the loop is 0.7 % slower.
+  - The runtime prologue mode also slowed the unfused kernels by 3–4 % (cheap 15.8–15.95, final 18.7).
+  - The span (first DP start to fix-up end) equals the sum of the passes within 0.03 µs/block, so dispatch gaps
+    leave nothing for a loop to recover.
+  - Under 3 %, so the simpler form stays; the experiment diff is not committed.
+- Global atomics for the code counts were not tried. The packed form already costs only 0.35 µs.
+
+### Next steps
+
+- K3opt per-pass latency remains the whole cost (4 passes × 15–18 µs). The T3 performance study owns the
+  relaxation loop. The prologue/epilogue code is modular and independent of the DP body:
+  - `prologue(valid, b)`, with `count_block` and `cover_chunk`;
+  - `hist_seq` / `hist_lits` / `hist_move`, called only from `emit_series` and the end of `dp`;
+  - `hist_epilogue`.
+- Any rewrite must keep the workgroup footprint in mind: +870 B per workgroup costs 33 % at wg16.
+- The cover-literal prologue (+1.2 µs, opt14 only) could be cut:
+  - unroll or prefetch the candidate-word loads;
+  - or compute it in K2opt, which writes those words.

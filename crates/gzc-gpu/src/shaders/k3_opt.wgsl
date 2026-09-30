@@ -38,9 +38,27 @@
 // Precondition (K2opt's output satisfies it): every candidate record lies in the block before its
 // position, and its length is the true common length capped at SEARCH_CAP.
 //
+// Passes (M5 T4, opt::passes): pass n + 1 is priced from pass n's own output histogram
+// (opt::Hist::of_output of the fixed-up block parse: literal bytes, and each sequence's LL code
+// with the literal carry, ML code, and OF code of the off_base under the block's true decoder
+// reps). A HIST_OUT pass (the cheap ones) keeps the candidate words: its raw sequences go to the
+// segment's series-log words of `seqs` instead of `best`, and a workgroup epilogue (hist_epilogue)
+// histograms them: every lane counts its own sequences and literal bytes, then the block's
+// segment-0 lane applies what main_fixup would change (the literal carry of each segment's first
+// sequence, and the OF codes of the sequences it re-encodes against the true reps), and the
+// block's lanes store the Hist (377 words: lit[256] ll[36] ml[53] of[32]) at `prices`[b * 377].
+// The next pass's prologue (PRICE_MODE 3) turns it into price tables (opt::Prices::from_hist).
+// No fix-up runs after a HIST_OUT pass. A HIST_OUT pass needs each block's segments in one
+// workgroup (LPB == NSEG).
+//
+// PRICE_MODE: 0 block-init (opt::Prices::block_init), 1 explicit tables in `prices`, 2 the prior
+// seed (codes::OPT_PRIOR_* tables plus opt::cover_literals of the block's candidate words; needs
+// LPB == NSEG), 3 opt::Prices::from_hist of the Hist in `prices`.
+//
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
-// (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, BI_LL / BI_ML / BI_OF (block-init
-// LL / ML / OF prices), and the ring declarations (ring_p/a/b/c, rix).
+// (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
+// (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
+// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the ring declarations (ring_p/a/b/c, rix).
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;
@@ -59,7 +77,30 @@ const PRICE_WORDS: u32 = 377u;
 // seqs words per segment for the series log: at most SEG / 3 series with a match (each covers at
 // least one 3-byte match, and series are disjoint), 3 words each.
 const LOG_WORDS: u32 = (3u * MAX_SEQS) / NSEG;
+// HIST_OUT: the segment's raw sequences, in order, end at word lbase + 3 * LOG_SEQS (written last
+// first while phase 2 still reads the series log from the front: raw sequence j from the end
+// lands at slot LOG_SEQS - 1 - j, which holds a series entry already read, since each unread
+// series still has at least one sequence to emit and a segment has at most SEG / 3).
+const LOG_SEQS: u32 = LOG_WORDS / 3u;
 const_assert 3u * (SEG / 3u) <= LOG_WORDS;
+const_assert SEG / 3u <= LOG_SEQS;
+const HIST_WORDS: u32 = 377u;
+// HIST_OUT counts in the workgroup's `hist` words, no extra workgroup memory (K3opt's residency
+// is bound by it: 870 more bytes per workgroup cost 33 % at wg16, M5 T4 log): word e of block pb
+// holds literal byte e's count in its low 17 bits (at most BLOCK_SIZE <= 65536) and code e's count
+// in its high 15 bits (at most MAX_SEQS < 32768), codes numbered as in the Hist: LL 0..36,
+// ML 36..89, OF 89..121. Counts never go negative, so the packed atomics are exact.
+const LIT_BITS: u32 = 17u;
+const LIT_MASK: u32 = (1u << LIT_BITS) - 1u;
+const CODE_ONE: u32 = 1u << LIT_BITS;
+const H_LL: u32 = 0u;
+const H_ML: u32 = 36u;
+const H_OF: u32 = 89u;
+const_assert BLOCK_SIZE < (1u << LIT_BITS);
+const_assert MAX_SEQS < (1u << (32u - LIT_BITS));
+// HIST_OUT: the segment summary (sequences, final anchor, final reps) for hist_epilogue, in the
+// segment's first trace words (dead after its phase 2).
+const SUM_WORDS: u32 = 5u;
 const_assert BLOCK_SIZE <= 65536u;
 const_assert WG % NSEG == 0u || NSEG % WG == 0u;
 const_assert 3u * (SEG / 3u) <= SEG_META;
@@ -73,7 +114,9 @@ const_assert MIN_MATCH == 3u;
 @group(0) @binding(2) var<storage, read_write> seqs: array<u32>;
 @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
 @group(0) @binding(4) var<storage, read_write> trace: array<u32>;
-@group(0) @binding(5) var<storage, read> prices: array<u32>;
+// PRICE_MODE 1: opt::Prices per block; PRICE_MODE 3 / HIST_OUT: opt::Hist per block (the
+// previous pass's, replaced by this pass's). PRICE_WORDS == HIST_WORDS words per block.
+@group(0) @binding(5) var<storage, read_write> prices: array<u32>;
 
 // zstd LL_Code for lit_len < 64 (codes::ll_code).
 const LL_CODE: array<u32, 64> = array<u32, 64>(
@@ -91,8 +134,11 @@ var<workgroup> p_llc: array<i32, 36u * BPW>;
 // ML price by match length (3..=SUFF).
 var<workgroup> p_ml: array<i32, RING_N * BPW>;
 var<workgroup> p_of: array<i32, 32u * BPW>;
+// The prologue's literal frequencies; with HIST_OUT, then the pass's packed histogram (see
+// LIT_BITS).
 var<workgroup> hist: array<atomic<u32>, 256u * BPW>;
-var<workgroup> hsum: array<atomic<u32>, BPW>;
+// Per block: the table sums (lit, ll, ml, of) and, for PRICE_MODE 2, the uncovered bytes.
+var<workgroup> hsum: array<atomic<u32>, 5u * BPW>;
 
 // Lane constants.
 var<private> lane: u32;
@@ -253,6 +299,42 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
     }
 }
 
+// == codes::ll_code / codes::ml_code.
+fn ll_code(ll: u32) -> u32 {
+    if (ll > 63u) { return firstLeadingBit(ll) + 19u; }
+    return LL_CODE[ll];
+}
+fn ml_code(ml: u32) -> u32 {
+    let b = ml - 3u;
+    if (b > 127u) { return firstLeadingBit(b) + 36u; }
+    return ML_CODE[b];
+}
+
+// HIST_OUT: counts the literal bytes at [a, e) of the lane's block.
+fn hist_lits(a: u32, e: u32) {
+    // Terminates: q rises to e.
+    for (var q = a; q < e; q += 1u) {
+        atomicAdd(&hist[pb * 256u + load_byte(base, q)], 1u);
+    }
+}
+
+// HIST_OUT: counts one raw sequence (its match at block position `m`) under the segment's own
+// history: its literal bytes and its LL / ML / OF codes (hist_epilogue fixes the rest).
+fn hist_seq(m: u32, ll: u32, ml: u32, ob: u32) {
+    hist_lits(m - ll, m);
+    atomicAdd(&hist[pb * 256u + H_LL + ll_code(ll)], CODE_ONE);
+    atomicAdd(&hist[pb * 256u + H_ML + ml_code(ml)], CODE_ONE);
+    atomicAdd(&hist[pb * 256u + H_OF + firstLeadingBit(ob)], CODE_ONE);
+}
+
+// HIST_OUT: moves one count of block pb's code from index i to j (hist_epilogue's fixes).
+fn hist_move(i: u32, j: u32) {
+    if (i != j) {
+        atomicSub(&hist[pb * 256u + i], CODE_ONE);
+        atomicAdd(&hist[pb * 256u + j], CODE_ONE);
+    }
+}
+
 fn trace_put(p: u32, n: Node) {
     let t = tbase + 2u * p;
     trace[t] = n.mlen | (n.litlen << 8u);
@@ -287,6 +369,9 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
 // rep's length (candidate lengths are true capped lengths, extended at the cap, both clamped to
 // iend) and so is never recorded after it; the last rep index needs rep0 > 1 in both. So the
 // DP's history is the canonical one and the trailer's reps are st_rep.
+//
+// HIST_OUT: the sequences go to the segment's series-log words instead (see LOG_SEQS), and each
+// is counted in the pass's histograms with its literal bytes (hist_seq).
 fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_ob: u32) {
     var sp = last_pos - last_mlen - last_litlen;
     var mlen = last_mlen;
@@ -296,10 +381,18 @@ fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_o
         let t0 = trace[t];
         let nm = t0 & 0xFFu;
         let nl = t0 >> 8u;
-        let o = wbase + 3u * n_seq;
-        best[o] = nl;
-        best[o + 1u] = mlen;
-        best[o + 2u] = ob;
+        if (HIST_OUT) {
+            let o = lbase + 3u * (LOG_SEQS - 1u - n_seq);
+            seqs[o] = nl;
+            seqs[o + 1u] = mlen;
+            seqs[o + 2u] = ob;
+            hist_seq(sip + sp, nl, mlen, ob);
+        } else {
+            let o = wbase + 3u * n_seq;
+            best[o] = nl;
+            best[o + 1u] = mlen;
+            best[o + 2u] = ob;
+        }
         n_seq += 1u;
         ml_sum += mlen;
         // Terminates: sp falls by nl + nm >= 3 per step (a node ending a match has mlen >= 3);
@@ -311,51 +404,203 @@ fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_o
     }
 }
 
+// Literal price from the frequency `f` and the base weight `lb` (opt::Prices::from_freqs).
+fn lit_from(f: u32, lb: u32) -> i32 {
+    return i32(lb - min(frac_weight(f), lb - 256u));
+}
+
+// opt::Prices::from_hist's frequency of a count.
+fn seen(c: u32) -> u32 {
+    return c + select(0u, 1u, c > 0u);
+}
+
+// The block's literal byte counts into hist (LPB lanes striding over its words).
+fn count_block(blk: u32, kl: u32, b: u32) {
+    let w0 = block_base(b);
+    for (var w = kl; w < BLOCK_SIZE / 4u; w += LPB) {
+        let v = data[w0 + w];
+        atomicAdd(&hist[blk * 256u + (v & 0xFFu)], 1u);
+        atomicAdd(&hist[blk * 256u + ((v >> 8u) & 0xFFu)], 1u);
+        atomicAdd(&hist[blk * 256u + ((v >> 16u) & 0xFFu)], 1u);
+        atomicAdd(&hist[blk * 256u + (v >> 24u)], 1u);
+    }
+}
+
+// PRICE_MODE 2 (opt::cover_literals): the bytes of lane kl's chunk of the block that no
+// candidate covers into hist, and their number into hsum[blk * 5 + 4]. Position p is covered
+// when some p' <= p has p' + lenB(p') > p; lenB <= SEARCH_CAP, so the chunk's running maximum
+// starts from the SEARCH_CAP positions before it.
+fn cover_chunk(blk: u32, kl: u32, b: u32) {
+    const C: u32 = BLOCK_SIZE / LPB;
+    let cb = 2u * b * BLOCK_SIZE;
+    let bb = block_base(b);
+    let p0 = kl * C;
+    var reach = 0u;
+    // Terminates: p rises to p0.
+    for (var p = p0 - min(p0, SEARCH_CAP); p < p0; p += 1u) {
+        reach = max(reach, p + (best[cb + 2u * p] >> 24u));
+    }
+    var n = 0u;
+    // Terminates: p rises to p0 + C.
+    for (var p = p0; p < p0 + C; p += 1u) {
+        reach = max(reach, p + (best[cb + 2u * p] >> 24u));
+        if (reach <= p) {
+            atomicAdd(&hist[blk * 256u + load_byte(bb, p)], 1u);
+            n += 1u;
+        }
+    }
+    atomicAdd(&hsum[blk * 5u + 4u], n);
+}
+
 // The workgroup's price tables (see the header). Every lane calls it (it has barriers).
 fn prologue(valid: bool, b: u32) {
     let blk = lane / LPB;
     let kl = lane % LPB;
-    if (PRICE_MODE == 0u) {
+    if (PRICE_MODE == 0u || PRICE_MODE == 2u) {
         for (var i = lane; i < 256u * BPW; i += WG) { atomicStore(&hist[i], 0u); }
-        if (lane < BPW) { atomicStore(&hsum[lane], 0u); }
+        for (var i = lane; i < 5u * BPW; i += WG) { atomicStore(&hsum[i], 0u); }
         workgroupBarrier();
         if (valid) {
-            // The whole block, LPB lanes striding over its words.
-            let w0 = block_base(b);
-            for (var w = kl; w < BLOCK_SIZE / 4u; w += LPB) {
-                let v = data[w0 + w];
-                atomicAdd(&hist[blk * 256u + (v & 0xFFu)], 1u);
-                atomicAdd(&hist[blk * 256u + ((v >> 8u) & 0xFFu)], 1u);
-                atomicAdd(&hist[blk * 256u + ((v >> 16u) & 0xFFu)], 1u);
-                atomicAdd(&hist[blk * 256u + (v >> 24u)], 1u);
-            }
+            if (PRICE_MODE == 0u) { count_block(blk, kl, b); } else { cover_chunk(blk, kl, b); }
+        }
+        workgroupBarrier();
+        // Every byte covered: the whole block's histogram.
+        if (PRICE_MODE == 2u && valid && atomicLoad(&hsum[blk * 5u + 4u]) == 0u) {
+            count_block(blk, kl, b);
         }
         workgroupBarrier();
         for (var e = kl; e < 256u; e += LPB) {
             let c = atomicLoad(&hist[blk * 256u + e]);
-            let f = select(0u, 1u, c > 0u) + (c >> 8u);
+            var f = seen(c);
+            if (PRICE_MODE == 0u) { f = select(0u, 1u, c > 0u) + (c >> 8u); }
             atomicStore(&hist[blk * 256u + e], f);
-            atomicAdd(&hsum[blk], f);
+            atomicAdd(&hsum[blk * 5u], f);
         }
         workgroupBarrier();
-        let lb = frac_weight(max(atomicLoad(&hsum[blk]), 1u));
+        let lb = frac_weight(max(atomicLoad(&hsum[blk * 5u]), 1u));
         for (var e = kl; e < 256u; e += LPB) {
-            let f = atomicLoad(&hist[blk * 256u + e]);
-            p_lit[blk * 256u + e] = i32(lb - min(frac_weight(f), lb - 256u));
+            p_lit[blk * 256u + e] = lit_from(atomicLoad(&hist[blk * 256u + e]), lb);
         }
-        for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = BI_LL[c]; }
-        for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = BI_LL[LL_CODE[l]]; }
-        for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = BI_ML[max(m, 3u) - 3u]; }
-        for (var c = kl; c < 32u; c += LPB) { p_of[blk * 32u + c] = BI_OF[c]; }
-    } else if (valid) {
-        let q = b * PRICE_WORDS;
-        for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = i32(prices[q + e]); }
-        for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = i32(prices[q + 256u + c]); }
-        for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = i32(prices[q + 256u + LL_CODE[l]]); }
-        for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = i32(prices[q + 292u + max(m, 3u) - 3u]); }
-        for (var c = kl; c < 32u; c += LPB) { p_of[blk * 32u + c] = i32(prices[q + 345u + c]); }
+        if (PRICE_MODE == 0u) {
+            for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = BI_LL[c]; }
+            for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = BI_LL[LL_CODE[l]]; }
+            for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = BI_ML[max(m, 3u) - 3u]; }
+            for (var c = kl; c < 32u; c += LPB) { p_of[blk * 32u + c] = BI_OF[c]; }
+        } else {
+            for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = PR_LL[c]; }
+            for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = PR_LL[LL_CODE[l]]; }
+            for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = PR_ML[max(m, 3u) - 3u]; }
+            for (var c = kl; c < 32u; c += LPB) { p_of[blk * 32u + c] = PR_OF[c]; }
+        }
+    } else if (PRICE_MODE == 1u) {
+        if (valid) {
+            let q = b * PRICE_WORDS;
+            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = i32(prices[q + e]); }
+            for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = i32(prices[q + 256u + c]); }
+            for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = i32(prices[q + 256u + LL_CODE[l]]); }
+            for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = i32(prices[q + 292u + max(m, 3u) - 3u]); }
+            for (var c = kl; c < 32u; c += LPB) { p_of[blk * 32u + c] = i32(prices[q + 345u + c]); }
+        }
+    } else {
+        // PRICE_MODE 3: opt::Prices::from_hist of the block's Hist (lit, ll, ml, of).
+        for (var i = lane; i < 5u * BPW; i += WG) { atomicStore(&hsum[i], 0u); }
+        workgroupBarrier();
+        let q = b * HIST_WORDS;
+        if (valid) {
+            var sl = 0u;
+            var sll = 0u;
+            var sml = 0u;
+            var sof = 0u;
+            for (var e = kl; e < 256u; e += LPB) { sl += seen(prices[q + e]); }
+            for (var c = kl; c < 36u; c += LPB) { sll += seen(prices[q + 256u + c]); }
+            for (var c = kl; c < 53u; c += LPB) { sml += seen(prices[q + 292u + c]); }
+            for (var c = kl; c < 32u; c += LPB) { sof += seen(prices[q + 345u + c]); }
+            atomicAdd(&hsum[blk * 5u], sl);
+            atomicAdd(&hsum[blk * 5u + 1u], sll);
+            atomicAdd(&hsum[blk * 5u + 2u], sml);
+            atomicAdd(&hsum[blk * 5u + 3u], sof);
+        }
+        workgroupBarrier();
+        if (valid) {
+            let lb = frac_weight(max(atomicLoad(&hsum[blk * 5u]), 1u));
+            let llb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 1u]), 1u));
+            let mlb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 2u]), 1u));
+            let ofb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 3u]), 1u));
+            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = lit_from(seen(prices[q + e]), lb); }
+            for (var c = kl; c < 36u; c += LPB) {
+                p_llc[blk * 36u + c] = i32(LL_BITS[c] * 256u + llb - frac_weight(seen(prices[q + 256u + c])));
+            }
+            for (var l = kl; l < 64u; l += LPB) {
+                let c = LL_CODE[l];
+                p_lls[blk * 64u + l] = i32(LL_BITS[c] * 256u + llb - frac_weight(seen(prices[q + 256u + c])));
+            }
+            for (var m = kl; m < RING_N; m += LPB) {
+                let c = max(m, 3u) - 3u;
+                p_ml[blk * RING_N + m] = i32(ML_BITS[c] * 256u + mlb - frac_weight(seen(prices[q + 292u + c])));
+            }
+            for (var c = kl; c < 32u; c += LPB) {
+                p_of[blk * 32u + c] = i32(c * 256u + ofb - frac_weight(seen(prices[q + 345u + c])));
+            }
+        }
     }
     workgroupBarrier();
+    if (HIST_OUT) {
+        for (var i = lane; i < 256u * BPW; i += WG) { atomicStore(&hist[i], 0u); }
+        workgroupBarrier();
+    }
+}
+
+// HIST_OUT: the pass's Hist of block b (lane of segment k), after every lane's phase 2. Each lane
+// has counted its own raw sequences and literal bytes (in `hist`, packed, see LIT_BITS) and left
+// its segment summary in its first trace words (SUM_WORDS); the segment-0 lane then applies main_fixup's
+// changes (the literal carry of each segment's first sequence, and the off_bases it re-encodes
+// against the true reps, walking the segments in order exactly as main_fixup does), and the
+// block's lanes store the Hist at prices[b * HIST_WORDS]. Every lane calls it (barriers).
+fn hist_epilogue(valid: bool, b: u32, k: u32) {
+    storageBarrier();
+    workgroupBarrier();
+    if (valid && k == 0u) {
+        var reps = vec3<u32>(1u, 4u, 8u);
+        var prev_end = 0u;
+        for (var kk = 0u; kk < NSEG; kk += 1u) {
+            let sm = 2u * (b * BLOCK_SIZE + kk * SEG);
+            let n = trace[sm];
+            let carry = kk * SEG - prev_end;
+            if (n > 0u) { prev_end = trace[sm + 1u]; }
+            let src = b * (3u * MAX_SEQS) + kk * LOG_WORDS + 3u * (LOG_SEQS - n);
+            if (n > 0u && carry > 0u) {
+                let own = seqs[src];
+                hist_move(H_LL + ll_code(own), H_LL + ll_code(own + carry));
+            }
+            var spec = select(vec3<u32>(0u), vec3<u32>(1u, 4u, 8u), kk == 0u);
+            var i = 0u;
+            // Terminates: i rises to n.
+            loop {
+                if (i >= n || all(reps == spec)) { break; }
+                let r = src + 3u * i;
+                let ll = seqs[r] + select(0u, carry, i == 0u);
+                let spec_ob = seqs[r + 2u];
+                let offset = offset_of(spec, spec_ob, ll);
+                spec = applied(spec, spec_ob, ll);
+                let ob = ob_for(reps, offset, ll);
+                reps = applied(reps, ob, ll);
+                hist_move(H_OF + firstLeadingBit(spec_ob), H_OF + firstLeadingBit(ob));
+                i += 1u;
+            }
+            if (i < n) { reps = vec3<u32>(trace[sm + 2u], trace[sm + 3u], trace[sm + 4u]); }
+        }
+    }
+    workgroupBarrier();
+    if (valid) {
+        let q = b * HIST_WORDS;
+        for (var e = k; e < HIST_WORDS; e += NSEG) {
+            if (e < 256u) {
+                prices[q + e] = atomicLoad(&hist[pb * 256u + e]) & LIT_MASK;
+            } else {
+                prices[q + e] = atomicLoad(&hist[pb * 256u + e - 256u]) >> LIT_BITS;
+            }
+        }
+    }
 }
 
 @compute @workgroup_size(WG)
@@ -367,8 +612,12 @@ fn main_opt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     lane = lid;
     pb = lid / LPB;
     prologue(valid, b);
-    if (!valid) { return; }
+    if (valid) { dp(b, k); }
+    if (HIST_OUT) { hist_epilogue(valid, b, k); }
+}
 
+// The DP pass of segment k of block b (phases 1 and 2).
+fn dp(b: u32, k: u32) {
     base = block_base(b);
     cbase = 2u * b * BLOCK_SIZE;
     tbase = cbase;
@@ -560,6 +809,18 @@ fn main_opt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
         let a = seqs[l];
         let c = seqs[l + 1u];
         emit_series(a & 0xFFFFu, c & 0xFFFFu, a >> 16u, c >> 16u, seqs[l + 2u]);
+    }
+    if (HIST_OUT) {
+        // The literals after the segment's last match; the summary for hist_epilogue. The
+        // candidate words stay (no trailer in `best`).
+        hist_lits(st_anchor, iend);
+        let sm = tbase + 2u * s;
+        trace[sm] = n_seq;
+        trace[sm + 1u] = st_anchor;
+        trace[sm + 2u] = st_rep.x;
+        trace[sm + 3u] = st_rep.y;
+        trace[sm + 4u] = st_rep.z;
+        return;
     }
     best[wbase + SEG_META] = n_seq;
     best[wbase + SEG_META + 1u] = st_anchor;
