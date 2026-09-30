@@ -368,87 +368,35 @@ fn k3opt_timing() {
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
     let bufs = OptBuffers::new(&ctx, blocks.len() as u32);
-    let variants: Vec<(&str, K3OptConfig)> = vec![
-        (
-            "wg32 ring=wg L2 blockinit",
-            cfg(2, RingMem::Workgroup, PriceSrc::BlockInit),
-        ),
-        (
-            "wg32 ring=wg L2 buffer",
-            cfg(2, RingMem::Workgroup, PriceSrc::Buffer),
-        ),
-        (
-            "wg32 ring=wg L0 buffer",
-            cfg(0, RingMem::Workgroup, PriceSrc::Buffer),
-        ),
-        (
-            "wg16 ring=wg L2 buffer",
-            K3OptConfig {
-                wg: 16,
-                ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg64 ring=wg L2 buffer",
-            K3OptConfig {
-                wg: 64,
-                ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg32 ring=private L2 buffer",
-            cfg(2, RingMem::Private, PriceSrc::Buffer),
-        ),
-        (
-            "wg64 ring=private L2 buffer",
-            K3OptConfig {
-                wg: 64,
-                ..cfg(2, RingMem::Private, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg16 ring=private L2 buffer",
-            K3OptConfig {
-                wg: 16,
-                ..cfg(2, RingMem::Private, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg8 ring=wg L2 buffer",
-            K3OptConfig {
-                wg: 8,
-                ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg8 ring=private L2 buffer",
-            K3OptConfig {
-                wg: 8,
-                ..cfg(2, RingMem::Private, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg16 ring=wg L0 buffer",
-            K3OptConfig {
-                wg: 16,
-                ..cfg(0, RingMem::Workgroup, PriceSrc::Buffer)
-            },
-        ),
-        (
-            "wg16 ring=wg L2 blockinit",
-            K3OptConfig {
-                wg: 16,
-                ..cfg(2, RingMem::Workgroup, PriceSrc::BlockInit)
-            },
-        ),
-        (
-            "wg32 ring=wg L2 buffer checked",
-            K3OptConfig {
-                unbounded: false,
-                ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer)
-            },
-        ),
+    // (wg, ring, level, prices, unbounded loops)
+    let table: [(u32, RingMem, u8, PriceSrc, bool); 13] = [
+        (16, RingMem::Workgroup, 2, PriceSrc::BlockInit, true),
+        (16, RingMem::Workgroup, 2, PriceSrc::Buffer, true),
+        (16, RingMem::Workgroup, 0, PriceSrc::Buffer, true),
+        (32, RingMem::Workgroup, 2, PriceSrc::BlockInit, true),
+        (32, RingMem::Workgroup, 2, PriceSrc::Buffer, true),
+        (32, RingMem::Workgroup, 0, PriceSrc::Buffer, true),
+        (64, RingMem::Workgroup, 2, PriceSrc::Buffer, true),
+        (8, RingMem::Workgroup, 2, PriceSrc::Buffer, true),
+        (8, RingMem::Private, 2, PriceSrc::Buffer, true),
+        (16, RingMem::Private, 2, PriceSrc::Buffer, true),
+        (32, RingMem::Private, 2, PriceSrc::Buffer, true),
+        (64, RingMem::Private, 2, PriceSrc::Buffer, true),
+        (16, RingMem::Workgroup, 2, PriceSrc::Buffer, false),
     ];
+    let variants: Vec<(String, K3OptConfig)> = table
+        .iter()
+        .map(|&(wg, ring, level, prices, unbounded)| {
+            let name = format!(
+                "wg{wg} ring={} L{level} {}{}",
+                if ring == RingMem::Workgroup { "wg" } else { "private" },
+                if prices == PriceSrc::Buffer { "buffer" } else { "blockinit" },
+                if unbounded { "" } else { " checked" }
+            );
+            let c = K3OptConfig { wg, ring: Some(ring), level, prices, unbounded };
+            (name, c)
+        })
+        .collect();
     let filter = std::env::var("GZC_K3OPT_VARIANTS").ok();
     for (name, c) in variants {
         if let Some(f) = &filter
