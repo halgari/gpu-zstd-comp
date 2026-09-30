@@ -704,11 +704,26 @@ impl<'a> Pipeline<'a> {
         let bytes = n as usize * BLOCK_SIZE;
         {
             let mut view = slot.upload.get_mapped_range_mut(..bytes as u64 + 4).context("upload mapped range")?;
-            for (k, b) in blocks.iter().enumerate() {
-                view.slice(k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE).copy_from_slice(b);
-            }
-            // Trailing zero word after the last block (`data` may hold stale blocks beyond it).
-            view.slice(bytes..bytes + 4).copy_from_slice(&[0u8; 4]);
+            // Several threads write their share of the blocks: one thread's stores into the
+            // (write-combined, ReBAR) upload buffer run at ~20 GB/s, which made this copy the
+            // pipeline thread's largest cost once the readback left the GPU's critical path.
+            let per = blocks.len().div_ceil(upload_threads()).max(64);
+            let mut rest = view.slice(..);
+            std::thread::scope(|s| {
+                for chunk in blocks.chunks(per) {
+                    let (mine, tail) = std::mem::take(&mut rest).split_at(chunk.len() * BLOCK_SIZE);
+                    rest = tail;
+                    let mine = SendWriteOnly(mine);
+                    s.spawn(move || {
+                        let mut mine = mine.into_inner();
+                        for (k, b) in chunk.iter().enumerate() {
+                            mine.slice(k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE).copy_from_slice(b);
+                        }
+                    });
+                }
+                // Trailing zero word after the last block (`data` may hold stale blocks beyond it).
+                rest.copy_from_slice(&[0u8; 4]);
+            });
         }
         slot.upload.unmap();
         let t2 = Instant::now();
@@ -877,6 +892,31 @@ impl<'a> Pipeline<'a> {
             }
         }
     }
+}
+
+/// A disjoint piece of a mapped upload range, handed to one writer thread. `WriteOnly<[u8]>` is
+/// not `Send` only because its `Send` impl needs a sized `T`; like `&mut [u8]`, a byte slice of
+/// it is safe to move to another thread.
+struct SendWriteOnly<'a>(wgpu::WriteOnly<'a, [u8]>);
+
+// SAFETY: see above; the pieces come from `split_at`, so no two threads write the same bytes.
+unsafe impl Send for SendWriteOnly<'_> {}
+
+impl<'a> SendWriteOnly<'a> {
+    /// A method, so that a closure captures the whole wrapper rather than its non-`Send` field.
+    fn into_inner(self) -> wgpu::WriteOnly<'a, [u8]> {
+        self.0
+    }
+}
+
+/// Threads writing a batch into its upload buffer: `GZC_UPLOAD_THREADS`, else 4 (at most the
+/// available parallelism).
+fn upload_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::env::var("GZC_UPLOAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, cores.max(1))
+    })
 }
 
 /// Out-of-memory and validation error scopes, popped together.
