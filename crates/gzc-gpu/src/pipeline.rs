@@ -234,7 +234,7 @@ impl PackKernel {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        const _: () = assert!(FRAME_STRIDE % PACK_ALIGN == 0 && STAGING_ALIGN as usize % PACK_ALIGN == 0);
+        const _: () = assert!(FRAME_STRIDE.is_multiple_of(PACK_ALIGN) && (STAGING_ALIGN as usize).is_multiple_of(PACK_ALIGN));
         let src = format!(
             "const FRAME_WORDS: u32 = {}u;\nconst PACK_BASE: u32 = {}u;\n{PACK_WGSL}",
             FRAME_STRIDE / 4,
