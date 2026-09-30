@@ -85,7 +85,7 @@ fn main(
                     let hv = head[hbase + hk];
                     pr = select(hv - 1u, NO_POS, hv == 0u);
                 }
-                pred_out[pbase + pos] = pr;
+                pred_out[pbase + pos] = pred_word(pr, pred_fp(load_u32_at(base, pos), load_u32_at(base, pos + 4u)));
             }
             storageBarrier();
             workgroupBarrier();
@@ -97,7 +97,7 @@ fn main(
         }
 
         if (lid < BLOCK_SIZE - HASHED_POSITIONS) {
-            pred_out[pbase + HASHED_POSITIONS + lid] = NO_POS;
+            pred_out[pbase + HASHED_POSITIONS + lid] = PRED_NONE;
         }
     }
 }

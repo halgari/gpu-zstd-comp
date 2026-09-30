@@ -83,20 +83,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sp = (p & 3u) * 8u;
     let p0 = load_u32_at(base, p);
     let p1 = load_u32_at(base, p + 4u);
+    let fpp = pred_fp(p0, p1);
     // Cap early-out: once best_len == SEARCH_CAP nothing later can win, so the whole walk
     // stops (identical to walking on; see the header).
     for (var chain = 0u; chain < N_HASHES && best_len < SEARCH_CAP; chain++) {
         let pb = (b * N_HASHES + chain) * BLOCK_SIZE;
-        var q = pred[pb + p];
+        var q = pred[pb + p] & PRED_POS;
         for (var d = 0u; d < DEPTH; d++) {
-            if (q == NO_POS) { break; }
-            let len = match_len_capped(pw, sp, p0, p1, base, q, max);
-            if (len > best_len || (len == best_len && q > best_q)) {
-                best_len = len;
-                best_q = q;
-                if (len == SEARCH_CAP) { break; }
+            if (q == PRED_NONE) { break; }
+            let wq = pred[pb + q];
+            let x = (wq ^ fpp) & ~PRED_POS;
+            if ((x & PRED_FP_LO) == 0u
+                && (x == 0u || (MIN_MATCH <= 4u && (best_len < 4u || (best_len == 4u && q > best_q))))) {
+                let len = match_len_capped(pw, sp, p0, p1, base, q, max);
+                if (len > best_len || (len == best_len && q > best_q)) {
+                    best_len = len;
+                    best_q = q;
+                    if (len == SEARCH_CAP) { break; }
+                }
             }
-            q = pred[pb + q];
+            q = wq & PRED_POS;
         }
     }
     best[o] = select(0u, (best_len << BEST_OFF_BITS) | (p - best_q), best_len >= MIN_MATCH);

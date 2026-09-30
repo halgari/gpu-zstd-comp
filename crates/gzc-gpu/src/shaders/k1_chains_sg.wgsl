@@ -74,6 +74,18 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
     return mix(lo, hi & 0xFFu);
 }
 
+// pred_fp at p from the same words.
+fn fp_words(w: vec3<u32>, p: u32) -> u32 {
+    let sh = (p & 3u) * 8u;
+    var lo = w.x;
+    var hi = w.y;
+    if (sh != 0u) {
+        lo = (w.x >> sh) | (w.y << (32u - sh));
+        hi = (w.y >> sh) | (w.z << (32u - sh));
+    }
+    return pred_fp(lo, hi);
+}
+
 // The words chain_hash_words needs at p (zeros, without loading, if p is not hashed).
 fn load_words(base: u32, p: u32) -> vec3<u32> {
     var w = vec3<u32>(0u);
@@ -216,13 +228,13 @@ fn main(
                         pr = select(NO_POS, (old & POS_MASK) - 1u, (old & ~POS_MASK) == tag);
                     }
                 }
-                pred_out[pb + p] = pr;
+                pred_out[pb + p] = pred_word(pr, fp_words(cur, p));
             }
             storageBarrier();
         }
 
         if (li < BLOCK_SIZE - HASHED_POSITIONS) {
-            pred_out[pb + HASHED_POSITIONS + li] = NO_POS;
+            pred_out[pb + HASHED_POSITIONS + li] = PRED_NONE;
         }
     }
 }

@@ -14,7 +14,7 @@
 //!
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
-use gzc_core::config::{BLOCK_SIZE, HASH_BITS, LOG2_BLOCK};
+use gzc_core::config::{BLOCK_SIZE, HASH_BITS, LOG2_BLOCK, NO_POS};
 use gzc_core::params::MatchParams;
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
@@ -31,6 +31,23 @@ pub const HEAD_TABLES: u32 = 256;
 /// for the ~32 MB L2 of 8 GB-class target GPUs. The RTX 5090 (96 MB L2) is fastest at 224-256
 /// (`GZC_K1_GROUPS`).
 pub const DEFAULT_SG_GROUPS: u32 = 128;
+
+/// Predecessor bits of a K1 pred word (see `pred_fp`); `PRED_NONE` there means none.
+pub const PRED_POS: u32 = 0x1_FFFF;
+const _: () = assert!(LOG2_BLOCK <= 17);
+
+/// The predecessor a K1 pred word holds (`NO_POS` for none), without its fingerprint.
+pub fn pred_of_word(w: u32) -> u32 {
+    let pr = w & PRED_POS;
+    if pr == PRED_POS { NO_POS } else { pr }
+}
+
+/// Fingerprint bits K1 stores in the pred word of position `p < HASHED_POSITIONS` of `block`
+/// (common.wgsl `pred_fp`): bits 17..24 hash bytes p..p+4, bits 24..32 are byte p + 4.
+pub fn pred_fp(block: &[u8], p: usize) -> u32 {
+    let lo = u32::from_le_bytes(block[p..p + 4].try_into().unwrap());
+    ((lo.wrapping_mul(0x85EB_CA6B) >> 25) << 17) | ((block[p + 4] as u32) << 24)
+}
 
 /// Bytes of one head table (2^HASH_BITS u32 entries).
 const TABLE_BYTES: u64 = (1u64 << HASH_BITS) * 4;
@@ -251,6 +268,7 @@ impl ChainsKernel {
         ctx.queue.submit([enc.finish()]);
         let per_block = self.n_hashes as usize * BLOCK_SIZE;
         let all: Vec<u32> = ctx.read_buffer(pred, 0, per_block * n_blocks as usize);
+        let all: Vec<u32> = all.into_iter().map(pred_of_word).collect();
         all.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect()
     }
 
