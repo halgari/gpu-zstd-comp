@@ -258,8 +258,12 @@ struct SegParse {
     n_seg: u32,
 }
 
-/// Lanes per workgroup of `k3_seg.wgsl`'s `main_seg`.
-const K3_SEG_WG: u32 = 64;
+/// Lanes per workgroup of `k3_seg.wgsl`'s `main_seg` (32: 4 % faster K3 than 64 or 128 on an
+/// RTX 5090 at 64 KiB blocks).
+const K3_SEG_WG: u32 = 32;
+/// Positions `k3_seg.wgsl`'s literal scan tests per step (8: K3 12.1 -> 7.1 ms at 128 KiB blocks
+/// against 1; 4 and 12-16 are slower).
+const K3_SEG_SCAN: u32 = 8;
 
 /// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
 /// comes from gzc_core, so the GPU mirrors the CPU tables exactly.
@@ -523,17 +527,18 @@ impl Kernels {
         // BLOCK_SIZE (match_len's n grows to max <= lim - p), the skip by exactly 1; the fixup
         // loops count up to NSEG and to the segments' sequence counts.
         let parse_seg = (m.segment_log2 > 0).then(|| {
+            let seg_log2 = m.segment_log2;
             let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
             let body = format!(
-                "{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst SEG_LOG2: u32 = {}u;\n{K3_SEG_WGSL}",
-                m.segment_log2
+                "{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst SEG_LOG2: u32 = {}u;\nconst SEG_WG: u32 = {K3_SEG_WG}u;\nconst SCAN_W: u32 = {K3_SEG_SCAN}u;\n{K3_SEG_WGSL}",
+                seg_log2
             );
             let module = ctx.shader_unbounded_loops("k3_seg", &body);
             SegParse {
                 seg: pipeline_from_module(ctx, "k3_seg", &layout, &module, "main_seg"),
                 fixup: pipeline_from_module(ctx, "k3_seg_fixup", &layout, &module, "main_fixup"),
                 layout,
-                n_seg: (BLOCK_SIZE >> m.segment_log2) as u32,
+                n_seg: (BLOCK_SIZE >> seg_log2) as u32,
             }
         });
         let (tab, consts) = k4_tables();

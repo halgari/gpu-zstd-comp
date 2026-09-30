@@ -114,6 +114,51 @@ fn search_max(base: u32, bbase: u32, ip: u32, lim: u32) -> vec2<u32> {
     return vec2<u32>(len, off + 3u);
 }
 
+// Bytes [p, p + 4) of the 8 bytes (lo, hi) starting at p - j, for j in 0..4.
+fn window4(lo: u32, hi: u32, j: u32) -> u32 {
+    if (j == 0u) { return lo; }
+    return (lo >> (8u * j)) | (hi << (32u - 8u * j));
+}
+
+// Literal scan, SCAN_W positions per step: the first j < SCAN_W such that position ip + j could
+// start a match at the loop top (best[ip + j] has at least MIN_MATCH bytes, or the 4 bytes at
+// ip + j + 1 repeat at offset_1 == rep_len(ip + j + 1, offset_1) > 0), considering only
+// positions below ilimit; SCAN_W when there is none. Every position it skips is one where the
+// loop top would find no match and step by 1. For ip + j < ilimit, ip + j + 1 + 4 <= lim, so a
+// 4-byte compare equals rep_len's >= 4 test. best[] is read only below ilimit (this segment's
+// words). The data loads for positions at or past ilimit (masked out) can read up to 4 bytes past
+// the block (ip <= PARSE_END - 1 = BLOCK_SIZE - 9), i.e. the next block or pack_blocks' trailing
+// zero word: still inside the buffer.
+const_assert SCAN_W == 4u || SCAN_W == 8u;
+fn scan(base: u32, bbase: u32, ip: u32, ilimit: u32, lim: u32, off1: u32) -> u32 {
+    var hit = 0u;
+    for (var j = 0u; j < SCAN_W; j += 1u) {
+        if (ip + j < ilimit && best_len_of(best[bbase + ip + j]) >= MIN_MATCH) { hit |= 1u << j; }
+    }
+    let p0 = ip + 1u;
+    if (off1 != 0u) {
+        if (off1 <= p0) {
+            let q0 = p0 - off1;
+            for (var h = 0u; h < SCAN_W; h += 4u) {
+                let x0 = load_u32_at(base, p0 + h);
+                let x1 = load_u32_at(base, p0 + h + 4u);
+                let y0 = load_u32_at(base, q0 + h);
+                let y1 = load_u32_at(base, q0 + h + 4u);
+                for (var j = 0u; j < 4u; j += 1u) {
+                    if (window4(x0, x1, j) == window4(y0, y1, j)) { hit |= 1u << (h + j); }
+                }
+            }
+        } else {
+            for (var j = 0u; j < SCAN_W; j += 1u) {
+                if (ip + j < ilimit && rep_len(base, p0 + j, off1, lim) > 0u) { hit |= 1u << j; }
+            }
+        }
+    }
+    let n_valid = min(SCAN_W, ilimit - ip);
+    let valid = select((1u << n_valid) - 1u, 0xFFFFFFFFu, n_valid >= 32u);
+    return min(countTrailingZeros(hit & valid), SCAN_W);
+}
+
 // == lazy.rs store: sequence n_seq (ll, ml, off_base under the parse's own rep history) into the
 // segment's best[] words at wbase, updating that history. Returns the new count.
 fn store_raw(wbase: u32, n_seq: u32, ll: u32, offset: u32, ml: u32) -> u32 {
@@ -126,7 +171,7 @@ fn store_raw(wbase: u32, n_seq: u32, ll: u32, offset: u32, ml: u32) -> u32 {
     return n_seq + 1u;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(SEG_WG)
 fn main_seg(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = gid.x / NSEG;
     let k = gid.x % NSEG;
@@ -159,6 +204,11 @@ fn main_seg(@builtin(global_invocation_id) gid: vec3<u32>) {
     var ml_sum = 0u;
 
     while (ip < ilimit) {
+        // Skip positions that cannot start a match, SCAN_W at a time.
+        let j = scan(base, bbase, ip, ilimit, lim, offset_1);
+        ip += j;
+        if (j == SCAN_W) { continue; }
+
         var match_length = 0u;
         var off_base = 1u; // REPCODE1_TO_OFFBASE
         var start = ip + 1u;
