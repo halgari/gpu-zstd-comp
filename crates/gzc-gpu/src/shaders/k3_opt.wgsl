@@ -120,8 +120,9 @@ const_assert MIN_MATCH == 3u;
 // PRICE_MODE 1: opt::Prices per block; PRICE_MODE 3 / HIST_OUT: opt::Hist per block (the
 // previous pass's, replaced by this pass's). PRICE_WORDS == HIST_WORDS words per block.
 @group(0) @binding(5) var<storage, read_write> prices: array<u32>;
-// The DP nodes' payload (reps, litlen, mlen, offBase): 3 words per node, RING_N nodes per lane,
-// interleaved over the block's NSEG lanes (see six). Only the price stays in ring_p.
+// The DP nodes' payload (reps, litlen, mlen, offBase): 3 consecutive words per node, RING_N nodes
+// per lane (see six; lanes interleaved per slot measured 4 % slower, 16-byte nodes 0.5 %). Only
+// the price stays in ring_p.
 @group(0) @binding(6) var<storage, read_write> scr: array<u32>;
 
 // zstd LL_Code for lit_len < 64 (codes::ll_code).
@@ -225,8 +226,8 @@ struct Node {
 fn slot(pos: u32) -> u32 { return pos % RING_N; }
 
 // The payload words of the lane's slot s: scr[six(s)], scr[six(s) + SF], scr[six(s) + 2 SF].
-const SF: u32 = RING_N * NSEG;
-fn six(s: u32) -> u32 { return sbase + s * NSEG; }
+const SF: u32 = 1u;
+fn six(s: u32) -> u32 { return sbase + 3u * s; }
 
 fn ld(pos: u32) -> Node {
     let s = slot(pos);
@@ -636,7 +637,7 @@ fn dp(b: u32, k: u32) {
     cbase = 2u * b * BLOCK_SIZE;
     tbase = cbase;
     wbase = cbase + k * SEG_WORDS;
-    sbase = b * (3u * SF) + k;
+    sbase = (b * NSEG + k) * (3u * RING_N);
     let s = k * SEG;
     let iend = s + SEG;
     let ilimit = iend - 8u;
