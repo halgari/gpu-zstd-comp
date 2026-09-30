@@ -2,6 +2,9 @@
 //! fed `reference::find_cands` words (or `opt::cases`' scripted ones) from the host.
 //! M5 T4: every pass of `OptPasses` (seeds, cheap passes with their histograms, final pass)
 //! against `opt::passes`.
+//! opt14/opt16 only implement at blocks of at most 64 KiB, so this whole file is skipped in a
+//! `block-128k` build.
+#![cfg(not(feature = "block-128k"))]
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;

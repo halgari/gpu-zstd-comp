@@ -3,6 +3,9 @@
 //! (`reference::compress_block` + `write_frame`) on synthetic blocks and on real corpus blocks, in
 //! every upload/readback mode the adapter has. Run once more with `GZC_NO_SUBGROUPS=1` for the
 //! subgroup-less kernels, and in a `block-16k` build for 16 KiB blocks.
+//! opt14/opt16 only implement at blocks of at most 64 KiB, so this whole file is skipped in a
+//! `block-128k` build.
+#![cfg(not(feature = "block-128k"))]
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;

@@ -18,6 +18,10 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
   10 Gbit line rate, which suits slower links, 7z-extraction-bound installs and repacks.
 - Existing presets stay byte-identical (the lvl3 anchor and all differential tests).
 
+**As built.** Measured throughput on the 5090 (64 KiB, full corpus, median of 3): `opt14` 2169 MB/s and
+`opt16` 1426 MB/s at batch 2900 (one wave), and 1746 and 1090 MB/s at `--batch max` (b3586, past the
+one-wave boundary). See `docs/results/2026-09-30-m5.md`.
+
 ## 2. What L14 / L16 are at 64 KiB (established by research)
 
 - libzstd for sources ≤ 128 KiB: L14 = btopt (minMatch 3, searchLog 4, targetLength 32); L16 = btultra
@@ -81,6 +85,12 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
   extension, `<` in relaxation, lengths in descending order, record order (reps, then A, then B), and
   `newRep` numbering.
 
+**As built (after T3b).** The kernel uses workgroups of 16 lanes. Only each DP node's price stays in
+workgroup memory (about 4.6 KiB at 64 KiB blocks, which fits wgpu's 16 KiB default limit); node payloads
+(reps, litlen, mlen, offBase) live in a global scratch buffer, 6336 B per block at 64 KiB. The
+`var<private>` fallback remains for adapters whose workgroup storage limit is too small even for the
+prices alone.
+
 ### 3.4 Prices
 
 - Prices are static per block per pass, in 1/256-bit units: `WEIGHT(sum) − WEIGHT(count)` from the previous
@@ -103,6 +113,11 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
 - VRAM rises to ≈ 1.35 MiB per block, so `--batch max` shrinks (≈ 2900 blocks at 6 GiB, i3), and all of it
   is counted in `vram_bytes`.
 - Transfer queue, direct upload and the other speed2 paths are unchanged.
+
+**As built.** The optimal parse needs about 1.78 MiB per block at 64 KiB, at b3458 (copy upload), including
+three slots' worth of upload and staging buffers; at 6144 MiB with `--inflight 3` this resolves `--batch max`
+to 3458 blocks (copy upload) or 3586 (direct upload). The ≈ 2900 figure above was the one-wave residency
+(K3opt's occupancy limit on the 5090, not the VRAM budget). See `docs/results/2026-09-30-m5.md`.
 
 ## 4. Testing and gates
 

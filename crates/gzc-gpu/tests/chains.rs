@@ -113,6 +113,10 @@ fn k1_single_hash_preds_match_cpu() {
 /// The Opt3 chains (optimal-parse presets): the 4-byte chain, then zstd's 3-byte hash3 chain.
 #[test]
 fn k1_opt3_preds_match_cpu() {
+    // opt16 only implements at blocks of at most 64 KiB.
+    if gzc_core::config::LOG2_BLOCK > 16 {
+        return;
+    }
     use gzc_core::hash::hash3;
     let blocks = all_blocks();
     let block = &blocks[0].1;
@@ -219,6 +223,10 @@ fn k1_pred_words_carry_fingerprints() {
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         for params in [LVL3, LVL9, OPT16] {
+            // opt16 only implements at blocks of at most 64 KiB.
+            if params.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
             let kernel = ChainsKernel::new(&ctx, &params).unwrap();
             let nh = kernel.n_hashes() as usize;
             let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);
