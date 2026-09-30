@@ -85,8 +85,22 @@ const LOG_SEQS: u32 = LOG_WORDS / 3u;
 const_assert 3u * (SEG / 3u) <= LOG_WORDS;
 const_assert SEG / 3u <= LOG_SEQS;
 const HIST_WORDS: u32 = 377u;
-// Sizes of the HIST_OUT-only workgroup arrays (1 when unused).
-const HO: u32 = select(0u, 1u, HIST_OUT);
+// HIST_OUT counts in the workgroup's `hist` words, no extra workgroup memory (K3opt's residency
+// is bound by it: 870 more bytes per workgroup cost 33 % at wg16, M5 T4 log): word e of block pb
+// holds literal byte e's count in its low 17 bits (at most BLOCK_SIZE <= 65536) and code e's count
+// in its high 15 bits (at most MAX_SEQS < 32768), codes numbered as in the Hist: LL 0..36,
+// ML 36..89, OF 89..121. Counts never go negative, so the packed atomics are exact.
+const LIT_BITS: u32 = 17u;
+const LIT_MASK: u32 = (1u << LIT_BITS) - 1u;
+const CODE_ONE: u32 = 1u << LIT_BITS;
+const H_LL: u32 = 0u;
+const H_ML: u32 = 36u;
+const H_OF: u32 = 89u;
+const_assert BLOCK_SIZE < (1u << LIT_BITS);
+const_assert MAX_SEQS < (1u << (32u - LIT_BITS));
+// HIST_OUT: the segment summary (sequences, final anchor, final reps) for hist_epilogue, in the
+// segment's first trace words (dead after its phase 2).
+const SUM_WORDS: u32 = 5u;
 const_assert BLOCK_SIZE <= 65536u;
 const_assert WG % NSEG == 0u || NSEG % WG == 0u;
 const_assert 3u * (SEG / 3u) <= SEG_META;
@@ -120,18 +134,11 @@ var<workgroup> p_llc: array<i32, 36u * BPW>;
 // ML price by match length (3..=SUFF).
 var<workgroup> p_ml: array<i32, RING_N * BPW>;
 var<workgroup> p_of: array<i32, 32u * BPW>;
-// The prologue's literal frequencies; with HIST_OUT, then the pass's literal histogram.
+// The prologue's literal frequencies; with HIST_OUT, then the pass's packed histogram (see
+// LIT_BITS).
 var<workgroup> hist: array<atomic<u32>, 256u * BPW>;
 // Per block: the table sums (lit, ll, ml, of) and, for PRICE_MODE 2, the uncovered bytes.
 var<workgroup> hsum: array<atomic<u32>, 5u * BPW>;
-// HIST_OUT: the pass's LL / ML / OF code histograms, and each lane's segment summary (sequences,
-// final anchor, final reps).
-var<workgroup> o_ll: array<atomic<u32>, max(36u * BPW * HO, 1u)>;
-var<workgroup> o_ml: array<atomic<u32>, max(53u * BPW * HO, 1u)>;
-var<workgroup> o_of: array<atomic<u32>, max(32u * BPW * HO, 1u)>;
-var<workgroup> sg_n: array<u32, max(WG * HO, 1u)>;
-var<workgroup> sg_anchor: array<u32, max(WG * HO, 1u)>;
-var<workgroup> sg_rep: array<vec3<u32>, max(WG * HO, 1u)>;
 
 // Lane constants.
 var<private> lane: u32;
@@ -315,9 +322,17 @@ fn hist_lits(a: u32, e: u32) {
 // history: its literal bytes and its LL / ML / OF codes (hist_epilogue fixes the rest).
 fn hist_seq(m: u32, ll: u32, ml: u32, ob: u32) {
     hist_lits(m - ll, m);
-    atomicAdd(&o_ll[pb * 36u + ll_code(ll)], 1u);
-    atomicAdd(&o_ml[pb * 53u + ml_code(ml)], 1u);
-    atomicAdd(&o_of[pb * 32u + firstLeadingBit(ob)], 1u);
+    atomicAdd(&hist[pb * 256u + H_LL + ll_code(ll)], CODE_ONE);
+    atomicAdd(&hist[pb * 256u + H_ML + ml_code(ml)], CODE_ONE);
+    atomicAdd(&hist[pb * 256u + H_OF + firstLeadingBit(ob)], CODE_ONE);
+}
+
+// HIST_OUT: moves one count of block pb's code from index i to j (hist_epilogue's fixes).
+fn hist_move(i: u32, j: u32) {
+    if (i != j) {
+        atomicSub(&hist[pb * 256u + i], CODE_ONE);
+        atomicAdd(&hist[pb * 256u + j], CODE_ONE);
+    }
 }
 
 fn trace_put(p: u32, n: Node) {
@@ -531,15 +546,13 @@ fn prologue(valid: bool, b: u32) {
     workgroupBarrier();
     if (HIST_OUT) {
         for (var i = lane; i < 256u * BPW; i += WG) { atomicStore(&hist[i], 0u); }
-        for (var i = lane; i < 36u * BPW; i += WG) { atomicStore(&o_ll[i], 0u); }
-        for (var i = lane; i < 53u * BPW; i += WG) { atomicStore(&o_ml[i], 0u); }
-        for (var i = lane; i < 32u * BPW; i += WG) { atomicStore(&o_of[i], 0u); }
         workgroupBarrier();
     }
 }
 
 // HIST_OUT: the pass's Hist of block b (lane of segment k), after every lane's phase 2. Each lane
-// has counted its own raw sequences and literal bytes; the segment-0 lane then applies main_fixup's
+// has counted its own raw sequences and literal bytes (in `hist`, packed, see LIT_BITS) and left
+// its segment summary in its first trace words (SUM_WORDS); the segment-0 lane then applies main_fixup's
 // changes (the literal carry of each segment's first sequence, and the off_bases it re-encodes
 // against the true reps, walking the segments in order exactly as main_fixup does), and the
 // block's lanes store the Hist at prices[b * HIST_WORDS]. Every lane calls it (barriers).
@@ -550,15 +563,14 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
         var reps = vec3<u32>(1u, 4u, 8u);
         var prev_end = 0u;
         for (var kk = 0u; kk < NSEG; kk += 1u) {
-            let li = pb * NSEG + kk;
-            let n = sg_n[li];
+            let sm = 2u * (b * BLOCK_SIZE + kk * SEG);
+            let n = trace[sm];
             let carry = kk * SEG - prev_end;
-            if (n > 0u) { prev_end = sg_anchor[li]; }
+            if (n > 0u) { prev_end = trace[sm + 1u]; }
             let src = b * (3u * MAX_SEQS) + kk * LOG_WORDS + 3u * (LOG_SEQS - n);
             if (n > 0u && carry > 0u) {
                 let own = seqs[src];
-                atomicSub(&o_ll[pb * 36u + ll_code(own)], 1u);
-                atomicAdd(&o_ll[pb * 36u + ll_code(own + carry)], 1u);
+                hist_move(H_LL + ll_code(own), H_LL + ll_code(own + carry));
             }
             var spec = select(vec3<u32>(0u), vec3<u32>(1u, 4u, 8u), kk == 0u);
             var i = 0u;
@@ -572,32 +584,21 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
                 spec = applied(spec, spec_ob, ll);
                 let ob = ob_for(reps, offset, ll);
                 reps = applied(reps, ob, ll);
-                let c0 = firstLeadingBit(spec_ob);
-                let c1 = firstLeadingBit(ob);
-                if (c0 != c1) {
-                    atomicSub(&o_of[pb * 32u + c0], 1u);
-                    atomicAdd(&o_of[pb * 32u + c1], 1u);
-                }
+                hist_move(H_OF + firstLeadingBit(spec_ob), H_OF + firstLeadingBit(ob));
                 i += 1u;
             }
-            if (i < n) { reps = sg_rep[li]; }
+            if (i < n) { reps = vec3<u32>(trace[sm + 2u], trace[sm + 3u], trace[sm + 4u]); }
         }
     }
     workgroupBarrier();
     if (valid) {
         let q = b * HIST_WORDS;
         for (var e = k; e < HIST_WORDS; e += NSEG) {
-            var v: u32;
             if (e < 256u) {
-                v = atomicLoad(&hist[pb * 256u + e]);
-            } else if (e < 292u) {
-                v = atomicLoad(&o_ll[pb * 36u + e - 256u]);
-            } else if (e < 345u) {
-                v = atomicLoad(&o_ml[pb * 53u + e - 292u]);
+                prices[q + e] = atomicLoad(&hist[pb * 256u + e]) & LIT_MASK;
             } else {
-                v = atomicLoad(&o_of[pb * 32u + e - 345u]);
+                prices[q + e] = atomicLoad(&hist[pb * 256u + e - 256u]) >> LIT_BITS;
             }
-            prices[q + e] = v;
         }
     }
 }
@@ -813,9 +814,12 @@ fn dp(b: u32, k: u32) {
         // The literals after the segment's last match; the summary for hist_epilogue. The
         // candidate words stay (no trailer in `best`).
         hist_lits(st_anchor, iend);
-        sg_n[lane] = n_seq;
-        sg_anchor[lane] = st_anchor;
-        sg_rep[lane] = st_rep;
+        let sm = tbase + 2u * s;
+        trace[sm] = n_seq;
+        trace[sm + 1u] = st_anchor;
+        trace[sm + 2u] = st_rep.x;
+        trace[sm + 3u] = st_rep.y;
+        trace[sm + 4u] = st_rep.z;
         return;
     }
     best[wbase + SEG_META] = n_seq;

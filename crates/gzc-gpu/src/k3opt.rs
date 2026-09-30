@@ -114,12 +114,10 @@ pub fn ring_bytes(wg: u32, target_length: u32) -> u32 {
     wg * (target_length + 1) * 16
 }
 
-/// Workgroup bytes of the price tables (and the prologue's histogram and sums) for `bpw`
-/// blocks, plus with `hist_out` the epilogue's code histograms and `wg` lanes' segment summaries.
-fn price_table_bytes(bpw: u32, wg: u32, target_length: u32, hist_out: bool) -> u32 {
-    let tables = bpw * (256 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4;
-    let hist = if hist_out { bpw * (36 + 53 + 32) * 4 + wg * (4 + 4 + 16) } else { 0 };
-    tables + hist
+/// Workgroup bytes of the price tables (and the prologue's histogram and sums, which also hold a
+/// `hist_out` pass's histogram) for `bpw` blocks.
+fn price_table_bytes(bpw: u32, target_length: u32) -> u32 {
+    bpw * (256 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
 }
 
 /// Workgroup bytes `K3Opt` needs with its rings in workgroup memory.
@@ -127,7 +125,7 @@ pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     let suff = m.opt.map_or(32, |o| o.target_length).min(4095);
     let n_seg = n_seg(m);
     let bpw = (cfg.wg / n_seg).max(1);
-    ring_bytes(cfg.wg, suff) + price_table_bytes(bpw, cfg.wg, suff, cfg.hist_out) + 3 * 4 * n_seg + 64
+    ring_bytes(cfg.wg, suff) + price_table_bytes(bpw, suff) + 3 * 4 * n_seg + 64
 }
 
 /// The compiled K3opt pass.
