@@ -19,6 +19,43 @@
 @group(0) @binding(1) var<storage, read> pred: array<u32>;
 @group(0) @binding(2) var<storage, read_write> best: array<u32>;
 
+// Bytes [sh/8, sh/8 + 4) of the little-endian pair (lo, hi); sh in {0, 8, 16, 24}. The second
+// shift is split so sh == 0 shifts hi out entirely (WGSL masks shift amounts to 5 bits).
+fn funnel(lo: u32, hi: u32, sh: u32) -> u32 {
+    return (lo >> sh) | ((hi << (31u - sh)) << 1u);
+}
+
+// == match_len(base, p, q, SEARCH_CAP) for max = min(BLOCK_SIZE - p, SEARCH_CAP) >= 1, with p
+// given as its word index pw = base + p / 4 and shift sp = (p & 3) * 8. Streams aligned words on
+// both sides, one new word per side per 4 bytes (match_len's load_u32_at loads two), and masks
+// the last step to the max - n bytes still in range. Every word read is at most word
+// (p + max - 1) / 4 + 1 <= base + BLOCK_SIZE / 4 (q < p likewise): the next block's first word
+// or the packed buffer's trailing zero word, and only bytes past max come from it.
+fn match_len_capped(pw: u32, sp: u32, base: u32, q: u32, max: u32) -> u32 {
+    let qw = base + (q >> 2u);
+    let sq = (q & 3u) * 8u;
+    var plo = data[pw];
+    var qlo = data[qw];
+    var i = 1u;
+    var n = 0u;
+    loop {
+        let phi = data[pw + i];
+        let qhi = data[qw + i];
+        var x = funnel(plo, phi, sp) ^ funnel(qlo, qhi, sq);
+        let left = max - n;
+        if (left < 4u) {
+            x &= (1u << (left * 8u)) - 1u;
+        }
+        if (x != 0u) { return n + (countTrailingZeros(x) >> 3u); }
+        n += 4u;
+        if (n >= max) { break; }
+        plo = phi;
+        qlo = qhi;
+        i += 1u;
+    }
+    return max;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
@@ -32,6 +69,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = block_base(b);
     var best_len = 0u;
     var best_q = 0u;
+    let max = min(BLOCK_SIZE - p, SEARCH_CAP);
+    let pw = base + (p >> 2u);
+    let sp = (p & 3u) * 8u;
     // Cap early-out: once best_len == SEARCH_CAP nothing later can win, so the whole walk
     // stops (identical to walking on; see the header).
     for (var chain = 0u; chain < N_HASHES && best_len < SEARCH_CAP; chain++) {
@@ -39,7 +79,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var q = pred[pb + p];
         for (var d = 0u; d < DEPTH; d++) {
             if (q == NO_POS) { break; }
-            let len = match_len(base, p, q, SEARCH_CAP);
+            let len = match_len_capped(pw, sp, base, q, max);
             if (len > best_len || (len == best_len && q > best_q)) {
                 best_len = len;
                 best_q = q;
