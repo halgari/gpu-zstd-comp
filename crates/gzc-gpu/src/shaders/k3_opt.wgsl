@@ -133,7 +133,8 @@ const LL_CODE: array<u32, 64> = array<u32, 64>(
     24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u);
 
 // Price tables of the workgroup's blocks (local block pb at pb * size).
-var<workgroup> p_lit: array<i32, 256u * BPW>;
+// Literal prices as u16 pairs (byte 2e in the low half of word e; every price is in 0..65536).
+var<workgroup> p_lit: array<u32, 128u * BPW>;
 // ll_price(litlen) for litlen < 64.
 var<workgroup> p_lls: array<i32, 64u * BPW>;
 // LL price by code (litlen >= 64: code highbit(litlen) + 19).
@@ -215,7 +216,7 @@ fn ll_price(litlen: u32) -> i32 {
 
 // Literal price of byte value `c`.
 fn lit_cost(c: u32) -> i32 {
-    return p_lit[pb * 256u + c];
+    return i32((p_lit[pb * 128u + (c >> 1u)] >> ((c & 1u) * 16u)) & 0xFFFFu);
 }
 
 fn of_price(ob: u32) -> i32 {
@@ -532,8 +533,10 @@ fn prologue(valid: bool, b: u32) {
         }
         workgroupBarrier();
         let lb = frac_weight(max(atomicLoad(&hsum[blk * 5u]), 1u));
-        for (var e = kl; e < 256u; e += LPB) {
-            p_lit[blk * 256u + e] = lit_from(atomicLoad(&hist[blk * 256u + e]), lb);
+        for (var e = kl; e < 128u; e += LPB) {
+            let lo = lit_from(atomicLoad(&hist[blk * 256u + 2u * e]), lb);
+            let hi = lit_from(atomicLoad(&hist[blk * 256u + 2u * e + 1u]), lb);
+            p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
         }
         if (PRICE_MODE == 0u) {
             for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = BI_LL[c]; }
@@ -549,7 +552,7 @@ fn prologue(valid: bool, b: u32) {
     } else if (PRICE_MODE == 1u) {
         if (valid) {
             let q = b * PRICE_WORDS;
-            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = i32(prices[q + e]); }
+            for (var e = kl; e < 128u; e += LPB) { p_lit[blk * 128u + e] = prices[q + 2u * e] | (prices[q + 2u * e + 1u] << 16u); }
             for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = i32(prices[q + 256u + c]); }
             for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = i32(prices[q + 256u + LL_CODE[l]]); }
             for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = i32(prices[q + 292u + max(m, 3u) - 3u]); }
@@ -580,7 +583,11 @@ fn prologue(valid: bool, b: u32) {
             let llb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 1u]), 1u));
             let mlb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 2u]), 1u));
             let ofb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 3u]), 1u));
-            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = lit_from(seen(prices[q + e]), lb); }
+            for (var e = kl; e < 128u; e += LPB) {
+                let lo = lit_from(seen(prices[q + 2u * e]), lb);
+                let hi = lit_from(seen(prices[q + 2u * e + 1u]), lb);
+                p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
+            }
             for (var c = kl; c < 36u; c += LPB) {
                 p_llc[blk * 36u + c] = i32(LL_BITS[c] * 256u + llb - frac_weight(seen(prices[q + 256u + c])));
             }

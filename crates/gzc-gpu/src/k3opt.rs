@@ -133,7 +133,7 @@ pub fn scratch_bytes_per_block(m: &MatchParams) -> u64 {
 /// Workgroup bytes of the price tables (and the prologue's histogram and sums, which also hold a
 /// `hist_out` pass's histogram) for `bpw` blocks.
 fn price_table_bytes(bpw: u32, target_length: u32) -> u32 {
-    bpw * (256 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
+    bpw * (128 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
 }
 
 /// Workgroup bytes `K3Opt` needs with its rings in workgroup memory.
