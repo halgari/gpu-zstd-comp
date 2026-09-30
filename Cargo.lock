@@ -696,6 +696,7 @@ name = "gzc-gpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "gzc-core",
  "pollster",

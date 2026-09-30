@@ -2,5 +2,8 @@
 //! best-match kernels, host-side compressor orchestration, and streaming pipeline.
 pub mod context;
 pub mod chains;
+pub mod sorted;
 pub mod compressor;
 pub mod pipeline;
+pub mod multiqueue;
+pub mod transfer;

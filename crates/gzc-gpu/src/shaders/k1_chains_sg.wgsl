@@ -51,7 +51,7 @@ const_assert HASH_BITS == 16u;
 
 // The chain's hash at p from the words w = data[base + p / 4 ..][0..3] (lo and hi are
 // load_u32_at(base, p) and load_u32_at(base, p + 4)): == hash_width(base, p, MIN_MATCH) for Single,
-// hash_long / hash_short for Dfast chain 0 / 1.
+// hash_long / hash_short for Dfast chain 0 / 1, reduced to the chain key (>> KEY_SHIFT).
 fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
     let sh = (p & 3u) * 8u;
     var lo = w.x;
@@ -68,11 +68,11 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
         } else if (k < 4u) {
             mask = (1u << (8u * k)) - 1u;
         }
-        return mix(lo, hi & mask);
+        return mix(lo, hi & mask) >> KEY_SHIFT;
     } else if (chain == 0u) {
-        return mix(lo, hi);
+        return mix(lo, hi) >> KEY_SHIFT;
     }
-    return mix(lo, hi & 0xFFu);
+    return mix(lo, hi & 0xFFu) >> KEY_SHIFT;
 }
 
 // pred_fp at p from the same words.

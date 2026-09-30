@@ -9,7 +9,7 @@ name = "gzc-bench"
 path = "src/main.rs"
 
 [features]
-default = ["block-128k"]
+default = ["block-64k"]
 block-16k = ["gzc-core/block-16k", "gzc-gpu/block-16k"]
 block-32k = ["gzc-core/block-32k", "gzc-gpu/block-32k"]
 block-64k = ["gzc-core/block-64k", "gzc-gpu/block-64k"]

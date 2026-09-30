@@ -5,8 +5,8 @@
 //! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
 use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
-use crate::hash::{compute_preds, hash_long, hash_short, hash_width};
-use crate::lazy::lazy_parse;
+use crate::hash::{compute_preds, hash_long, hash_short, hash_width, key};
+use crate::lazy::{lazy_parse, lazy_parse_segmented};
 use crate::params::{cpu_supports, Hashes, MatchParams};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
@@ -48,14 +48,62 @@ pub fn match_len_capped(block: &[u8], p: usize, q: usize, cap: usize) -> usize {
 /// The predecessor chains `find_best` walks, in walk order: for `Dfast`, the long-hash
 /// (8-byte) chain then the short-hash (5-byte) chain; for `Single`, one chain over
 /// `hash_width(.., min_match)`.
+/// Each chain links equal *keys*: the hash's top `hash_bits` bits (`hash::key`; all 16 bits for
+/// every chain preset).
 pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
+    let hb = p.hash_bits;
     match p.hashes {
-        Hashes::Dfast => vec![compute_preds(block, hash_long), compute_preds(block, hash_short)],
+        Hashes::Dfast => vec![
+            compute_preds(block, move |b: &[u8], pos: usize| key(hash_long(b, pos), hb)),
+            compute_preds(block, move |b: &[u8], pos: usize| key(hash_short(b, pos), hb)),
+        ],
         Hashes::Single => {
             let min_match = p.min_match;
-            vec![compute_preds(block, move |b: &[u8], pos: usize| hash_width(b, pos, min_match))]
+            vec![compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, min_match), hb))]
         }
     }
+}
+
+/// `find_best` over the bucket-sorted candidate array (`hash::bucket_sort` of the Single chain's
+/// keys), the way the GPU's window K2 (`k2_window.wgsl`) walks it: for `p < PARSE_END` with slot
+/// `s = rank[p]`, visit the `min(depth, s)` entries `sorted[s - 1], sorted[s - 2], ..` (nearest
+/// first) and keep the largest (capped len, q), exactly as `find_best` does along a chain.
+///
+/// Equal to `find_best(block, &chains(block, params), params)`: inside p's bucket the entries
+/// before slot s are p's chain in chain order (same key, positions descending), so the first
+/// `min(depth, i)` of the window (i = p's index in its bucket) are the chain's first `depth`
+/// candidates. The window's remaining entries (only when i < depth) belong to other buckets: a
+/// different key means different first 4 bytes (the key hashes only bytes p..p+min_match; for
+/// min_match > 4, different first min_match bytes), so their len < min_match and they cannot
+/// win, nor stop the walk at the cap. Entries with q >= p (other buckets only) are skipped.
+/// Panics unless `params.hashes` is `Single`.
+pub fn find_best_window(block: &[u8], sorted: &[u32], rank: &[u32], params: &MatchParams) -> Vec<Match> {
+    assert_eq!(params.hashes, Hashes::Single, "find_best_window: Single hash only");
+    let mut best = vec![Match::default(); BLOCK_SIZE];
+    let (depth, cap, min_match) = (params.depth as usize, params.search_cap as usize, params.min_match as usize);
+    for p in 0..PARSE_END {
+        let s = rank[p] as usize;
+        let mut best_len = 0usize;
+        let mut best_q = 0usize;
+        for j in 1..=depth.min(s) {
+            let qu = sorted[s - j] as usize;
+            if qu >= p {
+                continue;
+            }
+            let len = match_len_capped(block, p, qu, cap);
+            if len > best_len || (len == best_len && qu > best_q) {
+                best_len = len;
+                best_q = qu;
+                if len == cap {
+                    break;
+                }
+            }
+        }
+        if best_len >= min_match {
+            best[p] = Match { offset: (p - best_q) as u32, len: best_len as u32 };
+        }
+    }
+    best
 }
 
 /// For every `p < PARSE_END`, find the best match by walking up to `depth` candidates along
@@ -92,10 +140,13 @@ pub fn find_best(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec
 }
 
 /// Parse a block from its best matches: the greedy parse for `lazy == 0`, otherwise the
-/// libzstd lazy/lazy2 port (`lazy::lazy_parse`).
+/// libzstd lazy/lazy2 port (`lazy::lazy_parse`, or `lazy::lazy_parse_segmented` with
+/// `segment_log2 > 0`).
 pub fn parse(block: &[u8], best: &[Match], p: &MatchParams) -> BlockOutput {
     if p.lazy == 0 {
         greedy_parse(block, best, p)
+    } else if p.segment_log2 > 0 {
+        lazy_parse_segmented(block, best, p)
     } else {
         lazy_parse(block, best, p)
     }
@@ -302,6 +353,25 @@ mod tests {
     #[should_panic(expected = "invalid params")]
     fn invalid_params_panic_clearly() {
         compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::params::LVL9 });
+    }
+
+    /// The window walk over the bucket-sorted array equals the chain walk, for 11/12/13-bit keys and
+    /// the 16-bit one, at depths 4, 16 and 32 (shallow walks rarely reach other buckets).
+    #[test]
+    fn window_walk_equals_chain_walk() {
+        use crate::params::{LVL9, LVL9S12, LVL9S12D16SEG};
+        let s13 = MatchParams { hash_bits: 13, ..LVL9 };
+        for params in [LVL9S12, LVL9S12D16SEG, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
+            for (name, bytes) in synth::test_cases() {
+                for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                    let block = &blk.data;
+                    let want = find_best(block, &chains(block, &params), &params);
+                    let (sorted, rank) = crate::hash::bucket_sort(block, &params);
+                    let got = find_best_window(block, &sorted, &rank, &params);
+                    assert!(got == want, "{name} block {i} {params:?}: window walk differs from the chain walk");
+                }
+            }
+        }
     }
 
     /// xxh64 of the concatenated lvl3 frames, captured on the unmodified M3 code (ddeee75).

@@ -10,7 +10,8 @@ and GPU throughput/ratio over a corpus; `tools/fetch-corpus` downloads/builds th
 benchmark corpus described by `corpus.toml`.
 
 Block size is a compile-time feature on `gzc-core`/`gzc-gpu`/`gzc-bench`: exactly one
-of `block-16k`, `block-32k`, `block-64k`, `block-128k` (default `block-128k`).
+of `block-16k`, `block-32k`, `block-64k`, `block-128k` (default `block-64k`, the largest block
+size the downloader uses; blocks are always independent).
 
 ## Build
 
@@ -30,6 +31,8 @@ Non-default block size (all three feature-gated crates must agree):
 cargo test --workspace --no-default-features \
   --features gzc-core/block-16k,gzc-gpu/block-16k,gzc-bench/block-16k
 ```
+
+The portable (no-subgroup) kernels: `GZC_NO_SUBGROUPS=1 cargo test --workspace --release`.
 
 ## Corpus (`tools/fetch-corpus`, dev-only)
 
@@ -89,21 +92,39 @@ the given thread counts, and writes the same table/JSON/HTML report shape.
 and errors on any mismatch against the original block.
 
 `--preset <list>` (on `ref`, `gpu` and `all`; default `lvl3`) picks the match
-parameters (`gzc_core::params::PRESETS`), one run per preset:
+parameters (`gzc_core::params::PRESETS`), one run per preset. Every preset runs on both `cpu-ref`
+and the GPU, byte for byte the same frames:
 
-| Preset | hashes | min match | depth | parse | Compare against |
-|---|---|---|---|---|---|
-| `lvl3` | dfast (8 B + 5 B) | 5 | 1 | greedy | M3 output (byte-identical) / L3 |
-| `rung1` | single 4 B | 4 | 8 | greedy | L5 |
-| `rung2` | single 4 B | 4 | 8 | lazy | L6 |
-| `lvl9` | single 4 B | 4 | 32 | lazy2 | L9 |
+| Preset | What it is | Compare against | ≥ libzstd L9 at |
+|---|---|---|---|
+| `lvl3` | dfast chains (8 B + 5 B), min match 5, depth 1, greedy | M3 output (byte-identical) / L3 | – |
+| `rung1` | single 4 B hash chain, depth 8, greedy | L5 | – |
+| `rung2` | `rung1` with a lazy parse | L6 | – |
+| `lvl9` | single 4 B hash chain, depth 32, lazy2 | L9 | 16, 32, 64, 128 KiB |
+| `lvl9seg` | `lvl9` with the parse split into independent 4 KiB segments (speed-2 E1) | L9 | 16, 32, 64, 128 KiB |
+| `lvl9s12` | `lvl9` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2) | L9 | 16, 32, 64, 128 KiB |
+| `lvl9s12seg` | `lvl9s12` + segmented parse: **the fastest preset validated at every block size** | L9 | 16, 32, 64, 128 KiB |
+| `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 | 16, 32, 64 KiB only (below L9 at 128 KiB) |
 
-All four presets run on both `cpu-ref` and the GPU. See `docs/results/2026-09-29-m4.md`
-for the M4 measurement and `docs/results/2026-09-30-speed.md` for the speed-phase
-headline: GPU `lvl9` now reaches **4107 MB/s** at `--batch max --inflight 3` (**4260
-MB/s** at `--inflight 2`), ratio 1.355 — matching libzstd L9's ratio (1.3532) at 669
-MB/s on 8 threads of the same CPU. All these numbers are measured on an RTX 5090; the
-speed-phase doc also has a projection for an 8 GB-class card.
+Full-corpus ratios (`gzc-bench ref`, which the GPU matches byte for byte) against libzstd L9 on
+the same block size:
+
+| Block | L9 | lvl9 | lvl9seg | lvl9s12 | lvl9s12seg | lvl9s12d16seg |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 KiB | 1.30009 | 1.30024 | 1.30042 | 1.30023 | 1.30040 | 1.30017 |
+| 32 KiB | 1.31996 | 1.32131 | 1.32140 | 1.32128 | 1.32137 | 1.32107 |
+| 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
+| 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | 1.35159 |
+
+Headline (speed phase 2, `docs/results/2026-09-30-speed2.md`, RTX 5090, 64 KiB blocks, full
+corpus, `--batch max --inflight 3`): GPU **`lvl9s12seg` reaches 10588 MB/s** (median of 8 runs) at
+ratio **1.33926**, above libzstd L9's 1.3379 on the same blocks (libzstd L9: 1754 MB/s on 32
+threads). `lvl9` does 5767 MB/s and `lvl9seg` 8809 MB/s; with `GZC_NO_SUBGROUPS=1`, `lvl9s12seg`
+does 8722 MB/s. At this speed the pipeline is **host-bound** (the pipeline thread writes uploads and
+delivers frames; the GPU waits ~2 ms per batch), so end-to-end numbers depend on the CPU and system
+load. The earlier phases are in `docs/results/2026-09-29-m4.md` and
+`docs/results/2026-09-30-speed.md` (128 KiB blocks). All these numbers are measured on an RTX
+5090.
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -114,7 +135,7 @@ cargo run --release -p gzc-bench -- ref \
 ```
 
 `gzc-bench gpu` runs the streaming GPU compressor (engine `gpu`, config
-`<preset> b<batch> i<inflight>`, e.g. `lvl9 b2559 i3`): the GPU runs the whole parse and emits
+`<preset> b<batch> i<inflight>`, e.g. `lvl9s12seg b5403 i3`): the GPU runs the whole parse and emits
 complete zstd frames (Huffman literals included), byte-identical to `cpu-ref`;
 the host only uploads blocks and copies finished frames out. Each comma-separated
 list is swept:
@@ -133,22 +154,24 @@ list is swept:
   (batch, inflight) config must fit, checked before anything runs.
 - `--verify` decompresses every frame with libzstd after the timed pass.
 
-At the default 6144 MiB budget, `--batch max` resolves (RTX 5090) to b2047 for
-`lvl3` (its two hash chains cost more scratch per block) and b2559 for the
-single-hash presets (`rung1`, `rung2`, `lvl9`) at `--inflight 3`; at `--inflight 2`
-it's b2047 for `lvl3` and b2860 for the single-hash presets. These depend on the
-pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes`), not just the device, so
-re-derive them for your own card/build with e.g.:
+At the default 6144 MiB budget and 64 KiB blocks, `--batch max` resolves (RTX 5090, with the
+direct upload active) to b4095 for `lvl3` (the device's own limit) and b5403 for every
+single-hash preset (`rung1` … `lvl9s12d16seg`) at `--inflight 3`; at `--inflight 2` it's b4095
+and b6078. Without the direct upload (`GZC_DIRECT_UPLOAD=0`, or no full ReBAR) the pipeline keeps a
+shared `data` buffer and the single-hash presets resolve to b5118 at `--inflight 3`. These depend
+on the pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes_with`), the block size and the
+device, so re-derive them for your own card/build with e.g.:
 
 ```sh
-cargo run --release -p gzc-bench -- gpu --synthetic --preset lvl3,rung1,lvl9 --batch max --inflight 3
+cargo run --release -p gzc-bench -- gpu --synthetic \
+  --preset lvl3,rung1,rung2,lvl9,lvl9seg,lvl9s12,lvl9s12seg,lvl9s12d16seg --batch max --inflight 3
 ```
 
 ```sh
 cargo run --release -p gzc-bench -- gpu --synthetic --verify   # smoke run
 
 cargo run --release -p gzc-bench -- gpu \
-  --input data/corpus --ext dds,nif --preset lvl9 --batch max --inflight 3 --verify --out out
+  --input data/corpus --ext dds,nif --preset lvl9s12seg --batch max --inflight 3 --verify --out out
 ```
 
 `gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`), cpu-ref
@@ -160,34 +183,61 @@ fails, the CPU results are still written.
 ```sh
 cargo run --release -p gzc-bench -- all \
   --input data/corpus --ext dds,nif --max-bytes 2000000000 \
-  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --preset lvl3,rung1,rung2,lvl9 \
+  --levels 1,2,3,4,5,6,9 --threads 1,8,16,32 --preset lvl3,lvl9,lvl9s12seg \
   --batch max --inflight 3 --verify --out out
 ```
 
 ## Tuning / diagnostics
 
-Environment knobs for the GPU kernels (`crates/gzc-gpu`), all read once at startup or
-kernel construction, never per record:
+Environment knobs for the GPU kernels and host pipeline (`crates/gzc-gpu`), all read once at
+startup or kernel construction, never per record. Boolean knobs follow one convention: a knob
+that is off by default is turned on by any value but `0`; one that is on by default is turned off
+by `0` only.
 
-- `GZC_NO_SUBGROUPS` (anything but `0`): forces the fallback K1 (`k1_chains.wgsl`)
-  **and** the sequential K3 (`k3_parse.wgsl`/`k3_lazy.wgsl`) — this is the code path
-  GPUs without subgroup support run, and the floor for throughput on this card (see
-  `docs/results/2026-09-30-speed.md`).
-- `GZC_K1_GROUPS=N`: live head tables (persistent workgroups) the subgroup K1 kernel
-  keeps resident; default 128, sized for the ~32 MB L2 of 8 GB-class cards. 256 is
-  about +7% on an RTX 5090 (96 MB L2).
+- `GZC_NO_SUBGROUPS` (anything but `0`): a device without subgroups, i.e. the portable kernels
+  every GPU can run. Chain presets use the fallback K1 (`k1_chains.wgsl`); the sorted presets
+  (`lvl9s12*`) use the workgroup-memory bucket sort (`k1_sort.wgsl`) instead of
+  `k1_sort_sg.wgsl`, with the same window K2. K3 is the sequential kernel
+  (`k3_parse.wgsl`/`k3_lazy.wgsl`) for unsegmented presets; the segmented parse (`*seg`) never
+  uses subgroups. Output is byte-identical either way; `lvl9s12seg` does 8722 MB/s this way on the
+  RTX 5090 (see `docs/results/2026-09-30-speed2.md`).
+- `GZC_SORTED=0`: the sorted presets use the hash-chain K1/K2 over the same 12-bit key instead of
+  the bucket-sorted finder (byte-identical, slower); for comparisons.
+- `GZC_K1_GROUPS=N`: live head tables (persistent workgroups) the subgroup chain K1 keeps
+  resident; default 128, sized for the ~32 MB L2 of 8 GB-class cards. 256 is about +7% on an RTX
+  5090 (96 MB L2).
 - `GZC_K3_MODE=seq|coop`: forces the sequential or subgroup-cooperative K3 kernel
   (`coop` errors if the device/probe can't support it); default: auto-detected.
 - `GZC_K3_W=4|8|16|32|64`: cooperative K3's lanes per block (at most the device's
   minimum subgroup size).
 - `GZC_K3_BPW=2`: two blocks per cooperative-K3 workgroup (needs min == max subgroup
   size == W); opt-in, worthwhile on Ada's 24-workgroups-per-SM limit.
+- `GZC_TRANSFER_QUEUE=0`: turns off the transfer-queue readback (speed-2 E3). By default, on a
+  Vulkan 1.2+ adapter with timeline semaphores and a transfer-only queue family, the frame path
+  reads each batch back on that dedicated copy queue, overlapping the next batch's kernels. Only
+  one such pipeline may exist per `GpuContext` (a second `Pipeline::new` errors), and nothing else
+  may submit to the context's queue from another thread while it exists (see
+  `GpuContext::transfer`).
+- `GZC_DIRECT_UPLOAD=0|1`: the kernels read each batch straight from its mapped upload buffer, with
+  no upload copy and no shared `data` buffer (E8). Default: on when host-visible device-local
+  memory covers VRAM (full ReBAR / SAM); `0` turns it off, `1` forces it on wherever
+  `MAPPABLE_PRIMARY_BUFFERS` exists (without ReBAR the kernels would then read over PCIe).
+- `GZC_UPLOAD_THREADS=N`: threads writing a batch into its upload buffer (default 4, at most the
+  available cores).
+- `GZC_CHECKED_SHADERS` (anything but `0`): builds K2/K4/K5 with naga's bounds checks and loop
+  bounding (E9 builds them unchecked); a debugging aid.
 - `GZC_PACK` (anything but `0`): GPU-side frame packing instead of the fixed-stride
   copy; opt-in, since it's slower than the copy on an RTX 5090 but saves PCIe traffic
-  worth it on ×8-lane cards.
+  worth it on ×8-lane cards. Packing **disables the transfer-queue readback** (packed frames are
+  read back on the main queue).
 - `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
   time runs without per-kernel timestamp queries.
 - `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
   actually fails the guard.
+
+**Backends:** the E3 paths (transfer-queue readback, and the direct upload's ReBAR detection) are
+Vulkan-only. On DX12 (wgpu's default on Windows) and Metal they are inactive: readback runs on the
+main queue and the upload is copied (unless `GZC_DIRECT_UPLOAD=1`), which gives correct output at
+lower throughput. Pin the Vulkan backend (e.g. `WGPU_BACKEND=vulkan`) to get them on Windows.

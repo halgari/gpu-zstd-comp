@@ -5,7 +5,7 @@ version.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["block-128k"]
+default = ["block-64k"]
 block-16k = ["gzc-core/block-16k"]
 block-32k = ["gzc-core/block-32k"]
 block-64k = ["gzc-core/block-64k"]
@@ -17,6 +17,9 @@ wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
+# The Vulkan types behind wgpu-hal's escape hatches (same version wgpu-hal 30 uses): the ReBAR
+# probe (`context::rebar`) and the extra queues of the multi-queue path.
+ash = "0.38"
 
 [dev-dependencies]
 zstd = { workspace = true }

@@ -1,5 +1,6 @@
 //! Long/short match-finding hashes and predecessor-chain computation.
 use crate::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, NO_POS};
+use crate::params::{Hashes, MatchParams};
 
 pub fn read_u32(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
@@ -34,6 +35,42 @@ pub fn hash_width(b: &[u8], p: usize, width: u32) -> u32 {
         u32::MAX
     };
     mix(read_u32(b, p), read_u32(b, p + 4) & mask)
+}
+
+/// The top `bits` bits of a `HASH_BITS`-bit hash `h`: the match finder's key
+/// (`MatchParams::hash_bits`). `key(h, HASH_BITS) == h`.
+pub fn key(h: u32, bits: u32) -> u32 {
+    h >> (HASH_BITS - bits)
+}
+
+/// The bucket-sorted candidate array of a Single-hash `params` (speed2 E2): every hashed position
+/// `p < HASHED_POSITIONS`, ordered by key (`key(hash_width(block, p, min_match), hash_bits)`)
+/// ascending, positions ascending inside a key (a stable counting sort by key). Returns
+/// `(sorted, rank)`: `sorted[s]` is the position in slot `s` (`HASHED_POSITIONS` slots, the rest
+/// of the `BLOCK_SIZE`-long array is `NO_POS`), and `rank[p]` is p's slot (`NO_POS` for
+/// `p >= HASHED_POSITIONS`). p's hash-chain predecessor is `sorted[rank[p] - 1]` when that slot is
+/// in p's bucket, so the chain of depth d is the (up to) d entries just below p's slot.
+pub fn bucket_sort(block: &[u8], params: &MatchParams) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(block.len(), BLOCK_SIZE);
+    assert_eq!(params.hashes, Hashes::Single, "bucket_sort: Single hash only");
+    let keys: Vec<u32> =
+        (0..HASHED_POSITIONS).map(|p| key(hash_width(block, p, params.min_match), params.hash_bits)).collect();
+    let mut start = vec![0u32; (1 << params.hash_bits) + 1];
+    for &k in &keys {
+        start[k as usize + 1] += 1;
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut sorted = vec![NO_POS; BLOCK_SIZE];
+    let mut rank = vec![NO_POS; BLOCK_SIZE];
+    for (p, &k) in keys.iter().enumerate() {
+        let s = start[k as usize];
+        start[k as usize] += 1;
+        sorted[s as usize] = p as u32;
+        rank[p] = s;
+    }
+    (sorted, rank)
 }
 
 /// pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS. len == BLOCK_SIZE.

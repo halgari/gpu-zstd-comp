@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use gzc_core::params::{MatchParams, PRESETS, cpu_supports};
 use gzc_gpu::compressor::{GpuParams, gpu_supports, max_batch_blocks};
 use gzc_gpu::context::GpuContext;
-use gzc_gpu::pipeline::{PipelineConfig, vram_bytes};
+use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
 
 use corpus::{Corpus, LoadOpts};
 
@@ -107,7 +107,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -141,9 +141,17 @@ fn parse_batch_spec(s: &str) -> Result<BatchSpec, String> {
 /// Resolves `BatchSpec::Max` to the largest batch that fits `budget_mb` at `inflight` for match
 /// params `m`, capped by `device_max` (`gzc_gpu::compressor::max_batch_blocks`). `vram_bytes` is
 /// non-decreasing in `batch` (every buffer it counts scales with `batch`, at fixed `inflight`), so
-/// this binary searches rather than scanning every batch size.
-fn resolve_max_batch(m: MatchParams, inflight: u32, vram_budget_mb: u64, device_max: u32) -> anyhow::Result<u32> {
-    let fits = |batch: u32| vram_bytes(&sweep_cfg(m, batch, inflight)).div_ceil(1 << 20) <= vram_budget_mb;
+/// this binary searches rather than scanning every batch size. `direct_upload`: the context reads
+/// batches from the upload buffers (`GpuContext::direct_upload`, no shared `data` buffer).
+fn resolve_max_batch(
+    m: MatchParams,
+    inflight: u32,
+    vram_budget_mb: u64,
+    device_max: u32,
+    direct_upload: bool,
+) -> anyhow::Result<u32> {
+    let fits =
+        |batch: u32| vram_bytes_with(&sweep_cfg(m, batch, inflight), direct_upload).div_ceil(1 << 20) <= vram_budget_mb;
     anyhow::ensure!(
         device_max >= 1 && fits(1),
         "--batch max: even batch 1 at inflight {inflight} does not fit {vram_budget_mb} MiB (--vram-budget-mb) \
@@ -161,10 +169,17 @@ fn resolve_max_batch(m: MatchParams, inflight: u32, vram_budget_mb: u64, device_
 }
 
 /// `spec` as an exact batch count: `N` as is, `Max` resolved via `resolve_max_batch`.
-fn resolve_batch(spec: BatchSpec, m: MatchParams, inflight: u32, vram_budget_mb: u64, device_max: u32) -> anyhow::Result<u32> {
+fn resolve_batch(
+    spec: BatchSpec,
+    m: MatchParams,
+    inflight: u32,
+    vram_budget_mb: u64,
+    device_max: u32,
+    direct_upload: bool,
+) -> anyhow::Result<u32> {
     match spec {
         BatchSpec::N(n) => Ok(n),
-        BatchSpec::Max => resolve_max_batch(m, inflight, vram_budget_mb, device_max),
+        BatchSpec::Max => resolve_max_batch(m, inflight, vram_budget_mb, device_max, direct_upload),
     }
 }
 
@@ -185,7 +200,8 @@ struct GpuSweepArgs {
     #[arg(long, value_delimiter = ',', default_value = "0")]
     writer_threads: Vec<usize>,
     /// GPU memory budget in MiB (default: an 8 GB card minus headroom). Every (batch, inflight)
-    /// config's pipeline footprint (`gzc_gpu::pipeline::vram_bytes`) must fit, else the run errors.
+    /// config's pipeline footprint (`gzc_gpu::pipeline::vram_bytes_with`, for the context's upload mode
+    /// once the device is open) must fit, else the run errors.
     #[arg(long, default_value_t = 6144)]
     vram_budget_mb: u64,
 }
@@ -194,7 +210,7 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
@@ -212,7 +228,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -316,10 +332,11 @@ fn run_ref_cmd(args: RefArgs) -> anyhow::Result<()> {
     write_reports(&results, &args.out)
 }
 
-/// GPU memory of the frame-path pipeline for `cfg`, checked against `budget_mb`.
-fn check_vram(cfg: &PipelineConfig, budget_mb: u64) -> anyhow::Result<u64> {
+/// GPU memory of the frame-path pipeline for `cfg` (with the direct upload's footprint when
+/// `direct_upload`), checked against `budget_mb`.
+fn check_vram(cfg: &PipelineConfig, budget_mb: u64, direct_upload: bool) -> anyhow::Result<u64> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
-    let mib = vram_bytes(&cfg).div_ceil(1 << 20);
+    let mib = vram_bytes_with(&cfg, direct_upload).div_ceil(1 << 20);
     anyhow::ensure!(
         mib <= budget_mb,
         "gpu b{} i{} needs {mib} MiB of GPU memory, over the {budget_mb} MiB budget (--vram-budget-mb)",
@@ -346,7 +363,7 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
         for &spec in &sweep.batch {
             if let BatchSpec::N(batch) = spec {
                 for &inflight in &sweep.inflight {
-                    check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+                    check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, false)?;
                 }
             }
         }
@@ -356,13 +373,13 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
         let max = max_batch_blocks(&ctx.device.limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
                 anyhow::ensure!(
                     batch >= 1 && batch <= max,
                     "--batch {batch} not in 1..={max} for preset '{}' on this device",
                     p.name
                 );
-                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, ctx.direct_upload)?;
             }
         }
     }
@@ -385,10 +402,10 @@ fn run_gpu_sweep(
         let max = max_batch_blocks(&ctx.device.limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
                 for &writers in &sweep.writer_threads {
                     let cfg = sweep_cfg(p.params, batch, inflight);
-                    let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
+                    let mib = check_vram(&cfg, sweep.vram_budget_mb, ctx.direct_upload)?;
                     eprintln!(
                         "running gpu {} b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})...",
                         p.name
@@ -446,15 +463,16 @@ fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gzc_gpu::pipeline::vram_bytes;
 
     #[test]
     fn vram_budget_rejects_configs_that_do_not_fit() {
         let params = GpuParams { matching: gzc_core::params::LVL3, emit_frames: false, huffman: true };
         let cfg = PipelineConfig { batch: 64, inflight: 2, params };
-        let mib = check_vram(&cfg, 1 << 20).unwrap();
+        let mib = check_vram(&cfg, 1 << 20, false).unwrap();
         assert!(mib > 0);
-        assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
-        let err = check_vram(&cfg, mib - 1).unwrap_err().to_string();
+        assert_eq!(check_vram(&cfg, mib, false).unwrap(), mib, "a config exactly at the budget fits");
+        let err = check_vram(&cfg, mib - 1, false).unwrap_err().to_string();
         assert!(err.contains("--vram-budget-mb") && err.contains("b64 i2"), "{err}");
     }
 
@@ -502,7 +520,7 @@ mod tests {
             let want = (1..=device_max)
                 .rev()
                 .find(|&b| vram_bytes(&sweep_cfg(m, b, inflight)).div_ceil(1 << 20) <= budget_mb);
-            let got = resolve_max_batch(m, inflight, budget_mb, device_max).ok();
+            let got = resolve_max_batch(m, inflight, budget_mb, device_max, false).ok();
             assert_eq!(got, want, "budget_mb={budget_mb} inflight={inflight} device_max={device_max}");
         }
     }
@@ -511,23 +529,23 @@ mod tests {
     fn resolve_max_batch_returns_device_max_when_it_fits() {
         let m = gzc_core::params::LVL3;
         let mib = vram_bytes(&sweep_cfg(m, 8, 1)).div_ceil(1 << 20);
-        assert_eq!(resolve_max_batch(m, 1, mib, 8).unwrap(), 8, "device_max itself fits: use it");
-        assert_eq!(resolve_max_batch(m, 1, mib + 1_000_000, 8).unwrap(), 8, "a huge budget: still capped at device_max");
+        assert_eq!(resolve_max_batch(m, 1, mib, 8, false).unwrap(), 8, "device_max itself fits: use it");
+        assert_eq!(resolve_max_batch(m, 1, mib + 1_000_000, 8, false).unwrap(), 8, "a huge budget: still capped at device_max");
     }
 
     #[test]
     fn resolve_max_batch_errors_when_even_batch_1_does_not_fit() {
         let m = gzc_core::params::LVL3;
-        let err = resolve_max_batch(m, 1, 0, 4096).unwrap_err().to_string();
+        let err = resolve_max_batch(m, 1, 0, 4096, false).unwrap_err().to_string();
         assert!(err.contains("--batch max") && err.contains("--vram-budget-mb"), "{err}");
     }
 
     #[test]
     fn resolve_batch_passes_through_n_and_resolves_max() {
         let m = gzc_core::params::LVL3;
-        assert_eq!(resolve_batch(BatchSpec::N(77), m, 1, 1, 1).unwrap(), 77, "N is never validated by resolve_batch itself");
+        assert_eq!(resolve_batch(BatchSpec::N(77), m, 1, 1, 1, false).unwrap(), 77, "N is never validated by resolve_batch itself");
         let mib = vram_bytes(&sweep_cfg(m, 16, 2)).div_ceil(1 << 20);
-        assert_eq!(resolve_batch(BatchSpec::Max, m, 2, mib, 16).unwrap(), 16);
+        assert_eq!(resolve_batch(BatchSpec::Max, m, 2, mib, 16, false).unwrap(), 16);
     }
 
     /// Different presets can resolve `max` to different numbers at the same budget/inflight:
@@ -535,9 +553,12 @@ mod tests {
     #[test]
     fn resolve_max_batch_differs_per_preset() {
         let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
-        let lvl3 = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max).unwrap();
-        let rung1 = resolve_max_batch(gzc_core::params::RUNG1, inflight, budget_mb, device_max).unwrap();
+        let lvl3 = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, false).unwrap();
+        let rung1 = resolve_max_batch(gzc_core::params::RUNG1, inflight, budget_mb, device_max, false).unwrap();
         assert!(lvl3 < rung1, "lvl3 {lvl3} should resolve smaller than rung1 {rung1} at the same budget");
+        // The direct upload has no shared `data` buffer: a larger batch fits.
+        let direct = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, true).unwrap();
+        assert!(direct > lvl3, "direct upload {direct} vs copy upload {lvl3}");
     }
 
     #[test]
@@ -565,6 +586,18 @@ mod tests {
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
+    }
+
+    #[test]
+    fn preset_help_lists_every_preset() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        for cmd in ["ref", "gpu", "all"] {
+            let help = cli.find_subcommand_mut(cmd).unwrap().render_long_help().to_string();
+            for (name, _) in PRESETS {
+                assert!(help.contains(name), "{cmd} --help does not list {name}");
+            }
+        }
     }
 
     #[test]
