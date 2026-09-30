@@ -1,0 +1,26 @@
+[package]
+name = "gzc-bench"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gzc-bench"
+path = "src/main.rs"
+
+[features]
+default = ["block-128k"]
+block-16k = ["gzc-core/block-16k", "gzc-gpu/block-16k"]
+block-32k = ["gzc-core/block-32k", "gzc-gpu/block-32k"]
+block-64k = ["gzc-core/block-64k", "gzc-gpu/block-64k"]
+block-128k = ["gzc-core/block-128k", "gzc-gpu/block-128k"]
+
+[dependencies]
+gzc-core = { workspace = true }
+gzc-gpu = { workspace = true }
+zstd = { workspace = true }
+rayon = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

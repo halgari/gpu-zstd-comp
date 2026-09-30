@@ -1,0 +1,794 @@
+//! Host side of the K2 (best match), K3 (parse), K5 (Huffman literals) and K4 (entropy + frame
+//! assembly) kernels; compress_batch / compress_frames entry points.
+//!
+//! K1 (hash chains) → K2 (`find_best`) → K3 (`greedy_parse`) reproduce
+//! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K5 writes each
+//! block's literals section into its frame and K4 completes the frame, byte-identical to
+//! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
+//! (`FrameOptions::default()`) with `huffman`, raw literals (K4 alone) without.
+use crate::chains::{self, ChainsKernel, head_bytes, pred_bytes};
+use crate::context::{GpuContext, pack_blocks};
+use anyhow::{Context as _, anyhow};
+use gzc_core::codes::{
+    LL_BASE, LL_BITS, LL_DEFAULT_NORM, ML_BASE, ML_BITS, ML_DEFAULT_NORM, OF_DEFAULT_NORM, ll_code, ml_code,
+};
+use gzc_core::config::{BLOCK_SIZE, MIN_MATCH};
+use gzc_core::frame::{FrameOptions, frame_header};
+use gzc_core::fse::FRAC;
+use gzc_core::seq::{BlockOutput, Sequence};
+
+const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
+const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
+const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
+const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
+
+/// Bytes reserved per block in the `frames` buffer: a Raw frame (header + 3 + BLOCK_SIZE) is the
+/// largest K4 emits.
+pub const FRAME_STRIDE: usize = BLOCK_SIZE + 64;
+
+/// Upper bound on sequences per block: every sequence covers at least MIN_MATCH bytes.
+pub const MAX_SEQS: u32 = (BLOCK_SIZE / MIN_MATCH) as u32 + 1;
+
+/// Largest batch `compress_batch` allocates buffers for (~3.1 MiB per 128K block, ~800 MiB), even when
+/// the device limits would allow more.
+const COMPRESS_BATCH_CAP: u32 = 256;
+
+/// Kernel names, in timestamp-query order, as reported in timing breakdowns (`k4_entropy` only
+/// runs with `GpuParams::emit_frames`; `k5_huffman` also needs `huffman` and is dispatched before
+/// K4; see `Kernels::names`).
+pub const KERNEL_NAMES: [&str; 5] = ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"];
+
+/// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
+pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
+
+/// Match-finder tuning for the GPU path. Level 3: `depth: 1` (== `reference::LVL3`).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuParams {
+    pub depth: u32,
+    /// Also run K4, which turns each block's parse into its complete zstd frame.
+    pub emit_frames: bool,
+    /// With `emit_frames`: also run K5, which Huffman-codes the literals (`FrameOptions::default()`);
+    /// without it the frames keep raw literals (`huffman: false`).
+    pub huffman: bool,
+}
+
+impl GpuParams {
+    /// The `write_frame` options the frames equal (checksums stay CPU-only).
+    pub fn frame_options(&self) -> FrameOptions {
+        FrameOptions { checksum: false, huffman: self.huffman }
+    }
+}
+
+/// Bytes of the packed `data` buffer for `n_blocks` (blocks plus one trailing zero word).
+pub fn data_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * BLOCK_SIZE as u64 + 4
+}
+
+/// Bytes of the `best` buffer: `[block][pos]` × (offset, len) u32.
+pub fn best_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * BLOCK_SIZE as u64 * 8
+}
+
+/// Bytes of the `seqs` buffer: `[block][MAX_SEQS]` × (lit_len, match_len, off_base) u32.
+pub fn seqs_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * MAX_SEQS as u64 * 12
+}
+
+/// Bytes of the `lits` buffer: `[block][BLOCK_SIZE/4]` u32.
+pub fn lits_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * BLOCK_SIZE as u64
+}
+
+/// Bytes of the `counts` buffer: `[block]` × (n_seq, n_lit) u32.
+pub fn counts_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * 8
+}
+
+/// Bytes of the `frames` buffer: `[block][FRAME_STRIDE]` frame bytes.
+pub fn frames_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * FRAME_STRIDE as u64
+}
+
+/// Bytes of the `frame_len` buffer: `[block]` u32.
+pub fn frame_len_bytes(n_blocks: u32) -> u64 {
+    n_blocks as u64 * 4
+}
+
+/// Largest `n_blocks` one `Kernels::record` call (and one `BatchBuffers`) may take under
+/// `limits`: K1's bound (`chains::max_blocks_per_batch`: data, head and pred buffers, the
+/// workgroups-per-dimension limit used by K1's x and K2's y dispatch, u32 head/pred indices)
+/// further limited so the best, seqs, lits, counts and frames buffers each fit one storage binding and
+/// one buffer and their u32 word indices (at most 2*BLOCK_SIZE words per block, in `best`)
+/// cannot wrap. 0 if one block doesn't fit.
+pub fn max_batch_blocks(limits: &wgpu::Limits) -> u32 {
+    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+    let by_k1 = chains::max_blocks_per_batch(limits) as u64;
+    let by_buffers = [best_bytes(1), seqs_bytes(1), lits_bytes(1), counts_bytes(1), frames_bytes(1)]
+        .into_iter()
+        .map(|per_block| limit / per_block)
+        .min()
+        .unwrap();
+    let by_index = (1u64 << 32) / (2 * BLOCK_SIZE as u64);
+    by_k1.min(by_buffers).min(by_index) as u32
+}
+
+/// Per-batch buffers, allocated for `capacity` blocks and reused.
+pub struct BatchBuffers {
+    pub capacity: u32,
+    /// Packed blocks (`pack_blocks` layout); written by the caller.
+    pub data: wgpu::Buffer,
+    /// K1 hash heads, `[block][width][2^HASH_BITS]`.
+    pub head: wgpu::Buffer,
+    /// K1 predecessor chains, `[block][width][pos]`.
+    pub pred: wgpu::Buffer,
+    /// K2 output, `[block][pos]` × (offset, len); len 0 = none.
+    pub best: wgpu::Buffer,
+    /// K3 output, `[block][MAX_SEQS]` × (lit_len, match_len, off_base).
+    pub seqs: wgpu::Buffer,
+    /// K3 output, `[block][BLOCK_SIZE/4]` literal bytes packed LE.
+    pub lits: wgpu::Buffer,
+    /// K3 output, `[block]` × (n_seq, n_lit).
+    pub counts: wgpu::Buffer,
+    /// K4 output, `[block][FRAME_STRIDE]` frame bytes (allocated only with `frames: true`).
+    pub frames: Option<wgpu::Buffer>,
+    /// K4 output, `[block]` frame length in bytes (allocated only with `frames: true`).
+    pub frame_len: Option<wgpu::Buffer>,
+}
+
+impl BatchBuffers {
+    /// Panics unless `1 <= capacity <= max_batch_blocks(&ctx.device.limits())`. `frames`
+    /// allocates K4's outputs (needed when the kernels emit frames).
+    pub fn new(ctx: &GpuContext, capacity: u32, frames: bool) -> Self {
+        let max = max_batch_blocks(&ctx.device.limits());
+        assert!(capacity >= 1 && capacity <= max, "BatchBuffers capacity {capacity} not in 1..={max}");
+        Self {
+            capacity,
+            data: ctx.storage_buffer("batch.data", data_bytes(capacity), false),
+            head: ctx.storage_buffer("batch.head", head_bytes(capacity), false),
+            pred: ctx.storage_buffer("batch.pred", pred_bytes(capacity), true),
+            best: ctx.storage_buffer("batch.best", best_bytes(capacity), true),
+            seqs: ctx.storage_buffer("batch.seqs", seqs_bytes(capacity), true),
+            lits: ctx.storage_buffer("batch.lits", lits_bytes(capacity), true),
+            counts: ctx.storage_buffer("batch.counts", counts_bytes(capacity), true),
+            frames: frames.then(|| ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
+            frame_len: frames.then(|| ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
+        }
+    }
+
+    /// New `data` (and K4 output) buffers, sharing `other`'s scratch buffers: head, pred, best,
+    /// seqs, lits and counts. Safe for batches recorded into later submissions on the same queue
+    /// as long as every batch reads those buffers back (or consumes them in K4) within its own
+    /// submission: wgpu orders the submissions and their buffer hazards.
+    pub fn new_sharing(ctx: &GpuContext, other: &BatchBuffers, frames: bool) -> Self {
+        let capacity = other.capacity;
+        Self {
+            capacity,
+            data: ctx.storage_buffer("batch.data", data_bytes(capacity), false),
+            head: other.head.clone(),
+            pred: other.pred.clone(),
+            best: other.best.clone(),
+            seqs: other.seqs.clone(),
+            lits: other.lits.clone(),
+            counts: other.counts.clone(),
+            frames: frames.then(|| ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
+            frame_len: frames.then(|| ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
+        }
+    }
+}
+
+/// Bytes of the scratch buffers `BatchBuffers::new_sharing` shares (head, pred, best, seqs, lits,
+/// counts) for `n_blocks`.
+pub fn scratch_bytes(n_blocks: u32) -> u64 {
+    head_bytes(n_blocks)
+        + pred_bytes(n_blocks)
+        + best_bytes(n_blocks)
+        + seqs_bytes(n_blocks)
+        + lits_bytes(n_blocks)
+        + counts_bytes(n_blocks)
+}
+
+/// Bytes of the per-slot buffers (data, plus frames and frame_len with `frames`) for `n_blocks`.
+pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
+    data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + frame_len_bytes(n_blocks) } else { 0 }
+}
+
+/// K4 pipeline and its constant tables.
+struct EntropyKernel {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    /// `tab`: code tables, FRAC and the predefined distributions (see `k4_tables`).
+    tables: wgpu::Buffer,
+}
+
+/// K5 pipeline (no tables of its own).
+struct HuffmanKernel {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// The K1, K2 and K3 pipelines (plus K4 with `emit_frames`, and K5 with `huffman` too), built once.
+pub struct Kernels {
+    chains: ChainsKernel,
+    best: wgpu::ComputePipeline,
+    best_layout: wgpu::BindGroupLayout,
+    parse: wgpu::ComputePipeline,
+    parse_layout: wgpu::BindGroupLayout,
+    entropy: Option<EntropyKernel>,
+    huffman: Option<HuffmanKernel>,
+    params: GpuParams,
+}
+
+/// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
+/// comes from gzc_core, so the GPU mirrors the CPU tables exactly.
+/// Bytes of K4's constant table buffer.
+pub fn k4_tables_bytes() -> u64 {
+    k4_tables().0.len() as u64 * 4
+}
+
+/// Frame-header options: the header does not depend on `huffman`.
+const HEADER_OPTIONS: FrameOptions = FrameOptions { checksum: false, huffman: true };
+
+fn k4_tables() -> (Vec<u32>, String) {
+    let mut tab: Vec<u32> = Vec::new();
+    let mut consts = String::new();
+    let mut add = |name: &str, values: Vec<u32>| {
+        consts += &format!("const TAB_{name}: u32 = {}u;\n", tab.len());
+        tab.extend(values);
+    };
+    add("LL_CODE", (0..64).map(|l| ll_code(l) as u32).collect());
+    add("ML_CODE", (0..128).map(|b| ml_code(b + 3) as u32).collect());
+    add("LL_BITS", LL_BITS.iter().map(|&b| b as u32).collect());
+    add("ML_BITS", ML_BITS.iter().map(|&b| b as u32).collect());
+    add("LL_BASE", LL_BASE.to_vec());
+    add("ML_BASE", ML_BASE.to_vec());
+    add("FRAC", FRAC.iter().map(|&f| f as u32).collect());
+    let norm = |n: &[i16]| n.iter().map(|&v| v as i32 as u32).collect();
+    add("LL_NORM", norm(&LL_DEFAULT_NORM));
+    add("OF_NORM", norm(&OF_DEFAULT_NORM));
+    add("ML_NORM", norm(&ML_DEFAULT_NORM));
+
+    let hdr = frame_header(HEADER_OPTIONS);
+    // K4 writes frame words [0, 4) byte by byte: header + block header + a literals header of up
+    // to 3 bytes must fit in 16 bytes.
+    assert!(hdr.len() <= 10, "frame header longer than K4 expects");
+    let mut hw = [0u8; 12];
+    hw[..hdr.len()].copy_from_slice(&hdr);
+    let w = |i: usize| u32::from_le_bytes(hw[4 * i..4 * i + 4].try_into().unwrap());
+    consts += &format!(
+        "const HDR_LEN: u32 = {}u;\nconst HDR_W0: u32 = 0x{:08X}u;\nconst HDR_W1: u32 = 0x{:08X}u;\nconst HDR_W2: u32 = 0x{:08X}u;\n",
+        hdr.len(),
+        w(0),
+        w(1),
+        w(2)
+    );
+    consts += &format!("const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst FRAME_WORDS: u32 = {}u;\n", FRAME_STRIDE / 4);
+    // K5 -> K4: frame_len[b] marker for "the literals section is Raw; K4 copies it".
+    consts += "const RAW_SECTION: u32 = 0xFFFFFFFFu;\n";
+    (tab, consts)
+}
+
+fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::BindGroupLayout {
+    let entries: Vec<_> = read_only
+        .iter()
+        .enumerate()
+        .map(|(i, &read_only)| wgpu::BindGroupLayoutEntry {
+            binding: i as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        })
+        .collect();
+    ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries })
+}
+
+fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayout, body: &str) -> wgpu::ComputePipeline {
+    let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let module = ctx.shader(label, body);
+    ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+impl Kernels {
+    pub fn new(ctx: &GpuContext, params: GpuParams) -> Self {
+        let best_layout = storage_layout(ctx, "k2", &[true, true, false]);
+        let best = compute_pipeline(
+            ctx,
+            "k2_best",
+            &best_layout,
+            &format!("const DEPTH: u32 = {}u;\n{K2_WGSL}", params.depth),
+        );
+        let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
+        let parse =
+            compute_pipeline(ctx, "k3_parse", &parse_layout, &format!("const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}"));
+        let (tab, consts) = k4_tables();
+        let huffman = params.emit_frames && params.huffman;
+        let entropy = params.emit_frames.then(|| {
+            let layout = storage_layout(ctx, "k4", &[true, true, true, true, true, false, false]);
+            let pipeline = compute_pipeline(
+                ctx,
+                "k4_entropy",
+                &layout,
+                &format!("{consts}const HUFFMAN: bool = {huffman};\n{K4_WGSL}"),
+            );
+            let tables = ctx.storage_buffer("k4.tables", (tab.len() * 4) as u64, false);
+            ctx.queue.write_buffer(&tables, 0, bytemuck::cast_slice(&tab));
+            EntropyKernel { pipeline, layout, tables }
+        });
+        let huffman = huffman.then(|| {
+            let layout = storage_layout(ctx, "k5", &[true, true, true, false, false]);
+            let pipeline = compute_pipeline(ctx, "k5_huffman", &layout, &format!("{consts}{K5_WGSL}"));
+            HuffmanKernel { pipeline, layout }
+        });
+        let params = GpuParams { huffman: huffman.is_some(), ..params };
+        Self { chains: ChainsKernel::new(ctx), best, best_layout, parse, parse_layout, entropy, huffman, params }
+    }
+
+    /// True when K4 runs (built with `GpuParams::emit_frames`).
+    pub fn emits_frames(&self) -> bool {
+        self.entropy.is_some()
+    }
+
+    /// The `write_frame` options the emitted frames equal (Huffman literals iff K5 runs).
+    pub fn frame_options(&self) -> FrameOptions {
+        self.params.frame_options()
+    }
+
+    /// Names of the kernels `record_timed` runs, in timestamp order.
+    pub fn names(&self) -> &'static [&'static str] {
+        let n = if self.huffman.is_some() {
+            5
+        } else if self.emits_frames() {
+            4
+        } else {
+            3
+        };
+        &KERNEL_NAMES[..n]
+    }
+
+    /// Upload is done by the caller (queue.write_buffer into bufs.data). Records K1→K2→K3, and
+    /// (K5→) K4 when emitting frames (then `bufs` must have been allocated with frames).
+    ///
+    /// Precondition: `n_blocks <= bufs.capacity` (asserted); `BatchBuffers::new` guarantees
+    /// `capacity <= max_batch_blocks`, which keeps every dispatch and u32 index in range.
+    pub fn record(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+        self.record_timed(ctx, enc, bufs, n_blocks, None);
+    }
+
+    /// `record`, with each kernel in its own compute pass writing begin/end timestamps into
+    /// `queries` (at least `KERNEL_QUERIES` entries): K1 at 0/1, K2 at 2/3, K3 at 4/5, K4 at 6/7,
+    /// K5 at 8/9.
+    pub fn record_timed(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
+        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
+        if n_blocks == 0 {
+            return;
+        }
+        self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
+
+        let k2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k2"),
+            layout: &self.best_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.pred.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.best.as_entire_binding() },
+            ],
+        });
+        // K3 derives the batch size from the bound length of `counts`.
+        let counts = wgpu::BufferBinding { buffer: &bufs.counts, offset: 0, size: wgpu::BufferSize::new(counts_bytes(n_blocks)) };
+        let k3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k3"),
+            layout: &self.parse_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.best.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.seqs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: bufs.lits.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Buffer(counts) },
+            ],
+        });
+
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: ts(1) });
+        pass.set_pipeline(&self.best);
+        pass.set_bind_group(0, &k2, &[]);
+        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
+        drop(pass);
+
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes: ts(2) });
+        pass.set_pipeline(&self.parse);
+        pass.set_bind_group(0, &k3, &[]);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
+        drop(pass);
+
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// Records K5 (with `huffman`) then K4, on whatever parse (`seqs`, `lits`, `counts`) and
+    /// blocks (`data`) `bufs` holds for its first `n_blocks` blocks; timestamps as in
+    /// `record_timed`. Panics unless built with `emit_frames` and `bufs` has frames and
+    /// `n_blocks <= bufs.capacity`.
+    pub fn record_entropy(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
+        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
+        if n_blocks == 0 {
+            return;
+        }
+        let k4 = self.entropy.as_ref().expect("Kernels built without emit_frames");
+        let (Some(frames), Some(frame_len)) = (&bufs.frames, &bufs.frame_len) else {
+            panic!("K4 needs BatchBuffers allocated with frames");
+        };
+        // K5 and K4 derive the batch size from the bound length of `frame_len`.
+        let frame_len =
+            wgpu::BufferBinding { buffer: frame_len, offset: 0, size: wgpu::BufferSize::new(frame_len_bytes(n_blocks)) };
+        if let Some(k5) = &self.huffman {
+            let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("k5"),
+                layout: &k5.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bufs.lits.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bufs.counts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: frames.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Buffer(frame_len.clone()) },
+                ],
+            });
+            let mut pass =
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k5"), timestamp_writes: ts(4) });
+            pass.set_pipeline(&k5.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_blocks, 1, 1);
+        }
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k4"),
+            layout: &k4.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.seqs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.lits.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: bufs.counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: k4.tables.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: frames.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Buffer(frame_len) },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k4"), timestamp_writes: ts(3) });
+        pass.set_pipeline(&k4.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
+    }
+}
+
+/// Decode one block's readback regions into a BlockOutput: `seq_words` holds at least
+/// `3 * n_seq` words (lit_len, match_len, off_base), `lit_words` at least `ceil(n_lit / 4)`
+/// words of literal bytes packed LE.
+pub fn decode_output(seq_words: &[u32], lit_words: &[u32], n_seq: u32, n_lit: u32) -> BlockOutput {
+    let sequences = seq_words[..3 * n_seq as usize]
+        .chunks_exact(3)
+        .map(|s| Sequence { lit_len: s[0], match_len: s[1], off_base: s[2] })
+        .collect();
+    let mut literals: Vec<u8> = lit_words[..(n_lit as usize).div_ceil(4)].iter().flat_map(|w| w.to_le_bytes()).collect();
+    literals.truncate(n_lit as usize);
+    BlockOutput { sequences, literals }
+}
+
+/// Convenience synchronous path used by tests: upload, run, read back, decode into BlockOutputs.
+/// Splits `blocks` (each BLOCK_SIZE bytes) into batches that fit the device limits.
+/// wgpu validation and out-of-memory errors while recording/submitting become `Err`.
+pub fn compress_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<BlockOutput>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max = max_batch_blocks(&ctx.device.limits()).min(COMPRESS_BATCH_CAP) as usize;
+    anyhow::ensure!(max > 0, "device limits too small for one block");
+
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, kernels.emits_frames());
+    let mut out = Vec::with_capacity(blocks.len());
+    let mut result = Ok(());
+    for batch in blocks.chunks(max) {
+        let n = batch.len() as u32;
+        ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(batch)));
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("compress_batch") });
+        kernels.record(ctx, &mut enc, &bufs, n);
+        ctx.queue.submit([enc.finish()]);
+        result = read_outputs(ctx, &bufs, n, &mut out);
+        if result.is_err() {
+            break;
+        }
+    }
+    if let Some(e) = pollster::block_on(validation_scope.pop()) {
+        return Err(anyhow!("wgpu validation error: {e}"));
+    }
+    if let Some(e) = pollster::block_on(oom_scope.pop()) {
+        return Err(anyhow!("wgpu out of memory: {e}"));
+    }
+    result?;
+    Ok(out)
+}
+
+/// Like `compress_batch`, but returns each block's complete zstd frame as produced by K4.
+/// Errors unless `kernels` was built with `emit_frames`.
+pub fn compress_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<u8>>> {
+    anyhow::ensure!(kernels.emits_frames(), "compress_frames needs Kernels built with emit_frames");
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max = max_batch_blocks(&ctx.device.limits()).min(COMPRESS_BATCH_CAP) as usize;
+    anyhow::ensure!(max > 0, "device limits too small for one block");
+
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, true);
+    let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
+    let mut out = Vec::with_capacity(blocks.len());
+    let mut result = Ok(());
+    for batch in blocks.chunks(max) {
+        let n = batch.len() as u32;
+        ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(batch)));
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("compress_frames") });
+        kernels.record(ctx, &mut enc, &bufs, n);
+        ctx.queue.submit([enc.finish()]);
+        result = read_regions(ctx, &[(frame_len, 0, n as u64), (frames, 0, frames_bytes(n) / 4)]).and_then(|words| {
+            let (lens, frames) = words.split_at(n as usize);
+            let bytes: &[u8] = bytemuck::cast_slice(frames);
+            for (b, &len) in lens.iter().enumerate() {
+                out.push(frame_bytes(bytes, b, len)?.to_vec());
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            break;
+        }
+    }
+    if let Some(e) = pollster::block_on(validation_scope.pop()) {
+        return Err(anyhow!("wgpu validation error: {e}"));
+    }
+    if let Some(e) = pollster::block_on(oom_scope.pop()) {
+        return Err(anyhow!("wgpu out of memory: {e}"));
+    }
+    result?;
+    Ok(out)
+}
+
+/// Runs K4 alone on caller-supplied parses: frame `i` encodes `blocks[i]` (BLOCK_SIZE bytes) with
+/// `parses[i]` as its parse, which must cover the block exactly (as `write_frame` requires).
+/// Lets tests drive K4 with scripted parses the match finder would never produce. At most
+/// `max_batch_blocks` blocks (one batch).
+pub fn frames_from_parses(
+    ctx: &GpuContext,
+    kernels: &Kernels,
+    blocks: &[&[u8]],
+    parses: &[BlockOutput],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    anyhow::ensure!(kernels.emits_frames(), "frames_from_parses needs Kernels built with emit_frames");
+    anyhow::ensure!(blocks.len() == parses.len(), "one parse per block");
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = blocks.len() as u32;
+    anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits()), "too many blocks for one batch");
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let bufs = BatchBuffers::new(ctx, n, true);
+    ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
+    for (b, p) in parses.iter().enumerate() {
+        anyhow::ensure!(p.sequences.len() <= MAX_SEQS as usize && p.literals.len() <= BLOCK_SIZE, "parse {b} too large");
+        let seqs: Vec<u32> = p.sequences.iter().flat_map(|s| [s.lit_len, s.match_len, s.off_base]).collect();
+        let mut lits = p.literals.clone();
+        lits.resize(p.literals.len().next_multiple_of(4), 0);
+        let b = b as u64;
+        if !seqs.is_empty() {
+            ctx.queue.write_buffer(&bufs.seqs, b * seqs_bytes(1), bytemuck::cast_slice(&seqs));
+        }
+        if !lits.is_empty() {
+            ctx.queue.write_buffer(&bufs.lits, b * lits_bytes(1), &lits);
+        }
+        let counts = [p.sequences.len() as u32, p.literals.len() as u32];
+        ctx.queue.write_buffer(&bufs.counts, b * counts_bytes(1), bytemuck::cast_slice(&counts));
+    }
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frames_from_parses") });
+    kernels.record_entropy(ctx, &mut enc, &bufs, n, None);
+    ctx.queue.submit([enc.finish()]);
+    let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
+    let result = read_regions(ctx, &[(frame_len, 0, n as u64), (frames, 0, frames_bytes(n) / 4)]).and_then(|words| {
+        let (lens, frames) = words.split_at(n as usize);
+        let bytes: &[u8] = bytemuck::cast_slice(frames);
+        lens.iter().enumerate().map(|(b, &len)| Ok(frame_bytes(bytes, b, len)?.to_vec())).collect()
+    });
+    if let Some(e) = pollster::block_on(validation_scope.pop()) {
+        return Err(anyhow!("wgpu validation error: {e}"));
+    }
+    if let Some(e) = pollster::block_on(oom_scope.pop()) {
+        return Err(anyhow!("wgpu out of memory: {e}"));
+    }
+    result
+}
+
+/// Block `b`'s frame out of a fixed-stride frames region (`FRAME_STRIDE` bytes per block),
+/// checking K4's reported length.
+pub fn frame_bytes(frames: &[u8], b: usize, len: u32) -> anyhow::Result<&[u8]> {
+    anyhow::ensure!(len > 0 && len as usize <= FRAME_STRIDE, "block {b}: bad frame length {len}");
+    let start = b * FRAME_STRIDE;
+    Ok(&frames[start..start + len as usize])
+}
+
+/// Reads counts, then each block's used seqs/lits regions, and decodes them into `out`.
+fn read_outputs(ctx: &GpuContext, bufs: &BatchBuffers, n: u32, out: &mut Vec<BlockOutput>) -> anyhow::Result<()> {
+    let counts: Vec<u32> = read_regions(ctx, &[(&bufs.counts, 0, 2 * n as u64)])?;
+    let mut regions = Vec::with_capacity(2 * n as usize);
+    for b in 0..n as u64 {
+        let (n_seq, n_lit) = (counts[2 * b as usize], counts[2 * b as usize + 1]);
+        anyhow::ensure!(n_seq <= MAX_SEQS && n_lit as usize <= BLOCK_SIZE, "block {b}: bad counts ({n_seq}, {n_lit})");
+        regions.push((&bufs.seqs, seqs_bytes(1) * b, 3 * n_seq as u64));
+        regions.push((&bufs.lits, lits_bytes(1) * b, (n_lit as u64).div_ceil(4)));
+    }
+    let words = read_regions(ctx, &regions)?;
+    let mut at = 0usize;
+    for b in 0..n as usize {
+        let (n_seq, n_lit) = (counts[2 * b], counts[2 * b + 1]);
+        let seq_end = at + 3 * n_seq as usize;
+        let lit_end = seq_end + (n_lit as usize).div_ceil(4);
+        out.push(decode_output(&words[at..seq_end], &words[seq_end..lit_end], n_seq, n_lit));
+        at = lit_end;
+    }
+    Ok(())
+}
+
+/// Copies `(buffer, byte offset, word count)` regions into one staging buffer, waits, and
+/// returns their words concatenated in order.
+fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyhow::Result<Vec<u32>> {
+    let total: u64 = regions.iter().map(|r| r.2 * 4).sum();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("compress_batch.readback"),
+        size: total,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+    let mut dst = 0u64;
+    for &(buf, offset, words) in regions {
+        if words > 0 {
+            enc.copy_buffer_to_buffer(buf, offset, &staging, dst, words * 4);
+            dst += words * 4;
+        }
+    }
+    ctx.queue.submit([enc.finish()]);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    staging.map_async(wgpu::MapMode::Read, .., move |r| {
+        let _ = tx.send(r);
+    });
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
+    rx.recv().context("map callback dropped")?.context("map readback buffer")?;
+    let words = {
+        let view = staging.get_mapped_range(..).context("mapped range")?;
+        bytemuck::pod_collect_to_vec(&view[..])
+    };
+    staging.unmap();
+    Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    fn limits(binding: u64, buffer: u64, wg: u32) -> wgpu::Limits {
+        wgpu::Limits {
+            max_storage_buffer_binding_size: binding,
+            max_buffer_size: buffer,
+            max_compute_workgroups_per_dimension: wg,
+            ..wgpu::Limits::default()
+        }
+    }
+
+    /// Every batch buffer for `n` blocks fits `limit`.
+    fn fits(n: u32, limit: u64) -> bool {
+        [data_bytes(n), head_bytes(n), pred_bytes(n), best_bytes(n), seqs_bytes(n), lits_bytes(n), counts_bytes(n), frames_bytes(n)]
+            .iter()
+            .all(|&b| b <= limit)
+    }
+
+    #[test]
+    fn max_seqs_bounds_minimal_sequences() {
+        assert!(MAX_SEQS as usize * MIN_MATCH >= BLOCK_SIZE);
+    }
+
+    #[test]
+    fn batch_fits_every_buffer() {
+        for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
+            let n = max_batch_blocks(&limits(limit, u64::MAX, 65535));
+            assert!(n > 0 && fits(n, limit) && !fits(n + 1, limit), "limit {limit}: n {n}");
+            // max_buffer_size is honoured the same way as the binding size.
+            assert_eq!(max_batch_blocks(&limits(u64::MAX, limit, 65535)), n);
+        }
+        #[cfg(feature = "block-128k")]
+        assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 65535)), 128); // pred/best: 1 MiB per block
+        #[cfg(feature = "block-16k")]
+        assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 65535)), 256); // head: 512 KiB per block
+    }
+
+    #[test]
+    fn batch_respects_workgroup_cap() {
+        assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 3)), 3);
+    }
+
+    #[test]
+    fn batch_keeps_u32_indices_in_range() {
+        let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX)) as u64;
+        assert!(n > 0);
+        // Largest word index of each buffer indexed by the kernels.
+        assert!(n * BLOCK_SIZE as u64 * 2 <= 1 << 32, "best");
+        assert!(n * 2 * BLOCK_SIZE as u64 <= 1 << 32, "pred");
+        assert!(n * MAX_SEQS as u64 * 3 <= 1 << 32, "seqs");
+        assert!((n * 2) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
+    }
+
+    #[test]
+    fn batch_is_zero_when_one_block_does_not_fit() {
+        assert_eq!(max_batch_blocks(&limits(BLOCK_SIZE as u64, u64::MAX, 65535)), 0);
+    }
+
+    #[test]
+    fn decode_output_unpacks_words() {
+        let seqs = [3, 5, 7, 0, 6, 1, 99, 99, 99];
+        let lits = [u32::from_le_bytes(*b"abcd"), u32::from_le_bytes(*b"ef\0\0"), 0xFFFF_FFFF];
+        let out = decode_output(&seqs, &lits, 2, 6);
+        assert_eq!(
+            out.sequences,
+            vec![
+                Sequence { lit_len: 3, match_len: 5, off_base: 7 },
+                Sequence { lit_len: 0, match_len: 6, off_base: 1 }
+            ]
+        );
+        assert_eq!(out.literals, b"abcdef");
+        assert_eq!(decode_output(&[], &[], 0, 0), BlockOutput::default());
+    }
+}

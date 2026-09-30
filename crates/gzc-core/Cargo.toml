@@ -1,0 +1,18 @@
+[package]
+name = "gzc-core"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["block-128k"]
+block-16k = []
+block-32k = []
+block-64k = []
+block-128k = []
+
+[dependencies]
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+zstd = { workspace = true }

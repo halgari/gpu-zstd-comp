@@ -1,0 +1,31 @@
+# Pinned benchmark corpus for gpu-zstd-comp (Task 2: fetch-corpus).
+#
+# Each [[mod]] entry pins an exact Nexus Mods file (not "latest"), so the
+# corpus is reproducible. `name` is the local subdirectory under
+# `data/corpus/<name>/…`. Run `fetch-corpus fetch` to download and unpack.
+#
+# Total extracted size target: roughly <= 12 GB.
+
+# Static Mesh Improvement Mod (SMIM) SE — cloned vanilla-adjacent mesh/texture
+# pack, mostly .nif meshes plus some .dds textures. Current MAIN file as of
+# 2026-09-29 (`fetch-corpus list skyrimspecialedition 659`): file_id 59069,
+# "SMIM SE 2-08-659-2-08.7z" (~1.03 GB compressed, category MAIN).
+[[mod]]
+name = "smim-se"
+game = "skyrimspecialedition"
+mod_id = 659
+file_id = 59069
+
+# Noble Skyrim Mod (NSM) HD-2K — a texture-replacer pack, almost entirely
+# .dds textures, so it's a good DDS-heavy corpus complement to SMIM's
+# meshes. Chosen over Skyrim 202X (mod 2347) because 202X's current MAIN
+# files are split into three multi-GB parts (9.6/4.5/11.4 GB compressed
+# each) with no single file in the desired size band; Noble Skyrim ships
+# one archive per edition. File_id 73168, "A. Noble Skyrim - FULL PACK_2K"
+# (~2.49 GB compressed, category MAIN) — the 2K variant, as opposed to the
+# larger 4K/full-res edition, keeping extracted size in the ~2-8 GB band.
+[[mod]]
+name = "noble-skyrim-2k"
+game = "skyrimspecialedition"
+mod_id = 21423
+file_id = 73168

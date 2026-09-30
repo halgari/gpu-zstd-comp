@@ -1,0 +1,131 @@
+//! Literal-length, match-length and offset code tables, and zstd's predefined FSE distributions.
+//!
+//! Values checked against libzstd 1.5.7 (`common/zstd_internal.h`,
+//! `decompress/zstd_decompress_internal.h`, `compress/zstd_compress_internal.h`).
+
+pub const LL_BASE: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+    16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, //
+    8192, 16384, 32768, 65536,
+];
+pub const LL_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, //
+    13, 14, 15, 16,
+];
+pub const ML_BASE: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, //
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, //
+    35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, //
+    4099, 8195, 16387, 32771, 65539,
+];
+pub const ML_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, //
+    12, 13, 14, 15, 16,
+];
+
+pub const LL_DEFAULT_NORM: [i16; 36] = [
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, //
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, //
+    -1, -1, -1, -1,
+];
+pub const LL_DEFAULT_LOG: u32 = 6;
+pub const ML_DEFAULT_NORM: [i16; 53] = [
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, //
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, //
+    -1, -1, -1, -1, -1,
+];
+pub const ML_DEFAULT_LOG: u32 = 6;
+pub const OF_DEFAULT_NORM: [i16; 29] = [
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, //
+    1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
+];
+pub const OF_DEFAULT_LOG: u32 = 5;
+
+/// Floor log2 of a nonzero value.
+fn highbit(v: u32) -> u32 {
+    debug_assert!(v != 0);
+    31 - v.leading_zeros()
+}
+
+/// Literal-length code (port of `ZSTD_LLcode`).
+pub fn ll_code(lit_len: u32) -> u8 {
+    const LL_CODE: [u8; 64] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+        16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21, //
+        22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, //
+        24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    ];
+    if lit_len > 63 { (highbit(lit_len) + 19) as u8 } else { LL_CODE[lit_len as usize] }
+}
+
+/// Match-length code for a real match length (>= 3) (port of `ZSTD_MLcode(matchLength - MINMATCH)`).
+pub fn ml_code(match_len: u32) -> u8 {
+    const ML_CODE: [u8; 128] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, //
+        32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, //
+        38, 38, 38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, //
+        40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, //
+        41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, //
+        42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, //
+        42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+    ];
+    debug_assert!(match_len >= 3);
+    let ml_base = match_len - 3;
+    if ml_base > 127 { (highbit(ml_base) + 36) as u8 } else { ML_CODE[ml_base as usize] }
+}
+
+/// Offset code: floor log2 of `off_base`; the code is also its number of extra bits.
+pub fn of_code(off_base: u32) -> u8 {
+    highbit(off_base) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference definition: the largest code whose base is <= value.
+    fn largest_base_le(base: &[u32], v: u32) -> u8 {
+        base.iter().rposition(|&b| b <= v).unwrap() as u8
+    }
+
+    #[test]
+    fn ll_code_matches_base_table() {
+        // lit_len < 128K always (a sequence also carries a match of >= 3 bytes)
+        for ll in 0..(1u32 << 17) {
+            let c = ll_code(ll);
+            assert_eq!(c, largest_base_le(&LL_BASE, ll), "ll {ll}");
+            assert!(ll - LL_BASE[c as usize] < (1 << LL_BITS[c as usize]), "ll {ll}");
+        }
+    }
+
+    #[test]
+    fn ml_code_matches_base_table() {
+        for ml in 3..=(1u32 << 17) {
+            let c = ml_code(ml);
+            assert_eq!(c, largest_base_le(&ML_BASE, ml), "ml {ml}");
+            assert!(ml - ML_BASE[c as usize] < (1 << ML_BITS[c as usize]), "ml {ml}");
+        }
+    }
+
+    #[test]
+    fn of_code_is_highbit() {
+        assert_eq!(of_code(1), 0);
+        assert_eq!(of_code(2), 1);
+        assert_eq!(of_code(3), 1);
+        assert_eq!(of_code(4), 2);
+        assert_eq!(of_code((1 << 17) + 3), 17);
+    }
+
+    #[test]
+    fn default_norms_sum_to_table_size() {
+        let sum = |n: &[i16]| n.iter().map(|&x| x.unsigned_abs() as u32).sum::<u32>();
+        assert_eq!(sum(&LL_DEFAULT_NORM), 1 << LL_DEFAULT_LOG);
+        assert_eq!(sum(&ML_DEFAULT_NORM), 1 << ML_DEFAULT_LOG);
+        assert_eq!(sum(&OF_DEFAULT_NORM), 1 << OF_DEFAULT_LOG);
+    }
+}

@@ -1,0 +1,14 @@
+[package]
+name = "fetch-corpus"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+ba2 = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

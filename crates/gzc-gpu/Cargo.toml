@@ -1,0 +1,22 @@
+[package]
+name = "gzc-gpu"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["block-128k"]
+block-16k = ["gzc-core/block-16k"]
+block-32k = ["gzc-core/block-32k"]
+block-64k = ["gzc-core/block-64k"]
+block-128k = ["gzc-core/block-128k"]
+
+[dependencies]
+gzc-core = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+zstd = { workspace = true }

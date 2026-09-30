@@ -33,6 +33,9 @@ compression ratio than its CPU could at the same speed.
 | Integers in WGSL | u32 only; no dependency on `shader-int64` |
 
 Reference hardware: AMD Ryzen 9 9950X3D (16C/32T), NVIDIA RTX 5090 (32 GB), Linux, Vulkan.
+Target hardware (what headline numbers must reflect): a typical gaming PC with ~8 CPU cores and an
+~8 GB GPU. GPU pipeline configs are capped to a ~6 GB VRAM budget (batch × inflight × per-block
+footprint); the 5090's extra memory is not used for headline results.
 
 ## 3. Architecture
 
@@ -100,7 +103,10 @@ Parameters for the level-3 calibration: `min_match = 5`, hash widths 8 bytes
    predecessors (long first, then short), compute the forward match length
    `len` (bounded by `BLOCK_SIZE - p`). Keep the longest; ties go to the
    nearest `q`. Store `best[p] = (offset = p - q, len)` if `len ≥ min_match`,
-   else none.
+   else none. Candidate comparison stops at `MATCH_SEARCH_CAP = 64` bytes
+   (bounded compare), so K2 is O(BLOCK_SIZE · cap) even on long repeats; an
+   uncapped search is O(BLOCK_SIZE²) per block on flat data (measured: 9.5 MB/s
+   on 8 threads for real DDS).
 3. **Greedy parse (K3), one pass per block.** `anchor = 0`, `p = 0`,
    `rep = [1, 4, 8]`, loop while `p < BLOCK_SIZE - 8`:
    - If `p > anchor` and `p ≥ rep[0]`, check a repeat match at `p` with
@@ -109,7 +115,9 @@ Parameters for the level-3 calibration: `min_match = 5`, hash widths 8 bytes
      mapped to a repeat code if it equals one of `rep`).
    - Else advance `p` by `1 + ((p - anchor) >> 8)` (literal-run acceleration),
      bounded to not skip past the end.
-   - Match lengths are bounded by the block end (`BLOCK_SIZE - p`).
+   - Match lengths are bounded by the block end (`BLOCK_SIZE - p`). When the
+     parse takes `best[p]` with `len == MATCH_SEARCH_CAP`, it first extends the
+     match with an uncapped compare (linear overall, since `p` skips past it).
    - On a match: emit `Sequence { lit_len: p - anchor, match_len, off_base }`,
      update `rep` exactly per the zstd spec (including the `lit_len == 0`
      repeat-code shift rule), set `p += match_len`, `anchor = p`.
@@ -150,14 +158,25 @@ top-K candidates per position. A suffix-array match finder is an M4 option.
   are injected at pipeline creation via WGSL `override` constants or source
   templating.
 
-Memory budget: ~2.5 MB scratch per 128 KB block (pred ×2, head ×2 at 256 KB each,
-best, sequences, literals) → ~1.3 GB for N = 512.
+Memory budget (as built, M3, 128 KiB blocks; `gzc_gpu::pipeline::vram_bytes`):
+~2.9 MiB of scratch per block (head, pred, best, sequences, literals, counts),
+allocated once and **shared by every in-flight slot**, plus ~0.5 MiB per block per
+in-flight slot (block data, frame output + lengths, upload and readback staging).
+Batches share one queue and the scratch, so K1 of batch i+1 cannot overlap K3 of
+batch i. Frame-path kernel order per batch: K1, K2, K3, then **K5 (Huffman
+literals) before K4** (K4 reads K5's literals-section length and writes the
+sequences section after it). A 6 GiB budget (`--vram-budget-mb 6144`, an 8 GB card
+minus headroom) fits `--batch 1388 --inflight 3` (6143 MiB).
 
 ### 3.4 gzc-bench
 
-- `gzc-bench cpu --input DIR [--ext dds,nif] [--max-bytes N] [--levels 1,3,...] [--threads 1,8,16,32]`
-- `gzc-bench gpu --input DIR [...] [--batch N] [--inflight K] [--config lvl3|...]`
-- `gzc-bench all ...` runs both and writes the report.
+- `gzc-bench cpu --input DIR [--ext dds,nif] [--max-bytes N] [--levels 1,...,6] [--threads 1,8,16,32]`
+  (levels default to 1–6; above 16 is rejected)
+- `gzc-bench ref --input DIR [...] [--threads 1,8] [--verify]`
+- `gzc-bench gpu --input DIR [...] [--batch N] [--inflight K] [--writer-threads W]
+  [--vram-budget-mb 6144] [--verify]`. A `--config lvl3|...` selector for other
+  parse strategies is future work (M4); M3 has only `lvl3-greedy`.
+- `gzc-bench all ...` runs every engine and writes one combined report.
 - Corpus: recursive load into RAM, per-file chunking, file-type tag
   (dds / nif / other) on each block.
 - Metrics per run: throughput in MB/s of **real** input bytes (not padding),
@@ -167,7 +186,8 @@ best, sequences, literals) → ~1.3 GB for N = 512.
   including upload, readback and any CPU-side frame assembly. Kernel-only time
   reported separately.
 - `--verify`: libzstd round-trip of every output, excluded from timing.
-- Outputs: stdout table; `out/results-<ts>.json`; `out/report-<ts>.html`
+- Outputs: stdout table; `results.json` and `report.html` in the `--out` directory
+  (default `out/`; not timestamped, so use one `--out` dir per run)
   (self-contained inline-SVG chart: x = throughput, y = ratio; CPU 8-thread
   curve by level; CPU 1-thread × 8 dashed projection; GPU points; vertical lines
   at 125 MB/s and 1250 MB/s; headline: best ratio at ≥ 1.25 GB/s for CPU-8T vs GPU).
