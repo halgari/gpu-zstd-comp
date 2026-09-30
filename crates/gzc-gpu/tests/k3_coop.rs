@@ -64,13 +64,13 @@ impl Case {
         self
     }
 
-    /// Explicit matches every 200 bytes from 200 up to about `end`, so the parse's anchor keeps
-    /// up (step 1) and the scan reaches `end` without regime jumps.
+    /// Explicit matches every 100 bytes from 200 up to about `end` (the last one ends 100 to 216
+    /// bytes before it), so the parse's anchor keeps up and the scan reaches `end` with step 1.
     fn chain_to(&mut self, end: usize) -> &mut Self {
         let mut p = 200;
-        while p + 200 + 16 < end {
+        while p + 100 + 16 < end {
             self.explicit(p, 150, 8, 8);
-            p += 200;
+            p += 100;
         }
         self
     }
