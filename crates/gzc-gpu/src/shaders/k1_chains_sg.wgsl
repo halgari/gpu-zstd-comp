@@ -51,7 +51,7 @@ const_assert HASH_BITS == 16u;
 
 // The chain's hash at p from the words w = data[base + p / 4 ..][0..3] (lo and hi are
 // load_u32_at(base, p) and load_u32_at(base, p + 4)): == hash_width(base, p, MIN_MATCH) for Single,
-// hash_long / hash_short for Dfast chain 0 / 1, reduced to the chain key (>> KEY_SHIFT).
+// hash_long / hash_short for Dfast chain 0 / 1, hash_width(.., 4) / hash3 for Opt3 chain 0 / 1, reduced to the chain key (>> KEY_SHIFT).
 fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
     let sh = (p & 3u) * 8u;
     var lo = w.x;
@@ -69,14 +69,17 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
             mask = (1u << (8u * k)) - 1u;
         }
         return mix(lo, hi & mask) >> KEY_SHIFT;
+    } else if (OPT3) {
+        if (chain == 0u) { return mix(lo, 0u) >> KEY_SHIFT; }
+        return ((lo << 8u) * 506832829u) >> (32u - HASH_BITS) >> KEY_SHIFT;
     } else if (chain == 0u) {
         return mix(lo, hi) >> KEY_SHIFT;
     }
     return mix(lo, hi & 0xFFu) >> KEY_SHIFT;
 }
 
-// pred_fp at p from the same words.
-fn fp_words(w: vec3<u32>, p: u32) -> u32 {
+// The pred word fingerprint at p from the same words: pred_fp, or pred_fp3 on the Opt3 h3 chain.
+fn fp_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
     let sh = (p & 3u) * 8u;
     var lo = w.x;
     var hi = w.y;
@@ -84,6 +87,7 @@ fn fp_words(w: vec3<u32>, p: u32) -> u32 {
         lo = (w.x >> sh) | (w.y << (32u - sh));
         hi = (w.y >> sh) | (w.z << (32u - sh));
     }
+    if (OPT3 && chain == 1u) { return pred_fp3(lo); }
     return pred_fp(lo, hi);
 }
 
@@ -229,7 +233,7 @@ fn main(
                         pr = select(NO_POS, (old & POS_MASK) - 1u, (old & ~POS_MASK) == tag);
                     }
                 }
-                pred_out[pb + p] = pred_word(pr, fp_words(cur, p));
+                pred_out[pb + p] = pred_word(pr, fp_words(cur, p, chain));
             }
             storageBarrier();
         }

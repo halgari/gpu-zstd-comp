@@ -21,12 +21,13 @@ use gzc_core::codes::{
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::{FrameOptions, frame_header};
 use gzc_core::fse::FRAC;
-use gzc_core::params::MatchParams;
-use gzc_core::reference::Match;
+use gzc_core::params::{MatchParams, OPT_H3_DEPTH};
+use gzc_core::reference::{CandWords, Match};
 use gzc_core::seq::{BlockOutput, Sequence};
 
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K2_WINDOW_WGSL: &str = include_str!("shaders/k2_window.wgsl");
+const K2_OPT_WGSL: &str = include_str!("shaders/k2_opt.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
@@ -120,6 +121,17 @@ pub const fn best_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * BLOCK_SIZE as u64 * 4
 }
 
+/// u32 words per position of the `best` buffer under match params `m`: 1 (K2's best match), or 2
+/// for the optimal parse (`m.opt`: K2opt's two candidate words, `reference::CandWords`).
+pub fn best_words(m: &MatchParams) -> u32 {
+    if m.opt.is_some() { 2 } else { 1 }
+}
+
+/// Bytes of the `best` buffer under match params `m`: `best_bytes`, times `best_words(m)`.
+pub fn best_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
+    best_bytes(n_blocks) * best_words(m) as u64
+}
+
 /// Bytes of the `seqs` buffer: `[block][MAX_SEQS]` × (lit_len, match_len, off_base) u32.
 pub fn seqs_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * MAX_SEQS as u64 * 12
@@ -145,16 +157,17 @@ pub fn frame_len_bytes(n_blocks: u32) -> u64 {
 /// head and pred buffers, the workgroups-per-dimension limit used by K1's x and K2's y dispatch,
 /// u32 head/pred indices) further limited so the best, seqs, counts and frames buffers each
 /// fit one storage binding and one buffer and their u32 word indices (at most BLOCK_SIZE words
-/// per block, in `best`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap. 0 if one block doesn't fit.
+/// per block, in `best`, times `best_words(m)`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap.
+/// 0 if one block doesn't fit.
 pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let by_k1 = chains::max_blocks_per_batch(limits, m.n_hashes()) as u64;
-    let by_buffers = [best_bytes(1), seqs_bytes(1), counts_bytes(1), frames_bytes(1)]
+    let by_buffers = [best_bytes_for(1, m), seqs_bytes(1), counts_bytes(1), frames_bytes(1)]
         .into_iter()
         .map(|per_block| limit / per_block)
         .min()
         .unwrap();
-    let by_index = (1u64 << 32) / BLOCK_SIZE as u64;
+    let by_index = (1u64 << 32) / (BLOCK_SIZE as u64 * best_words(m) as u64);
     by_k1.min(by_buffers).min(by_index) as u32
 }
 
@@ -170,7 +183,8 @@ pub struct BatchBuffers {
     pub head: wgpu::Buffer,
     /// K1 predecessor chains, `[block][chain][pos]`.
     pub pred: wgpu::Buffer,
-    /// K2 output, `[block][pos]` × `(capped len << BEST_OFF_BITS) | offset`; 0 = none.
+    /// K2 output, `[block][pos]` × `(capped len << BEST_OFF_BITS) | offset`; 0 = none. For `opt`
+    /// params K2opt's `[block][pos]` × 2 candidate words (`best_bytes_for`).
     pub best: wgpu::Buffer,
     /// K3 output, `[block][MAX_SEQS]` × (lit_len, match_len, off_base).
     pub seqs: wgpu::Buffer,
@@ -220,7 +234,7 @@ impl BatchBuffers {
             data: data.unwrap_or_else(|| ctx.storage_buffer("batch.data", data_bytes(capacity), false)),
             head: ctx.storage_buffer("batch.head", head_bytes(capacity, n_hashes), false),
             pred: ctx.storage_buffer("batch.pred", pred_bytes(capacity, n_hashes), true),
-            best: ctx.storage_buffer("batch.best", best_bytes(capacity), true),
+            best: ctx.storage_buffer("batch.best", best_bytes_for(capacity, m), true),
             seqs: ctx.storage_buffer("batch.seqs", seqs_bytes(capacity), true),
             counts: ctx.storage_buffer("batch.counts", counts_bytes(capacity), true),
             frames,
@@ -234,7 +248,7 @@ impl BatchBuffers {
 pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
     head_bytes(n_blocks, m.n_hashes())
         + pred_bytes(n_blocks, m.n_hashes())
-        + best_bytes(n_blocks)
+        + best_bytes_for(n_blocks, m)
         + seqs_bytes(n_blocks)
         + counts_bytes(n_blocks)
 }
@@ -1274,6 +1288,116 @@ pub fn best_from_blocks(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -
     })
 }
 
+/// K1 (the `Opt3` h4 + h3 chains) and K2opt (`k2_opt.wgsl`, == `reference::find_cands`): the
+/// optimal parse's candidate words, two per position, in the `best` buffer
+/// (`best_bytes_for(n, m)`, layout `[block][pos][2]`, `reference::CandWords`).
+pub struct OptCandKernel {
+    chains: ChainsKernel,
+    cands: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    matching: MatchParams,
+}
+
+impl OptCandKernel {
+    /// Builds K1 and K2opt for `m`. Errors unless `m` is valid with `opt` set. Independent of
+    /// `gpu_supports` (the full opt pipeline is not on the GPU yet), so tests and benches can run
+    /// the candidate stage alone.
+    pub fn new(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<Self> {
+        m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
+        anyhow::ensure!(m.opt.is_some(), "OptCandKernel needs opt params, got {m:?}");
+        let chains = ChainsKernel::new(ctx, m)?;
+        let layout = storage_layout(ctx, "k2opt", &[true, true, false]);
+        let body = format!(
+            "{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\nconst H3_DEPTH: u32 = {OPT_H3_DEPTH}u;\n{K2_WGSL}\n{K2_OPT_WGSL}",
+            params_wgsl(m)
+        );
+        // Loops: the merged walk decrements a depth counter every iteration (DEPTH + H3_DEPTH at
+        // most) and match_len_capped is bounded by SEARCH_CAP; indices as in K2 (pred words hold
+        // positions below HASHED_POSITIONS, from K1 in the same submission).
+        let module = ctx.shader_trusted("k2_opt", &body);
+        let cands = pipeline_from_module(ctx, "k2_opt", &layout, &module, "main_opt");
+        Ok(Self { chains, cands, layout, matching: *m })
+    }
+
+    /// The match params the kernels were built for.
+    pub fn matching(&self) -> MatchParams {
+        self.matching
+    }
+
+    /// True when K1 is the subgroup kernel.
+    pub fn uses_subgroups(&self) -> bool {
+        self.chains.uses_subgroups()
+    }
+
+    /// Records K1 then K2opt for the first `n_blocks` blocks of `data`: K1 into `head`/`pred`
+    /// (`chains::head_bytes`/`pred_bytes` for 2 chains), the candidates into `cands` (at least
+    /// `best_bytes_for(n_blocks, m)`). `ts(0)` / `ts(1)` are K1's / K2opt's timestamp writes.
+    /// `n_blocks <= max_batch_blocks(.., m)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_timed<'q>(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        data: &wgpu::Buffer,
+        head: &wgpu::Buffer,
+        pred: &wgpu::Buffer,
+        cands: &wgpu::Buffer,
+        n_blocks: u32,
+        ts: impl Fn(u32) -> Option<wgpu::ComputePassTimestampWrites<'q>>,
+    ) {
+        if n_blocks == 0 {
+            return;
+        }
+        assert!(cands.size() >= best_bytes_for(n_blocks, &self.matching), "cands buffer too small");
+        self.chains.record_timed(ctx, enc, data, head, pred, n_blocks, ts(0));
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k2opt"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pred.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cands.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2opt"), timestamp_writes: ts(1) });
+        pass.set_pipeline(&self.cands);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
+    }
+}
+
+/// Runs K1 + K2opt on `blocks` (in batches of at most `max_batch_blocks`) and returns each
+/// block's candidate words (BLOCK_SIZE entries), for tests that check K2opt against
+/// `reference::find_cands` directly.
+pub fn cands_from_blocks(ctx: &GpuContext, kernel: &OptCandKernel, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<CandWords>>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let m = kernel.matching();
+    let max = max_batch_blocks(&ctx.device.limits(), &m).min(COMPRESS_BATCH_CAP) as usize;
+    anyhow::ensure!(max > 0, "device limits too small for one block");
+    with_error_scopes(ctx, || {
+        let cap = blocks.len().min(max) as u32;
+        let nh = m.n_hashes();
+        let data = ctx.storage_buffer("cands.data", data_bytes(cap), false);
+        let head = ctx.storage_buffer("cands.head", head_bytes(cap, nh), false);
+        let pred = ctx.storage_buffer("cands.pred", pred_bytes(cap, nh), false);
+        let cands = ctx.storage_buffer("cands.cands", best_bytes_for(cap, &m), true);
+        let mut out = Vec::with_capacity(blocks.len());
+        for batch in blocks.chunks(max) {
+            let n = batch.len() as u32;
+            ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&pack_blocks(batch)));
+            let mut enc =
+                ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cands_from_blocks") });
+            kernel.record_timed(ctx, &mut enc, &data, &head, &pred, &cands, n, |_| None);
+            ctx.queue.submit([enc.finish()]);
+            let words = read_regions(ctx, &[(&cands, 0, best_bytes_for(n, &m) / 4)])?;
+            out.extend(words.chunks_exact(2 * BLOCK_SIZE).map(|b| b.chunks_exact(2).map(|w| [w[0], w[1]]).collect::<Vec<_>>()));
+        }
+        Ok(out)
+    })
+}
+
 /// Decodes one block's `best[]` words (K2's layout) into matches.
 pub fn decode_best(words: &[u32]) -> Vec<Match> {
     let mask = (1 << BEST_OFF_BITS) - 1;
@@ -1446,6 +1570,23 @@ mod tests {
         // chains::HEAD_TABLES tables).
         #[cfg(feature = "block-16k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (1024, 2048));
+    }
+
+    /// The optimal parse's `best` buffer holds two candidate words per position (8 B), which
+    /// `max_batch_blocks`, `BatchBuffers` and `scratch_bytes` (so `vram_bytes`) all count.
+    #[test]
+    fn opt_batch_counts_two_candidate_words() {
+        use gzc_core::params::{OPT14, OPT16};
+        assert_eq!((best_words(&LVL9), best_words(&OPT16), best_words(&OPT14)), (1, 2, 2));
+        assert_eq!(best_bytes_for(3, &OPT16), 3 * 8 * BLOCK_SIZE as u64);
+        assert_eq!(scratch_bytes(10, &OPT16) - scratch_bytes(10, &LVL3), best_bytes(10));
+        for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
+            let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &OPT16);
+            let fits = |n: u32| fits(n, 2, limit) && best_bytes_for(n, &OPT16) <= limit;
+            assert!(n > 0 && fits(n) && !fits(n + 1), "limit {limit}: n {n}");
+        }
+        let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16) as u64;
+        assert!(n > 0 && n * 2 * BLOCK_SIZE as u64 <= 1 << 32, "cands word index");
     }
 
     #[test]
