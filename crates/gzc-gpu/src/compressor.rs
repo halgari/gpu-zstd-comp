@@ -443,6 +443,32 @@ impl Kernels {
         if n_blocks == 0 {
             return;
         }
+        self.record_best(ctx, enc, bufs, n_blocks, queries);
+        self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
+
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// Records K1 then K2 (timestamps as in `record_timed`) for the first `n_blocks` blocks of
+    /// `bufs.data`, leaving the matches in `bufs.best`. `1 <= n_blocks <= bufs.capacity`.
+    fn record_best(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
+        debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity);
         self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
 
         let k2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -458,13 +484,6 @@ impl Kernels {
         pass.set_pipeline(&self.best);
         pass.set_bind_group(0, &k2, &[]);
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
-        drop(pass);
-
-        self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
-
-        if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
-        }
     }
 
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
@@ -764,8 +783,7 @@ fn submit_from_best(
                 m.search_cap
             );
         }
-        let mut words: Vec<u32> = best.iter().flat_map(|m| [m.offset, m.len]).collect();
-        words.resize(2 * BLOCK_SIZE, 0);
+        let words = encode_best(best);
         ctx.queue.write_buffer(&bufs.best, b as u64 * best_bytes(1), bytemuck::cast_slice(&words));
     }
     let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("from_best") });
@@ -833,6 +851,40 @@ pub fn parses_from_best(
         read_outputs(ctx, &bufs, blocks.len() as u32, &mut out)?;
         Ok(out)
     })
+}
+
+/// Runs K1 and K2 on `blocks` (one batch, at most `max_batch_blocks`) and returns each block's
+/// `best[]` table (BLOCK_SIZE entries, K2's layout decoded), for tests that check K2 against
+/// `reference::find_best` directly.
+pub fn best_from_blocks(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<Match>>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = blocks.len() as u32;
+    let m = kernels.matching();
+    anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
+    with_error_scopes(ctx, || {
+        let bufs = BatchBuffers::new(ctx, n, false, &m);
+        ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("best_from_blocks") });
+        kernels.record_best(ctx, &mut enc, &bufs, n, None);
+        ctx.queue.submit([enc.finish()]);
+        let words = read_regions(ctx, &[(&bufs.best, 0, best_bytes(n) / 4)])?;
+        Ok(words.chunks(best_bytes(1) as usize / 4).map(decode_best).collect())
+    })
+}
+
+/// Decodes one block's `best[]` words (K2's layout) into matches.
+pub fn decode_best(words: &[u32]) -> Vec<Match> {
+    words.chunks(2).map(|w| Match { offset: w[0], len: w[1] }).collect()
+}
+
+/// Encodes one block's matches into `best[]` words (K2's layout), padded with "no match" to
+/// BLOCK_SIZE entries.
+pub fn encode_best(best: &[Match]) -> Vec<u32> {
+    let mut words: Vec<u32> = best.iter().flat_map(|m| [m.offset, m.len]).collect();
+    words.resize(2 * BLOCK_SIZE, 0);
+    words
 }
 
 /// Block `b`'s frame out of a fixed-stride frames region (`FRAME_STRIDE` bytes per block),

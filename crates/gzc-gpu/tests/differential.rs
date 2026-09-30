@@ -11,12 +11,13 @@ use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases};
 use gzc_core::lazy::lazy_parse;
 use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
-use gzc_core::reference::{Match, compress_block};
+use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
 use gzc_gpu::compressor::{
-    GpuParams, Kernels, compress_batch, compress_frames, frames_from_best, frames_from_parses, parses_from_best,
+    GpuParams, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
+    parses_from_best,
 };
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
@@ -1087,6 +1088,135 @@ fn k5_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+// ---- K2 ----
+
+/// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
+/// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), and a Single
+/// chain with a small cap.
+const K2_VARIANTS: [MatchParams; 4] = [
+    MatchParams { depth: 4, ..LVL3 },
+    MatchParams { depth: 16, search_cap: 8, ..LVL3 },
+    MatchParams { depth: 8, search_cap: 16, ..LVL3 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+];
+
+/// CPU mirror of K2's walk with the cap early-out (stop the whole walk, all chains, at the first
+/// candidate reaching search_cap).
+fn find_best_early_out(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<Match> {
+    let mut best = vec![Match::default(); BLOCK_SIZE];
+    let (depth, cap) = (params.depth, params.search_cap as usize);
+    for (p, slot) in best.iter_mut().enumerate().take(gzc_core::config::PARSE_END) {
+        let (mut best_len, mut best_q) = (0usize, 0usize);
+        'walk: for preds in chains {
+            let mut q = preds[p];
+            for _ in 0..depth {
+                if q == gzc_core::config::NO_POS {
+                    break;
+                }
+                let len = match_len_capped(block, p, q as usize, cap);
+                if len > best_len || (len == best_len && q as usize > best_q) {
+                    (best_len, best_q) = (len, q as usize);
+                    if len == cap {
+                        break 'walk;
+                    }
+                }
+                q = preds[q as usize];
+            }
+        }
+        if best_len >= params.min_match as usize {
+            *slot = Match { offset: (p - best_q) as u32, len: best_len as u32 };
+        }
+    }
+    best
+}
+
+/// Dfast blocks where both chains offer candidates at the same p = 5000: there a 200-byte string
+/// `s`; further back (q = 1000) its full copy (on the long chain, caps); nearer (q = 3000) a
+/// prefix of `s` of 5..=9 bytes and then a break (on the short chain, and on the long chain too
+/// once it is >= 8 bytes). The background seed is picked so no hash collision gets in the way:
+/// the first long-chain candidate at 5000 is 3000 (near >= 8) or 1000, the first short-chain one
+/// is 3000.
+fn k2_chain_blocks() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for near in [5usize, 6, 7, 8, 9] {
+        let block = (0u64..)
+            .map(|seed| {
+                let mut block = random(40 + 100 * seed + near as u64, BLOCK_SIZE);
+                let s = random(50, 200);
+                block[1000..1200].copy_from_slice(&s);
+                block[3000..3000 + near].copy_from_slice(&s[..near]);
+                block[3000 + near] = s[near] ^ 0x55;
+                block[5000..5200].copy_from_slice(&s);
+                block
+            })
+            .find(|block| {
+                let ch = chains(block, &LVL3);
+                ch[0][5000] == if near >= 8 { 3000 } else { 1000 } && ch[1][5000] == 3000
+            })
+            .unwrap();
+        out.push((format!("chain-near{near}"), block));
+    }
+    out
+}
+
+/// The early-out walk equals `find_best` on every test block, for every preset and K2 variant.
+#[test]
+fn k2_cap_early_out_matches_find_best_cpu() {
+    let mut blocks = all_blocks();
+    blocks.extend(k2_chain_blocks());
+    for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
+        for (name, block) in &blocks {
+            let ch = chains(block, &params);
+            assert!(find_best_early_out(block, &ch, &params) == find_best(block, &ch, &params), "{params:?} {name}");
+        }
+    }
+}
+
+/// K2's best[] equals `find_best` exactly, for every preset and K2 variant.
+#[test]
+fn k2_best_matches_find_best() {
+    let mut blocks = all_blocks();
+    blocks.extend(k2_chain_blocks());
+    let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+    for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
+        let (ctx, kernels) = setup(params);
+        let got = best_from_blocks(&ctx, &kernels, &refs).expect("best_from_blocks");
+        for ((name, block), got) in blocks.iter().zip(&got) {
+            let want = find_best(block, &chains(block, &params), &params);
+            if let Some(p) = (0..BLOCK_SIZE).find(|&p| got[p] != want[p]) {
+                panic!("{params:?} {name}: best[{p}] gpu {:?} cpu {:?}", got[p], want[p]);
+            }
+        }
+    }
+}
+
+/// Dfast, the case the cross-chain early-out must get right: the long chain caps at a far
+/// candidate while the short chain holds a nearer (larger q) one. A nearer candidate shorter
+/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one of
+/// >= 8 bytes is on the long chain too, ahead of the far copy, and wins there (with search_cap
+/// 8 it caps first, and the far copy is never compared).
+#[test]
+fn k2_dfast_nearer_short_chain_candidate() {
+    for params in [LVL3, MatchParams { search_cap: 8, ..LVL3 }] {
+        let (ctx, kernels) = setup(params);
+        let blocks = k2_chain_blocks();
+        let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+        let got = best_from_blocks(&ctx, &kernels, &refs).expect("best_from_blocks");
+        for ((name, block), got) in blocks.iter().zip(&got) {
+            let near: u32 = name.trim_start_matches("chain-near").parse().unwrap();
+            let want = find_best(block, &chains(block, &params), &params);
+            assert_eq!(got[5000], want[5000], "{params:?} {name}");
+            // Depth 1: the long chain's first candidate is the nearer copy once it is >= 8 bytes.
+            let expect = if near >= 8 {
+                Match { offset: 2000, len: near.min(params.search_cap) }
+            } else {
+                Match { offset: 4000, len: params.search_cap }
+            };
+            assert_eq!(got[5000], expect, "{params:?} {name}");
+        }
+    }
 }
 
 // ---- K3 lazy / lazy2 ----
