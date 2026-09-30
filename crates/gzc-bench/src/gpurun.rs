@@ -78,10 +78,12 @@ impl FrameSink for Discard {
 /// timed region spans from the first upload to the last frame recorded. With `verify`, every frame
 /// is then decompressed with libzstd and compared with its padded block. `kernel_ms` holds the
 /// timed run's summed per-kernel GPU time (when the device supports timestamps); a per-batch
-/// breakdown is printed to stderr. `cfg.params.emit_frames` is forced on.
+/// breakdown is printed to stderr. `cfg.params.emit_frames` is forced on. `preset` names
+/// `cfg.params.matching` in the run's config label.
 pub fn run_gpu(
     ctx: &GpuContext,
     corpus: &Corpus,
+    preset: &str,
     cfg: &PipelineConfig,
     writer_threads: usize,
     verify: bool,
@@ -135,7 +137,7 @@ pub fn run_gpu(
     let real_bytes = corpus.real_bytes();
     let mb = real_bytes as f64 / 1e6;
     eprintln!(
-        "  gpu b{} i{} w{writer_threads}: {} batches, pipeline {:.3}s ({:.1} MB/s), end-to-end {seconds:.3}s ({:.1} MB/s)",
+        "  gpu {preset} b{} i{} w{writer_threads}: {} batches, pipeline {:.3}s ({:.1} MB/s), end-to-end {seconds:.3}s ({:.1} MB/s)",
         cfg.batch,
         cfg.inflight,
         stats.batches,
@@ -155,7 +157,7 @@ pub fn run_gpu(
     Ok(RunResult {
         engine: "gpu".to_string(),
         config: format!(
-            "lvl3-greedy {}b{} i{}",
+            "{preset} {}b{} i{}",
             if cfg.params.huffman { "" } else { "rawlit " },
             cfg.batch,
             cfg.inflight
@@ -173,7 +175,8 @@ pub fn run_gpu(
 mod tests {
     use super::*;
     use gzc_core::frame::{FrameOptions, write_frame};
-    use gzc_core::reference::{LVL3, compress_block};
+    use gzc_core::params::LVL3;
+    use gzc_core::reference::compress_block;
 
     #[test]
     fn gpu_run_synthetic_verifies() {
@@ -186,11 +189,11 @@ mod tests {
         };
         let ctx = GpuContext::new().unwrap();
         for (writers, huffman) in [(0, true), (2, true), (0, false)] {
-            let params = GpuParams { depth: 1, emit_frames: false, huffman };
+            let params = GpuParams { matching: LVL3, emit_frames: false, huffman };
             let cfg = PipelineConfig { batch: 4, inflight: 2, params };
-            let r = run_gpu(&ctx, &corpus, &cfg, writers, true).unwrap();
+            let r = run_gpu(&ctx, &corpus, "lvl3", &cfg, writers, true).unwrap();
             assert_eq!(r.engine, "gpu");
-            assert_eq!(r.config, if huffman { "lvl3-greedy b4 i2" } else { "lvl3-greedy rawlit b4 i2" });
+            assert_eq!(r.config, if huffman { "lvl3 b4 i2" } else { "lvl3 rawlit b4 i2" });
             assert_eq!(r.threads, Some(writers));
             assert_eq!(r.real_bytes, corpus.real_bytes());
             assert!(r.ratio() > 1.0, "ratio was {}", r.ratio());

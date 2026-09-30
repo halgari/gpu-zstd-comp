@@ -1,4 +1,6 @@
-// K3: greedy parse (== gzc_core::reference::greedy_parse), one thread per block, sequential.
+// K3: parse, one thread per block, sequential. LAZY == 0: the greedy parse below
+// (== gzc_core::reference::greedy_parse); LAZY 1/2: `lazy_parse` in k3_lazy.wgsl (appended by the
+// host; == gzc_core::lazy::lazy_parse). The injected LAZY constant selects the entry.
 // Dispatch (n_blocks, 1, 1) with workgroup size 1: each block gets its own subgroup, so the
 // long, data-dependent per-block loops never diverge against each other (2.5-6x faster than
 // 64-wide workgroups on an RTX 5090). The host binds exactly n_blocks * 2 words of `counts`,
@@ -7,7 +9,8 @@
 //   seqs[(b*MAX_SEQS + i)*3 ..] = (lit_len, match_len, off_base) for i < n_seq
 //   lits[b*BLOCK_SIZE/4 ..]     = literal bytes packed little-endian
 //   counts[b*2 ..]              = (n_seq, n_lit)
-// MAX_SEQS is prepended by the host.
+// MAX_SEQS is prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come from the injected
+// MatchParams.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> best: array<u32>;
@@ -94,6 +97,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     lit_w = b * (BLOCK_SIZE / 4u);
     n_lit = 0u;
 
+    // Each parse pushes every literal including the trailing ones and returns n_seq.
+    var n_seq: u32;
+    if (LAZY == 0u) {
+        n_seq = greedy_parse(base, sbase, bbase);
+    } else {
+        n_seq = lazy_parse(base, sbase, bbase);
+    }
+    if (acc_n > 0u) {
+        lits[lit_w] = acc;
+    }
+    counts[b * 2u] = n_seq;
+    counts[b * 2u + 1u] = n_lit;
+}
+
+// == gzc_core::reference::greedy_parse.
+fn greedy_parse(base: u32, sbase: u32, bbase: u32) -> u32 {
     var n_seq = 0u;
     var p = 0u;
     var anchor = 0u;
@@ -112,7 +131,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (bl >= MIN_MATCH) {
                 off = best[bbase + p * 2u];
                 len = bl;
-                if (bl == MATCH_SEARCH_CAP) {
+                if (bl == SEARCH_CAP) {
                     // K2 stopped comparing at the cap: extend to the full length.
                     len = match_len(base, p, p - off, 0xFFFFFFFFu);
                 }
@@ -136,9 +155,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         anchor = p;
     }
     push_lits(base, anchor, BLOCK_SIZE);
-    if (acc_n > 0u) {
-        lits[lit_w] = acc;
-    }
-    counts[b * 2u] = n_seq;
-    counts[b * 2u + 1u] = n_lit;
+    return n_seq;
 }

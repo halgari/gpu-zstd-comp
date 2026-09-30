@@ -8,12 +8,18 @@ use gzc_core::frame::{FrameOptions, frame_header, write_frame, write_literals_ra
 use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
-use gzc_core::reference::{LVL3, RefParams, compress_block};
+use gzc_core::lazy::cases::{LazyCase, lazy_test_cases};
+use gzc_core::lazy::lazy_parse;
+use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
+use gzc_core::reference::{Match, compress_block};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
-use gzc_gpu::compressor::{GpuParams, Kernels, compress_batch, compress_frames, frames_from_parses};
+use gzc_gpu::compressor::{
+    GpuParams, Kernels, compress_batch, compress_frames, frames_from_best, frames_from_parses, parses_from_best,
+};
 use gzc_gpu::context::GpuContext;
+use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
 
 /// Every test case chunked into padded blocks, labelled "name[i]".
 fn all_blocks() -> Vec<(String, Vec<u8>)> {
@@ -32,11 +38,17 @@ fn case(name: &str) -> Vec<u8> {
     test_cases().into_iter().find(|(n, _)| *n == name).unwrap().1
 }
 
-fn setup(depth: u32) -> (GpuContext, Kernels) {
+fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let kernels = Kernels::new(&ctx, GpuParams { depth, emit_frames: false, huffman: false });
+    let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: false, huffman: false }).expect("Kernels::new");
     (ctx, kernels)
 }
+
+/// The presets the GPU implements, each checked by the differential tests below.
+const GPU_PRESETS: [(&str, MatchParams); 4] = [("lvl3", LVL3), ("rung1", RUNG1), ("rung2", RUNG2), ("lvl9", LVL9)];
+
+/// LVL3 with a deeper chain walk.
+const DEPTH4: MatchParams = MatchParams { depth: 4, ..LVL3 };
 
 fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
     let i = got.sequences.iter().zip(&want.sequences).position(|(a, b)| a != b);
@@ -59,7 +71,8 @@ fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
 }
 
 /// Runs one batch and compares every block against the CPU reference.
-fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)], params: RefParams) -> Vec<BlockOutput> {
+fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)], params: MatchParams) -> Vec<BlockOutput> {
+    assert_eq!(kernels.matching(), params, "kernels built for other params");
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let outs = compress_batch(ctx, kernels, &refs).expect("compress_batch");
     assert_eq!(outs.len(), blocks.len());
@@ -74,36 +87,38 @@ fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]
 
 #[test]
 fn gpu_matches_reference() {
-    let (ctx, kernels) = setup(1);
-    // All blocks in one batch (every block has neighbours on both sides)...
-    check_batch(&ctx, &kernels, &all_blocks(), LVL3);
-    // ...and each block alone, so its end is followed only by the trailing zero word.
-    for b in all_blocks() {
-        check_batch(&ctx, &kernels, std::slice::from_ref(&b), LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        // All blocks in one batch (every block has neighbours on both sides)...
+        check_batch(&ctx, &kernels, &all_blocks(), params);
+        // ...and each block alone, so its end is followed only by the trailing zero word.
+        for b in all_blocks() {
+            check_batch(&ctx, &kernels, std::slice::from_ref(&b), params);
+        }
     }
 }
 
 #[test]
 fn gpu_matches_reference_depth4() {
-    let (ctx, kernels) = setup(4);
+    let (ctx, kernels) = setup(DEPTH4);
     let blocks: Vec<_> = all_blocks().into_iter().step_by(2).collect();
-    check_batch(&ctx, &kernels, &blocks, RefParams { depth: 4, ..LVL3 });
+    check_batch(&ctx, &kernels, &blocks, DEPTH4);
 }
 
-/// Depth 4, where MATCH_SEARCH_CAP changes the choice: at 2000 the long chain offers q=1500
+/// Depth 4, where search_cap changes the choice: at 2000 the long chain offers q=1500
 /// (80-byte match) then q=0 (200 bytes). Both cap to 64, so the tie goes to the closer q=1500,
 /// and the parse extends that match to its full 80 bytes.
 #[test]
 fn capped_search_prefers_closer_candidate() {
-    let (ctx, kernels) = setup(4);
+    let (ctx, kernels) = setup(DEPTH4);
     let mut block = random(20, BLOCK_SIZE);
     let s = random(21, 200);
     block[..200].copy_from_slice(&s);
     block[1500..1580].copy_from_slice(&s[..80]);
     block[2000..2200].copy_from_slice(&s);
     let blocks = [("capped".to_string(), block)];
-    let params = RefParams { depth: 4, ..LVL3 };
-    let out = check_batch(&ctx, &kernels, &blocks, params);
+    let out = check_batch(&ctx, &kernels, &blocks, DEPTH4);
     assert!(
         out[0].sequences.iter().any(|s| s.match_len == 80 && s.off_base == 500 + 3),
         "expected the extended capped match (offset 500, len 80): {:?}",
@@ -116,7 +131,6 @@ fn capped_search_prefers_closer_candidate() {
 /// past the end would see a mismatch).
 #[test]
 fn block_ends_with_adjacent_neighbours() {
-    let (ctx, kernels) = setup(1);
     let period3 = case("period3");
     // period3 continued across the boundary: its phase at BLOCK_SIZE.
     let mut period3_cont = period3.clone();
@@ -138,31 +152,65 @@ fn block_ends_with_adjacent_neighbours() {
         named("random", &random(11, BLOCK_SIZE)),
         named("zeros", &zeros(BLOCK_SIZE)),
     ];
-    check_batch(&ctx, &kernels, &blocks, LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        check_batch(&ctx, &kernels, &blocks, params);
+    }
 }
 
 #[test]
 fn gpu_frames_roundtrip() {
-    let (ctx, kernels) = setup(1);
-    let blocks = all_blocks();
-    let outs = check_batch(&ctx, &kernels, &blocks, LVL3);
-    for ((name, block), out) in blocks.iter().zip(&outs) {
-        let frame = write_frame(block, out, FrameOptions::default());
-        let back = zstd::bulk::decompress(&frame, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: libzstd: {e}"));
-        assert!(back == *block, "{name}: libzstd output differs from input block");
+    for (preset, params) in GPU_PRESETS {
+        let (ctx, kernels) = setup(params);
+        let blocks = all_blocks();
+        let outs = check_batch(&ctx, &kernels, &blocks, params);
+        for ((name, block), out) in blocks.iter().zip(&outs) {
+            let frame = write_frame(block, out, FrameOptions::default());
+            let back =
+                zstd::bulk::decompress(&frame, BLOCK_SIZE).unwrap_or_else(|e| panic!("{preset} {name}: libzstd: {e}"));
+            assert!(back == *block, "{preset} {name}: libzstd output differs from input block");
+        }
     }
 }
 
 #[test]
 fn batch_of_300_mixed() {
-    let (ctx, kernels) = setup(1);
-    let blocks: Vec<_> = all_blocks().into_iter().cycle().take(300).collect();
-    check_batch(&ctx, &kernels, &blocks, LVL3);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup(params);
+        let blocks: Vec<_> = all_blocks().into_iter().cycle().take(300).collect();
+        check_batch(&ctx, &kernels, &blocks, params);
+    }
+}
+
+/// Kernels for different match params coexist in one process, and unsupported or invalid
+/// params are errors, not panics.
+#[test]
+fn kernels_per_params_coexist_and_reject_unsupported() {
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
+    let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
+    let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
+    let rung1 = Kernels::new(&ctx, gp(RUNG1)).unwrap();
+    let rung2 = Kernels::new(&ctx, gp(RUNG2)).unwrap();
+    let lvl9 = Kernels::new(&ctx, gp(LVL9)).unwrap();
+    let blocks = [("text".to_string(), text(12, BLOCK_SIZE))];
+    check_batch(&ctx, &lvl3, &blocks, LVL3);
+    check_batch(&ctx, &depth4, &blocks, DEPTH4);
+    check_batch(&ctx, &rung1, &blocks, RUNG1);
+    check_batch(&ctx, &lvl9, &blocks, LVL9);
+    check_batch(&ctx, &rung2, &blocks, RUNG2);
+    check_batch(&ctx, &lvl3, &blocks, LVL3);
+    let e = Kernels::new(&ctx, gp(MatchParams { lazy: 3, ..LVL9 })).err().expect("lazy 3 rejected");
+    assert!(e.to_string().contains("lazy 3"), "{e}");
+    let e = Kernels::new(&ctx, gp(MatchParams { depth: 0, ..LVL3 })).err().expect("depth 0 rejected");
+    assert!(e.to_string().contains("depth"), "{e}");
 }
 
 #[test]
 fn empty_batch_is_empty() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     assert!(compress_batch(&ctx, &kernels, &[]).unwrap().is_empty());
 }
 
@@ -171,10 +219,15 @@ fn empty_batch_is_empty() {
 /// The CPU frame options of the raw-literals GPU path (`GpuParams { huffman: false }`).
 const NO_HUFFMAN: FrameOptions = FrameOptions { checksum: false, huffman: false };
 
-/// Frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
+/// LVL3 frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
 fn setup_frames(huffman: bool) -> (GpuContext, Kernels) {
+    setup_frames_for(LVL3, huffman)
+}
+
+/// `setup_frames` for any match params.
+fn setup_frames_for(matching: MatchParams, huffman: bool) -> (GpuContext, Kernels) {
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let kernels = Kernels::new(&ctx, GpuParams { depth: 1, emit_frames: true, huffman });
+    let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: true, huffman }).expect("Kernels::new");
     assert_eq!(kernels.frame_options().huffman, huffman);
     (ctx, kernels)
 }
@@ -298,13 +351,13 @@ fn first_byte_diff(got: &[u8], want: &[u8]) -> String {
 }
 
 /// GPU frames for `blocks` must equal `write_frame` on the CPU reference parse (with the
-/// kernels' frame options), and decode.
+/// kernels' match params and frame options), and decode.
 fn check_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]) {
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let frames = compress_frames(ctx, kernels, &refs).expect("compress_frames");
     assert_eq!(frames.len(), blocks.len());
     for (i, ((name, block), got)) in blocks.iter().zip(&frames).enumerate() {
-        let want = write_frame(block, &compress_block(block, LVL3), kernels.frame_options());
+        let want = write_frame(block, &compress_block(block, kernels.matching()), kernels.frame_options());
         assert!(*got == want, "batch index {i} ({name}): GPU frame != CPU frame; {}", first_byte_diff(got, &want));
         let back = zstd::bulk::decompress(got, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: libzstd: {e}"));
         assert!(back == *block, "{name}: libzstd output differs from input block");
@@ -362,36 +415,45 @@ fn frame_blocks_cover_every_mode() {
 
 #[test]
 fn gpu_frames_identical_no_huffman() {
-    let (ctx, kernels) = setup_frames(false);
-    let blocks = frame_blocks();
-    // All blocks in one batch, then each block alone.
-    check_frames(&ctx, &kernels, &blocks);
-    for b in &blocks {
-        check_frames(&ctx, &kernels, std::slice::from_ref(b));
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, false);
+        let blocks = frame_blocks();
+        // All blocks in one batch, then each block alone.
+        check_frames(&ctx, &kernels, &blocks);
+        for b in &blocks {
+            check_frames(&ctx, &kernels, std::slice::from_ref(b));
+        }
     }
 }
 
 #[test]
 fn gpu_frames_identical_huffman() {
-    let (ctx, kernels) = setup_frames(true);
-    let blocks = frame_blocks();
-    // All blocks in one batch, then each block alone.
-    check_frames(&ctx, &kernels, &blocks);
-    for b in &blocks {
-        check_frames(&ctx, &kernels, std::slice::from_ref(b));
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let blocks = frame_blocks();
+        // All blocks in one batch, then each block alone.
+        check_frames(&ctx, &kernels, &blocks);
+        for b in &blocks {
+            check_frames(&ctx, &kernels, std::slice::from_ref(b));
+        }
     }
 }
 
 #[test]
 fn gpu_frames_batch_of_300_mixed() {
-    let (ctx, kernels) = setup_frames(true);
-    let blocks: Vec<_> = frame_blocks().into_iter().cycle().take(300).collect();
-    check_frames(&ctx, &kernels, &blocks);
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let blocks: Vec<_> = frame_blocks().into_iter().cycle().take(300).collect();
+        check_frames(&ctx, &kernels, &blocks);
+    }
 }
 
 #[test]
 fn compress_frames_needs_emit_frames() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     let block = zeros(BLOCK_SIZE);
     assert!(compress_frames(&ctx, &kernels, &[&block]).is_err());
     assert!(frames_from_parses(&ctx, &kernels, &[&block], &[BlockOutput::default()]).is_err());
@@ -486,6 +548,156 @@ fn k4_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+/// With `min_match = 4` a 128K block can hold more than 0x7F00 sequences (`MAX_SEQS` is
+/// `BLOCK_SIZE / 4 + 1`), so K4's 3-byte nbSeq header is reachable: 4 literals then 32767
+/// length-4 matches at offset 4 fill the block exactly. Unreachable below 128K.
+#[cfg(feature = "block-128k")]
+#[test]
+fn k4_nbseq_three_byte_form_matches_cpu() {
+    let n = BLOCK_SIZE / 4 - 1;
+    let mut script = vec![(4, 4, 4)];
+    script.extend(std::iter::repeat_n((0, 4, 4), n - 1));
+    let (block, parse) = scripted(&script, 0x7f00);
+    assert!(parse.sequences.len() >= 0x7F00);
+    // Also next to an ordinary block, so the two frames' seqs regions sit side by side.
+    let (block2, parse2) = scripted(&[(10, 5, 20), (3, 30, 9)], 1);
+    let cases = vec![
+        ("nbseq_3byte".to_string(), block, parse),
+        ("small".to_string(), block2, parse2),
+    ];
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames_for(RUNG1, huffman);
+        check_scripted(&ctx, &kernels, &cases);
+        check_scripted(&ctx, &kernels, &cases[..1]);
+        // Byte equality alone would also hold for a Raw block: pin that the GPU frame really is
+        // a Compressed block whose sequences section starts with the 3-byte nbSeq form.
+        let frame = &frames_from_parses(&ctx, &kernels, &[&cases[0].1], &[cases[0].2.clone()]).unwrap()[0];
+        let n = cases[0].2.sequences.len();
+        assert_eq!(nb_seq_header(frame, kernels.frame_options()), [0xFF, (n - 0x7F00) as u8, ((n - 0x7F00) >> 8) as u8]);
+    }
+}
+
+/// Composes `perm` with itself `k` times (`perm^k`).
+#[cfg(feature = "block-128k")]
+fn compose_pow(perm: &[usize], k: usize) -> Vec<usize> {
+    let l = perm.len();
+    let mut cur: Vec<usize> = (0..l).collect();
+    for _ in 0..k {
+        cur = cur.iter().map(|&i| perm[i]).collect();
+    }
+    cur
+}
+
+/// A permutation of `0..l` whose powers `perm^1..=perm^max_k` all avoid "successions"
+/// (`perm^k[i+1] == perm^k[i] + 1`): a hash-chain match found up to `max_k` generations back (the
+/// deepest a `depth`-limited chain walk can reach) always caps at exactly 4 bytes, whichever
+/// generation it lands on, rather than accidentally continuing into the next chunk. Fisher-Yates,
+/// then fix up violations (any power, any `i`) with random swaps until none remain.
+#[cfg(feature = "block-128k")]
+fn no_succession_at_any_depth_perm(seed: u64, l: usize, max_k: usize) -> Vec<usize> {
+    let mut r = Lcg(seed);
+    let mut perm: Vec<usize> = (0..l).collect();
+    for i in (1..l).rev() {
+        let j = r.below((i + 1) as u32) as usize;
+        perm.swap(i, j);
+    }
+    for _pass in 0..10_000 {
+        let mut fixed_any = false;
+        for k in 1..=max_k {
+            let pk = compose_pow(&perm, k);
+            if let Some(i) = (0..l - 1).find(|&i| pk[i + 1] == pk[i] + 1) {
+                let j = r.below(l as u32) as usize;
+                perm.swap(i + 1, j);
+                fixed_any = true;
+            }
+        }
+        if !fixed_any {
+            return perm;
+        }
+    }
+    panic!("no_succession_at_any_depth_perm: did not converge for l={l} max_k={max_k}");
+}
+
+/// A block that `RUNG1` parses into more than `0x7F00` sequences, found by the *real* hash-chain
+/// match finder (not scripted): `l` unique 4-byte seed values (byte 0 = the value's own index, so
+/// two different values can never share a first byte — whenever a candidate match's successor is
+/// a *different* value, the byte right after the match differs immediately, capping it at exactly
+/// 4 bytes instead of drifting a few bytes into the next chunk), then repeated "generations" each
+/// a fixed permutation (`perm`, applied again each generation) of the previous generation's 4-byte
+/// values. Every generation's chunk is a genuine offset match against the previous generation
+/// (found by K1's real hash chains), and `perm`'s powers avoid successions up to RUNG1's `depth`
+/// (8), so a chain walk landing on any of the last 8 generations still caps at 4 bytes: every
+/// generation is `l` separate `len == 4` sequences, not one long one. `(l, seed) = (72, 3)` was
+/// found by a small search over both and confirmed with the CPU oracle (`reference::compress_block`).
+#[cfg(feature = "block-128k")]
+fn over_0x7f00_sequences_block() -> Vec<u8> {
+    let l = 72usize;
+    let gens = BLOCK_SIZE / 4 / l - 1;
+    let seed = 3u64;
+    let mut r = Lcg(seed);
+    let seed_vals: Vec<[u8; 4]> =
+        (0..l).map(|k| [k as u8, r.next() as u8, r.next() as u8, r.next() as u8]).collect();
+    let perm = no_succession_at_any_depth_perm(seed ^ 0x5EED, l, 8);
+
+    let mut block = Vec::with_capacity(BLOCK_SIZE);
+    for v in &seed_vals {
+        block.extend_from_slice(v);
+    }
+    let mut cur = seed_vals;
+    for _ in 0..gens {
+        let next: Vec<[u8; 4]> = (0..l).map(|i| cur[perm[i]]).collect();
+        for v in &next {
+            block.extend_from_slice(v);
+        }
+        cur = next;
+    }
+    // Fill the remainder (the block doesn't divide evenly by `l`) with incompressible bytes.
+    while block.len() < BLOCK_SIZE {
+        block.push(r.next() as u8);
+    }
+    assert_eq!(block.len(), BLOCK_SIZE);
+    block
+}
+
+/// A block whose RUNG1 parse (found by the real K1/K2/K3 pipeline, not scripted) has more than
+/// `0x7F00` sequences: the GPU frame (K1→K2→K3→K5→K4, the full real pipeline via
+/// `compress_frames`) must still equal the CPU reference frame byte for byte and decode. Only
+/// reachable at 128K (`over_0x7f00_sequences_block`'s doc, and `k4_nbseq_three_byte_form_matches_cpu`).
+#[cfg(feature = "block-128k")]
+#[test]
+fn gpu_frames_match_cpu_over_0x7f00_sequences() {
+    let block = over_0x7f00_sequences_block();
+    let cpu_parse = compress_block(&block, RUNG1);
+    assert!(cpu_parse.sequences.len() >= 0x7F00, "only {} sequences", cpu_parse.sequences.len());
+
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames_for(RUNG1, huffman);
+        let want = write_frame(&block, &cpu_parse, kernels.frame_options());
+        let got = &compress_frames(&ctx, &kernels, &[&block]).expect("compress_frames")[0];
+        assert!(*got == want, "GPU frame != CPU frame; {}", first_byte_diff(got, &want));
+        let back = zstd::bulk::decompress(got, BLOCK_SIZE).expect("libzstd decode");
+        assert_eq!(back, block, "libzstd output differs from the input block");
+    }
+}
+
+/// The 3 bytes starting the sequences section of a one-block frame whose block is Compressed
+/// (asserted) with a Raw or RLE literals section (asserted).
+#[cfg(feature = "block-128k")]
+fn nb_seq_header(frame: &[u8], opts: FrameOptions) -> [u8; 3] {
+    let h = frame_header(opts).len();
+    assert_eq!((frame[h] >> 1) & 3, 2, "block type must be Compressed");
+    let c = &frame[h + 3..];
+    let lit_type = c[0] & 3;
+    assert!(lit_type <= 1, "literals section must be Raw or RLE, got type {lit_type}");
+    let (hdr, size) = match (c[0] >> 2) & 3 {
+        0 | 2 => (1, (c[0] >> 3) as usize),
+        1 => (2, (c[0] >> 4) as usize | (c[1] as usize) << 4),
+        _ => (3, (c[0] >> 4) as usize | (c[1] as usize) << 4 | (c[2] as usize) << 12),
+    };
+    let body = if lit_type == 0 { size } else { 1 };
+    c[hdr + body..hdr + body + 3].try_into().unwrap()
 }
 
 /// Hand-built cases pinning each decision boundary of the mode choice and the block type.
@@ -875,4 +1087,143 @@ fn k5_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+// ---- K3 lazy / lazy2 ----
+
+/// Lazy parses off the preset table: `min_match` above 4 (repcode matches may still be 4 bytes)
+/// and a small `search_cap`, so the parse extends many capped `best[]` entries.
+const LAZY_VARIANTS: [MatchParams; 2] = [
+    MatchParams { min_match: 6, ..RUNG2 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+];
+
+#[test]
+fn gpu_matches_reference_lazy_variants() {
+    for params in LAZY_VARIANTS {
+        eprintln!("{params:?}");
+        let (ctx, kernels) = setup(params);
+        check_batch(&ctx, &kernels, &all_blocks(), params);
+    }
+}
+
+/// Every hand-built lazy case (gain ties / wins by 1, `continue` after a win at step 1 and 2,
+/// catch-up bounds, the dedup-store rep rule, the immediate offset_2 loop, PARSE_END guards),
+/// run through K3 on its scripted `best[]` under both lazy presets. The K3 parse must equal
+/// `lazy_parse` (and the pinned sequences where the case lists them), and the frame must equal
+/// `write_frame` of it. The parse is compared directly because most of these mostly-random
+/// blocks become Raw frames, which would hide the sequences. Batched and one by one.
+#[test]
+fn k3_lazy_hand_built_best_matches_cpu() {
+    let cases = lazy_test_cases();
+    assert_eq!(cases.len(), 21);
+    for params in [RUNG2, LVL9] {
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let check = |cases: &[&LazyCase]| {
+            let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
+            let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
+            let parses = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("parses_from_best");
+            let frames = frames_from_best(&ctx, &kernels, &blocks, &bests).expect("frames_from_best");
+            for ((c, got), frame) in cases.iter().zip(&parses).zip(&frames) {
+                let want = lazy_parse(&c.block, &c.best, &params);
+                assert!(*got == want, "{} lazy {}: K3 != lazy_parse; {}", c.name, params.lazy, first_diff(got, &want));
+                if let Some((_, pinned)) = c.expect.iter().find(|(p, _)| *p == params) {
+                    assert_eq!(got.sequences, *pinned, "{} lazy {}: pinned sequences", c.name, params.lazy);
+                }
+                let want_frame = write_frame(&c.block, &want, kernels.frame_options());
+                assert!(*frame == want_frame, "{} lazy {}: frame; {}", c.name, params.lazy, first_byte_diff(frame, &want_frame));
+            }
+        };
+        let all: Vec<&LazyCase> = cases.iter().collect();
+        check(&all);
+        for c in &all {
+            check(std::slice::from_ref(c));
+        }
+    }
+}
+
+struct CollectFrames(Vec<Option<Vec<u8>>>);
+
+impl FrameSink for CollectFrames {
+    fn put(&mut self, index: usize, frame: &[u8]) {
+        assert!(self.0[index].is_none(), "index {index} delivered twice");
+        self.0[index] = Some(frame.to_vec());
+    }
+}
+
+/// The streaming pipeline (several slots in flight, a partial last batch reusing a slot with
+/// stale blocks, the pipeline reused for a second run) for every non-lvl3 preset.
+#[test]
+fn stream_frames_match_cpu_non_lvl3_presets() {
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let distinct = frame_blocks();
+    for (name, matching) in GPU_PRESETS.into_iter().filter(|(n, _)| *n != "lvl3") {
+        eprintln!("preset {name}");
+        let params = GpuParams { matching, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> =
+            distinct.iter().map(|(_, b)| write_frame(b, &compress_block(b, matching), params.frame_options())).collect();
+        // 100 = 6 * 16 + 4 blocks: 7 batches over 3 slots, the last one partial.
+        let blocks: Vec<&[u8]> = (0..100).map(|i| distinct[i % distinct.len()].1.as_slice()).collect();
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 16, inflight: 3, params }).expect("Pipeline::new");
+        for _ in 0..2 {
+            let mut sink = CollectFrames(vec![None; blocks.len()]);
+            let stats = pipe.run_frames(&blocks, &mut sink).expect("run_frames");
+            assert_eq!(stats.batches, 7);
+            for (i, got) in sink.0.iter().enumerate() {
+                let got = got.as_ref().unwrap_or_else(|| panic!("{name}: index {i} never delivered"));
+                let (bname, _) = &distinct[i % distinct.len()];
+                assert!(*got == want[i % distinct.len()], "{name}: index {i} ({bname}): GPU frame != CPU frame");
+            }
+        }
+    }
+}
+
+/// Informal (not in the normal suite; reads the real corpus): a few hundred real .dds/.nif blocks
+/// per preset, GPU frames against CPU frames.
+/// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test differential corpus_blocks -- --ignored --nocapture`
+/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks, spread over the files in sorted path order.
+#[test]
+#[ignore]
+fn corpus_blocks_match_cpu_per_preset() {
+    use std::path::{Path, PathBuf};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if matches!(ext.as_str(), "dds" | "nif") {
+                out.push(p);
+            }
+        }
+    }
+    let root = std::env::var("GZC_CORPUS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+    let want_blocks: usize = std::env::var("GZC_CORPUS_BLOCKS").map(|v| v.parse().unwrap()).unwrap_or(300);
+    let mut files = Vec::new();
+    walk(Path::new(&root), &mut files);
+    files.sort();
+    // Every k-th file, up to 4 blocks from each, so the sample spans the corpus.
+    let step = (files.len() / want_blocks).max(1);
+    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
+    for f in files.iter().step_by(step) {
+        if blocks.len() >= want_blocks {
+            break;
+        }
+        let bytes = std::fs::read(f).unwrap();
+        for (i, b) in chunk_file(&bytes).into_iter().take(4).enumerate() {
+            blocks.push((format!("{}[{i}]", f.display()), b.data));
+        }
+    }
+    blocks.truncate(want_blocks);
+    eprintln!("{} blocks from {} files", blocks.len(), files.len());
+    for (name, params) in GPU_PRESETS {
+        let (ctx, kernels) = setup_frames_for(params, true);
+        check_frames(&ctx, &kernels, &blocks);
+        let total: usize = blocks
+            .iter()
+            .map(|(_, b)| write_frame(b, &compress_block(b, params), kernels.frame_options()).len())
+            .sum();
+        eprintln!("preset {name}: {} blocks equal, {} -> {total} bytes", blocks.len(), blocks.len() * BLOCK_SIZE);
+    }
 }

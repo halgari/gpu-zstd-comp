@@ -30,9 +30,22 @@ fn mix(lo: u32, hi: u32) -> u32 {
 fn hash_long(base: u32, p: u32) -> u32 { return mix(load_u32_at(base, p), load_u32_at(base, p + 4u)); }
 fn hash_short(base: u32, p: u32) -> u32 { return mix(load_u32_at(base, p), load_byte(base, p + 4u)); }
 
+// == gzc_core::hash::hash_width: hash of `width` bytes at p (width in 4..=8), the second word
+// masked to width - 4 bytes. mask(4) is spelled out: WGSL, like Rust, must not shift by 32.
+fn hash_width(base: u32, p: u32, width: u32) -> u32 {
+    let k = width - 4u;
+    var mask = 0xFFFFFFFFu;
+    if (k == 0u) {
+        mask = 0u;
+    } else if (k < 4u) {
+        mask = (1u << (8u * k)) - 1u;
+    }
+    return mix(load_u32_at(base, p), load_u32_at(base, p + 4u) & mask);
+}
+
 // Length of the common prefix of block[p..] and block[q..] for q < p, bounded by
 // min(BLOCK_SIZE - p, cap): == gzc_core::reference::match_len with cap = 0xFFFFFFFFu, and
-// == match_len_capped with cap = MATCH_SEARCH_CAP. Compares 4 bytes at a time only while
+// == match_len_capped with cap = SEARCH_CAP. Compares 4 bytes at a time only while
 // n + 4 <= max, so every load_u32_at stays inside the block (q + n + 4 <= p + n + 4
 // <= BLOCK_SIZE); the tail is compared byte by byte.
 fn match_len(base: u32, p: u32, q: u32, cap: u32) -> u32 {

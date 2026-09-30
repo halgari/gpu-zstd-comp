@@ -81,12 +81,27 @@ once the running total reaches `N`). Reports land in `--out` (default
 `out/`, gitignored): `results.json` and `report.html`.
 
 `gzc-bench ref` runs the CPU reference compressor (`gzc_core::reference`, engine
-`cpu-ref`, config `lvl3-greedy`: level-3-style greedy parse, sequences with
+`cpu-ref`, config `<preset>`: hash-chain match finding and parse, sequences with
 per-stream predefined / RLE / computed FSE tables, Huffman (or RLE / raw)
 literals; the same frames the GPU emits, byte for byte) over a corpus, across
 the given thread counts, and writes the same table/JSON/HTML report shape.
 `--verify` decompresses every produced frame with libzstd after the timed pass
 and errors on any mismatch against the original block.
+
+`--preset <list>` (on `ref`, `gpu` and `all`; default `lvl3`) picks the match
+parameters (`gzc_core::params::PRESETS`), one run per preset:
+
+| Preset | hashes | min match | depth | parse | Compare against |
+|---|---|---|---|---|---|
+| `lvl3` | dfast (8 B + 5 B) | 5 | 1 | greedy | M3 output (byte-identical) / L3 |
+| `rung1` | single 4 B | 4 | 8 | greedy | L5 |
+| `rung2` | single 4 B | 4 | 8 | lazy | L6 |
+| `lvl9` | single 4 B | 4 | 32 | lazy2 | L9 |
+
+All four presets run on both `cpu-ref` and the GPU. See
+`docs/results/2026-09-29-m4.md` for the full M4 measurement; the headline: GPU
+`lvl9` reaches ratio 1.3549 at 1611 MB/s, against libzstd L9 at 8 threads'
+1.3532 at 669 MB/s — matching L9's ratio at 2.4x its throughput.
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -97,12 +112,18 @@ cargo run --release -p gzc-bench -- ref \
 ```
 
 `gzc-bench gpu` runs the streaming GPU compressor (engine `gpu`, config
-`lvl3-greedy b<batch> i<inflight>`): the GPU runs the whole parse and emits
+`<preset> b<batch> i<inflight>`, e.g. `lvl9 b1638 i3`): the GPU runs the whole parse and emits
 complete zstd frames (Huffman literals included), byte-identical to `cpu-ref`;
 the host only uploads blocks and copies finished frames out. Each comma-separated
 list is swept:
 
-- `--batch N` blocks per GPU batch (default 512).
+- `--preset P` match presets (default `lvl3`; see above).
+- `--batch N` blocks per GPU batch (default 512), or `max`: the largest batch that
+  fits `--vram-budget-mb` at a given preset and `--inflight` (capped by the
+  device's own limit), resolved separately per preset — the max batch depends on
+  how much scratch memory the preset's hash chains need per block, so it is not
+  the same number for every preset. Lists can mix the two, e.g. `--batch 512,max`.
+  The resolved number is what shows up in the run's config label.
 - `--inflight K` batches in flight (default 3).
 - `--writer-threads W` CPU threads that receive finished frames (default 0: the
   pipeline thread does it).
@@ -110,18 +131,19 @@ list is swept:
   (batch, inflight) config must fit, checked before anything runs.
 - `--verify` decompresses every frame with libzstd after the timed pass.
 
-The headline config, `--batch 1388 --inflight 3`, is the largest batch that fits
-6144 MiB with 3 batches in flight:
+At the default 6144 MiB budget and `--inflight 3`, `--batch max` resolves to
+b1365 for `lvl3` (its two hash chains cost more scratch per block) and b1638 for
+the single-hash presets (`rung1`, `rung2`, `lvl9`):
 
 ```sh
 cargo run --release -p gzc-bench -- gpu --synthetic --verify   # smoke run
 
 cargo run --release -p gzc-bench -- gpu \
-  --input data/corpus --ext dds,nif --batch 1388 --inflight 3 --verify --out out
+  --input data/corpus --ext dds,nif --preset lvl9 --batch max --inflight 3 --verify --out out
 ```
 
 `gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`), cpu-ref
-(across `--threads`) and gpu (across the GPU flags above) into a single combined
+(across `--preset` x `--threads`) and gpu (across the GPU flags above) into a single combined
 report, so all engines' ratio-vs-throughput points sit on one chart. The GPU
 configs and adapter are checked before the CPU runs start; if the GPU sweep
 fails, the CPU results are still written.
@@ -129,6 +151,6 @@ fails, the CPU results are still written.
 ```sh
 cargo run --release -p gzc-bench -- all \
   --input data/corpus --ext dds,nif --max-bytes 2000000000 \
-  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --batch 1388 --inflight 3 \
-  --verify --out out
+  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --preset lvl3,rung1,rung2,lvl9 \
+  --batch max --inflight 3 --verify --out out
 ```
