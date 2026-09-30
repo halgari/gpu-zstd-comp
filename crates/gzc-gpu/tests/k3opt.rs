@@ -14,7 +14,8 @@ use gzc_gpu::compressor::{GpuParams, Kernels, frames_from_parses};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::k3opt::{
     K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, parses_from_cands,
-    parses_from_passes, time_pass, time_passes, workgroup_bytes,
+    parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass, time_passes,
+    workgroup_bytes,
 };
 
 fn cfg(level: u8, ring: RingMem, prices: PriceSrc) -> K3OptConfig {
@@ -191,6 +192,33 @@ fn check_blocks_with(
         }
         eprintln!("{c:?} ring {:?}: {} blocks equal", k.ring, blocks.len());
     }
+}
+
+/// The ring-memory choice under small workgroup limits (M5 T3b): the price ring falls back to
+/// private memory when only the tables fit, and a limit below the tables fails cleanly in
+/// `ring_for` (before any pipeline is created). Also the footprint T3b is built around.
+#[test]
+fn k3opt_ring_choice() {
+    let auto = K3OptConfig::default();
+    let need = workgroup_bytes(&OPT16, &auto);
+    let tables = need - ring_bytes(auto.wg, 32);
+    if BLOCK_SIZE == 65536 {
+        assert!(need <= 5200, "wg16 workgroup footprint {need} B (one wave needs about 5 KB)");
+    }
+    assert_eq!(ring_for(&OPT16, &auto, need).unwrap(), RingMem::Workgroup);
+    assert_eq!(ring_for(&OPT16, &auto, need - 1).unwrap(), RingMem::Private);
+    assert_eq!(ring_for(&OPT16, &auto, tables).unwrap(), RingMem::Private);
+    assert!(ring_for(&OPT16, &auto, tables - 1).is_err());
+    let forced = K3OptConfig { ring: Some(RingMem::Workgroup), ..auto };
+    assert!(ring_for(&OPT16, &forced, need - 1).is_err());
+    let private = K3OptConfig { ring: Some(RingMem::Private), ..auto };
+    assert_eq!(ring_for(&OPT16, &private, tables).unwrap(), RingMem::Private);
+    let seg = BLOCK_SIZE as u64 >> OPT16.segment_log2;
+    assert_eq!(scratch_bytes_per_block(&OPT16), seg * 33 * 12);
+    // The fallback runs on this adapter too (the tests below build it explicitly).
+    let ctx = GpuContext::new().expect("GPU required");
+    let k = K3Opt::new(&ctx, &OPT16, private).expect("K3Opt::new");
+    assert_eq!(k.ring, RingMem::Private);
 }
 
 /// Every `opt::cases` run: explicit tables as given (or, for the preset runs, the oracle's final

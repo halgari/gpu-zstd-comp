@@ -21,11 +21,15 @@
 //! Buffers per block: data (BLOCK_SIZE), candidate words (8 B per position; after the DP each
 //! segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace (8 B
 //! per position: K1's `pred` in the pipeline), seqs (`MAX_SEQS_OPT` × 12 B; the DP's series log
-//! until the fix-up), counts, and the price tables (`PRICE_WORDS` words).
+//! until the fix-up), counts, the price tables (`PRICE_WORDS` words), and the DP nodes' payload
+//! scratch (`scratch_bytes_per_block`, 6336 B at 64 KiB: only the nodes' prices stay in
+//! workgroup memory, M5 T3b).
 //!
 //! Workgroups: `K3OptConfig::wg` lanes (a power of two, 8..=256; a block's 16 segment lanes may
-//! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 log in
-//! `docs/results/m5-log.md`).
+//! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 and T3b
+//! logs in `docs/results/m5-log.md`). Residency: about 5 KB of workgroup memory and ≤ 100
+//! registers per wg16 workgroup (T3b), so one wave holds 20 warps/SM (3400 blocks on the 5090);
+//! a change that raises either past that splits a 2900-block batch into two waves.
 use crate::compressor::{K3_FIXUP_WGSL, counts_bytes, data_bytes, decode_output};
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use anyhow::{anyhow, ensure};
@@ -142,6 +146,31 @@ fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     let n_seg = n_seg(m);
     let bpw = (cfg.wg / n_seg).max(1);
     price_table_bytes(bpw, suff_of(m)) + 3 * 4 * n_seg + 64
+}
+
+/// The ring memory `K3Opt::new` uses for `cfg` under a workgroup storage limit of `limit` bytes:
+/// `cfg.ring`, or (`None`) `Workgroup` when `workgroup_bytes` fits, else `Private`. Fails cleanly
+/// (before any pipeline is created) when a forced `Workgroup` ring does not fit, or when the price
+/// tables alone do not.
+pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<RingMem> {
+    let tables = table_bytes(m, cfg);
+    ensure!(
+        tables <= limit,
+        "wg {}: the price tables need {tables} B of workgroup memory > limit {limit}",
+        cfg.wg
+    );
+    let wg_need = workgroup_bytes(m, cfg);
+    let ring = cfg.ring.unwrap_or(if wg_need <= limit {
+        RingMem::Workgroup
+    } else {
+        RingMem::Private
+    });
+    ensure!(
+        ring == RingMem::Private || wg_need <= limit,
+        "wg {}: the workgroup ring needs {wg_need} B > limit {limit}",
+        cfg.wg
+    );
+    Ok(ring)
 }
 
 /// The compiled K3opt pass.
@@ -331,23 +360,7 @@ impl K3Opt {
             "wg {}: hist_out and PriceSrc::Prior need a block's {n_seg} segments in one workgroup",
             cfg.wg
         );
-        let limit = ctx.device.limits().max_compute_workgroup_storage_size;
-        let wg_need = workgroup_bytes(m, &cfg);
-        let ring = cfg.ring.unwrap_or(if wg_need <= limit {
-            RingMem::Workgroup
-        } else {
-            RingMem::Private
-        });
-        ensure!(
-            ring == RingMem::Private || wg_need <= limit,
-            "workgroup ring needs {wg_need} B > limit {limit}"
-        );
-        let tables = table_bytes(m, &cfg);
-        ensure!(
-            tables <= limit,
-            "wg {}: the price tables need {tables} B of workgroup memory > limit {limit}",
-            cfg.wg
-        );
+        let ring = ring_for(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
         let ring_decl = match ring {
             RingMem::Workgroup => {
                 "var<workgroup> ring_p: array<i32, RING_N * WG>;\n\
