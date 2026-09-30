@@ -105,6 +105,8 @@ and the GPU, byte for byte the same frames:
 | `lvl9s12` | `lvl9` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2) | L9 | 16, 32, 64, 128 KiB |
 | `lvl9s12seg` | `lvl9s12` + segmented parse: **the fastest preset validated at every block size** | L9 | 16, 32, 64, 128 KiB |
 | `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 | 16, 32, 64 KiB only (below L9 at 128 KiB) |
+| `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 | ≥ L14 at 16, 32, 64 KiB (the GPU runs it at ≤ 64 KiB) |
+| `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 | ≥ L16 at 16, 32, 64 KiB (the GPU runs it at ≤ 64 KiB) |
 
 Full-corpus ratios (`gzc-bench ref`, which the GPU matches byte for byte) against libzstd L9 on
 the same block size:
@@ -125,7 +127,8 @@ delivered frames; the GPU waited ~2 ms per batch); since the host track (`docs/r
 frames are delivered on a completion thread beside the uploading thread and the GPU is the
 bottleneck again, with the host's share of the wall time down from ~40–120 ms to ~25 ms per run. The earlier phases are in `docs/results/2026-09-29-m4.md` and
 `docs/results/2026-09-30-speed.md` (128 KiB blocks). All these numbers are measured on an RTX
-5090.
+5090. The quality presets `opt14`/`opt16` (M5, `docs/results/2026-09-30-m5.md`) reach libzstd L14/L16's
+ratio at 64 KiB (1.37064 / 1.37144) at 2.17 / 1.43 GB/s (batch 2900).
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
