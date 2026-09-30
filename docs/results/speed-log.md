@@ -44,3 +44,67 @@ Final per-kernel ms/batch (lvl9 b1890): K1 27.95 · K2 9.86 · K3 58.95 · K4 9.
 **M3→M4 lvl3 regression, explained.** M3 (c43eee2) and M4 run at the *same* batch give the same speed (M3 b1365 1462.0 / 1460.8 MB/s, M4 b1365 1461.3). The kernels did not regress. M4's larger `MAX_SEQS` (BLOCK_SIZE/4+1 instead of /5+1) moved lvl3's `--batch max` from 1388 to 1365, and the steady-state GPU time spent outside the kernels depends on the batch size in steps: 9 ms/batch at b1388 but 15 ms at b1365. It is 15–19 ms whenever the staging buffer's frames region starts at `frame_len_bytes(cap) = 4*cap`, which is only 4-byte aligned, and 4–10 ms when that offset is 16-byte (or better) aligned. The GPU→staging copy of about 200 MB into a destination that is only 4-byte aligned is that much slower. Aligning every staging region to 256 bytes gives 6–7 ms per batch at any batch size, which fixes lvl3 and also gains 7 % on lvl9.
 
 Kept: all of it. Notes: batch size itself matters on the 5090 because K3 (one lane per block) and K4 are far from filling the GPU, so K3's time per batch barely grows with blocks. Freeing VRAM therefore turns directly into MB/s here, but not on a card whose warp slots K3 already fills.
+## S2 — K1 rework (branch of `speed` @ 50d8710: 0c5019b + e511d6a), 2026-09-30 00:50–01:35, load avg 1.1–2.9
+
+Diagnosis (K1-only microbenchmark, 1638 corpus blocks): K1 was **DRAM-bound**, not barrier-bound. One 256 KiB
+head table per block (1638 × 256 KiB = 410 MB live) against 96 MB of L2. A one-warp-per-block ballot kernel was
+*slower* (35 ms), because it kept all tables live. With 64 shared tables (16 MB), the same kernel took 3.9 ms.
+
+What changed:
+- **0c5019b.** New `k1_chains_sg.wgsl` (needs `SUBGROUP` + `IMMEDIATES` and subgroup sizes 32..=128):
+  - a persistent grid of 256 workgroups, each reusing one L2-resident head table;
+  - tag-stamped entries, so head is never cleared (the host clears only when the 2^15 tags run out);
+  - 256-position tiles, with equal hashes matched by ballot bit-slicing inside 32-lane chunks and cross-chunk
+    links through ballots published to workgroup memory;
+  - 2 barriers per tile instead of 38.
+
+  The old kernel is kept as the fallback (`GZC_NO_SUBGROUPS=1`).
+- **e511d6a.** The fallback is persistent too, so head is capped at 256 tables (64 MiB) for both paths instead of
+  256 KiB per chain. `--batch max` for lvl9 grows from 1638 to 1736 (lvl3: 1365 → 1519).
+
+`pred` is identical: the chain tests run both kernels, and the differential tests pass on both paths at both block
+sizes (plus the 2000-block corpus test). A `--verify` run passed.
+
+Same-binary A/B (old kernel = `GZC_NO_SUBGROUPS=1` on 0c5019b), 3 clean runs each (no other GPU process), median:
+
+| Build / preset | Batch | End-to-end MB/s (3 runs) | Median | K1 ms/batch | Kernel sum ms/batch (µs/block) |
+|---|---|---|---:|---:|---:|
+| old K1, lvl9 | 1638 | 1623.2 / 1625.3 / 1626.0 | 1625.3 | 23.47 | 110.90 (67.7) |
+| 0c5019b, lvl9 | 1638 | 1879.7 / 1881.9 / 1879.3 | 1879.7 | 6.76 | 94.16 (57.5) |
+| **e511d6a, lvl9** | 1736 | 1977.7 / 1973.8 / 1961.9 | **1973.8** | 7.99 | 98.05 (56.5) |
+| e511d6a fallback, lvl9 | 1736 | 1817.9 / 1817.3 / 1817.3 | 1817.3 | 16.72 | 107.42 (61.9) |
+| old K1, rung1 | 1638 | 1978.5 / 1979.0 / 1976.0 | 1978.5 | 23.39 | 88.64 |
+| e511d6a, rung1 | 1736 | 2490.7 / 2484.1 / 2470.2 | 2484.1 | 8.01 | 75.61 |
+| old K1, lvl3 | 1365 | 1462.1 / 1456.2 / 1457.6 | 1457.6 | 42.72 | 101.55 |
+| e511d6a, lvl3 | 1519 | 2145.2 / 2140.5 / 2145.1 | 2145.1 | 12.74 | 73.06 |
+
+lvl9 per-kernel at e511d6a (median run): K1 8.00 · K2 16.93 · K3 61.53 · K4 8.39 · K5 3.20. `--verify` run: 1961.1 MB/s.
+
+**Kept.** lvl9 is +21.4 % end-to-end over the same-session baseline (+23 % over the S0 log), with the kernel sum per
+block −17 %. rung1 is +25.6 % and lvl3 +47 %; lvl3 is now above M3's 1545.7. Tuning note: `GZC_K1_GROUPS` sets the
+live-table count. 224 is ~0.5 ms faster for lvl9 and 256 is 1 ms faster for lvl3; on 32 MB-L2 cards ~64–96 should
+be right (untested).
+
+### S2 fix round 1 + S1+S2 merged (merge aa17791 of b7dc7db, fixes c2bcd03), 2026-09-30 01:40–01:55, load avg 1.0–2.1
+
+Fix round 1 changes:
+- K1's head is now per-dispatch scratch. Each workgroup clears its table in-kernel at the start of a dispatch, and tags
+  are chain ordinal + 1, so there is no host tag state and no IMMEDIATES feature.
+- The subgroup kernel self-tests at `ChainsKernel::new` and falls back on mismatch.
+- Default live tables: 128 (32 MiB) for 32 MB-L2 target cards.
+
+"S1+S2 merged", lvl9, 3 clean runs each (no other GPU process), median:
+
+| Config | Batch | End-to-end MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Sum ms/batch (µs/block) |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| default (128 tables), `--batch max` | 2026 | 2384.8 / 2390.2 / 2402.7 | **2390.2** | 13.20 | 10.71 | 59.22 | 9.99 | 3.48 | 96.60 (47.7) |
+| `GZC_K1_GROUPS=256`, `--batch max` | 2026 | 2463.6 / 2477.8 / 2481.0 | 2477.8 | 9.80 | 10.60 | 59.23 | 9.64 | 3.61 | 93.00 (45.9) |
+| default (128 tables), b1638 | 1638 | 2140.5 / 2140.5 / 2139.6 | 2140.5 | 10.83 | 8.75 | 58.83 | 7.02 | 3.00 | 88.40 (54.0) |
+| fallback K1 (`GZC_NO_SUBGROUPS=1`), b1638 | 1638 | 2019.8 / 2017.6 / 2021.9 | 2019.8 | 16.42 | | | | | 93.92 |
+
+- The 5090 cost of the 128-table default (the controller's ruling for 8 GB-class cards) against 256 is +3.4 ms/batch of K1,
+  which is −3.5 % end-to-end (2390.2 against 2477.8 MB/s). `GZC_K1_GROUPS=256` recovers it on 96 MB-L2 GPUs.
+- The in-kernel table clear per dispatch was not A/B-timed separately. It writes 32 MiB per dispatch (64 MiB at 256
+  tables); K1 at b1638 with 128 tables is 10.8 ms, in line with the pre-fix microbenchmark at 128 groups (about 10–11 ms),
+  so any cost is within noise.
+- `--verify` of the merged default passed: 2383.2 MB/s.

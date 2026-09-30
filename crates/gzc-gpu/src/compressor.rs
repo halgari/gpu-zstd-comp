@@ -156,7 +156,8 @@ pub struct BatchBuffers {
     pub n_hashes: u32,
     /// Packed blocks (`pack_blocks` layout); written by the caller.
     pub data: wgpu::Buffer,
-    /// K1 hash heads, `[block][chain][2^HASH_BITS]`.
+    /// K1 scratch hash-head tables, `[table < chains::HEAD_TABLES][2^HASH_BITS]`
+    /// (`chains::head_bytes`: one table per chain, at most `HEAD_TABLES`).
     pub head: wgpu::Buffer,
     /// K1 predecessor chains, `[block][chain][pos]`.
     pub pred: wgpu::Buffer,
@@ -1037,12 +1038,13 @@ mod tests {
             }
         }
         let at_128m = |m: &MatchParams| max_batch_blocks(&limits(128 * MIB, 128 * MIB, 65535), m);
-        // pred: 1 MiB per block with two chains; one chain: pred/best 512 KiB.
+        // 128K: pred 1 MiB per block with two chains; one chain: pred/best 512 KiB.
         #[cfg(feature = "block-128k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 256));
-        // head: 512 KiB per block, 256 KiB with one chain.
+        // 16K: pred 128 KiB per block with two chains, pred/best 64 KiB with one (head is capped at
+        // chains::HEAD_TABLES tables).
         #[cfg(feature = "block-16k")]
-        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (256, 512));
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (1024, 2048));
     }
 
     #[test]
@@ -1062,7 +1064,7 @@ mod tests {
             assert!(n * BLOCK_SIZE as u64 <= 1 << 32, "best");
             assert!(n * nh * BLOCK_SIZE as u64 <= 1 << 32, "pred");
             assert!(n * MAX_SEQS as u64 * 3 <= 1 << 32, "seqs");
-            assert!((n * nh) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
+            assert!((n * nh).min(chains::HEAD_TABLES as u64) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
         }
     }
 
