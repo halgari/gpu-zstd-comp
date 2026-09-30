@@ -3,12 +3,14 @@
 //! check runs both K1 kernels: the subgroup kernel (when the adapter has subgroups) and the
 //! workgroup-sort fallback (`GpuContext::with_subgroups(false)`).
 use gzc_core::block::chunk_file;
-use gzc_core::config::BLOCK_SIZE;
+use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS};
 use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
 use gzc_core::params::{Hashes, LVL3, LVL9, MatchParams, RUNG1};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
-use gzc_gpu::chains::{ChainsKernel, ChainsOptions, gpu_preds, gpu_preds_with, head_bytes, pred_bytes};
+use gzc_gpu::chains::{
+    ChainsKernel, ChainsOptions, PRED_POS, gpu_preds, gpu_preds_with, head_bytes, pred_bytes, pred_fp, pred_of_word,
+};
 use gzc_gpu::context::{GpuContext, pack_blocks};
 
 /// Every test case chunked into padded blocks, labelled "name[i]", plus small-alphabet blocks
@@ -182,6 +184,41 @@ fn k1_two_contexts_interleaved() {
         let i = round % 2;
         let subset: Vec<&(String, Vec<u8>)> = (0..4).map(|k| &blocks[(k + 5 * round) % blocks.len()]).collect();
         run_check(&ctxs[i], &kernels[i], &LVL3, &subset, &bufs[i].0, &bufs[i].1, &format!("ctx {i} round {round}"));
+    }
+}
+
+/// K1's raw pred words: the predecessor (PRED_POS for none) in bits 0..17 and `pred_fp` of the
+/// word's own position above, for every hashed position; the unhashed tail holds "none" and no
+/// fingerprint. Both kernels, Dfast (both chains carry the position's fingerprint) and Single.
+#[test]
+fn k1_pred_words_carry_fingerprints() {
+    let blocks = all_blocks();
+    let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+    let packed = pack_blocks(&refs);
+    let n = refs.len() as u32;
+    for ctx in contexts() {
+        let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
+        ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
+        for params in [LVL3, LVL9] {
+            let kernel = ChainsKernel::new(&ctx, &params).unwrap();
+            let nh = kernel.n_hashes() as usize;
+            let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);
+            let pred = ctx.storage_buffer("test.pred", pred_bytes(n, nh as u32), true);
+            let words = kernel.run_words(&ctx, &data, &head, &pred, n);
+            for (b, (name, block)) in blocks.iter().enumerate() {
+                let want = chains(block, &params);
+                for (c, want) in want.iter().enumerate() {
+                    let got = &words[(b * nh + c) * BLOCK_SIZE..][..BLOCK_SIZE];
+                    for p in 0..BLOCK_SIZE {
+                        let w = got[p];
+                        let expect = if p < HASHED_POSITIONS { pred_fp(block, p) } else { 0 };
+                        let what = format!("sg={} {params:?} {name} chain {c} p {p}: word {w:#x}", kernel.uses_subgroups());
+                        assert_eq!(w & !PRED_POS, expect, "{what}: fingerprint");
+                        assert_eq!(pred_of_word(w), want[p], "{what}: predecessor");
+                    }
+                }
+            }
+        }
     }
 }
 

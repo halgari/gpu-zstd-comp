@@ -1200,12 +1200,50 @@ fn literals_are_the_uncovered_block_bytes() {
 /// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
 /// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), and a Single
 /// chain with a small cap.
-const K2_VARIANTS: [MatchParams; 4] = [
+const K2_VARIANTS: [MatchParams; 6] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
+    // skips only against a best of >= 4) and 6.
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64 },
 ];
+
+/// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
+/// bytes (hash collisions), candidates equal in 4 bytes that differ at byte 4 (the byte field),
+/// and ties of length 4 and 5 between candidates. `words-tail1`: 4-byte words from 12 values, each
+/// followed by one of 3 bytes (so a word recurs with a different fifth byte); `words-tail2`: the
+/// same with two trailing bytes; `alphabet2`/`alphabet3`: random bytes of 2 or 3 values (dense
+/// chains with every length 0..=cap); `collide`: 4-byte random words drawn from 4096 values, which
+/// the 16-bit hash maps onto few buckets with many collisions.
+fn k2_fp_blocks() -> Vec<(String, Vec<u8>)> {
+    let mut r = Lcg(0x58f);
+    let words: Vec<u32> = (0..12).map(|_| r.next()).collect();
+    let pools: Vec<u32> = (0..4096).map(|_| r.next()).collect();
+    let mut out = Vec::new();
+    for tail in [1usize, 2] {
+        let mut b = Vec::with_capacity(BLOCK_SIZE + 8);
+        while b.len() < BLOCK_SIZE {
+            b.extend_from_slice(&words[r.below(12) as usize].to_le_bytes());
+            for _ in 0..tail {
+                b.push([7u8, 9, 200][r.below(3) as usize]);
+            }
+        }
+        b.truncate(BLOCK_SIZE);
+        out.push((format!("words-tail{tail}"), b));
+    }
+    for alphabet in [2u32, 3] {
+        out.push((format!("alphabet{alphabet}"), (0..BLOCK_SIZE).map(|_| r.below(alphabet) as u8).collect()));
+    }
+    let mut b = Vec::with_capacity(BLOCK_SIZE);
+    while b.len() < BLOCK_SIZE {
+        b.extend_from_slice(&pools[r.below(4096) as usize].to_le_bytes());
+    }
+    out.push(("collide".to_string(), b));
+    out
+}
 
 /// CPU mirror of K2's walk with the cap early-out (stop the whole walk, all chains, at the first
 /// candidate reaching search_cap).
@@ -1271,6 +1309,7 @@ fn k2_chain_blocks() -> Vec<(String, Vec<u8>)> {
 fn k2_cap_early_out_matches_find_best_cpu() {
     let mut blocks = all_blocks();
     blocks.extend(k2_chain_blocks());
+    blocks.extend(k2_fp_blocks());
     for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
         for (name, block) in &blocks {
             let ch = chains(block, &params);
@@ -1284,6 +1323,7 @@ fn k2_cap_early_out_matches_find_best_cpu() {
 fn k2_best_matches_find_best() {
     let mut blocks = all_blocks();
     blocks.extend(k2_chain_blocks());
+    blocks.extend(k2_fp_blocks());
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
         let (ctx, kernels) = setup(params);

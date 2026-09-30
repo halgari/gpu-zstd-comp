@@ -1,8 +1,9 @@
 // K1, subgroup kernel (needs Features::SUBGROUP and subgroups of 32..=128 lanes, and passes a
 // self-test at ChainsKernel::new; otherwise the fallback k1_chains.wgsl runs). Same output as the
-// fallback: pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS (== gzc_core
-// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..]. pred is bound to exactly this
-// dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
+// fallback: pred[p] = most recent q < p with hash(q) == hash(p), else none (== gzc_core
+// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..], stored as pred words with p's
+// fingerprint (common.wgsl `pred_word`; the tail p >= HASHED_POSITIONS holds PRED_NONE). pred is
+// bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
 //
 // Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
 // builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].
@@ -72,6 +73,18 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
         return mix(lo, hi);
     }
     return mix(lo, hi & 0xFFu);
+}
+
+// pred_fp at p from the same words.
+fn fp_words(w: vec3<u32>, p: u32) -> u32 {
+    let sh = (p & 3u) * 8u;
+    var lo = w.x;
+    var hi = w.y;
+    if (sh != 0u) {
+        lo = (w.x >> sh) | (w.y << (32u - sh));
+        hi = (w.y >> sh) | (w.z << (32u - sh));
+    }
+    return pred_fp(lo, hi);
 }
 
 // The words chain_hash_words needs at p (zeros, without loading, if p is not hashed).
@@ -216,13 +229,13 @@ fn main(
                         pr = select(NO_POS, (old & POS_MASK) - 1u, (old & ~POS_MASK) == tag);
                     }
                 }
-                pred_out[pb + p] = pr;
+                pred_out[pb + p] = pred_word(pr, fp_words(cur, p));
             }
             storageBarrier();
         }
 
         if (li < BLOCK_SIZE - HASHED_POSITIONS) {
-            pred_out[pb + HASHED_POSITIONS + li] = NO_POS;
+            pred_out[pb + HASHED_POSITIONS + li] = PRED_NONE;
         }
     }
 }

@@ -63,3 +63,20 @@ fn match_len(base: u32, p: u32, q: u32, cap: u32) -> u32 {
     }
     return n;
 }
+
+// K1's pred words, which K2 walks: bits 0..17 hold the predecessor (PRED_NONE = none; positions are
+// below HASHED_POSITIONS < 2^17), bits 17..32 a fingerprint of the word's own position p, whose
+// bytes lo = p..p+4 and hi = p+4..p+8: bits 17..24 are 7 bits of a hash of lo, bits 24..32 byte
+// p + 4. Equal bytes give equal fingerprints, so K2 can rule out a candidate from the pred word it
+// loads anyway: a differing lo field means len < 4, a differing byte field len <= 4.
+const PRED_POS: u32 = 0x1FFFFu;
+const PRED_NONE: u32 = 0x1FFFFu;
+const PRED_FP_LO: u32 = 0x7Fu << 17u;
+const_assert LOG2_BLOCK <= 17u;
+fn pred_fp(lo: u32, hi: u32) -> u32 {
+    return (((lo * 0x85EBCA6Bu) >> 25u) << 17u) | ((hi & 0xFFu) << 24u);
+}
+// A pred word for predecessor pr (NO_POS = none) and fingerprint fp.
+fn pred_word(pr: u32, fp: u32) -> u32 {
+    return select(pr, PRED_NONE, pr == NO_POS) | fp;
+}
