@@ -1,16 +1,17 @@
-// K1, subgroup kernel (needs Features::SUBGROUP + IMMEDIATES and subgroups of 32..=128 lanes;
-// otherwise the fallback k1_chains.wgsl runs). Same output as the fallback: pred[p] = most recent
-// q < p with hash(q) == hash(p), else NO_POS (== gzc_core compute_preds), layout
-// pred[(b*N_HASHES + chain)*BLOCK_SIZE ..].
+// K1, subgroup kernel (needs Features::SUBGROUP and subgroups of 32..=128 lanes, and passes a
+// self-test at ChainsKernel::new; otherwise the fallback k1_chains.wgsl runs). Same output as the
+// fallback: pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS (== gzc_core
+// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..]. pred is bound to exactly this
+// dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
 //
 // Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
 // builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].
 // G is kept small enough for the G live tables (256 KiB each) to stay in L2: with one table per
-// block (1638 x 256 KiB live) K1 was DRAM-bound. Table entries are (tag << LOG2_BLOCK) | (pos + 1)
-// with tag = imm.gen + (task ordinal within the workgroup), and only entries of the current tag
-// count (pos + 1 <= HASHED_POSITIONS < BLOCK_SIZE fits LOG2_BLOCK bits), so tables are never
-// cleared per block or per batch: the host gives every dispatch on a head buffer fresh tags
-// (`chains::next_gen`) and clears the buffer only when they run out.
+// block (1638 x 256 KiB live) K1 was DRAM-bound. Each workgroup clears its table once at the start
+// of the dispatch; its j-th task stamps entries (tag << LOG2_BLOCK) | (pos + 1) with tag = j + 1,
+// and only entries of the current tag count (pos + 1 <= HASHED_POSITIONS < BLOCK_SIZE fits
+// LOG2_BLOCK bits). So the table is not cleared between the workgroup's tasks, and no tag state
+// outlives the dispatch (the host ensures a workgroup has at most MAX_TAG tasks).
 //
 // A task walks its block in tiles of T = 256 positions, one per invocation. The tile-local index
 // li = subgroup_id * subgroup_size + subgroup_invocation_id (position t0 + li) splits the tile
@@ -36,13 +37,6 @@
 @group(0) @binding(1) var<storage, read_write> head: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> pred_out: array<u32>;
 
-struct K1Immediates {
-    gen: u32,
-    n_tasks: u32,
-    pad0: u32,
-    pad1: u32,
-}
-var<immediate> imm: K1Immediates;
 
 const T: u32 = 256u;
 const CHUNKS: u32 = T / 32u;
@@ -138,16 +132,23 @@ fn main(
     let word = sg_lane >> 5u;
     let below = (1u << cl) - 1u;
     let hb = wid.x << HASH_BITS;
+    let n_tasks = arrayLength(&pred_out) / BLOCK_SIZE;
     var parity = 0u;
+
+    // Stale entries of earlier dispatches may carry any tag: clear this workgroup's table.
+    for (var i = li; i < (1u << HASH_BITS); i += T) {
+        atomicStore(&head[hb + i], 0u);
+    }
+    storageBarrier();
 
     for (var j = 0u; ; j++) {
         let t = wid.x + nwg.x * j;
-        if (t >= imm.n_tasks) { break; }
+        if (t >= n_tasks) { break; }
         let b = t / N_HASHES;
         let chain = t % N_HASHES;
         let base = block_base(b);
         let pb = t * BLOCK_SIZE;
-        let tag = (imm.gen + j) << LOG2_BLOCK;
+        let tag = (j + 1u) << LOG2_BLOCK;
         // This lane's data words for the current tile; the next tile's are loaded a tile ahead.
         var words = load_words(base, li);
 

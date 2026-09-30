@@ -8,7 +8,7 @@ use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
 use gzc_core::params::{Hashes, LVL3, LVL9, MatchParams, RUNG1};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
-use gzc_gpu::chains::{ChainsKernel, ChainsOptions, gpu_preds, head_bytes, pred_bytes};
+use gzc_gpu::chains::{ChainsKernel, ChainsOptions, gpu_preds, gpu_preds_with, head_bytes, pred_bytes};
 use gzc_gpu::context::{GpuContext, pack_blocks};
 
 /// Every test case chunked into padded blocks, labelled "name[i]", plus small-alphabet blocks
@@ -118,11 +118,23 @@ fn k1_kernel_follows_context() {
     }
 }
 
-/// The subgroup kernel never clears `head` between dispatches: one head buffer, shared by kernels
-/// of different presets, reused across dispatches of varying size, must give the CPU chains every
-/// time. With `max_gen` 3 the gens wrap (clearing the buffer) every third dispatch on it; with 1 or
-/// 3 workgroups each subgroup builds many chains in a row; `wide_masks` covers the kernel's path
-/// for subgroups wider than 32 lanes.
+/// Runs `kernel` on `blocks` with the given head/pred buffers and checks every chain.
+fn run_check(ctx: &GpuContext, kernel: &ChainsKernel, params: &MatchParams, blocks: &[&(String, Vec<u8>)], head: &wgpu::Buffer, pred: &wgpu::Buffer, what: &str) {
+    let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+    let packed = pack_blocks(&refs);
+    let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
+    ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
+    let got = kernel.run(ctx, &data, head, pred, refs.len() as u32);
+    for ((name, block), g) in blocks.iter().zip(&got) {
+        compare(&format!("sg={} {what} {name}", kernel.uses_subgroups()), g, block, params);
+    }
+}
+
+/// `head` is per-dispatch scratch: one head buffer, shared by kernels of different presets and
+/// reused across dispatches of varying size (stale entries of other blocks and presets in it),
+/// must give the CPU chains every time. `groups` 1 makes one workgroup build every chain of the
+/// dispatch in a row (tags 1..=n on one table), 3 a few each; `wide_masks` covers the kernel's
+/// path for subgroups wider than 32 lanes.
 #[test]
 fn k1_head_reuse_across_dispatches() {
     let blocks = all_blocks();
@@ -130,30 +142,67 @@ fn k1_head_reuse_across_dispatches() {
         let cap = blocks.len() as u32;
         let head = ctx.storage_buffer("test.head", head_bytes(cap, 2), false);
         let pred = ctx.storage_buffer("test.pred", pred_bytes(cap, 2), true);
+        let opts = |groups, wide_masks| ChainsOptions { groups, wide_masks, ..ChainsOptions::default() };
         let kernels: Vec<(MatchParams, ChainsKernel)> = [
-            (LVL3, ChainsOptions { max_gen: 3, groups: None, wide_masks: false }),
-            (RUNG1, ChainsOptions { max_gen: 3, groups: Some(1), wide_masks: false }),
-            (LVL3, ChainsOptions { max_gen: 3, groups: Some(3), wide_masks: true }),
-            (LVL9, ChainsOptions::default()),
-            (RUNG1, ChainsOptions { wide_masks: true, ..ChainsOptions::default() }),
+            (LVL3, opts(None, false)),
+            (RUNG1, opts(Some(1), false)),
+            (LVL3, opts(Some(3), true)),
+            (LVL9, opts(Some(1), false)),
+            (RUNG1, opts(None, true)),
+            (LVL3, opts(Some(1), false)),
         ]
         .into_iter()
         .map(|(p, o)| (p, ChainsKernel::with_options(&ctx, &p, o).unwrap()))
         .collect();
-        for round in 0..15usize {
+        for round in 0..18usize {
             let (params, kernel) = &kernels[round % kernels.len()];
             // Rotating, varying-size subsets, so stale head entries of other blocks are present.
             let n = [blocks.len(), 5, 1, blocks.len() - 3, 9][round % 5];
             let subset: Vec<&(String, Vec<u8>)> = (0..n).map(|i| &blocks[(i + 7 * round) % blocks.len()]).collect();
-            let refs: Vec<&[u8]> = subset.iter().map(|(_, b)| b.as_slice()).collect();
-            let packed = pack_blocks(&refs);
-            let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
-            ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-            let got = kernel.run(&ctx, &data, &head, &pred, n as u32);
-            for ((name, block), g) in subset.iter().zip(&got) {
-                compare(&format!("sg={} round {round} {name}", ctx.subgroups), g, block, params);
-            }
+            run_check(&ctx, kernel, params, &subset, &head, &pred, &format!("round {round}"));
         }
+    }
+}
+
+/// Two live contexts (separate wgpu instances, whose buffer ids can coincide) interleave
+/// dispatches on their own head buffers; neither may disturb the other.
+#[test]
+fn k1_two_contexts_interleaved() {
+    let blocks = all_blocks();
+    let ctxs = [GpuContext::new().unwrap(), GpuContext::new().unwrap()];
+    let bufs: Vec<(wgpu::Buffer, wgpu::Buffer)> = ctxs
+        .iter()
+        .map(|c| (c.storage_buffer("head", head_bytes(4, 2), false), c.storage_buffer("pred", pred_bytes(4, 2), true)))
+        .collect();
+    let kernels: Vec<ChainsKernel> = ctxs
+        .iter()
+        .map(|c| ChainsKernel::with_options(c, &LVL3, ChainsOptions { groups: Some(1), ..ChainsOptions::default() }).unwrap())
+        .collect();
+    for round in 0..8usize {
+        let i = round % 2;
+        let subset: Vec<&(String, Vec<u8>)> = (0..4).map(|k| &blocks[(k + 5 * round) % blocks.len()]).collect();
+        run_check(&ctxs[i], &kernels[i], &LVL3, &subset, &bufs[i].0, &bufs[i].1, &format!("ctx {i} round {round}"));
+    }
+}
+
+/// A subgroup kernel that fails its self-test is replaced by the fallback, which still builds the
+/// right chains.
+#[test]
+fn k1_failed_self_test_falls_back() {
+    let ctx = GpuContext::new().unwrap();
+    if !ctx.subgroups {
+        return;
+    }
+    let good = ChainsKernel::with_options(&ctx, &LVL9, ChainsOptions::default()).unwrap();
+    assert!(good.uses_subgroups(), "self-test failed on this adapter");
+    let opts = ChainsOptions { break_subgroup_kernel: true, ..ChainsOptions::default() };
+    let broken = ChainsKernel::with_options(&ctx, &LVL9, opts).unwrap();
+    assert!(!broken.uses_subgroups());
+    let blocks = all_blocks();
+    let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+    let preds = gpu_preds_with(&ctx, &broken, &refs).unwrap();
+    for ((name, block), got) in blocks.iter().zip(&preds) {
+        compare(name, got, block, &LVL9);
     }
 }
 

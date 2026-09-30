@@ -5,24 +5,21 @@ use gzc_core::params::MatchParams;
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
-/// Immediate-data bytes K1's subgroup kernel sets per dispatch.
-pub const K1_IMMEDIATE_BYTES: u32 = 16;
-
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
     pub timestamps: bool,
-    /// True when the device was created with `Features::SUBGROUP | Features::IMMEDIATES`. K1 then
-    /// runs its subgroup kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it; otherwise
-    /// the workgroup-sort fallback.
+    /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
+    /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
+    /// otherwise the workgroup-sort fallback.
     pub subgroups: bool,
 }
 
 impl GpuContext {
     /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
-    /// enabling timestamp queries and subgroups (with immediates) when available. Setting the
+    /// enabling timestamp queries and subgroups when available. Setting the
     /// environment variable `GZC_NO_SUBGROUPS` to anything but `0` leaves subgroups off, which
     /// selects K1's fallback kernel.
     pub fn new() -> anyhow::Result<Self> {
@@ -43,15 +40,12 @@ impl GpuContext {
 
         let al = adapter.limits();
         let info = adapter.get_info();
-        let sg_features = wgpu::Features::SUBGROUP | wgpu::Features::IMMEDIATES;
-        let subgroups =
-            allow && adapter.features().contains(sg_features) && al.max_immediate_size >= K1_IMMEDIATE_BYTES;
+        let subgroups = allow && adapter.features().contains(wgpu::Features::SUBGROUP);
         let required_limits = wgpu::Limits {
             max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
             max_buffer_size: al.max_buffer_size,
             max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
             max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage,
-            max_immediate_size: if subgroups { K1_IMMEDIATE_BYTES } else { 0 },
             ..wgpu::Limits::default()
         };
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
@@ -60,7 +54,7 @@ impl GpuContext {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
         if subgroups {
-            required_features |= sg_features;
+            required_features |= wgpu::Features::SUBGROUP;
         }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
