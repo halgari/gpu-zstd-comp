@@ -371,6 +371,40 @@ mod tests {
         assert!(decoded >= 12, "only {decoded} frames checked");
     }
 
+    /// ML codes {0, big} leave a gap of more than 24 zero-probability codes, so `write_ncount` takes
+    /// its 24-zero-run (0xFFFF) branch; libzstd must still decode the table. The long match is sized
+    /// to the block (code 52 at 128K, code 49 at 16K: both gaps exceed 24).
+    #[test]
+    fn write_ncount_long_zero_run_roundtrips() {
+        let big = BLOCK_SIZE as u32 - 2 * 50 * 4 - 1 - 64;
+        let mut script = vec![(1, 1, 3); 50];
+        script.push((1, 1, big));
+        script.extend(vec![(1, 1, 3); 50]);
+        let (block, out) = scripted(&script, &mut lit_source(24));
+        let h = histograms(&out.sequences);
+        let used: Vec<usize> = (0..h[2].len()).filter(|&c| h[2][c] > 0).collect();
+        assert_eq!(used[0], 0);
+        assert_eq!(used.len(), 2);
+        assert!(used[1] > 24 + 1, "gap too small: {used:?}");
+
+        // ML forced computed; LL and OF as chosen (both RLE here).
+        let kinds = [StreamKind::LiteralLength, StreamKind::Offset, StreamKind::MatchLength];
+        let n = out.sequences.len();
+        let tables = [StreamTable::choose(kinds[0], &h[0], n), StreamTable::choose(kinds[1], &h[1], n), StreamTable::computed(kinds[2], &h[2])];
+        let mut section = Vec::new();
+        write_sequences_section_with(&out.sequences, &tables, &mut section);
+        assert_eq!(modes_byte(&section), 0b0101_1000, "LL/OF RLE, ML compressed");
+        let frame = frame_with_section(&out, &section).expect("fits");
+        assert!(zstd::bulk::decompress(&frame, BLOCK_SIZE).unwrap() == block, "decoded block differs");
+
+        // The auto choice picks the computed table for ML too, and the full frame round-trips.
+        let mut auto = Vec::new();
+        write_sequences_section_auto(&out.sequences, &mut auto);
+        assert_eq!(auto, section);
+        let opts = FrameOptions { checksum: false, huffman: false };
+        assert!(zstd::bulk::decompress(&write_frame(&block, &out, opts), BLOCK_SIZE).unwrap() == block);
+    }
+
     #[test]
     fn rle_mode_used_for_uniform_ml() {
         let mut r = Lcg(5);

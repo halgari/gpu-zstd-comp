@@ -1,10 +1,16 @@
 //! In-flight streaming submission and GPU timestamp queries.
 //!
 //! `inflight` slots each own a `BatchBuffers` and a mappable staging buffer. A batch is
-//! uploaded into a free slot; K1→K2→K3 plus copies of `counts`, the full fixed-stride `seqs`
-//! and `lits` regions (and resolved timestamps) into the slot's staging buffer are recorded in
-//! one submission, and the staging buffer is mapped once. Completed slots are decoded into the
-//! sink in submission order while later batches keep the GPU busy.
+//! uploaded into a free slot; the kernels plus copies of their outputs (and resolved timestamps)
+//! into the slot's staging buffer are recorded in one submission, and the staging buffer is
+//! mapped once. Completed slots are handed to the sink in submission order while later batches
+//! keep the GPU busy.
+//!
+//! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
+//! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
+//!   `seqs` and `lits` regions; the host decodes a `BlockOutput` per block.
+//! - frames (`run_frames`, `FrameSink`): K1→K2→K3→K4, staging holds `frame_len` and the full
+//!   fixed-stride `frames` region; the host only copies each frame's bytes out.
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -14,8 +20,8 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
-    BatchBuffers, GpuParams, KERNEL_NAMES, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
-    lits_bytes, max_batch_blocks, seqs_bytes,
+    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
+    frame_bytes, frame_len_bytes, frames_bytes, lits_bytes, max_batch_blocks, seqs_bytes,
 };
 use crate::context::GpuContext;
 
@@ -30,8 +36,9 @@ pub struct PipelineConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
-    /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse"), in
-    /// milliseconds; empty when the device has no timestamp queries.
+    /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
+    /// "k4_entropy" on the frame path), in milliseconds; empty when the device has no timestamp
+    /// queries.
     pub kernel_ms: Vec<(String, f64)>,
     /// Wall time from the first upload to the last block handed to the sink.
     pub wall_s: f64,
@@ -44,24 +51,44 @@ pub trait BlockSink {
     fn put(&mut self, index: usize, out: BlockOutput);
 }
 
-/// Byte offsets of one slot's staging buffer, laid out for `cap` blocks:
-/// `[counts][seqs][lits][timestamps]`, seqs and lits at the GPU buffers' fixed stride.
+/// Receives each block's complete zstd frame; called exactly once per index, in arbitrary order.
+/// `frame` borrows the mapped staging buffer: copy it out before returning.
+pub trait FrameSink {
+    fn put(&mut self, index: usize, frame: &[u8]);
+}
+
+/// Byte offsets of one slot's staging buffer, laid out for `cap` blocks. Parse path:
+/// `[counts][seqs][lits][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the
+/// regions keep the GPU buffers' fixed per-block stride.
 #[derive(Clone, Copy)]
 struct StagingLayout {
-    seqs: u64,
-    lits: u64,
+    frames: bool,
+    /// Parse path: seqs region. Frame path: frames region.
+    a: u64,
+    /// Parse path: lits region. Frame path: unused (== ts).
+    b: u64,
     ts: u64,
     size: u64,
 }
 
 impl StagingLayout {
-    fn new(cap: u32) -> Self {
-        let seqs = counts_bytes(cap);
-        let lits = seqs + seqs_bytes(cap);
-        let ts = lits + lits_bytes(cap);
-        Self { seqs, lits, ts, size: ts + KERNEL_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
+    fn new(cap: u32, frames: bool) -> Self {
+        let (a, b, ts) = if frames {
+            let a = frame_len_bytes(cap);
+            let ts = a + frames_bytes(cap);
+            (a, ts, ts)
+        } else {
+            let a = counts_bytes(cap);
+            let b = a + seqs_bytes(cap);
+            (a, b, b + lits_bytes(cap))
+        };
+        Self { frames, a, b, ts, size: ts + KERNEL_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
     }
 }
+
+/// Hands one completed batch to the caller's sink: `(first block index, block count, mapped
+/// staging bytes)`.
+type Deliver<'d> = dyn FnMut(usize, u32, &[u8]) -> anyhow::Result<()> + 'd;
 
 /// A submitted batch awaiting its staging map.
 struct Job {
@@ -79,7 +106,7 @@ struct Slot {
     job: Option<Job>,
 }
 
-/// Compiled kernels plus `inflight` slots of `batch` blocks, reusable across `run` calls.
+/// Compiled kernels plus `inflight` slots of `batch` blocks, reusable across runs.
 pub struct Pipeline<'a> {
     ctx: &'a GpuContext,
     cfg: PipelineConfig,
@@ -89,19 +116,21 @@ pub struct Pipeline<'a> {
 }
 
 impl<'a> Pipeline<'a> {
-    /// Compiles the kernels and allocates every slot. Errors on `batch`/`inflight` of 0, a
-    /// batch above `max_batch_blocks`, or a wgpu out-of-memory/validation error.
+    /// Compiles the kernels and allocates every slot, for the frame path when
+    /// `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight` of 0,
+    /// a batch above `max_batch_blocks`, or a wgpu out-of-memory/validation error.
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
         let max = max_batch_blocks(&ctx.device.limits());
         anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
         anyhow::ensure!(cfg.batch >= 1 && cfg.batch <= max, "batch {} not in 1..={max} for this device", cfg.batch);
 
         let scopes = ErrorScopes::push(ctx);
+        let frames = cfg.params.emit_frames;
         let kernels = Kernels::new(ctx, cfg.params);
-        let layout = StagingLayout::new(cfg.batch);
+        let layout = StagingLayout::new(cfg.batch, frames);
         let slots = (0..cfg.inflight)
             .map(|_| Slot {
-                bufs: BatchBuffers::new(ctx, cfg.batch),
+                bufs: BatchBuffers::new(ctx, cfg.batch, frames),
                 staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.staging"),
                     size: layout.size,
@@ -130,15 +159,59 @@ impl<'a> Pipeline<'a> {
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's parse
-    /// to `sink` exactly once. wgpu validation/out-of-memory errors become `Err`.
+    /// to `sink` exactly once. Errors on a frame-path pipeline, and on wgpu validation or
+    /// out-of-memory errors.
     pub fn run(&mut self, blocks: &[&[u8]], sink: &mut impl BlockSink) -> anyhow::Result<PipelineStats> {
+        anyhow::ensure!(!self.layout.frames, "pipeline built with emit_frames: use run_frames");
+        let layout = self.layout;
+        self.run_with(blocks, &mut |first, n, view| {
+            let words: &[u32] = bytemuck::cast_slice(view);
+            let seq_stride = 3 * MAX_SEQS as usize;
+            let lit_stride = BLOCK_SIZE / 4;
+            for b in 0..n as usize {
+                let (n_seq, n_lit) = (words[2 * b], words[2 * b + 1]);
+                anyhow::ensure!(
+                    n_seq <= MAX_SEQS && n_lit as usize <= BLOCK_SIZE,
+                    "block {}: bad counts ({n_seq}, {n_lit})",
+                    first + b
+                );
+                let s = (layout.a / 4) as usize + b * seq_stride;
+                let l = (layout.b / 4) as usize + b * lit_stride;
+                sink.put(first + b, decode_output(&words[s..s + seq_stride], &words[l..l + lit_stride], n_seq, n_lit));
+            }
+            Ok(())
+        })
+    }
+
+    /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's zstd
+    /// frame (K4 output) to `sink` exactly once. Errors on a parse-path pipeline, and on wgpu
+    /// validation or out-of-memory errors.
+    pub fn run_frames(&mut self, blocks: &[&[u8]], sink: &mut impl FrameSink) -> anyhow::Result<PipelineStats> {
+        anyhow::ensure!(self.layout.frames, "pipeline built without emit_frames: use run");
+        let layout = self.layout;
+        self.run_with(blocks, &mut |first, n, view| {
+            let lens: &[u32] = bytemuck::cast_slice(&view[..frame_len_bytes(n) as usize]);
+            let frames = &view[layout.a as usize..layout.a as usize + n as usize * FRAME_STRIDE];
+            for (b, &len) in lens.iter().enumerate() {
+                sink.put(first + b, frame_bytes(frames, b, len).with_context(|| format!("block {}", first + b))?);
+            }
+            Ok(())
+        })
+    }
+
+    fn run_with(
+        &mut self,
+        blocks: &[&[u8]],
+        deliver: &mut Deliver<'_>,
+    ) -> anyhow::Result<PipelineStats> {
         if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
             anyhow::bail!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len());
         }
         let scopes = ErrorScopes::push(self.ctx);
         let start = Instant::now();
-        let mut ticks = [0u64; KERNEL_NAMES.len()];
-        let result = self.stream(blocks, sink, &mut ticks);
+        let names = self.kernels.names();
+        let mut ticks = vec![0u64; names.len()];
+        let result = self.stream(blocks, deliver, &mut ticks);
         let wall_s = start.elapsed().as_secs_f64();
         if result.is_err() {
             self.abandon();
@@ -148,15 +221,20 @@ impl<'a> Pipeline<'a> {
 
         let kernel_ms = if self.ctx.timestamps {
             let period_ns = self.ctx.queue.get_timestamp_period() as f64;
-            KERNEL_NAMES.iter().zip(ticks).map(|(name, t)| (name.to_string(), t as f64 * period_ns / 1e6)).collect()
+            names.iter().zip(ticks).map(|(name, t)| (name.to_string(), t as f64 * period_ns / 1e6)).collect()
         } else {
             Vec::new()
         };
         Ok(PipelineStats { kernel_ms, wall_s, batches })
     }
 
-    /// The submit / wait / decode loop; returns the number of batches submitted.
-    fn stream(&mut self, blocks: &[&[u8]], sink: &mut impl BlockSink, ticks: &mut [u64]) -> anyhow::Result<u32> {
+    /// The submit / wait / deliver loop; returns the number of batches submitted.
+    fn stream(
+        &mut self,
+        blocks: &[&[u8]],
+        deliver: &mut Deliver<'_>,
+        ticks: &mut [u64],
+    ) -> anyhow::Result<u32> {
         let batch = self.cfg.batch as usize;
         let mut next = 0usize;
         let mut batches = 0u32;
@@ -186,7 +264,7 @@ impl<'a> Pipeline<'a> {
                     Err(mpsc::TryRecvError::Empty) if !waited_for => break,
                     Err(_) => anyhow::bail!("staging map callback not delivered after waiting for its submission"),
                 }
-                self.finish(i, sink, ticks)?;
+                self.finish(i, deliver, ticks)?;
                 busy.pop_front();
                 waited_for = false;
             }
@@ -194,7 +272,7 @@ impl<'a> Pipeline<'a> {
         Ok(batches)
     }
 
-    /// Uploads `blocks` into slot `i` and submits K1→K2→K3 plus the staging copies.
+    /// Uploads `blocks` into slot `i` and submits the kernels plus the staging copies.
     fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]]) {
         let (ctx, layout) = (self.ctx, self.layout);
         let slot = &mut self.slots[i];
@@ -206,14 +284,22 @@ impl<'a> Pipeline<'a> {
         ctx.queue.write_buffer(&slot.bufs.data, n as u64 * BLOCK_SIZE as u64, &[0u8; 4]);
 
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
-        // record_timed binds exactly counts_bytes(n), so K3 never parses stale blocks.
+        // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K4), so no
+        // kernel processes the stale blocks of a partial batch.
         self.kernels.record_timed(ctx, &mut enc, &slot.bufs, n, slot.queries.as_ref().map(|q| &q.0));
-        enc.copy_buffer_to_buffer(&slot.bufs.counts, 0, &slot.staging, 0, counts_bytes(n));
-        enc.copy_buffer_to_buffer(&slot.bufs.seqs, 0, &slot.staging, layout.seqs, seqs_bytes(n));
-        enc.copy_buffer_to_buffer(&slot.bufs.lits, 0, &slot.staging, layout.lits, lits_bytes(n));
+        if layout.frames {
+            let (frames, frame_len) = (slot.bufs.frames.as_ref().unwrap(), slot.bufs.frame_len.as_ref().unwrap());
+            enc.copy_buffer_to_buffer(frame_len, 0, &slot.staging, 0, frame_len_bytes(n));
+            enc.copy_buffer_to_buffer(frames, 0, &slot.staging, layout.a, frames_bytes(n));
+        } else {
+            enc.copy_buffer_to_buffer(&slot.bufs.counts, 0, &slot.staging, 0, counts_bytes(n));
+            enc.copy_buffer_to_buffer(&slot.bufs.seqs, 0, &slot.staging, layout.a, seqs_bytes(n));
+            enc.copy_buffer_to_buffer(&slot.bufs.lits, 0, &slot.staging, layout.b, lits_bytes(n));
+        }
         if let Some((set, resolve)) = &slot.queries {
-            enc.resolve_query_set(set, 0..KERNEL_QUERIES, resolve, 0);
-            enc.copy_buffer_to_buffer(resolve, 0, &slot.staging, layout.ts, resolve.size());
+            let q = 2 * self.kernels.names().len() as u32;
+            enc.resolve_query_set(set, 0..q, resolve, 0);
+            enc.copy_buffer_to_buffer(resolve, 0, &slot.staging, layout.ts, q as u64 * wgpu::QUERY_SIZE as u64);
         }
         let submission = ctx.queue.submit([enc.finish()]);
 
@@ -224,32 +310,23 @@ impl<'a> Pipeline<'a> {
         slot.job = Some(Job { first, n, submission, mapped });
     }
 
-    /// Decodes mapped slot `i` into `sink`, adds its kernel ticks, unmaps and frees the slot.
-    fn finish(&mut self, i: usize, sink: &mut impl BlockSink, ticks: &mut [u64]) -> anyhow::Result<()> {
+    /// Hands mapped slot `i` to `deliver`, adds its kernel ticks, unmaps and frees the slot.
+    fn finish(
+        &mut self,
+        i: usize,
+        deliver: &mut Deliver<'_>,
+        ticks: &mut [u64],
+    ) -> anyhow::Result<()> {
         let layout = self.layout;
         let slot = &mut self.slots[i];
         let job = slot.job.take().unwrap();
         let result = (|| -> anyhow::Result<()> {
             let view = slot.staging.get_mapped_range(..).context("mapped range")?;
-            let words: &[u32] = bytemuck::cast_slice(&view[..]);
-            let seq_stride = 3 * MAX_SEQS as usize;
-            let lit_stride = BLOCK_SIZE / 4;
-            for b in 0..job.n as usize {
-                let (n_seq, n_lit) = (words[2 * b], words[2 * b + 1]);
-                anyhow::ensure!(
-                    n_seq <= MAX_SEQS && n_lit as usize <= BLOCK_SIZE,
-                    "block {}: bad counts ({n_seq}, {n_lit})",
-                    job.first + b
-                );
-                let s = (layout.seqs / 4) as usize + b * seq_stride;
-                let l = (layout.lits / 4) as usize + b * lit_stride;
-                let out = decode_output(&words[s..s + seq_stride], &words[l..l + lit_stride], n_seq, n_lit);
-                sink.put(job.first + b, out);
-            }
+            deliver(job.first, job.n, &view[..])?;
             if slot.queries.is_some() {
                 // Only 4-byte aligned in general (seqs_bytes(1) is not a multiple of 8).
                 let t = layout.ts as usize;
-                let stamps: Vec<u64> = view[t..t + KERNEL_QUERIES as usize * 8]
+                let stamps: Vec<u64> = view[t..t + ticks.len() * 16]
                     .chunks_exact(8)
                     .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
                     .collect();
@@ -300,7 +377,8 @@ impl ErrorScopes {
     }
 }
 
-/// Builds a `Pipeline` for `cfg` and streams `blocks` through it (see `Pipeline::run`).
+/// Builds a parse-path `Pipeline` for `cfg` (whose `emit_frames` must be false) and streams
+/// `blocks` through it (see `Pipeline::run`).
 pub fn compress_stream(
     ctx: &GpuContext,
     cfg: &PipelineConfig,
@@ -310,12 +388,27 @@ pub fn compress_stream(
     Pipeline::new(ctx, cfg)?.run(blocks, sink)
 }
 
+/// Builds a frame-path `Pipeline` for `cfg` (`emit_frames` is forced on) and streams `blocks`
+/// through it (see `Pipeline::run_frames`).
+pub fn compress_stream_frames(
+    ctx: &GpuContext,
+    cfg: &PipelineConfig,
+    blocks: &[&[u8]],
+    sink: &mut impl FrameSink,
+) -> anyhow::Result<PipelineStats> {
+    let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
+    Pipeline::new(ctx, &cfg)?.run_frames(blocks, sink)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gzc_core::block::chunk_file;
     use gzc_core::reference::{LVL3, compress_block};
+    use gzc_core::frame::write_frame;
     use gzc_core::synth::test_cases;
+
+    use crate::compressor::K4_FRAME_OPTIONS;
 
     struct Collect(Vec<Option<BlockOutput>>);
 
@@ -327,7 +420,7 @@ mod tests {
     }
 
     fn cfg(batch: u32, inflight: u32) -> PipelineConfig {
-        PipelineConfig { batch, inflight, params: GpuParams { depth: 1 } }
+        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false } }
     }
 
     #[test]
@@ -385,5 +478,67 @@ mod tests {
         assert!(compress_stream(&ctx, &cfg(0, 2), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(8, 0), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(u32::MAX, 1), &[], &mut sink).is_err());
+    }
+
+    struct CollectFrames(Vec<Option<Vec<u8>>>);
+
+    impl FrameSink for CollectFrames {
+        fn put(&mut self, index: usize, frame: &[u8]) {
+            assert!(self.0[index].is_none(), "index {index} delivered twice");
+            self.0[index] = Some(frame.to_vec());
+        }
+    }
+
+    fn distinct_blocks() -> Vec<Vec<u8>> {
+        test_cases().into_iter().flat_map(|(_, bytes)| chunk_file(&bytes)).map(|b| b.data).collect()
+    }
+
+    fn cpu_frame(block: &[u8]) -> Vec<u8> {
+        write_frame(block, &compress_block(block, LVL3), K4_FRAME_OPTIONS)
+    }
+
+    #[test]
+    fn stream_frames_match_cpu_every_index_once() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b)).collect();
+        // 1000 = 15 * 64 + 40: the last batch is partial and reuses a slot holding stale blocks.
+        let blocks: Vec<&[u8]> = (0..1000).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+
+        let mut sink = CollectFrames(vec![None; blocks.len()]);
+        // emit_frames: false in cfg is overridden by compress_stream_frames.
+        let stats = compress_stream_frames(&ctx, &cfg(64, 3), &blocks, &mut sink).expect("compress_stream_frames");
+
+        for (i, got) in sink.0.iter().enumerate() {
+            let got = got.as_ref().unwrap_or_else(|| panic!("index {i} never delivered"));
+            assert!(*got == want[i % distinct.len()], "index {i}: GPU frame != CPU frame");
+        }
+        assert_eq!(stats.batches, 16);
+        if ctx.timestamps {
+            let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy"]);
+            assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{:?}", stats.kernel_ms);
+        }
+    }
+
+    #[test]
+    fn stream_frames_odd_batch_single_slot_and_reuse() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = distinct.iter().map(|b| b.as_slice()).collect();
+        let frames_cfg = PipelineConfig { params: GpuParams { depth: 1, emit_frames: true }, ..cfg(7, 1) };
+        let mut pipe = Pipeline::new(&ctx, &frames_cfg).unwrap();
+        for _ in 0..2 {
+            let mut sink = CollectFrames(vec![None; blocks.len()]);
+            let stats = pipe.run_frames(&blocks, &mut sink).unwrap();
+            assert_eq!(stats.batches as usize, blocks.len().div_ceil(7));
+            for (i, got) in sink.0.into_iter().enumerate() {
+                assert!(got.unwrap() == cpu_frame(blocks[i]), "index {i}");
+            }
+        }
+        // The frame pipeline has no parse output, and the parse pipeline no frames.
+        assert!(pipe.run(&blocks, &mut Collect(vec![None; blocks.len()])).is_err());
+        let mut parse_pipe = Pipeline::new(&ctx, &cfg(7, 1)).unwrap();
+        assert!(parse_pipe.run_frames(&blocks, &mut CollectFrames(vec![None; blocks.len()])).is_err());
     }
 }

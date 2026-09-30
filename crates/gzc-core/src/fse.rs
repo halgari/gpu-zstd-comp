@@ -160,7 +160,8 @@ fn highbit(v: u32) -> u32 {
 }
 
 /// `FRAC[i] = round(256 * log2(1 + i/256))`: fractional part of log2 in 1/256 bits.
-const FRAC: [u16; 256] = [
+/// Public so the GPU cost model (K4) can upload the exact table.
+pub const FRAC: [u16; 256] = [
     0, 1, 3, 4, 6, 7, 9, 10, 11, 13, 14, 16, 17, 18, 20, 21, //
     22, 24, 25, 26, 28, 29, 30, 32, 33, 34, 36, 37, 38, 40, 41, 42, //
     44, 45, 46, 47, 49, 50, 51, 52, 54, 55, 56, 57, 59, 60, 61, 62, //

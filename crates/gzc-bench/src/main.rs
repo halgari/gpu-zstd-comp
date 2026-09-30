@@ -27,7 +27,8 @@ enum Command {
     Cpu(CpuArgs),
     /// CPU reference compressor (the algorithm the GPU mirrors).
     Ref(RefArgs),
-    /// Streaming GPU compressor (level-3 greedy parse on the GPU, frames written on the CPU).
+    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames on the GPU;
+    /// literals stay raw until the GPU does Huffman).
     Gpu(GpuArgs),
     /// Every engine (cpu-libzstd, cpu-ref, gpu) into one report.
     All(AllArgs),
@@ -88,8 +89,10 @@ struct GpuSweepArgs {
     /// Comma-separated number of batches in flight.
     #[arg(long, value_delimiter = ',', default_value = "3")]
     inflight: Vec<u32>,
-    /// Comma-separated number of CPU frame-writer threads.
-    #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
+    /// Comma-separated number of CPU frame-writer threads. The GPU emits finished frames, so a
+    /// writer only records (in a real tool: writes out) the bytes it is handed; 0 = the pipeline
+    /// thread does that itself, N > 0 = N threads fed through a bounded channel.
+    #[arg(long, value_delimiter = ',', default_value = "0")]
     writer_threads: Vec<usize>,
 }
 
@@ -203,7 +206,7 @@ fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &
     for &batch in &sweep.batch {
         for &inflight in &sweep.inflight {
             for &writers in &sweep.writer_threads {
-                let cfg = PipelineConfig { batch, inflight, params: GpuParams { depth: 1 } };
+                let cfg = PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false } };
                 eprintln!("running gpu lvl3-greedy b{batch} i{inflight} @ {writers} writer threads (verify={verify})...");
                 results.push(gpurun::run_gpu(corpus, &cfg, writers, verify)?);
             }
