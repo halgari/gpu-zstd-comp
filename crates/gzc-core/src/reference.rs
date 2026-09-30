@@ -5,9 +5,9 @@
 //! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
 use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
-use crate::hash::{compute_preds, hash_long, hash_short, hash_width, key};
+use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_width, key};
 use crate::lazy::{lazy_parse, lazy_parse_segmented};
-use crate::params::{cpu_supports, Hashes, MatchParams};
+use crate::params::{cpu_supports, Hashes, MatchParams, OPT_H3_DEPTH};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
 pub use crate::params::LVL3;
@@ -47,7 +47,8 @@ pub fn match_len_capped(block: &[u8], p: usize, q: usize, cap: usize) -> usize {
 
 /// The predecessor chains `find_best` walks, in walk order: for `Dfast`, the long-hash
 /// (8-byte) chain then the short-hash (5-byte) chain; for `Single`, one chain over
-/// `hash_width(.., min_match)`.
+/// `hash_width(.., min_match)`; for `Opt3`, the 4-byte chain (`hash_width(.., 4)`) then the
+/// 3-byte chain (`hash3`).
 /// Each chain links equal *keys*: the hash's top `hash_bits` bits (`hash::key`; all 16 bits for
 /// every chain preset).
 pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
@@ -61,7 +62,97 @@ pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
             let min_match = p.min_match;
             vec![compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, min_match), hb))]
         }
+        Hashes::Opt3 => vec![
+            compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, 4), hb)),
+            compute_preds(block, move |b: &[u8], pos: usize| key(hash3(b, pos), hb)),
+        ],
     }
+}
+
+/// One `find_cands` record: offset back from the position and capped length (`len == 0`: none).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cand {
+    pub offset: u32,
+    pub len: u32,
+}
+
+/// The two candidate words of a position (K2opt's output, 8 B per position):
+/// `w[0] = offA | lenA << 16 | lenB << 24`, `w[1] = offB`. All zero when there is no candidate.
+pub type CandWords = [u32; 2];
+
+/// Packs records `a` (nearest) and `b` (longest) into `CandWords`.
+pub fn pack_cands(a: Cand, b: Cand) -> CandWords {
+    debug_assert!(a.offset < 1 << 16 && b.offset < 1 << 16 && a.len < 256 && b.len < 256);
+    [a.offset | a.len << 16 | b.len << 24, b.offset]
+}
+
+/// Unpacks `CandWords` into `(A, B)`.
+pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
+    (Cand { offset: w[0] & 0xFFFF, len: (w[0] >> 16) & 0xFF }, Cand { offset: w[1] & 0xFFFF, len: w[0] >> 24 })
+}
+
+/// K2opt (m5-opt-design §2.1), the optimal parse's candidates: for every `p < PARSE_END`, walk
+/// chain 0 (`h4`) `params.depth` deep and chain 1 (`h3`) `OPT_H3_DEPTH` deep, merged by position
+/// nearest first (both chains are strictly decreasing; a position on both is visited once). Each
+/// visited `q` gets the capped length `c = match_len_capped(block, p, q, search_cap)`; a *record*
+/// is a `q` whose `c` strictly beats every earlier `c` and the floor 2 (so records start at
+/// length 3, and on equal lengths the nearer `q` wins). `A` = the first record (the nearest
+/// match of at least 3 bytes), `B` = the last (longest); with one record `B == A`. The walk may
+/// stop once `c`
+/// reaches `min(search_cap, BLOCK_SIZE - p)` (no later `q` can beat it). Lengths are capped: a
+/// stored 64 (`search_cap`) means "at least 64", extended by the parse. Positions `>= PARSE_END`
+/// are zero. Requires `Opt3` chains (`chains(block, params)`).
+///
+/// Fingerprint caveat (for GPU filters): an `h4`-chain entry whose first 4 bytes differ from
+/// `p`'s (a 16-bit hash collision) can still share 3 bytes and is then a valid 3-byte record, so
+/// a 4-byte fingerprint mismatch may skip the compare only once `best >= 3` (or when the first 3
+/// bytes differ too).
+pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<CandWords> {
+    assert_eq!(params.hashes, Hashes::Opt3, "find_cands: Opt3 chains only");
+    assert_eq!(chains.len(), 2);
+    let (h4, h3) = (&chains[0], &chains[1]);
+    let cap = params.search_cap as usize;
+    let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+    for p in 0..PARSE_END {
+        let max_c = cap.min(BLOCK_SIZE - p);
+        let (mut q4, mut n4) = (h4[p], params.depth);
+        let (mut q3, mut n3) = (h3[p], OPT_H3_DEPTH);
+        let mut best = 2usize;
+        let (mut a, mut b) = (Cand::default(), Cand::default());
+        loop {
+            // Next position of the merged walk: the larger live head; equal heads advance both.
+            let live4 = n4 > 0 && q4 != NO_POS;
+            let live3 = n3 > 0 && q3 != NO_POS;
+            let q = match (live4, live3) {
+                (false, false) => break,
+                (true, false) => q4,
+                (false, true) => q3,
+                (true, true) => q4.max(q3),
+            };
+            if live4 && q4 == q {
+                q4 = h4[q as usize];
+                n4 -= 1;
+            }
+            if live3 && q3 == q {
+                q3 = h3[q as usize];
+                n3 -= 1;
+            }
+            let qu = q as usize;
+            let c = match_len_capped(block, p, qu, cap);
+            if c > best {
+                best = c;
+                b = Cand { offset: (p - qu) as u32, len: c as u32 };
+                if a.len == 0 {
+                    a = b;
+                }
+                if c == max_c {
+                    break;
+                }
+            }
+        }
+        out[p] = pack_cands(a, b);
+    }
+    out
 }
 
 /// `find_best` over the bucket-sorted candidate array (`hash::bucket_sort` of the Single chain's
@@ -141,8 +232,10 @@ pub fn find_best(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec
 
 /// Parse a block from its best matches: the greedy parse for `lazy == 0`, otherwise the
 /// libzstd lazy/lazy2 port (`lazy::lazy_parse`, or `lazy::lazy_parse_segmented` with
-/// `segment_log2 > 0`).
+/// `segment_log2 > 0`). The optimal parse (`p.opt`) takes `find_cands` words instead: see
+/// `parse_cands`; `compress_block` dispatches between the two.
 pub fn parse(block: &[u8], best: &[Match], p: &MatchParams) -> BlockOutput {
+    assert!(p.opt.is_none(), "reference::parse: opt params parse find_cands words (parse_cands)");
     if p.lazy == 0 {
         greedy_parse(block, best, p)
     } else if p.segment_log2 > 0 {
@@ -200,7 +293,13 @@ pub fn greedy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> Block
     BlockOutput { sequences, literals }
 }
 
-/// Compress one full-size block: compute the hash chains, find best matches, parse.
+/// The optimal parse (`opt::parse`) of a block from its `find_cands` words. `p.opt` must be set.
+pub fn parse_cands(block: &[u8], cands: &[CandWords], p: &MatchParams) -> BlockOutput {
+    crate::opt::parse(block, cands, p)
+}
+
+/// Compress one full-size block: compute the hash chains, find best matches (or the optimal
+/// parse's candidates), parse.
 /// Panics if `params` is invalid or not implemented on the CPU yet (`params::cpu_supports`).
 pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     assert_eq!(block.len(), BLOCK_SIZE);
@@ -209,6 +308,9 @@ pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     }
     assert!(cpu_supports(&params), "reference::compress_block: {params:?} is not implemented yet on cpu");
     let chains = chains(block, &params);
+    if params.opt.is_some() {
+        return parse_cands(block, &find_cands(block, &chains, &params), &params);
+    }
     let best = find_best(block, &chains, &params);
     parse(block, &best, &params)
 }
@@ -372,6 +474,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `find_cands` by its definition: the union of the two chains' first `depth` / 4 entries,
+    /// sorted nearest first, filtered by "capped length strictly above the best so far, from 3".
+    fn find_cands_by_definition(block: &[u8], params: &MatchParams) -> Vec<CandWords> {
+        let ch = chains(block, params);
+        let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+        for (p, w) in out.iter_mut().enumerate().take(PARSE_END) {
+            let mut v = Vec::new();
+            for (c, d) in [(&ch[0], params.depth), (&ch[1], OPT_H3_DEPTH)] {
+                let mut q = c[p];
+                for _ in 0..d {
+                    if q == NO_POS {
+                        break;
+                    }
+                    v.push(q);
+                    q = c[q as usize];
+                }
+            }
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            v.dedup();
+            let mut recs = Vec::new();
+            let mut best = 2;
+            for q in v {
+                let c = match_len_capped(block, p, q as usize, params.search_cap as usize);
+                if c > best {
+                    best = c;
+                    recs.push(Cand { offset: (p - q as usize) as u32, len: c as u32 });
+                }
+            }
+            if let (Some(&a), Some(&b)) = (recs.first(), recs.last()) {
+                *w = pack_cands(a, b);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn find_cands_matches_its_definition() {
+        // OPT16 (and its depth variants) only validate at blocks of at most 64 KiB.
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
+        use crate::params::OPT16;
+        for params in [OPT16, MatchParams { depth: 3, ..OPT16 }, MatchParams { depth: 64, ..OPT16 }] {
+            for (name, bytes) in synth::test_cases() {
+                for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                    let got = find_cands(&blk.data, &chains(&blk.data, &params), &params);
+                    let want = find_cands_by_definition(&blk.data, &params);
+                    assert!(got == want, "{name} block {i} depth {}: find_cands differs from its definition", params.depth);
+                    for (p, &w) in got.iter().enumerate() {
+                        let (a, b) = unpack_cands(w);
+                        assert_eq!(a.len == 0, b.len == 0, "p={p}");
+                        if a.len > 0 {
+                            assert!(a.len >= 3 && a.len <= b.len && b.len <= 64, "p={p} {a:?} {b:?}");
+                            assert!(a.offset <= b.offset || a == b, "p={p}: A must be the nearer record");
+                            for c in [a, b] {
+                                let l = match_len_capped(&blk.data, p, p - c.offset as usize, 64) as u32;
+                                assert_eq!(l, c.len, "p={p} {c:?} is not a real (capped) match");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// K2opt's record rules on one position of a random block: the h3-only neighbour (3 bytes)
+    /// is A, a 4-byte h4/h3 match then a 10-byte one are records, a farther 10-byte tie is not;
+    /// B is the nearer 10-byte match. A 100-byte match is stored capped at 64.
+    #[test]
+    fn find_cands_records_nearest_then_longest() {
+        use crate::params::OPT16;
+        let mut block = synth::random(77, BLOCK_SIZE);
+        let p = 5000;
+        let put = |block: &mut Vec<u8>, q: usize, len: usize| {
+            for i in 0..len {
+                block[q + i] = block[p + i];
+            }
+            block[q + len] = block[p + len] ^ 0xFF;
+        };
+        put(&mut block, 4990, 3);
+        put(&mut block, 4900, 4);
+        put(&mut block, 4000, 10);
+        put(&mut block, 3000, 10);
+        let c = find_cands(&block, &chains(&block, &OPT16), &OPT16);
+        assert_eq!(unpack_cands(c[p]), (Cand { offset: 10, len: 3 }, Cand { offset: 1000, len: 10 }));
+        let p2 = 9000;
+        for i in 0..100 {
+            block[p2 + i] = block[p2 - 700 + i];
+        }
+        let c = find_cands(&block, &chains(&block, &OPT16), &OPT16);
+        let (a, b) = unpack_cands(c[p2]);
+        assert_eq!(b, Cand { offset: 700, len: 64 });
+        assert_eq!(unpack_cands(pack_cands(a, b)), (a, b));
     }
 
     /// xxh64 of the concatenated lvl3 frames, captured on the unmodified M3 code (ddeee75).

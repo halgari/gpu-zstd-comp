@@ -249,7 +249,7 @@ mod tests {
 
     fn k3(ctx: &GpuContext, k: &Kernels, s: &Set) -> wgpu::CommandBuffer {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        k.record_parse(ctx, &mut enc, &s.bufs, s.n, None);
+        k.record_parse(ctx, &mut enc, &s.bufs, s.n, None).unwrap();
         enc.finish()
     }
 
@@ -286,7 +286,7 @@ mod tests {
             beginning_of_pass_write_index: Some(0),
             end_of_pass_write_index: Some(1),
         };
-        k.record_parse(ctx, &mut enc, &s.bufs, s.n, Some(w));
+        k.record_parse(ctx, &mut enc, &s.bufs, s.n, Some(w)).unwrap();
         enc.resolve_query_set(&t.set, 0..2, &t.resolve, 0);
         enc.finish()
     }
@@ -387,7 +387,7 @@ mod tests {
             }));
             t_single.push(time(&mut || {
                 let mut enc = main.device.create_command_encoder(&Default::default());
-                km.record_parse(main, &mut enc, &a.bufs, a.n, None);
+                km.record_parse(main, &mut enc, &a.bufs, a.n, None).unwrap();
                 km.record_best(main, &mut enc, &bm.bufs, bm.n, None);
                 main.queue.submit([enc.finish()]);
                 wait(main);

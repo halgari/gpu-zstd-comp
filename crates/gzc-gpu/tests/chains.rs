@@ -5,11 +5,11 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS};
 use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
-use gzc_core::params::{Hashes, LVL3, LVL9, MatchParams, RUNG1};
+use gzc_core::params::{Hashes, LVL3, LVL9, MatchParams, OPT16, RUNG1};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
 use gzc_gpu::chains::{
-    ChainsKernel, ChainsOptions, PRED_POS, gpu_preds, gpu_preds_with, head_bytes, pred_bytes, pred_fp, pred_of_word,
+    ChainsKernel, ChainsOptions, PRED_POS, chain_fp, gpu_preds, gpu_preds_with, head_bytes, pred_bytes, pred_of_word,
 };
 use gzc_gpu::context::{GpuContext, pack_blocks};
 
@@ -110,6 +110,28 @@ fn k1_single_hash_preds_match_cpu() {
     }
 }
 
+/// The Opt3 chains (optimal-parse presets): the 4-byte chain, then zstd's 3-byte hash3 chain.
+#[test]
+fn k1_opt3_preds_match_cpu() {
+    // opt16 only implements at blocks of at most 64 KiB.
+    if gzc_core::config::LOG2_BLOCK > 16 {
+        return;
+    }
+    use gzc_core::hash::hash3;
+    let blocks = all_blocks();
+    let block = &blocks[0].1;
+    assert_eq!(
+        chains(block, &OPT16),
+        vec![compute_preds(block, |b: &[u8], p: usize| hash_width(b, p, 4)), compute_preds(block, hash3)]
+    );
+    for ctx in contexts() {
+        check(&ctx, &blocks, &OPT16);
+        for b in blocks.iter().step_by(5) {
+            check(&ctx, std::slice::from_ref(b), &OPT16);
+        }
+    }
+}
+
 /// The context picks the kernel: the subgroup one exactly when the device has subgroups.
 #[test]
 fn k1_kernel_follows_context() {
@@ -187,9 +209,10 @@ fn k1_two_contexts_interleaved() {
     }
 }
 
-/// K1's raw pred words: the predecessor (PRED_POS for none) in bits 0..17 and `pred_fp` of the
-/// word's own position above, for every hashed position; the unhashed tail holds "none" and no
-/// fingerprint. Both kernels, Dfast (both chains carry the position's fingerprint) and Single.
+/// K1's raw pred words: the predecessor (PRED_POS for none) in bits 0..17 and the fingerprint
+/// (`chain_fp`: `pred_fp`, or `pred_fp3` on the Opt3 h3 chain) of the word's own position above,
+/// for every hashed position; the unhashed tail holds "none" and no fingerprint. Both kernels,
+/// Dfast (both chains carry the position's fingerprint), Single and Opt3.
 #[test]
 fn k1_pred_words_carry_fingerprints() {
     let blocks = all_blocks();
@@ -199,7 +222,11 @@ fn k1_pred_words_carry_fingerprints() {
     for ctx in contexts() {
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-        for params in [LVL3, LVL9] {
+        for params in [LVL3, LVL9, OPT16] {
+            // opt16 only implements at blocks of at most 64 KiB.
+            if params.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
             let kernel = ChainsKernel::new(&ctx, &params).unwrap();
             let nh = kernel.n_hashes() as usize;
             let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);
@@ -211,7 +238,7 @@ fn k1_pred_words_carry_fingerprints() {
                     let got = &words[(b * nh + c) * BLOCK_SIZE..][..BLOCK_SIZE];
                     for p in 0..BLOCK_SIZE {
                         let w = got[p];
-                        let expect = if p < HASHED_POSITIONS { pred_fp(block, p) } else { 0 };
+                        let expect = if p < HASHED_POSITIONS { chain_fp(&params, c, block, p) } else { 0 };
                         let what = format!("sg={} {params:?} {name} chain {c} p {p}: word {w:#x}", kernel.uses_subgroups());
                         assert_eq!(w & !PRED_POS, expect, "{what}: fingerprint");
                         assert_eq!(pred_of_word(w), want[p], "{what}: predecessor");

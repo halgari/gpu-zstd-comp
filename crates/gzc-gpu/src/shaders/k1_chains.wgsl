@@ -1,7 +1,8 @@
 // K1 fallback (no subgroups; see k1_chains_sg.wgsl): builds the hash-chain predecessor arrays K2
 // walks (== gzc_core::reference::chains). A task is one chain t = b*N_HASHES + chain: with
-// N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with N_HASHES == 1 (Single)
-// chain 0 is hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected MatchParams
+// N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with OPT3 (Opt3 params,
+// also N_HASHES == 2) chain 0 is hash_width(4) and chain 1 hash3, whose words carry pred_fp3
+// instead of pred_fp; with N_HASHES == 1 (Single) chain 0 is hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected MatchParams
 // (`context::params_wgsl`); the chains link equal keys, the hash's top MatchParams::hash_bits bits
 // (hash >> KEY_SHIFT, `chains::finder_wgsl`). pred[t*BLOCK_SIZE + p] = most recent q < p with
 // key(q) == key(p), else none (== gzc_core compute_preds), stored as pred words with p's fingerprint (common.wgsl
@@ -49,6 +50,8 @@ fn main(
             if (p < HASHED_POSITIONS) {
                 if (N_HASHES == 1u) {
                     h = hash_width(base, p, MIN_MATCH) >> KEY_SHIFT;
+                } else if (OPT3) {
+                    h = select(hash3(base, p), hash_width(base, p, 4u), chain == 0u) >> KEY_SHIFT;
                 } else if (chain == 0u) {
                     h = hash_long(base, p) >> KEY_SHIFT;
                 } else {
@@ -87,7 +90,10 @@ fn main(
                     let hv = head[hbase + hk];
                     pr = select(hv - 1u, NO_POS, hv == 0u);
                 }
-                pred_out[pbase + pos] = pred_word(pr, pred_fp(load_u32_at(base, pos), load_u32_at(base, pos + 4u)));
+                let lo = load_u32_at(base, pos);
+                var fp = pred_fp(lo, load_u32_at(base, pos + 4u));
+                if (OPT3 && chain == 1u) { fp = pred_fp3(lo); }
+                pred_out[pbase + pos] = pred_word(pr, fp);
             }
             storageBarrier();
             workgroupBarrier();

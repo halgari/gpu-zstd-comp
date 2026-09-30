@@ -8,6 +8,40 @@ pub enum Hashes {
     Dfast,
     /// One chain over a hash of `min_match` bytes.
     Single,
+    /// The optimal-parse candidate chains (M5): a 4-byte hash chain (`hash_width(.., 4)`) walked
+    /// `depth` deep, and a 3-byte hash chain (`hash::hash3`) walked `OPT_H3_DEPTH` deep, merged
+    /// nearest-first (`reference::find_cands`). Requires `opt`.
+    Opt3,
+}
+
+/// Depth of the 3-byte hash chain walked by `Hashes::Opt3` (m5-opt-design §2.1).
+pub const OPT_H3_DEPTH: u32 = 4;
+
+/// How the optimal parse prices its first pass (m5-opt-design §2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seed {
+    /// zstd's first-block statistics (`ZSTD_rescaleFreqs`): literal counts `(c > 0) + (c >> 8)`
+    /// over the block, the baseline LL/ML/OF tables.
+    BlockInit,
+    /// The constant LL/ML/OF prior (`codes::OPT_PRIOR_*`) and the histogram of the bytes no
+    /// candidate covers ("cover literals", `opt::cover_literals`).
+    Prior,
+}
+
+/// Optimal-parse settings (M5, `opt` module). The parse is `passes` cheap DP passes (optLevel-0
+/// control flow) each re-pricing the next from its own output, then one final pass at `level`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptParams {
+    /// zstd optLevel of the final pass: 0 (btopt control flow) or 2 (btultra).
+    pub level: u8,
+    /// zstd `targetLength` (`sufficient_len`): 8..=32. Longer matches are committed at once.
+    pub target_length: u32,
+    /// Cheap intermediate passes before the final one (0..=7).
+    pub passes: u8,
+    /// Prices of the first pass.
+    pub seed: Seed,
+    /// Candidate records per position from `find_cands` (only 2 is implemented: A and B).
+    pub k: u8,
 }
 
 /// Match-finder and parse tuning.
@@ -30,15 +64,28 @@ pub struct MatchParams {
     /// 0: the lazy parse runs over the whole block. Otherwise log2 of the parse segment
     /// (`lazy::lazy_parse_segmented`): segments of `1 << segment_log2` bytes are parsed
     /// independently (empty rep state, matches clamped to the segment, no skip acceleration),
-    /// then the offsets are re-encoded with the block's true rep history. Needs `lazy > 0`.
+    /// then the offsets are re-encoded with the block's true rep history. Needs `lazy > 0`, or
+    /// `opt` (whose DP runs per segment the same way).
     pub segment_log2: u32,
+    /// `Some`: the optimal parse (`opt::parse`) over `find_cands` candidates instead of
+    /// `find_best` + greedy/lazy. `None` for every pre-M5 preset.
+    pub opt: Option<OptParams>,
 }
 
 impl MatchParams {
     /// Ok when every field is in its supported range: min_match 4..=8, depth 1..=64,
     /// lazy 0..=2, search_cap 8..=256, hash_bits 11..=16, and Dfast only with min_match 5.
+    /// With `opt` (and only then): hashes `Opt3`, min_match 3, lazy 0, search_cap 64, hash_bits
+    /// 16, segment_log2 12, blocks of 16..64 KiB (offsets fit 16 bits), level 0 or 2,
+    /// target_length 8..=32, passes 0..=7, k 2.
     pub fn validate(&self) -> Result<(), String> {
-        let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits, segment_log2 } = *self;
+        let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits, segment_log2, opt } = *self;
+        if let Some(o) = opt {
+            return validate_opt(self, &o);
+        }
+        if hashes == Hashes::Opt3 {
+            return Err("Opt3 hashes need opt".to_string());
+        }
         if !(4..=8).contains(&min_match) {
             return Err(format!("min_match {min_match} not in 4..=8"));
         }
@@ -63,31 +110,55 @@ impl MatchParams {
         Ok(())
     }
 
-    /// Number of hash chains: Dfast 2, Single 1.
+    /// Number of hash chains: Dfast 2, Single 1, Opt3 2 (h4, h3).
     pub fn n_hashes(&self) -> u32 {
         match self.hashes {
             Hashes::Dfast => 2,
             Hashes::Single => 1,
+            Hashes::Opt3 => 2,
         }
     }
 
     /// Shortest sequence the parse can emit (bounds the sequence count per block): `min_match`
     /// for the greedy parse; 4 for lazy/lazy2, whose repcode matches (zstd's `MEM_read32`
-    /// checks) need only 4 bytes whatever `min_match` is.
+    /// checks) need only 4 bytes whatever `min_match` is; 3 for the optimal parse.
     pub fn min_seq_len(&self) -> u32 {
-        if self.lazy > 0 { 4 } else { self.min_match }
+        if self.opt.is_some() {
+            3
+        } else if self.lazy > 0 {
+            4
+        } else {
+            self.min_match
+        }
     }
+}
+
+/// `validate` for `opt` params (see there).
+fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
+    let want = |ok: bool, what: String| if ok { Ok(()) } else { Err(what) };
+    want(p.hashes == Hashes::Opt3, format!("opt needs Opt3 hashes, got {:?}", p.hashes))?;
+    want(p.min_match == 3, format!("opt needs min_match 3, got {}", p.min_match))?;
+    want((1..=64).contains(&p.depth), format!("depth {} not in 1..=64", p.depth))?;
+    want(p.lazy == 0, format!("opt needs lazy 0, got {}", p.lazy))?;
+    want(p.search_cap == 64, format!("opt needs search_cap 64, got {}", p.search_cap))?;
+    want(p.hash_bits == HASH_BITS, format!("opt needs hash_bits {HASH_BITS}, got {}", p.hash_bits))?;
+    want(p.segment_log2 == 12, format!("opt needs segment_log2 12, got {}", p.segment_log2))?;
+    want((14..=16).contains(&LOG2_BLOCK), format!("opt needs 16..64 KiB blocks, built for 2^{LOG2_BLOCK}"))?;
+    want(o.level == 0 || o.level == 2, format!("opt level {} not 0 or 2", o.level))?;
+    want((8..=32).contains(&o.target_length), format!("opt target_length {} not in 8..=32", o.target_length))?;
+    want(o.passes <= 7, format!("opt passes {} not in 0..=7", o.passes))?;
+    want(o.k == 2, format!("opt k {} not 2", o.k))
 }
 
 /// Level-3 calibration (the M3 output, byte for byte): dfast chains, depth 1, greedy.
 pub const LVL3: MatchParams =
-    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
+    MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 /// Single 4-byte hash, depth 8, greedy (compare against libzstd L5).
 pub const RUNG1: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 /// Rung 1 with a lazy parse (compare against libzstd L6).
 pub const RUNG2: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 /// Single 4-byte hash, depth 32, lazy2 (compare against libzstd L9).
 ///
 /// Full-corpus ratios (`gzc-bench ref`, byte-identical to the GPU; `--ext dds,nif`) against
@@ -100,7 +171,7 @@ pub const RUNG2: MatchParams =
 /// | 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
 /// | 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | **1.35159** (below L9) |
 pub const LVL9: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0 };
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 
 /// lvl9 with the parse split into independent 4 KiB segments (speed-2 E1): same match finder,
 /// a parse that runs one GPU lane per segment. Validated >= libzstd L9 at 16, 32, 64 and 128 KiB
@@ -120,8 +191,36 @@ pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
 /// at `LVL9`).
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
+/// Optimal parse aimed at libzstd L16 (btultra, M5): `Opt3` candidates (h4 chain 32 deep + h3
+/// chain 4 deep, two records per position), the zstd optimal-parse DP per 4 KiB segment with
+/// exact rep history, prices seeded from zstd's block init, 3 cheap re-pricing passes, then an
+/// optLevel-2 final pass (m5-opt-design §3.1).
+///
+/// Full-corpus ratios (`gzc-bench ref`, `--ext dds,nif`) against libzstd L14 / L16 on the same
+/// blocks (docs/results/m5-log.md):
+///
+/// | block | L14 | L16 | opt14 | opt16 |
+/// |---|---|---|---|---|
+/// | 16 KiB | 1.32606 | 1.32774 | 1.32765 | 1.32794 |
+/// | 32 KiB | 1.34797 | 1.35025 | 1.35105 | 1.35158 |
+/// | 64 KiB | 1.36827 | 1.37100 | 1.37064 | 1.37144 |
+pub const OPT16: MatchParams = MatchParams {
+    hashes: Hashes::Opt3,
+    min_match: 3,
+    depth: 32,
+    lazy: 0,
+    search_cap: 64,
+    hash_bits: HASH_BITS,
+    segment_log2: 12,
+    opt: Some(OptParams { level: 2, target_length: 32, passes: 3, seed: Seed::BlockInit, k: 2 }),
+};
+/// `opt16`'s candidates and DP aimed at libzstd L14: first pass priced from the corpus prior plus
+/// the block's cover literals, 1 cheap pass, then the optLevel-2 final pass.
+pub const OPT14: MatchParams =
+    MatchParams { opt: Some(OptParams { level: 2, target_length: 32, passes: 1, seed: Seed::Prior, k: 2 }), ..OPT16 };
+
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 8] = [
+pub const PRESETS: [(&str, MatchParams); 10] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
@@ -130,6 +229,8 @@ pub const PRESETS: [(&str, MatchParams); 8] = [
     ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
     ("lvl9s12d16seg", LVL9S12D16SEG),
+    ("opt14", OPT14),
+    ("opt16", OPT16),
 ];
 
 /// The preset called `name`; an unknown name is an error listing the valid ones.
@@ -154,7 +255,7 @@ mod tests {
     #[test]
     fn presets_validate() {
         // The spec's preset table, verbatim.
-        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16, segment_log2: 0 };
+        let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16, segment_log2: 0, opt: None };
         assert_eq!(LVL3, m(Hashes::Dfast, 5, 1, 0));
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
         assert_eq!(RUNG2, m(Hashes::Single, 4, 8, 1));
@@ -164,9 +265,18 @@ mod tests {
         assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {
-            assert_eq!(p.validate(), Ok(()), "{name}");
+            // opt14/opt16 only validate at blocks of at most 64 KiB (`validate_opt`'s
+            // `LOG2_BLOCK` check); skip that assertion above that size.
+            if p.opt.is_none() || LOG2_BLOCK <= 16 {
+                assert_eq!(p.validate(), Ok(()), "{name}");
+            }
             assert_eq!(preset(name), Ok(p), "{name}");
         }
+        let opt = OptParams { level: 2, target_length: 32, passes: 3, seed: Seed::BlockInit, k: 2 };
+        let o16 = MatchParams { hashes: Hashes::Opt3, min_match: 3, depth: 32, lazy: 0, search_cap: 64, hash_bits: 16, segment_log2: 12, opt: Some(opt) };
+        assert_eq!(OPT16, o16);
+        assert_eq!(OPT14, MatchParams { opt: Some(OptParams { passes: 1, seed: Seed::Prior, ..opt }), ..o16 });
+        assert_eq!((OPT16.n_hashes(), OPT16.min_seq_len(), OPT14.min_seq_len()), (2, 3, 3));
         assert_eq!(LVL3.n_hashes(), 2);
         assert_eq!(LVL9.n_hashes(), 1);
         assert_eq!(LVL3.min_seq_len(), 5);
@@ -213,9 +323,49 @@ mod tests {
     }
 
     #[test]
+    fn validate_opt() {
+        // opt only validates at blocks of at most 64 KiB; above that every case here (including
+        // the "good" ones) is rejected by the `LOG2_BLOCK` check before its own field is checked.
+        if LOG2_BLOCK > 16 {
+            return;
+        }
+        let o = OPT16.opt.unwrap();
+        let bad = [
+            MatchParams { min_match: 4, ..OPT16 },
+            MatchParams { hashes: Hashes::Single, ..OPT16 },
+            MatchParams { lazy: 2, ..OPT16 },
+            MatchParams { search_cap: 32, ..OPT16 },
+            MatchParams { hash_bits: 12, ..OPT16 },
+            MatchParams { segment_log2: 11, ..OPT16 },
+            MatchParams { segment_log2: 0, ..OPT16 },
+            MatchParams { depth: 0, ..OPT16 },
+            MatchParams { opt: Some(OptParams { level: 1, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { target_length: 33, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { target_length: 7, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { passes: 8, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { k: 3, ..o }), ..OPT16 },
+            MatchParams { opt: None, ..OPT16 },
+            MatchParams { hashes: Hashes::Opt3, ..LVL9 },
+        ];
+        for p in bad {
+            assert!(p.validate().is_err(), "{p:?} accepted");
+        }
+        let good = [
+            MatchParams { depth: 1, ..OPT16 },
+            MatchParams { depth: 64, ..OPT14 },
+            MatchParams { opt: Some(OptParams { level: 0, target_length: 8, passes: 0, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { passes: 7, seed: Seed::Prior, ..o }), ..OPT16 },
+        ];
+        for p in good {
+            assert_eq!(p.validate(), Ok(()), "{p:?}");
+        }
+    }
+
+    #[test]
     fn cpu_supports_all_presets() {
         for (name, p) in PRESETS {
-            assert!(cpu_supports(&p), "{name}");
+            // opt14/opt16 only validate (and so `cpu_supports`) at blocks of at most 64 KiB.
+            assert_eq!(cpu_supports(&p), p.opt.is_none() || LOG2_BLOCK <= 16, "{name}");
         }
         assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(cpu_supports(&MatchParams { min_match: 6, lazy: 1, ..RUNG2 }));

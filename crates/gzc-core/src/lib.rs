@@ -15,3 +15,4 @@ pub mod huffman;
 pub mod params;
 pub mod lazy;
 pub mod reference;
+pub mod opt;

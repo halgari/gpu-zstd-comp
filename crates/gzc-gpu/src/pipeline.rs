@@ -49,10 +49,11 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
-    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, data_bytes, decode_output,
-    frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks, scratch_bytes, seqs_bytes,
+    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, counts_bytes, data_bytes, decode_output,
+    frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks, max_seqs, scratch_bytes, seqs_bytes_for,
     slot_bytes,
 };
+use gzc_core::params::MatchParams;
 use crate::context::GpuContext;
 use crate::transfer::{Commands, RawBuffer, StreamingGuard, Timeline, TransferQueue};
 
@@ -145,8 +146,9 @@ const PIPELINE_QUERIES: u32 = KERNEL_QUERIES + 2;
 const STAGING_ALIGN: u64 = 256;
 
 /// Byte offsets of one slot's staging buffer, laid out for `cap` blocks. Parse path:
-/// `[counts][seqs][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the regions keep
-/// the GPU buffers' fixed per-block stride (packed frames need at most that much).
+/// `[counts][seqs][timestamps]` (`seqs` of `max_seqs(m)` per block); frame path:
+/// `[frame_len][frames][timestamps]`; the regions keep the GPU buffers' fixed per-block stride
+/// (packed frames need at most that much).
 #[derive(Clone, Copy)]
 struct StagingLayout {
     frames: bool,
@@ -157,7 +159,7 @@ struct StagingLayout {
 }
 
 impl StagingLayout {
-    fn new(cap: u32, frames: bool) -> Self {
+    fn new(cap: u32, frames: bool, m: &MatchParams) -> Self {
         // Every region starts STAGING_ALIGN-aligned: a GPU->staging copy to a destination that is
         // only 4-byte aligned runs several times slower (RTX 5090 / Vulkan: 6-10 ms more per
         // batch for the ~200 MB frames region), which showed up as a batch-size-dependent loss.
@@ -167,7 +169,7 @@ impl StagingLayout {
             (a, al(a + frames_bytes(cap)))
         } else {
             let a = al(counts_bytes(cap));
-            (a, al(a + seqs_bytes(cap)))
+            (a, al(a + seqs_bytes_for(cap, m)))
         };
         Self { frames, a, ts, size: ts + PIPELINE_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
     }
@@ -636,7 +638,7 @@ impl<'a> Pipeline<'a> {
         let frames = cfg.params.emit_frames;
         // Kernels::new validates the match params (`check_matching`) before any buffer is allocated.
         let kernels = Kernels::new(ctx, cfg.params)?;
-        let layout = StagingLayout::new(cfg.batch, frames);
+        let layout = StagingLayout::new(cfg.batch, frames, &m);
         let pack = (frames && ctx.pack_frames).then(|| PackKernel::new(ctx, &layout));
         let mut staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         if pack.is_some() {
@@ -708,13 +710,18 @@ impl<'a> Pipeline<'a> {
             } else {
                 None
             };
+            // `data_bytes`: the batch plus one trailing word, which `UploadSlot::submit_with` zeroes
+            // after the last submitted block (K3opt reads one word past each block; with the
+            // direct upload this buffer is `data`, with the copy upload it is copied along).
+            let upload = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pipeline.upload"),
+                size: data_bytes(cfg.batch),
+                usage: upload_usage,
+                mapped_at_creation: true,
+            });
+            assert_eq!(upload.size(), data_bytes(cfg.batch), "upload slots keep the trailing zero word");
             slots.push(Slot {
-                upload: ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("pipeline.upload"),
-                    size: data_bytes(cfg.batch),
-                    usage: upload_usage,
-                    mapped_at_creation: true,
-                }),
+                upload,
                 upload_mapped: None,
                 upload_unmapped: false,
                 upload_submission: None,
@@ -774,10 +781,12 @@ impl<'a> Pipeline<'a> {
         let s = &self.bufs;
         // Direct upload: `data` is a slot's upload buffer, counted with the slots.
         let data = if self.direct { 0 } else { s.data.size() };
+        let k3opt = s.opt.as_ref().map_or(0, |o| o.prices.size() + o.scratch.size());
         let shared = data
             + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| b.size()).sum::<u64>()
             + opt(&s.frames)
-            + opt(&s.frame_len);
+            + opt(&s.frame_len)
+            + k3opt;
         let per_slot: u64 = self.slots.iter().map(|slot| slot.upload.size() + slot.staging.size()).sum();
         // Transfer readback: frames / frame_len are imports of `Xfer`'s buffers (same sizes).
         shared + per_slot + self.kernels.own_buffer_bytes()
@@ -790,13 +799,14 @@ impl<'a> Pipeline<'a> {
         anyhow::ensure!(!self.layout.frames, "pipeline built with emit_frames: use run_frames");
         check_blocks(blocks)?;
         let layout = self.layout;
+        let max = max_seqs(&self.cfg.params.matching);
         let handler = move |lease: Lease, first: usize, n: u32, _tag: u64| -> anyhow::Result<()> {
             let words: &[u32] = bytemuck::cast_slice(lease.bytes());
-            let seq_stride = 3 * MAX_SEQS as usize;
+            let seq_stride = 3 * max as usize;
             for b in 0..n as usize {
                 let (n_seq, n_lit) = (words[2 * b], words[2 * b + 1]);
                 anyhow::ensure!(
-                    n_seq <= MAX_SEQS && n_lit as usize <= BLOCK_SIZE,
+                    n_seq <= max && n_lit as usize <= BLOCK_SIZE,
                     "block {}: bad counts ({n_seq}, {n_lit})",
                     first + b
                 );
@@ -1047,7 +1057,7 @@ impl<'a> Pipeline<'a> {
                 x.next_seq += 1;
                 // K1–K3, then K5/K4 in a second submission that waits for the previous batch's
                 // readback (it overwrites `frames`) and signals `k_done`.
-                self.kernels.record_front(ctx, &mut enc, bufs, n, queries);
+                self.kernels.record_front(ctx, &mut enc, bufs, n, queries)?;
                 // Through `submit_wgpu` too (nothing staged), so it holds the same lock as the
                 // second submission and can never pick up semaphores staged for it.
                 // SAFETY: nothing is staged.
@@ -1080,7 +1090,7 @@ impl<'a> Pipeline<'a> {
             (None, Staging::Wgpu(staging)) => {
                 // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4),
                 // so no kernel processes the stale blocks of a partial batch.
-                self.kernels.record_timed(ctx, &mut enc, bufs, n, queries);
+                self.kernels.record_timed(ctx, &mut enc, bufs, n, queries)?;
                 if let Some(pack) = &self.pack {
                     pack.record(ctx, &mut enc, bufs, n, staging);
                 } else if layout.frames {
@@ -1089,7 +1099,7 @@ impl<'a> Pipeline<'a> {
                     enc.copy_buffer_to_buffer(frames, 0, staging, layout.a, frames_bytes(n));
                 } else {
                     enc.copy_buffer_to_buffer(&bufs.counts, 0, staging, 0, counts_bytes(n));
-                    enc.copy_buffer_to_buffer(&bufs.seqs, 0, staging, layout.a, seqs_bytes(n));
+                    enc.copy_buffer_to_buffer(&bufs.seqs, 0, staging, layout.a, seqs_bytes_for(n, &self.cfg.params.matching));
                 }
                 marker(&mut enc, n_queries + 1);
                 if let Some(q) = &slot.queries {
@@ -1640,14 +1650,15 @@ impl ErrorScopes {
 
 /// Bytes a slot owns: its upload buffer and its staging buffer (both mappable; counted although
 /// drivers may place them in host memory).
-fn per_slot_bytes(batch: u32, frames: bool) -> u64 {
-    data_bytes(batch) + StagingLayout::new(batch, frames).size
+fn per_slot_bytes(batch: u32, frames: bool, m: &MatchParams) -> u64 {
+    data_bytes(batch) + StagingLayout::new(batch, frames, m).size
 }
 
 /// Device memory a `Pipeline` for `cfg` allocates: the shared buffers once (the scratch buffers,
 /// their hash chain buffers sized by `cfg.params.matching`: one chain for single-hash presets, two
-/// for Dfast; plus `data` and, on the frame path, `frames` and `frame_len`), per slot its upload
-/// and staging buffers, plus K4's constant tables. K5 has no buffers of its own. Uploads go
+/// for Dfast and Opt3; the optimal parse's 8 B per position of candidates and of trace, its
+/// larger `seqs` and K3opt's prices and scratch; plus `data` and, on the frame path, `frames` and
+/// `frame_len`), per slot its upload and staging buffers, plus K4's constant tables. K5 has no buffers of its own. Uploads go
 /// through the persistent upload buffers only, so no transient staging adds to this. Timestamp
 /// query sets are not counted.
 /// This is the copy-upload footprint, an upper bound for any context (`vram_bytes_with`).
@@ -1661,7 +1672,7 @@ pub fn vram_bytes_with(cfg: &PipelineConfig, direct_upload: bool) -> u64 {
     let frames = cfg.params.emit_frames;
     scratch_bytes(cfg.batch, &cfg.params.matching) + slot_bytes(cfg.batch, frames)
         - if direct_upload { data_bytes(cfg.batch) } else { 0 }
-        + cfg.inflight as u64 * per_slot_bytes(cfg.batch, frames)
+        + cfg.inflight as u64 * per_slot_bytes(cfg.batch, frames, &cfg.params.matching)
         + if frames { k4_tables_bytes() } else { 0 }
 }
 
@@ -1694,7 +1705,7 @@ mod tests {
     use crate::chains::{head_bytes, pred_bytes};
     use gzc_core::block::chunk_file;
     use gzc_core::frame::write_frame;
-    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, RUNG1};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
@@ -1793,9 +1804,9 @@ mod tests {
     fn staging_regions_are_aligned() {
         for cap in [1, 7, 1365, 1535, 1890] {
             for frames in [true, false] {
-                let l = StagingLayout::new(cap, frames);
+                let l = StagingLayout::new(cap, frames, &LVL3);
                 assert!([l.a, l.ts].iter().all(|x| x % STAGING_ALIGN == 0), "cap {cap} frames {frames}");
-                let end = l.a + if frames { frames_bytes(cap) } else { seqs_bytes(cap) };
+                let end = l.a + if frames { frames_bytes(cap) } else { seqs_bytes_for(cap, &LVL3) };
                 assert!(l.a >= if frames { frame_len_bytes(cap) } else { counts_bytes(cap) } && end <= l.ts);
             }
         }
@@ -1811,7 +1822,7 @@ mod tests {
         let per_slot = vram_bytes(&frames(100, 2)) - one;
         assert_eq!(vram_bytes(&frames(100, 4)), one + 3 * per_slot);
         // A slot owns only its upload and staging buffers; data, frames and frame_len are shared.
-        assert_eq!(per_slot, data_bytes(100) + StagingLayout::new(100, true).size);
+        assert_eq!(per_slot, data_bytes(100) + StagingLayout::new(100, true, &LVL3).size);
         assert_eq!(one, scratch_bytes(100, &LVL3) + slot_bytes(100, true) + per_slot + k4_tables_bytes());
         // The parse path reads back the fixed-stride seqs instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
@@ -1838,11 +1849,17 @@ mod tests {
     }
 
     /// `vram_bytes` equals the bytes of every buffer a `Pipeline` actually creates (shared scratch
-    /// once), per preset: single-hash presets allocate one chain's head/pred.
+    /// once), per preset: single-hash presets allocate one chain's head/pred; the optimal parse
+    /// adds its second candidate word, the 8 B-per-position trace (in `pred`), the larger `seqs`
+    /// and K3opt's prices and scratch.
     #[test]
     fn vram_matches_params() {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-        for matching in [LVL3, RUNG1, LVL9] {
+        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14] {
+            // opt14/opt16 only implement at blocks of at most 64 KiB.
+            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg =
                     PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
@@ -1863,6 +1880,68 @@ mod tests {
         };
         // One chain instead of two: head and pred halve.
         assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + pred_bytes(10, 1));
+        // opt14/opt16 only implement at blocks of at most 64 KiB.
+        if gzc_core::config::LOG2_BLOCK <= 16 {
+            // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging
+            // only on the parse path), K3opt's prices and scratch.
+            let opt_extra = crate::compressor::best_bytes(10)
+                + crate::compressor::seqs_bytes_for(10, &OPT16)
+                - crate::compressor::seqs_bytes(10)
+                + crate::compressor::opt_bytes(10, &OPT16);
+            assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
+            assert_eq!(scratch(OPT14), scratch(OPT16));
+        }
+    }
+
+    /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4) through the streaming
+    /// pipeline in every upload/readback mode, over partial batches and reuse, equals the CPU
+    /// oracle's frames (which libzstd decodes); the parse path too. `allocated_bytes` equals
+    /// `vram_bytes` in every mode.
+    #[test]
+    fn opt_stream_every_mode_matches_cpu() {
+        // opt14/opt16 only implement at blocks of at most 64 KiB.
+        if gzc_core::config::LOG2_BLOCK > 16 {
+            return;
+        }
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = (0..50).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let modes = mode_contexts();
+        for matching in [OPT14, OPT16] {
+            let params = GpuParams { matching, emit_frames: true, huffman: true };
+            let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+            for (w, b) in want.iter().zip(&distinct) {
+                assert_eq!(zstd::bulk::decompress(w, BLOCK_SIZE).unwrap(), *b, "libzstd decodes the oracle's frame");
+            }
+            for (name, ctx) in &modes {
+                let pcfg = PipelineConfig { batch: 16, inflight: 3, params };
+                let mut pipe = Pipeline::new(ctx, &pcfg).unwrap();
+                assert_eq!(pipe.transfer_readback(), ctx.transfer.is_some(), "{name}");
+                assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&pcfg, ctx.direct_upload), "{name}");
+                for _ in 0..2 {
+                    let mut sink = CollectFrames(vec![None; blocks.len()]);
+                    let stats = pipe.run_frames(&blocks, &mut sink).unwrap();
+                    assert_eq!(stats.batches, 4, "{name}");
+                    for (i, got) in sink.0.into_iter().enumerate() {
+                        assert!(got.unwrap() == want[i % distinct.len()], "{name} {matching:?}: index {i}");
+                    }
+                    if ctx.timestamps {
+                        let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
+                        assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"]);
+                        assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{name}: {:?}", stats.kernel_ms);
+                    }
+                }
+            }
+            // The parse path: the `seqs` readback at MAX_SEQS_OPT per block.
+            let ctx = &modes[0].1;
+            let pcfg = PipelineConfig { batch: 7, inflight: 2, params: GpuParams { emit_frames: false, ..params } };
+            let mut pipe = Pipeline::new(ctx, &pcfg).unwrap();
+            assert_eq!(pipe.allocated_bytes(), vram_bytes_with(&pcfg, ctx.direct_upload));
+            let mut sink = Collect(vec![None; blocks.len()]);
+            pipe.run(&blocks, &mut sink).unwrap();
+            for (i, got) in sink.0.into_iter().enumerate() {
+                assert!(got.unwrap() == compress_block(blocks[i], matching), "parse path {matching:?}: index {i}");
+            }
+        }
     }
 
     #[test]
@@ -2095,7 +2174,18 @@ mod tests {
     #[test]
     fn stream_frames_zero_copy_every_mode() {
         let distinct = distinct_blocks();
-        let params = GpuParams { matching: LVL9S12SEG, emit_frames: true, huffman: true };
+        // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
+        // trailing zero word after partial batches of stale blocks). opt14 only implements at
+        // blocks of at most 64 KiB.
+        for matching in [LVL9S12SEG, OPT14] {
+            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
+            zero_copy_every_mode(&distinct, GpuParams { matching, emit_frames: true, huffman: true });
+        }
+    }
+
+    fn zero_copy_every_mode(distinct: &[Vec<u8>], params: GpuParams) {
         let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
         // Batch sizes per submission: full (16), and partial ones as a flush timer would send.
         let sizes = [16usize, 5, 16, 1, 16, 16, 9, 16, 16, 16, 3, 16];
