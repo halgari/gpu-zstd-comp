@@ -49,6 +49,56 @@ pub struct PipelineStats {
     pub wall_s: f64,
     /// Number of batches submitted.
     pub batches: u32,
+    /// Where the time outside the kernels goes, summed over all batches, in milliseconds (see
+    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (empty without them); the
+    /// `host_*` ones are wall time on the pipeline thread.
+    pub transfer_ms: Vec<(String, f64)>,
+}
+
+/// Names of `PipelineStats::transfer_ms`, in order:
+/// - `gpu_upload_copy`: upload -> data copy (from the batch's start marker to K1's begin).
+/// - `gpu_readback_copy`: output -> staging copies (from the last kernel's end to the end marker).
+/// - `gpu_idle`: gaps between one batch's end marker and the next batch's start marker.
+/// - `host_upload_wait`: waiting for a slot's upload buffer to be mapped again.
+/// - `host_upload_write`: writing the blocks into the mapped upload buffer, plus unmap.
+/// - `host_submit`: recording and submitting the batch, plus the map requests.
+/// - `host_wait`: blocked in `device.poll` for the oldest batch.
+/// - `host_deliver`: handing a completed batch to the sink.
+/// - `host_unmap`: unmapping the staging buffer.
+/// - `host_fill`: from the start to the first submission.
+/// - `host_drain`: from the last `device.poll` returning to the end.
+pub const TRANSFER_NAMES: [&str; 11] = [
+    "gpu_upload_copy",
+    "gpu_readback_copy",
+    "gpu_idle",
+    "host_upload_wait",
+    "host_upload_write",
+    "host_submit",
+    "host_wait",
+    "host_deliver",
+    "host_unmap",
+    "host_fill",
+    "host_drain",
+];
+
+/// Accumulators behind `PipelineStats::transfer_ms`: GPU ticks and host seconds.
+#[derive(Default)]
+struct Profile {
+    /// Kernel ticks, per `Kernels::names`.
+    ticks: Vec<u64>,
+    upload_copy: u64,
+    readback_copy: u64,
+    idle: u64,
+    /// End marker of the last batch finished (ticks), for `idle`.
+    last_end: Option<u64>,
+    upload_wait: f64,
+    upload_write: f64,
+    submit: f64,
+    wait: f64,
+    deliver: f64,
+    unmap: f64,
+    fill: f64,
+    drain: f64,
 }
 
 /// Receives each block's parse; called exactly once per index, in arbitrary order.
@@ -61,6 +111,10 @@ pub trait BlockSink {
 pub trait FrameSink {
     fn put(&mut self, index: usize, frame: &[u8]);
 }
+
+/// Timestamp queries per slot: the kernels' begin/end pairs, then a start and an end marker (see
+/// `Pipeline::submit`).
+const PIPELINE_QUERIES: u32 = KERNEL_QUERIES + 2;
 
 /// Alignment of each region of a slot's staging buffer (see `StagingLayout::new`).
 const STAGING_ALIGN: u64 = 256;
@@ -94,7 +148,7 @@ impl StagingLayout {
             let b = al(a + seqs_bytes(cap));
             (a, b, al(b + lits_bytes(cap)))
         };
-        Self { frames, a, b, ts, size: ts + KERNEL_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
+        Self { frames, a, b, ts, size: ts + PIPELINE_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
     }
 }
 
@@ -173,11 +227,11 @@ impl<'a> Pipeline<'a> {
                     let set = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
                         label: Some("pipeline.timestamps"),
                         ty: wgpu::QueryType::Timestamp,
-                        count: KERNEL_QUERIES,
+                        count: PIPELINE_QUERIES,
                     });
                     let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("pipeline.resolve"),
-                        size: KERNEL_QUERIES as u64 * wgpu::QUERY_SIZE as u64,
+                        size: PIPELINE_QUERIES as u64 * wgpu::QUERY_SIZE as u64,
                         usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     });
@@ -260,8 +314,8 @@ impl<'a> Pipeline<'a> {
         let scopes = ErrorScopes::push(self.ctx);
         let start = Instant::now();
         let names = self.kernels.names();
-        let mut ticks = vec![0u64; names.len()];
-        let result = self.stream(blocks, deliver, &mut ticks);
+        let mut prof = Profile { ticks: vec![0u64; names.len()], ..Default::default() };
+        let result = self.stream(blocks, deliver, &mut prof, start);
         let wall_s = start.elapsed().as_secs_f64();
         if result.is_err() {
             self.abandon();
@@ -269,32 +323,58 @@ impl<'a> Pipeline<'a> {
         scopes.pop()?;
         let batches = result?;
 
-        let kernel_ms = if self.ctx.timestamps {
+        let (kernel_ms, gpu_ms) = if self.ctx.timestamps {
             let period_ns = self.ctx.queue.get_timestamp_period() as f64;
-            names.iter().zip(ticks).map(|(name, t)| (name.to_string(), t as f64 * period_ns / 1e6)).collect()
+            let ms = |t: u64| t as f64 * period_ns / 1e6;
+            (
+                names.iter().zip(&prof.ticks).map(|(name, &t)| (name.to_string(), ms(t))).collect(),
+                vec![ms(prof.upload_copy), ms(prof.readback_copy), ms(prof.idle)],
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        Ok(PipelineStats { kernel_ms, wall_s, batches })
+        let host_ms = [
+            prof.upload_wait,
+            prof.upload_write,
+            prof.submit,
+            prof.wait,
+            prof.deliver,
+            prof.unmap,
+            prof.fill,
+            prof.drain,
+        ]
+        .map(|s| s * 1e3);
+        let transfer_ms = TRANSFER_NAMES[..3]
+            .iter()
+            .zip(gpu_ms)
+            .chain(TRANSFER_NAMES[3..].iter().zip(host_ms))
+            .map(|(n, ms)| (n.to_string(), ms))
+            .collect();
+        Ok(PipelineStats { kernel_ms, wall_s, batches, transfer_ms })
     }
 
-/// The submit / wait / deliver loop; returns the number of batches submitted.
+    /// The submit / wait / deliver loop; returns the number of batches submitted.
     fn stream(
         &mut self,
         blocks: &[&[u8]],
         deliver: &mut Deliver<'_>,
-        ticks: &mut [u64],
+        prof: &mut Profile,
+        start: Instant,
     ) -> anyhow::Result<u32> {
         let batch = self.cfg.batch as usize;
         let mut next = 0usize;
         let mut batches = 0u32;
+        let mut last_wait = start;
         // Busy slots, oldest submission first.
         let mut busy: VecDeque<usize> = VecDeque::new();
         loop {
             while next < blocks.len() {
                 let Some(i) = self.slots.iter().position(|s| s.job.is_none()) else { break };
                 let n = batch.min(blocks.len() - next);
-                self.submit(i, next, &blocks[next..next + n])?;
+                self.submit(i, next, &blocks[next..next + n], prof)?;
+                if batches == 0 {
+                    prof.fill = start.elapsed().as_secs_f64();
+                }
                 busy.push_back(i);
                 next += n;
                 batches += 1;
@@ -302,10 +382,13 @@ impl<'a> Pipeline<'a> {
             let Some(&oldest) = busy.front() else { break };
             // Every slot is busy (or nothing is left to submit): block on the oldest batch...
             let submission = self.slots[oldest].job.as_ref().unwrap().submission.clone();
+            let t = Instant::now();
             self.ctx
                 .device
                 .poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None })
                 .context("device poll")?;
+            last_wait = Instant::now();
+            prof.wait += (last_wait - t).as_secs_f64();
             // ...then drain it and every later batch that has also completed.
             let mut waited_for = true;
             while let Some(&i) = busy.front() {
@@ -314,21 +397,23 @@ impl<'a> Pipeline<'a> {
                     Err(mpsc::TryRecvError::Empty) if !waited_for => break,
                     Err(_) => anyhow::bail!("staging map callback not delivered after waiting for its submission"),
                 }
-                self.finish(i, deliver, ticks)?;
+                self.finish(i, deliver, prof)?;
                 busy.pop_front();
                 waited_for = false;
             }
         }
+        prof.drain = last_wait.elapsed().as_secs_f64();
         Ok(batches)
     }
 
     /// Uploads `blocks` into slot `i` and submits the kernels plus the staging copies.
     /// Uses the slot's persistent upload buffer rather than `queue.write_buffer`, which would
     /// allocate a fresh staging buffer per call that lives until the submission completes.
-    fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]]) -> anyhow::Result<()> {
+    fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]], prof: &mut Profile) -> anyhow::Result<()> {
         let (ctx, layout) = (self.ctx, self.layout);
         let slot = &mut self.slots[i];
         let n = blocks.len() as u32;
+        let t0 = Instant::now();
         if let Some(rx) = slot.upload_mapped.take() {
             // Its submission has completed (the slot is free), so the callback is normally in.
             let r = match rx.try_recv() {
@@ -340,6 +425,7 @@ impl<'a> Pipeline<'a> {
             };
             r.context("map upload buffer")?;
         }
+        let t1 = Instant::now();
         let bytes = n as usize * BLOCK_SIZE;
         {
             let mut view = slot.upload.get_mapped_range_mut(..bytes as u64 + 4).context("upload mapped range")?;
@@ -350,8 +436,25 @@ impl<'a> Pipeline<'a> {
             view.slice(bytes..bytes + 4).copy_from_slice(&[0u8; 4]);
         }
         slot.upload.unmap();
+        let t2 = Instant::now();
 
+        let n_queries = 2 * self.kernels.names().len() as u32;
+        // Start/end markers: empty passes whose timestamps (written at BOTTOM_OF_PIPE on Vulkan,
+        // i.e. once all earlier commands completed) bracket the batch's copies.
+        let marker = |enc: &mut wgpu::CommandEncoder, index: u32| {
+            if let Some((set, _)) = &slot.queries {
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("marker"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: set,
+                        beginning_of_pass_write_index: Some(index),
+                        end_of_pass_write_index: None,
+                    }),
+                });
+            }
+        };
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
+        marker(&mut enc, n_queries);
         enc.copy_buffer_to_buffer(&slot.upload, 0, &slot.bufs.data, 0, bytes as u64 + 4);
         // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4), so no
         // kernel processes the stale blocks of a partial batch.
@@ -365,8 +468,9 @@ impl<'a> Pipeline<'a> {
             enc.copy_buffer_to_buffer(&slot.bufs.seqs, 0, &slot.staging, layout.a, seqs_bytes(n));
             enc.copy_buffer_to_buffer(&slot.bufs.lits, 0, &slot.staging, layout.b, lits_bytes(n));
         }
+        marker(&mut enc, n_queries + 1);
         if let Some((set, resolve)) = &slot.queries {
-            let q = 2 * self.kernels.names().len() as u32;
+            let q = n_queries + 2;
             enc.resolve_query_set(set, 0..q, resolve, 0);
             enc.copy_buffer_to_buffer(resolve, 0, &slot.staging, layout.ts, q as u64 * wgpu::QUERY_SIZE as u64);
         }
@@ -382,36 +486,51 @@ impl<'a> Pipeline<'a> {
         });
         slot.upload_mapped = Some(upload_mapped);
         slot.job = Some(Job { first, n, submission, mapped });
+        let t3 = Instant::now();
+        prof.upload_wait += (t1 - t0).as_secs_f64();
+        prof.upload_write += (t2 - t1).as_secs_f64();
+        prof.submit += (t3 - t2).as_secs_f64();
         Ok(())
     }
 
-    /// Hands mapped slot `i` to `deliver`, adds its kernel ticks, unmaps and frees the slot.
-    fn finish(
-        &mut self,
-        i: usize,
-        deliver: &mut Deliver<'_>,
-        ticks: &mut [u64],
-    ) -> anyhow::Result<()> {
+    /// Hands mapped slot `i` to `deliver`, adds its timestamps to `prof`, unmaps and frees the slot.
+    fn finish(&mut self, i: usize, deliver: &mut Deliver<'_>, prof: &mut Profile) -> anyhow::Result<()> {
         let layout = self.layout;
+        // Query of the last kernel's end: K4 (6/7) on the frame path, K3 (4/5) on the parse path.
+        let last_kernel_end = if layout.frames { 7 } else { 5 };
         let slot = &mut self.slots[i];
         let job = slot.job.take().unwrap();
+        let t0 = Instant::now();
+        let mut t1 = t0;
         let result = (|| -> anyhow::Result<()> {
             let view = slot.staging.get_mapped_range(..).context("mapped range")?;
             deliver(job.first, job.n, &view[..])?;
+            t1 = Instant::now();
             if slot.queries.is_some() {
+                let nk = prof.ticks.len();
                 // Only 4-byte aligned in general (seqs_bytes(1) is not a multiple of 8).
                 let t = layout.ts as usize;
-                let stamps: Vec<u64> = view[t..t + ticks.len() * 16]
+                let stamps: Vec<u64> = view[t..t + (nk + 1) * 16]
                     .chunks_exact(8)
                     .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
                     .collect();
-                for (k, acc) in ticks.iter_mut().enumerate() {
+                for (k, acc) in prof.ticks.iter_mut().enumerate() {
                     *acc += stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
                 }
+                let (m0, m1) = (stamps[2 * nk], stamps[2 * nk + 1]);
+                prof.upload_copy += stamps[0].saturating_sub(m0);
+                prof.readback_copy += m1.saturating_sub(stamps[last_kernel_end]);
+                if let Some(end) = prof.last_end {
+                    prof.idle += m0.saturating_sub(end);
+                }
+                prof.last_end = Some(m1);
             }
             Ok(())
         })();
         slot.staging.unmap();
+        let t2 = Instant::now();
+        prof.deliver += (t1 - t0).as_secs_f64();
+        prof.unmap += (t2 - t1).as_secs_f64();
         result
     }
 

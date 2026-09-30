@@ -48,7 +48,9 @@ impl GpuContext {
             max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage,
             ..wgpu::Limits::default()
         };
-        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        // GZC_NO_TIMESTAMPS (anything but 0) leaves timestamp queries off, to time runs without them.
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            && !std::env::var("GZC_NO_TIMESTAMPS").is_ok_and(|v| v != "0");
         let mut required_features = wgpu::Features::empty();
         if timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
