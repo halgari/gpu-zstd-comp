@@ -357,3 +357,126 @@ over roughly in proportion, since K3 is the kernel least hurt by fewer SMs. K5's
 parallel across 256 threads per block and scales with bandwidth like the rest of K5; its share stays small. The
 VRAM saving is worth more on an 8 GB card: 128 KiB per block is 5 % more blocks per batch, or headroom for
 per-slot scratch.
+
+## S8 — K1/K2 second pass (branch of `speed` @ bc2d809; 468834a, 8d42f97, d153d8a, b4db3f5), 2026-09-30 03:15–04:40, load avg 0.8–3.3, runs gated on no other gzc process and an idle GPU ("c" = a run another agent's job overlapped anyway)
+
+### What bounds K2
+
+A CPU simulation of K2's walk over 513–2049 corpus blocks (lvl9) and GPU diagnostics, before any change:
+- Candidates: 3.68 per position. 22 % are hash collisions (len < 4), 61 % stop at 4..7 bytes, 15 % at 8..63, 2 % cap.
+- SIMT waste is large: a subgroup of 32 consecutive positions steps as long as its longest walk (16.1 steps against a
+  mean of 3.7; 5.7 of 32 lanes active at depth ≥ 16).
+- But K2's time follows the **number of candidates, not subgroup steps**. Capping the walk at depth d gives K2 0.85
+  (d0), 3.2 (d1), 4.5 (d2), 5.9 (d4), 7.4 (d8), 9.1 (d16) and 12.5 ms (d32). One extra `pred` load per candidate in the
+  *same* 32-byte sector costs +0.5 ms; one in *another* line costs +3.6–3.9 ms. So K2 is bound by the sectors it
+  pulls into the SMs: about 1 for `pred[q]` plus 1.23 for q's data per candidate.
+
+Consequently, the ideas from the dispatch that cut subgroup steps or add memory-level parallelism did not help
+(lvl9 b2431, pre-merge, base K2 12.56 ms/b):
+
+| K2 variant (byte-identical) | K2 ms/b | |
+|---|---:|---|
+| prefetch `pred[q]` before q's compare | 12.48 | no change |
+| third q word loaded only after the first 4 bytes match | 12.55 | no change |
+| two walks per invocation (p, p + 32), loads of both issued before either compare | 13.55 | slower |
+| per-workgroup work queue (atomic counter, 4096 positions per workgroup) | 14.97 | slower: init/steps no longer coalesce |
+| the same, static 4/16 positions per lane | 14.00 / 16.27 | slower |
+| two phases: 4 lockstep steps, then leftover walks compacted in workgroup memory | 23.1 | much slower (1 run) |
+
+### What changed (kept)
+
+- **Fingerprinted pred words** (468834a, 8d42f97). K1 (both kernels) stores `pred[p]` as a word: bits 0..17 hold the
+  predecessor (0x1FFFF = none), and bits 17..32 hold a fingerprint of p itself: 7 hash bits of bytes p..p+4 and
+  byte p+4 (common.wgsl `pred_fp`, `pred_word`). K2 loads q's word anyway, for the next candidate. It now compares
+  q's fingerprint with p's before touching q's data. The search result is the lexicographic max of (len, q) over the
+  visited candidates, or none below MIN_MATCH. So K2 skips q when:
+  - the lo bits differ: len < 4;
+  - or byte 4 differs (len ≤ 4) and MIN_MATCH > 4, best_len > 4, or best_len == 4 with q < best_q.
+
+  Skipped candidates still count toward DEPTH and can never be cap-length, so the walk and its early-out are unchanged.
+  58 % of lvl9 candidates are skipped (22 % collisions, 36.5 % byte-4 mismatches). The `pred` buffer and VRAM are
+  unchanged (u32 per position), so `--batch max` is unchanged. `ChainsKernel::run` decodes the words, and `run_words`
+  returns them raw.
+- **Next pred word loaded before the compare** (d153d8a). This is worth it only now that the compare depends on the
+  pred load: K2 10.67 → 9.99 ms/b in the step runs below.
+
+Rejected: a finer fingerprint (3 lo bits + byte 4 + a nibble of byte 5, which could skip another ~7 % of candidates)
+gave the same K2 time (10.70 against 10.67 ms/b).
+
+Step runs (not interleaved; lvl9 `--batch max` b2559, i3):
+
+| Step | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Sum ms/b |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| merged baseline bc2d809 | 3698.4 / 3666.6 / 3686.3 | 3686.3 | 16.08 | 13.17 | 30.80 | 9.77 | 4.58 | 74.39 |
+| + fingerprints | 3776.6 / 3772.6 / 3779.3 | 3776.6 | 15.85 | 10.67 | 30.82 | 9.84 | 4.71 | 71.88 |
+| + next pred word first | 2548.0c / 3838.7 / 3836.6 | 3836.6 | 15.90 | 9.99 | 30.89 | 9.61 | 4.66 | 71.05 |
+
+**Final, baseline and S8 binaries interleaved run by run** (i3):
+
+| Preset / batch | Build | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Sum ms/b |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| lvl9 max (b2559) | bc2d809 | 3696.5 / 3640.3 / 3664.6 | 3664.6 | 16.14 | 13.10 | 30.87 | 9.97 | 4.70 | 74.78 |
+| lvl9 max (b2559) | **S8** | 2199.4c / 3834.8 / 3851.6 | **3834.8 (+4.6 %)** | 15.88 | **9.84** | 30.88 | 9.74 | 4.60 | **70.95 (−5.1 %)** |
+| lvl9 b2431 | bc2d809 | 3585.9 / 3597.8 / 3616.9 | 3597.8 | 15.40 | 12.51 | 30.50 | 9.91 | 4.58 | 72.90 |
+| lvl9 b2431 | **S8** | 3764.7 / 3728.6 / 3762.1 | **3762.1 (+4.6 %)** | 15.19 | 9.44 | 30.52 | 9.58 | 4.58 | 69.30 (−4.9 %) |
+| rung1 max (b2559) | bc2d809 | 5288.9 / 5259.1 / 5229.6 | 5259.1 | 16.14 | 7.51 | 11.36 | 9.70 | 4.61 | 49.32 |
+| rung1 max (b2559) | **S8** | 5451.3 / 5450.7 / 5465.3 | **5451.3 (+3.7 %)** | 15.87 | 5.42 | 11.38 | 10.05 | 4.48 | 47.19 (−4.3 %) |
+
+K2 −25 % (lvl9) and −28 % (rung1). `--verify` lvl9 (S8): every block round-trips, 3627.5 MB/s. Compressed bytes equal
+the baseline (lvl9 4,792,885,250; rung1 4,834,508,359).
+
+**Kept** (lvl9 +4.6 % end-to-end, kernel sum −5 %).
+
+### K1: table groups, and where a tile's time goes (nothing kept)
+
+K1 is a persistent grid, so its time is (rounds = ⌈chains / groups⌉) × (time per round). A round takes ~0.8 ms while
+each SM holds at most one workgroup (≤ 160 groups on the 170-SM 5090), and ~0.95–1.1 ms beyond that. That is about
+1.6 µs per 256-position tile, latency-bound with 8 warps per SM.
+
+`GZC_K1_GROUPS` sweep, lvl9 `--batch max` (b2559, 2559 chains), final S8 tree, median of 3:
+
+| Groups | Rounds | K1 ms/b | E2E MB/s |
+|---:|---:|---:|---:|
+| 96 | 27 | 21.08 | 3588.9 |
+| **128 (default)** | 20 | 15.90 | 3828.2 |
+| 160 | 16 | 13.00 | 3957.0 |
+| 192 | 14 | 13.28 | 3939.8 |
+| 224 | 12 | 11.41 | 4044.5 |
+| 256 | 10 | 11.35 | 4049.6 |
+
+On the 5090, 224–256 groups is +5.6 % end-to-end over the 128 default, and 160 (40 MiB of tables) gets +3.4 % of that.
+The default stays at 128 (the controller's ruling for 32 MB-L2 cards). A 4060 (24 SMs, 32 MB L2) needs ≥ 4–6 workgroups
+per SM to hide the tile latency, i.e. 96–144 groups, and ≤ ~96–128 tables (24–32 MiB) to leave L2 room for the data
+and pred streams. So 96–128 is right there, to be measured.
+
+Ablations of the subgroup kernel (diagnostic builds, output wrong on purpose, self-test bypassed, 1 run each, lvl9
+b2431, K1 15.35 ms/b):
+
+| Removed | K1 ms/b |
+|---|---:|
+| device-scope fence per tile (`storageBarrier` → `workgroupBarrier`) | 13.61 |
+| the speculative `head` load | 13.97 |
+| the `head` store | 12.78 |
+| fence + load | 11.73 |
+| cross-chunk matching (8 × 5 vec4 of ballots per chunk-first lane) | 11.27 |
+| fence + load + store + matching | 6.75 |
+| + 15 of the 16 hash-bit ballots | 4.37 |
+
+Two restructurings from these, both byte-identical and both slower, so dropped:
+- Pipelined head loads: tile k + 1's hash and head load are issued in tile k, right after its fence. The first lane
+  of a hash also matches against the previous tile's published ballots. K1 went to 18.95 ms/b, because the extra
+  matching costs more than the hidden load. The store still sits right before the fence.
+- A per-tile uniqueness filter: two workgroup bitmaps (8192 slots, triple-buffered) let lanes whose hash is unique
+  in the tile skip the cross-chunk matching. K1 went to 17.09 ms/b: the shared-memory atomics cost more than the
+  matching they save on this corpus.
+
+Fusing K1 + K2 (ideas-sonnet 5) was not tried. K2 is bound by the sectors of `pred` and data it reads, and fusion
+still has to write and re-read `pred`. It would also run the whole K2 walk inside K1's 128 persistent workgroups,
+about 1/20 of K2's parallelism. That is not a simple change.
+
+4060-class carry-over:
+- The fingerprints remove sector traffic, about a third of K2's per-candidate reads, rather than latency. The
+  4060's K2 should be at least as transaction-bound (a smaller L2, and each batch's per-block working set of data
+  plus pred is 640 KiB), so K2 should drop by a similar ~20–25 %.
+- The pred-word prefetch is latency hiding, which helps more when fewer warps are resident.
+- VRAM is unchanged.
