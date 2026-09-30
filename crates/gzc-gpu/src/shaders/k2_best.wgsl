@@ -25,30 +25,39 @@ fn funnel(lo: u32, hi: u32, sh: u32) -> u32 {
     return (lo >> sh) | ((hi << (31u - sh)) << 1u);
 }
 
-// == match_len(base, p, q, SEARCH_CAP) for max = min(BLOCK_SIZE - p, SEARCH_CAP) >= 1, with p
-// given as its word index pw = base + p / 4 and shift sp = (p & 3) * 8. Streams aligned words on
-// both sides, one new word per side per 4 bytes (match_len's load_u32_at loads two), and masks
-// the last step to the max - n bytes still in range. Every word read is at most word
-// (p + max - 1) / 4 + 1 <= base + BLOCK_SIZE / 4 (q < p likewise): the next block's first word
-// or the packed buffer's trailing zero word, and only bytes past max come from it.
-fn match_len_capped(pw: u32, sp: u32, base: u32, q: u32, max: u32) -> u32 {
+// == match_len(base, p, q, SEARCH_CAP) for max = min(BLOCK_SIZE - p, SEARCH_CAP), which is >= 8
+// (p < PARSE_END = BLOCK_SIZE - 8 and SEARCH_CAP >= 8). p is given as its word index
+// pw = base + p / 4 and shift sp = (p & 3) * 8, plus its first 8 bytes p0, p1, which the
+// thread loads once: most candidates are decided within them, from three q loads. Beyond them
+// both sides stream aligned words, one new word per side per 4 bytes (match_len's load_u32_at
+// loads two), and the last step is masked to the max - n bytes still in range. Every word read
+// is at most word (p + max - 1) / 4 + 1 <= base + BLOCK_SIZE / 4 (q < p likewise): the next
+// block's first word or the packed buffer's trailing zero word, and only bytes past max come
+// from it.
+fn match_len_capped(pw: u32, sp: u32, p0: u32, p1: u32, base: u32, q: u32, max: u32) -> u32 {
     let qw = base + (q >> 2u);
     let sq = (q & 3u) * 8u;
-    var plo = data[pw];
-    var qlo = data[qw];
-    var i = 1u;
-    var n = 0u;
+    let q0 = data[qw];
+    let q1 = data[qw + 1u];
+    var qlo = data[qw + 2u];
+    var x = p0 ^ funnel(q0, q1, sq);
+    if (x != 0u) { return countTrailingZeros(x) >> 3u; }
+    x = p1 ^ funnel(q1, qlo, sq);
+    if (x != 0u) { return 4u + (countTrailingZeros(x) >> 3u); }
+    var n = 8u;
+    var plo = data[pw + 2u];
+    var i = 3u;
     loop {
+        if (n >= max) { break; }
         let phi = data[pw + i];
         let qhi = data[qw + i];
-        var x = funnel(plo, phi, sp) ^ funnel(qlo, qhi, sq);
+        x = funnel(plo, phi, sp) ^ funnel(qlo, qhi, sq);
         let left = max - n;
         if (left < 4u) {
             x &= (1u << (left * 8u)) - 1u;
         }
         if (x != 0u) { return n + (countTrailingZeros(x) >> 3u); }
         n += 4u;
-        if (n >= max) { break; }
         plo = phi;
         qlo = qhi;
         i += 1u;
@@ -72,6 +81,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let max = min(BLOCK_SIZE - p, SEARCH_CAP);
     let pw = base + (p >> 2u);
     let sp = (p & 3u) * 8u;
+    let p0 = load_u32_at(base, p);
+    let p1 = load_u32_at(base, p + 4u);
     // Cap early-out: once best_len == SEARCH_CAP nothing later can win, so the whole walk
     // stops (identical to walking on; see the header).
     for (var chain = 0u; chain < N_HASHES && best_len < SEARCH_CAP; chain++) {
@@ -79,7 +90,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var q = pred[pb + p];
         for (var d = 0u; d < DEPTH; d++) {
             if (q == NO_POS) { break; }
-            let len = match_len_capped(pw, sp, base, q, max);
+            let len = match_len_capped(pw, sp, p0, p1, base, q, max);
             if (len > best_len || (len == best_len && q > best_q)) {
                 best_len = len;
                 best_q = q;
