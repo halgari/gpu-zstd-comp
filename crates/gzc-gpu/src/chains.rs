@@ -117,6 +117,21 @@ impl ChainsKernel {
         pred: &wgpu::Buffer,
         n_blocks: u32,
     ) {
+        self.record_timed(ctx, enc, data, head, pred, n_blocks, None);
+    }
+
+    /// `record`, with the K1 compute pass writing `timestamp_writes` (if any).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_timed(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        data: &wgpu::Buffer,
+        head: &wgpu::Buffer,
+        pred: &wgpu::Buffer,
+        n_blocks: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites>,
+    ) {
         if n_blocks == 0 {
             return;
         }
@@ -130,7 +145,7 @@ impl ChainsKernel {
                 wgpu::BindGroupEntry { binding: 2, resource: pred.as_entire_binding() },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k1"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k1"), timestamp_writes });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 2, 1);
