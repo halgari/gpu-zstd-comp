@@ -98,17 +98,18 @@ pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
 /// `lvl9` with a 13-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^13 keys in workgroup memory) instead of 16-bit hash
-/// chains. Ratio -0.004 % vs lvl9 in the R5 sample.
+/// chains. Full corpus at 64 KiB: 1.33929 (lvl9 1.33932).
 pub const LVL9S13: MatchParams = MatchParams { hash_bits: 13, ..LVL9 };
 /// `lvl9s13` with a 12-bit key: at 64 KiB blocks as dense as 13 bits at 128 KiB, and half the
-/// sorted K1's workgroup memory (8 KiB).
+/// sorted K1's workgroup memory (8 KiB). 1.33927 at 64 KiB.
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
-/// `lvl9` walking 16 candidates instead of 32 (speed2 E4): K2 -25 %, ratio -0.026 % (R5 sample).
+/// `lvl9` walking 16 candidates instead of 32 (speed2 E4): K2 -29 %, 1.33902 at 64 KiB.
 pub const LVL9D16: MatchParams = MatchParams { depth: 16, ..LVL9 };
 /// The bucket-sorted finders with the segmented parse (E1 + E2).
 pub const LVL9S13SEG: MatchParams = MatchParams { hash_bits: 13, ..LVL9SEG };
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// Depth 16 with the segmented parse (E4 + E1), and with the 12-bit sorted finder (E4 + E2 + E1).
+/// Depth 16 with the segmented parse (E4 + E1; 1.33901 at 64 KiB), and with the 12-bit sorted
+/// finder (E4 + E2 + E1; 1.33860).
 pub const LVL9D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9SEG };
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 

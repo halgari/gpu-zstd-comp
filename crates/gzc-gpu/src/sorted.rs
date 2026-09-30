@@ -1,14 +1,20 @@
 //! Host side of the bucket-sorted K1 (speed2 E2, `k1_sort_sg.wgsl`) and its window K2
 //! (`k2_window.wgsl`).
 //!
-//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s13`), K1 builds,
-//! per block, every hashed position ordered by key and position (`gzc_core::hash::bucket_sort`)
-//! into the `pred` buffer, with a counting sort in workgroup memory (one 32-lane subgroup per
-//! block); K2 then walks, for each position, the entries just below its own slot that share its
-//! key, which is its hash chain. Both are byte-identical to `gzc_core::reference::find_best`.
-//! Needs subgroups of at least 32 lanes, `table_bytes` of workgroup memory and a passing
-//! self-test; otherwise (or with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the
-//! same chains over the same key.
+//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s13`, `lvl9s12`
+//! and their segmented / depth-16 variants), K1 builds, per block, every hashed position ordered
+//! by key and position (`gzc_core::hash::bucket_sort`) into the `pred` buffer: a counting sort in
+//! workgroup memory (one 32-lane subgroup per block) ranks the positions into `best` (scratch),
+//! then a block-major scatter places them. K2 then walks, for each slot, the entries just below
+//! it that share its key, which is its position's hash chain. Both are byte-identical to
+//! `gzc_core::reference::find_best`. VRAM is unchanged (the chain kernels' `head` buffer is left
+//! unused).
+//!
+//! Needs subgroups of at least 32 lanes, `table_bytes` of workgroup memory within the device's
+//! limit (the context keeps wgpu's default 16 KiB, so a 13-bit key needs blocks of at most 64 KiB)
+//! and a passing self-test; otherwise (or with `GZC_SORTED=0`) `Kernels` runs the chain kernels,
+//! which build the same chains over the same key (byte-identical, just slower: K2 walks the
+//! denser chains of the shorter key).
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK};
@@ -16,8 +22,8 @@ use gzc_core::params::{Hashes, MatchParams};
 
 const K1_SORT_WGSL: &str = include_str!("shaders/k1_sort_sg.wgsl");
 
-/// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory at 64 KiB
-/// blocks, wgpu's default limit; 32 KiB at 128 KiB, where the device must allow it).
+/// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory at 64 KiB blocks,
+/// wgpu's default limit; 32 KiB at 128 KiB, which needs a raised limit).
 pub const MAX_SORT_KEY_BITS: u32 = 13;
 
 /// Workgroup memory of the sorted K1's counters: 2^hash_bits of 16 bits (32 bits for blocks of
