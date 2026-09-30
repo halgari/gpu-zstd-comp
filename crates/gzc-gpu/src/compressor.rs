@@ -974,9 +974,9 @@ mod tests {
         // pred/best: 1 MiB per block (best alone with one chain).
         #[cfg(feature = "block-128k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 128));
-        // head: 512 KiB per block, 256 KiB with one chain.
+        // pred/best: 128 KiB per block (head is capped at chains::HEAD_TABLES tables).
         #[cfg(feature = "block-16k")]
-        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (256, 512));
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (1024, 1024));
     }
 
     #[test]
@@ -996,7 +996,7 @@ mod tests {
             assert!(n * BLOCK_SIZE as u64 * 2 <= 1 << 32, "best");
             assert!(n * nh * BLOCK_SIZE as u64 <= 1 << 32, "pred");
             assert!(n * MAX_SEQS as u64 * 3 <= 1 << 32, "seqs");
-            assert!((n * nh) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
+            assert!((n * nh).min(chains::HEAD_TABLES as u64) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
         }
     }
 
