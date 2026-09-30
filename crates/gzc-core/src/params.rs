@@ -102,7 +102,8 @@ pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
 /// `lvl9s12` with the segmented parse (E2 + E1): 1.33926 at 64 KiB, 1.35456 at 128 KiB.
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4): 1.33860 at 64 KiB.
+/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4): 1.33860 at 64 KiB (above libzstd L9,
+/// 1.3379). Validated for blocks of at most 64 KiB only: at 128 KiB it gives 1.35159, below L9 (1.3532).
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
 /// Every named preset, in CLI order.
