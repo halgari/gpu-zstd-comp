@@ -85,6 +85,10 @@ fn h4_hash_is_injective_in_byte_3() {
 
 #[test]
 fn gpu_cands_match_cpu_opt16() {
+    // opt16 only implements at blocks of at most 64 KiB.
+    if gzc_core::config::LOG2_BLOCK > 16 {
+        return;
+    }
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT16);
@@ -95,6 +99,10 @@ fn gpu_cands_match_cpu_opt16() {
 /// opt14 has the same candidates; other depths of the h4 walk (1: h3-dominated, 64: the maximum).
 #[test]
 fn gpu_cands_match_cpu_other_depths() {
+    // opt14/opt16 only implement at blocks of at most 64 KiB.
+    if gzc_core::config::LOG2_BLOCK > 16 {
+        return;
+    }
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT14);

@@ -1453,6 +1453,10 @@ mod tests {
     /// a 4 KiB segment.
     #[test]
     fn synthetic_roundtrip_all_variants() {
+        // opt only validates at blocks of at most 64 KiB.
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
         for params in variants() {
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
@@ -1542,6 +1546,10 @@ mod tests {
 
     #[test]
     fn deterministic() {
+        // opt only validates at blocks of at most 64 KiB.
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
         let bytes = synth::dds_like(9, BLOCK_SIZE);
         for params in [OPT14, OPT16] {
             assert_eq!(compress_block(&bytes, params), compress_block(&bytes, params));

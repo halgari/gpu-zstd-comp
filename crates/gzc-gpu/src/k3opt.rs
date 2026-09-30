@@ -954,3 +954,47 @@ pub fn time_passes(
         })
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gzc_core::params::{OPT16, OptParams};
+
+    /// `OptBinds::check`'s error paths: bad `n`, a scratch buffer sized for other opt params,
+    /// and a `data` buffer missing the batch's trailing 4-byte word. Each errors rather than
+    /// panics (the kernel itself does no bounds checking on these buffers).
+    #[test]
+    fn check_rejects_bad_buffers() {
+        // opt16 only implements at blocks of at most 64 KiB.
+        if BLOCK_SIZE > 1 << 16 {
+            return;
+        }
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let n = 4u32;
+        let bufs = OptBuffers::new(&ctx, &OPT16, n);
+        let binds = bufs.binds();
+
+        // (a) n = 0 and n > capacity.
+        assert!(binds.check(0, &OPT16).is_err(), "n = 0 must be rejected");
+        assert!(binds.check(n + 1, &OPT16).is_err(), "n > capacity must be rejected");
+        // Sanity: the buffers themselves are fine for 1..=n blocks.
+        assert!(binds.check(n, &OPT16).is_ok());
+
+        // (b) a scratch buffer sized for a different target_length (a smaller one, so its
+        // scratch is too small for OPT16's).
+        let o = OPT16.opt.unwrap();
+        let smaller = MatchParams { opt: Some(OptParams { target_length: 8, ..o }), ..OPT16 };
+        assert!(scratch_bytes_per_block(&smaller) < scratch_bytes_per_block(&OPT16));
+        let small_bufs = OptBuffers::new(&ctx, &smaller, n);
+        let e = small_bufs.binds().check(n, &OPT16).unwrap_err();
+        assert!(e.to_string().contains("scratch"), "{e}");
+
+        // (c) a `data` buffer missing its trailing 4-byte word (`ld32` reads one word past the
+        // last block).
+        let short_data = ctx.storage_buffer("test.short_data", data_bytes(n) - 4, false);
+        let mut short = binds;
+        short.data = &short_data;
+        let e = short.check(n, &OPT16).unwrap_err();
+        assert!(e.to_string().contains("data"), "{e}");
+    }
+}

@@ -585,11 +585,18 @@ mod tests {
         assert!(check_presets(&[lvl3], true, true).is_ok());
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
-        assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
+        // opt14/opt16 only implement (cpu and gpu) at blocks of at most 64 KiB; above that,
+        // check every other preset instead of the whole list.
+        let all_at_this_block: Vec<Preset> =
+            all.iter().copied().filter(|p| p.params.opt.is_none() || gzc_core::config::LOG2_BLOCK <= 16).collect();
+        assert!(check_presets(&all_at_this_block, true, false).is_ok(), "the cpu implements every preset");
         // M5 T5: the GPU implements the optimal parse too (blocks of at most 64 KiB).
-        assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
-        let opt16 = parse_preset("opt16").unwrap();
-        assert!(check_presets(&[opt16], false, true).is_ok(), "opt16 runs on the gpu");
+        assert!(check_presets(&all_at_this_block, true, true).is_ok(), "cpu and gpu implement every preset");
+        // opt16 only runs on the gpu at blocks of at most 64 KiB.
+        if gzc_core::config::LOG2_BLOCK <= 16 {
+            let opt16 = parse_preset("opt16").unwrap();
+            assert!(check_presets(&[opt16], false, true).is_ok(), "opt16 runs on the gpu");
+        }
     }
 
     /// `--batch max` for the optimal parse under the 6 GiB budget at `--inflight 3`: its larger

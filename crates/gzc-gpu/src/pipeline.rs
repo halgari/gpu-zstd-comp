@@ -1856,6 +1856,10 @@ mod tests {
     fn vram_matches_params() {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14] {
+            // opt14/opt16 only implement at blocks of at most 64 KiB.
+            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg =
                     PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
@@ -1876,14 +1880,17 @@ mod tests {
         };
         // One chain instead of two: head and pred halve.
         assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + pred_bytes(10, 1));
-        // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging only
-        // on the parse path), K3opt's prices and scratch.
-        let opt_extra = crate::compressor::best_bytes(10)
-            + crate::compressor::seqs_bytes_for(10, &OPT16)
-            - crate::compressor::seqs_bytes(10)
-            + crate::compressor::opt_bytes(10, &OPT16);
-        assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
-        assert_eq!(scratch(OPT14), scratch(OPT16));
+        // opt14/opt16 only implement at blocks of at most 64 KiB.
+        if gzc_core::config::LOG2_BLOCK <= 16 {
+            // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging
+            // only on the parse path), K3opt's prices and scratch.
+            let opt_extra = crate::compressor::best_bytes(10)
+                + crate::compressor::seqs_bytes_for(10, &OPT16)
+                - crate::compressor::seqs_bytes(10)
+                + crate::compressor::opt_bytes(10, &OPT16);
+            assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
+            assert_eq!(scratch(OPT14), scratch(OPT16));
+        }
     }
 
     /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4) through the streaming
@@ -1892,6 +1899,10 @@ mod tests {
     /// `vram_bytes` in every mode.
     #[test]
     fn opt_stream_every_mode_matches_cpu() {
+        // opt14/opt16 only implement at blocks of at most 64 KiB.
+        if gzc_core::config::LOG2_BLOCK > 16 {
+            return;
+        }
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..50).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let modes = mode_contexts();
@@ -2164,8 +2175,12 @@ mod tests {
     fn stream_frames_zero_copy_every_mode() {
         let distinct = distinct_blocks();
         // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
-        // trailing zero word after partial batches of stale blocks).
+        // trailing zero word after partial batches of stale blocks). opt14 only implements at
+        // blocks of at most 64 KiB.
         for matching in [LVL9S12SEG, OPT14] {
+            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
+                continue;
+            }
             zero_copy_every_mode(&distinct, GpuParams { matching, emit_frames: true, huffman: true });
         }
     }

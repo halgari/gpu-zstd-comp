@@ -834,6 +834,16 @@ impl Kernels {
         queries: Option<&wgpu::QuerySet>,
     ) -> anyhow::Result<()> {
         debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity, "record_front: n_blocks {n_blocks} not in 1..={}", bufs.capacity);
+        // `bufs.opt` (`OptScratch`, K3opt's prices/scratch) exists iff `bufs` was allocated for
+        // an opt preset; reject a mismatch with these kernels before recording any dispatch,
+        // rather than let K3opt bind a scratch buffer that was never allocated (or skip one that
+        // was).
+        anyhow::ensure!(
+            bufs.opt.is_some() == self.is_opt(),
+            "BatchBuffers allocated for {} match params, but these Kernels are {}opt",
+            if bufs.opt.is_some() { "opt" } else { "non-opt" },
+            if self.is_opt() { "" } else { "not " }
+        );
         let ts = |k: u32| {
             queries.map(|query_set| wgpu::ComputePassTimestampWrites {
                 query_set,
@@ -1431,8 +1441,8 @@ pub struct OptCandKernel {
 
 impl OptCandKernel {
     /// Builds K1 and K2opt for `m`. Errors unless `m` is valid with `opt` set. Independent of
-    /// `gpu_supports` (the full opt pipeline is not on the GPU yet), so tests and benches can run
-    /// the candidate stage alone.
+    /// `gpu_supports` (it builds only the candidate stage, not the rest of the opt pipeline:
+    /// K3opt's passes, K5, K4), so tests and benches can run the candidate stage alone.
     pub fn new(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<Self> {
         m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
         anyhow::ensure!(m.opt.is_some(), "OptCandKernel needs opt params, got {m:?}");
@@ -1694,6 +1704,31 @@ mod tests {
         let bad = MatchParams { lazy: 3, ..LVL9 };
         assert!(!gpu_supports(&bad));
         assert!(check_matching(&bad).unwrap_err().to_string().contains("lazy 3"));
+    }
+
+    /// `record` (via `record_front`) rejects `BatchBuffers` whose `opt` scratch does not match
+    /// these `Kernels`' opt-ness, in both directions, before recording any dispatch.
+    #[test]
+    fn record_front_rejects_mismatched_opt_buffers() {
+        // opt14/opt16 only implement at blocks of at most 64 KiB.
+        if BLOCK_SIZE > 1 << 16 {
+            return;
+        }
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
+        let opt16 = gzc_core::params::OPT16;
+
+        let non_opt_kernels = Kernels::new(&ctx, gp(LVL3)).unwrap();
+        let opt_bufs = BatchBuffers::new(&ctx, 4, false, &opt16);
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let e = non_opt_kernels.record(&ctx, &mut enc, &opt_bufs, 4).unwrap_err();
+        assert!(e.to_string().contains("opt"), "{e}");
+
+        let opt_kernels = Kernels::new(&ctx, gp(opt16)).unwrap();
+        let non_opt_bufs = BatchBuffers::new(&ctx, 4, false, &LVL3);
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let e = opt_kernels.record(&ctx, &mut enc, &non_opt_bufs, 4).unwrap_err();
+        assert!(e.to_string().contains("opt"), "{e}");
     }
 
     #[test]

@@ -128,7 +128,8 @@ frames are delivered on a completion thread beside the uploading thread and the 
 bottleneck again, with the host's share of the wall time down from ~40–120 ms to ~25 ms per run. The earlier phases are in `docs/results/2026-09-29-m4.md` and
 `docs/results/2026-09-30-speed.md` (128 KiB blocks). All these numbers are measured on an RTX
 5090. The quality presets `opt14`/`opt16` (M5, `docs/results/2026-09-30-m5.md`) reach libzstd L14/L16's
-ratio at 64 KiB (1.37064 / 1.37144) at 2.17 / 1.43 GB/s (batch 2900).
+ratio at 64 KiB (1.37064 / 1.37144) at 2.17 / 1.43 GB/s (batch 2900; 1.75 / 1.09 GB/s at the default
+`--batch max` on a 6 GiB budget, which spills past one wave).
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify

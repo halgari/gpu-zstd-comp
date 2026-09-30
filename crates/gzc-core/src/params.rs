@@ -265,7 +265,11 @@ mod tests {
         assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {
-            assert_eq!(p.validate(), Ok(()), "{name}");
+            // opt14/opt16 only validate at blocks of at most 64 KiB (`validate_opt`'s
+            // `LOG2_BLOCK` check); skip that assertion above that size.
+            if p.opt.is_none() || LOG2_BLOCK <= 16 {
+                assert_eq!(p.validate(), Ok(()), "{name}");
+            }
             assert_eq!(preset(name), Ok(p), "{name}");
         }
         let opt = OptParams { level: 2, target_length: 32, passes: 3, seed: Seed::BlockInit, k: 2 };
@@ -320,6 +324,11 @@ mod tests {
 
     #[test]
     fn validate_opt() {
+        // opt only validates at blocks of at most 64 KiB; above that every case here (including
+        // the "good" ones) is rejected by the `LOG2_BLOCK` check before its own field is checked.
+        if LOG2_BLOCK > 16 {
+            return;
+        }
         let o = OPT16.opt.unwrap();
         let bad = [
             MatchParams { min_match: 4, ..OPT16 },
@@ -355,7 +364,8 @@ mod tests {
     #[test]
     fn cpu_supports_all_presets() {
         for (name, p) in PRESETS {
-            assert!(cpu_supports(&p), "{name}");
+            // opt14/opt16 only validate (and so `cpu_supports`) at blocks of at most 64 KiB.
+            assert_eq!(cpu_supports(&p), p.opt.is_none() || LOG2_BLOCK <= 16, "{name}");
         }
         assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(cpu_supports(&MatchParams { min_match: 6, lazy: 1, ..RUNG2 }));

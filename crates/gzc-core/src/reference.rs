@@ -513,6 +513,10 @@ mod tests {
 
     #[test]
     fn find_cands_matches_its_definition() {
+        // OPT16 (and its depth variants) only validate at blocks of at most 64 KiB.
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
         use crate::params::OPT16;
         for params in [OPT16, MatchParams { depth: 3, ..OPT16 }, MatchParams { depth: 64, ..OPT16 }] {
             for (name, bytes) in synth::test_cases() {
