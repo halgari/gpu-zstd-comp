@@ -107,19 +107,39 @@ fn coop_catch_up(base: u32, start0: u32, anchor: u32, off: u32, k: u32) -> u32 {
     return moved;
 }
 
-// == push_lits (k3_parse.wgsl): every lane keeps the same accumulator, lane 0 stores.
+// == push_lits (k3_parse.wgsl): the same bytes packed into the same words. The literal stream
+// continues with the acc_n (< 4) pending bytes in acc followed by block[start..end), total bytes
+// in all. Stream word j >= 1 is the unaligned block word at start + 4j - acc_n, word 0 is acc with
+// the block word at start shifted in above its acc_n bytes; lane k stores word t + k for the
+// `total / 4` complete words, W at a time. The last total % 4 bytes become the new accumulator.
+// start >= acc_n (the pending bytes came from earlier positions); every load that matters stays
+// in [start, end), and nothing reads `lits`, so which lane stores a word does not matter.
 fn coop_push_lits(base: u32, start: u32, end: u32, k: u32) {
-    for (var i = start; i < end; i++) {
-        acc |= load_byte(base, i) << (acc_n * 8u);
-        acc_n += 1u;
-        if (acc_n == 4u) {
-            if (k == 0u) { lits[lit_w] = acc; }
-            lit_w += 1u;
-            acc = 0u;
-            acc_n = 0u;
+    let len = end - start;
+    n_lit += len;
+    let total = acc_n + len;
+    let full = total >> 2u;
+    let sh = acc_n * 8u;
+    for (var t = 0u; t < full; t += W) {
+        let j = t + k;
+        let jc = min(j, full - 1u);
+        let w = load_u32_nb(base, select(start + 4u * jc - acc_n, start, jc == 0u));
+        let v = select(w, acc | (w << sh), jc == 0u);
+        if (j < full) { lits[lit_w + j] = v; }
+    }
+    let rem = total & 3u;
+    if (full == 0u) {
+        if (len > 0u) {
+            acc |= (load_u32_nb(base, start) & ((1u << (8u * len)) - 1u)) << sh;
+        }
+    } else {
+        acc = 0u;
+        if (rem > 0u) {
+            acc = load_u32_nb(base, start + 4u * full - acc_n) & ((1u << (8u * rem)) - 1u);
         }
     }
-    n_lit += end - start;
+    lit_w += full;
+    acc_n = rem;
 }
 
 // == store_seq (k3_lazy.wgsl), seqs written by lane 0.
