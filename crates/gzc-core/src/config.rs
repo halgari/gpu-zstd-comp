@@ -25,3 +25,5 @@ pub const PARSE_END: usize = BLOCK_SIZE - 8;
 /// Positions 0..HASHED_POSITIONS have an 8-byte hash window inside the block.
 pub const HASHED_POSITIONS: usize = BLOCK_SIZE - 7;
 pub const NO_POS: u32 = u32::MAX;
+/// find_best compares at most this many bytes per candidate; the parse extends capped matches.
+pub const MATCH_SEARCH_CAP: usize = 64;
