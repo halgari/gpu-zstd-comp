@@ -39,7 +39,9 @@
 // lenB << 24, best[.. + 1] = offB; lengths capped at SEARCH_CAP (a stored SEARCH_CAP is extended).
 //
 // Precondition (K2opt's output satisfies it): every candidate record lies in the block before its
-// position, and its length is the true common length capped at SEARCH_CAP.
+// position, and its length is the true common length capped at SEARCH_CAP. The kernel trusts the
+// words (no bounds checks on offsets); only the host test harness (k3opt.rs `OptBuffers::upload`)
+// validates scripted ones, the pipeline runs it right after K2opt.
 //
 // Passes (M5 T4, opt::passes): pass n + 1 is priced from pass n's own output histogram
 // (opt::Hist::of_output of the fixed-up block parse: literal bytes, and each sequence's LL code
@@ -173,7 +175,10 @@ var<private> lbase: u32;
 var<private> n_series: u32;
 
 // load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
-// are loaded, the high one masked when aligned (data[w + 1] is in bounds, see load_u32_at).
+// are loaded, the high one masked when aligned. data[w + 1] is in bounds because every `data`
+// binding ends with one zero word after the batch's last block (`compressor::data_bytes` =
+// n * BLOCK_SIZE + 4, asserted by `OptBinds::check`; the pipeline's copy, direct-upload and
+// zero-copy slots all keep and zero it).
 fn ld32(base: u32, byte_off: u32) -> u32 {
     let w = base + (byte_off >> 2u);
     let sh = (byte_off & 3u) * 8u;

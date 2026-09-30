@@ -586,10 +586,34 @@ mod tests {
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
-        let gpu: Vec<Preset> = all.iter().filter(|p| p.params.opt.is_none()).copied().collect();
-        assert!(check_presets(&gpu, true, true).is_ok(), "cpu and gpu implement every non-opt preset");
+        // M5 T5: the GPU implements the optimal parse too (blocks of at most 64 KiB).
+        assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
         let opt16 = parse_preset("opt16").unwrap();
-        assert!(check_presets(&[opt16], false, true).is_err(), "opt16 is cpu-only for now");
+        assert!(check_presets(&[opt16], false, true).is_ok(), "opt16 runs on the gpu");
+    }
+
+    /// `--batch max` for the optimal parse under the 6 GiB budget at `--inflight 3`: its larger
+    /// per-block footprint (8 B of candidates and of trace per position, `MAX_SEQS_OPT` seqs,
+    /// K3opt's prices and scratch, all in `vram_bytes`) resolves to a smaller batch than
+    /// lvl9s12seg: 1.82 MiB per block at 64 KiB with three slots' upload and staging buffers
+    /// (spec §3.5 estimated ≈ 1.35 MiB / ≈ 2900 blocks), so 3458 blocks (copy upload).
+    #[test]
+    fn resolve_max_batch_shrinks_for_opt() {
+        use gzc_core::params::{LVL9S12SEG, OPT14, OPT16};
+        let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
+        let lvl = resolve_max_batch(LVL9S12SEG, inflight, budget_mb, device_max, false).unwrap();
+        let o16 = resolve_max_batch(OPT16, inflight, budget_mb, device_max, false).unwrap();
+        let o14 = resolve_max_batch(OPT14, inflight, budget_mb, device_max, false).unwrap();
+        eprintln!("--batch max at {budget_mb} MiB, i{inflight}: lvl9s12seg {lvl}, opt {o16}");
+        assert_eq!(o16, o14, "opt14 and opt16 allocate the same buffers");
+        assert!(o16 < lvl, "opt {o16} should resolve below lvl9s12seg {lvl}");
+        let fits = |b: u32| vram_bytes(&sweep_cfg(OPT16, b, inflight)).div_ceil(1 << 20) <= budget_mb;
+        assert!(fits(o16) && !fits(o16 + 1));
+        if gzc_core::config::BLOCK_SIZE == 65536 {
+            let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
+            assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
+            assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
+        }
     }
 
     #[test]
