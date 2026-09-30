@@ -4,7 +4,7 @@ A prototype GPU (wgpu/compute-shader) zstd compressor: match finding, parsing an
 entropy coding run on the GPU in fixed-size blocks, producing standard zstd frames
 that decode with libzstd. `gzc-core` holds the shared, CPU-checkable primitives
 (block chunking, the sequence/repeat-offset model, hashing, synthetic test corpora,
-and — as later tasks land — the CPU reference encoder); `gzc-gpu` holds the wgpu
+the frame writer and the CPU reference encoder the GPU mirrors); `gzc-gpu` holds the wgpu
 kernels and host-side orchestration; `gzc-bench` compares CPU-baseline, CPU-reference
 and GPU throughput/ratio over a corpus; `tools/fetch-corpus` downloads/builds the
 benchmark corpus described by `corpus.toml`.
@@ -70,20 +70,23 @@ cargo run --release -p gzc-bench -- cpu --synthetic --levels 1,3 --threads 1,8
 # Against a real corpus directory, filtered to DDS/NIF files:
 cargo run --release -p gzc-bench -- cpu \
   --input data/corpus --ext dds,nif \
-  --levels 1,3,5,7,9,12,15,19 --threads 1,8,16,32 \
+  --levels 1,2,3,4,5,6 --threads 1,8,16,32 \
   --out out
 ```
+
+`--levels` defaults to `1,2,3,4,5,6`; levels above 16 are rejected.
 
 `--max-bytes N` caps the amount of corpus data loaded (stops adding files
 once the running total reaches `N`). Reports land in `--out` (default
 `out/`, gitignored): `results.json` and `report.html`.
 
 `gzc-bench ref` runs the CPU reference compressor (`gzc_core::reference`, engine
-`cpu-ref`, config `lvl3-greedy`: level-3-style greedy parse, predefined FSE
-tables, raw literals) over a corpus, across the given thread counts, and writes
-the same table/JSON/HTML report shape. `--verify` decompresses every produced
-frame with libzstd after the timed pass and errors on any mismatch against the
-original block.
+`cpu-ref`, config `lvl3-greedy`: level-3-style greedy parse, sequences with
+per-stream predefined / RLE / computed FSE tables, Huffman (or RLE / raw)
+literals; the same frames the GPU emits, byte for byte) over a corpus, across
+the given thread counts, and writes the same table/JSON/HTML report shape.
+`--verify` decompresses every produced frame with libzstd after the timed pass
+and errors on any mismatch against the original block.
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -93,13 +96,39 @@ cargo run --release -p gzc-bench -- ref \
   --threads 8 --verify --out out
 ```
 
-`gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`) then cpu-ref
-(across `--threads`, with `--verify`) — and, once the GPU engine lands, gpu too
-— into a single combined report, so all engines' ratio-vs-throughput points sit
-on one chart:
+`gzc-bench gpu` runs the streaming GPU compressor (engine `gpu`, config
+`lvl3-greedy b<batch> i<inflight>`): the GPU runs the whole parse and emits
+complete zstd frames (Huffman literals included), byte-identical to `cpu-ref`;
+the host only uploads blocks and copies finished frames out. Each comma-separated
+list is swept:
+
+- `--batch N` blocks per GPU batch (default 512).
+- `--inflight K` batches in flight (default 3).
+- `--writer-threads W` CPU threads that receive finished frames (default 0: the
+  pipeline thread does it).
+- `--vram-budget-mb M` (default 6144, i.e. an ~8 GB card minus headroom): every
+  (batch, inflight) config must fit, checked before anything runs.
+- `--verify` decompresses every frame with libzstd after the timed pass.
+
+The headline config, `--batch 1388 --inflight 3`, is the largest batch that fits
+6144 MiB with 3 batches in flight:
+
+```sh
+cargo run --release -p gzc-bench -- gpu --synthetic --verify   # smoke run
+
+cargo run --release -p gzc-bench -- gpu \
+  --input data/corpus --ext dds,nif --batch 1388 --inflight 3 --verify --out out
+```
+
+`gzc-bench all` runs cpu-libzstd (across `--levels` x `--threads`), cpu-ref
+(across `--threads`) and gpu (across the GPU flags above) into a single combined
+report, so all engines' ratio-vs-throughput points sit on one chart. The GPU
+configs and adapter are checked before the CPU runs start; if the GPU sweep
+fails, the CPU results are still written.
 
 ```sh
 cargo run --release -p gzc-bench -- all \
   --input data/corpus --ext dds,nif --max-bytes 2000000000 \
-  --levels 1,3,5,7,9,12,15,19 --threads 1,8,16,32 --verify --out out
+  --levels 1,2,3,4,5,6 --threads 1,8,16,32 --batch 1388 --inflight 3 \
+  --verify --out out
 ```

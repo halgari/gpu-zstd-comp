@@ -158,14 +158,25 @@ top-K candidates per position. A suffix-array match finder is an M4 option.
   are injected at pipeline creation via WGSL `override` constants or source
   templating.
 
-Memory budget: ~2.5 MB scratch per 128 KB block (pred ×2, head ×2 at 256 KB each,
-best, sequences, literals) → ~1.3 GB for N = 512.
+Memory budget (as built, M3, 128 KiB blocks; `gzc_gpu::pipeline::vram_bytes`):
+~2.9 MiB of scratch per block (head, pred, best, sequences, literals, counts),
+allocated once and **shared by every in-flight slot**, plus ~0.5 MiB per block per
+in-flight slot (block data, frame output + lengths, upload and readback staging).
+Batches share one queue and the scratch, so K1 of batch i+1 cannot overlap K3 of
+batch i. Frame-path kernel order per batch: K1, K2, K3, then **K5 (Huffman
+literals) before K4** (K4 reads K5's literals-section length and writes the
+sequences section after it). A 6 GiB budget (`--vram-budget-mb 6144`, an 8 GB card
+minus headroom) fits `--batch 1388 --inflight 3` (6143 MiB).
 
 ### 3.4 gzc-bench
 
-- `gzc-bench cpu --input DIR [--ext dds,nif] [--max-bytes N] [--levels 1,3,...] [--threads 1,8,16,32]`
-- `gzc-bench gpu --input DIR [...] [--batch N] [--inflight K] [--config lvl3|...]`
-- `gzc-bench all ...` runs both and writes the report.
+- `gzc-bench cpu --input DIR [--ext dds,nif] [--max-bytes N] [--levels 1,...,6] [--threads 1,8,16,32]`
+  (levels default to 1–6; above 16 is rejected)
+- `gzc-bench ref --input DIR [...] [--threads 1,8] [--verify]`
+- `gzc-bench gpu --input DIR [...] [--batch N] [--inflight K] [--writer-threads W]
+  [--vram-budget-mb 6144] [--verify]`. A `--config lvl3|...` selector for other
+  parse strategies is future work (M4); M3 has only `lvl3-greedy`.
+- `gzc-bench all ...` runs every engine and writes one combined report.
 - Corpus: recursive load into RAM, per-file chunking, file-type tag
   (dds / nif / other) on each block.
 - Metrics per run: throughput in MB/s of **real** input bytes (not padding),
@@ -175,7 +186,8 @@ best, sequences, literals) → ~1.3 GB for N = 512.
   including upload, readback and any CPU-side frame assembly. Kernel-only time
   reported separately.
 - `--verify`: libzstd round-trip of every output, excluded from timing.
-- Outputs: stdout table; `out/results-<ts>.json`; `out/report-<ts>.html`
+- Outputs: stdout table; `results.json` and `report.html` in the `--out` directory
+  (default `out/`; not timestamped, so use one `--out` dir per run)
   (self-contained inline-SVG chart: x = throughput, y = ratio; CPU 8-thread
   curve by level; CPU 1-thread × 8 dashed projection; GPU points; vertical lines
   at 125 MB/s and 1250 MB/s; headline: best ratio at ≥ 1.25 GB/s for CPU-8T vs GPU).
