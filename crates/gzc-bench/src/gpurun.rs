@@ -91,9 +91,10 @@ pub fn run_gpu(
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     let mut pipe = Pipeline::new(ctx, &cfg)?;
     eprintln!(
-        "  k3 mode: {:?}; direct upload: {}; allocated {} MiB",
+        "  k3 mode: {:?}; direct upload: {}; transfer readback: {}; allocated {} MiB",
         pipe.k3_mode(),
         ctx.direct_upload,
+        pipe.transfer_readback(),
         vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)
     );
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();

@@ -6,6 +6,13 @@ use gzc_core::params::MatchParams;
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
 pub struct GpuContext {
+    /// A queue of a transfer-only family on the same `VkDevice` (speed-2 E3): frame-path
+    /// pipelines read their frames back through it, concurrently with the next batch's kernels
+    /// (`pipeline`). Vulkan adapters with such a family (NVIDIA: family 1; AMD: SDMA when the
+    /// driver exposes it), unless `GZC_TRANSFER_QUEUE=0` or frame packing is on. Declared first:
+    /// it must drop before `device`, whose teardown destroys the `VkDevice` and then the instance
+    /// (a `VkDevice` outliving its instance crashes the driver).
+    pub transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
@@ -59,6 +66,25 @@ impl GpuContext {
     /// for the direct upload (`direct_upload`, on by default with full ReBAR).
     pub fn with_options(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
         let p = Prepared::new(allow_subgroups, mappable)?;
+        let transfer_family = (!p.pack_frames && !std::env::var("GZC_TRANSFER_QUEUE").is_ok_and(|v| v == "0"))
+            .then(|| {
+                crate::multiqueue::queue_families(&p.adapter).into_iter().find(|f| {
+                    use ash::vk::QueueFlags as Q;
+                    f.flags.contains(Q::TRANSFER) && !f.flags.intersects(Q::COMPUTE | Q::GRAPHICS) && f.count > 0
+                })
+            })
+            .flatten();
+        if let Some(f) = transfer_family {
+            let rd = crate::multiqueue::RawDevice::new(&p, &[(f.index, 0)])?;
+            let mut ctx = rd.context(&p, 0, 0)?;
+            ctx.transfer = Some(std::sync::Arc::new(crate::transfer::TransferQueue::new(
+                rd.owner.clone(),
+                f.index,
+                rd.memory,
+                p.adapter.clone(),
+            )));
+            return Ok(ctx);
+        }
         let (device, queue) = pollster::block_on(p.adapter.request_device(&p.descriptor()))
             .context("request_device")?;
         Ok(p.context(device, queue))
@@ -99,6 +125,7 @@ impl Prepared {
             mappable_storage: self.mappable_storage,
             pack_frames: self.pack_frames,
             direct_upload: self.direct_upload,
+            transfer: None,
         }
     }
 

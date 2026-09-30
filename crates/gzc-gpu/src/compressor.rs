@@ -629,6 +629,27 @@ impl Kernels {
         n_blocks: u32,
         queries: Option<&wgpu::QuerySet>,
     ) {
+        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
+        assert_eq!(bufs.n_hashes, self.chains.n_hashes(), "BatchBuffers allocated for other match params");
+        if n_blocks == 0 {
+            return;
+        }
+        self.record_front(ctx, enc, bufs, n_blocks, queries);
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// K1, K2 and K3 of `record_timed` (the pipeline's transfer readback submits K5/K4
+    /// separately). `1 <= n_blocks <= bufs.capacity`.
+    pub(crate) fn record_front(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
         let ts = |k: u32| {
             queries.map(|query_set| wgpu::ComputePassTimestampWrites {
                 query_set,
@@ -636,17 +657,8 @@ impl Kernels {
                 end_of_pass_write_index: Some(2 * k + 1),
             })
         };
-        assert!(n_blocks <= bufs.capacity, "n_blocks {n_blocks} > capacity {}", bufs.capacity);
-        assert_eq!(bufs.n_hashes, self.chains.n_hashes(), "BatchBuffers allocated for other match params");
-        if n_blocks == 0 {
-            return;
-        }
         self.record_best(ctx, enc, bufs, n_blocks, queries);
         self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
-
-        if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
-        }
     }
 
     /// Records K1 then K2 (timestamps as in `record_timed`) for the first `n_blocks` blocks of

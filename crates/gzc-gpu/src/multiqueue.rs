@@ -3,31 +3,20 @@
 //! wgpu 30 creates one queue per device (family 0, queue 0) and chains every submission behind
 //! the previous one with a semaphore waited at TOP_OF_PIPE, so nothing submitted through one
 //! `wgpu::Queue` ever overlaps. Here the `VkDevice` is created by hand with more queues (e.g. the
-//! async-compute family, or a second queue of family 0), and each queue is wrapped in its own
-//! `wgpu::Device` through `hal::vulkan::Adapter::device_from_raw` + `create_device_from_hal`: every
-//! queue gets a complete `GpuContext` (its own pipelines and allocator) on the same `VkDevice`, so
-//! the rest of the crate runs on any of them unchanged. The `VkDevice` is destroyed once the last
-//! of the hal devices has dropped (`DeviceOwner`). Vulkan only.
+//! async-compute family, a transfer family, or a second queue of family 0). Queues can be wrapped
+//! in their own `wgpu::Device` through `hal::vulkan::Adapter::device_from_raw` +
+//! `create_device_from_hal` (every such queue gets a complete `GpuContext` on the same
+//! `VkDevice`), or driven with raw Vulkan (`transfer::TransferQueue`). The `VkDevice` is
+//! destroyed once its last user has dropped (`transfer::DeviceOwner`). Vulkan only.
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use ash::vk;
 
 use crate::context::{GpuContext, Prepared};
-
-/// Destroys the shared `VkDevice` when the last hal device wrapping it has dropped.
-struct DeviceOwner(ash::Device);
-
-impl Drop for DeviceOwner {
-    fn drop(&mut self) {
-        // SAFETY: every hal device (and so every wgpu object) created on this VkDevice is gone.
-        unsafe {
-            let _ = self.0.device_wait_idle();
-            self.0.destroy_device(None);
-        }
-    }
-}
+use crate::transfer::DeviceOwner;
 
 /// A queue family of the adapter: its index, flags and queue count.
 #[derive(Clone, Copy, Debug)]
@@ -37,31 +26,38 @@ pub struct QueueFamily {
     pub count: u32,
 }
 
-/// Contexts sharing one `VkDevice`: `main` on family 0 queue 0 (what `GpuContext::new` would
-/// give) and one per requested extra queue, in request order.
-pub struct MultiQueue {
-    pub extra: Vec<GpuContext>,
-    pub main: GpuContext,
-    pub families: Vec<QueueFamily>,
+/// The adapter's queue families (empty on non-Vulkan backends).
+pub(crate) fn queue_families(adapter: &wgpu::Adapter) -> Vec<QueueFamily> {
+    // SAFETY: plain property query while `adapter` lives.
+    let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else { return Vec::new() };
+    let instance = hal.shared_instance().raw_instance();
+    unsafe { instance.get_physical_device_queue_family_properties(hal.raw_physical_device()) }
+        .iter()
+        .enumerate()
+        .map(|(i, f)| QueueFamily { index: i as u32, flags: f.queue_flags, count: f.queue_count })
+        .collect()
 }
 
-impl MultiQueue {
-    /// Opens the adapter as `GpuContext::with_options(allow_subgroups, mappable)` does, with the
-    /// extra `(family, queue index)` queues. Errors on a non-Vulkan adapter, an unknown family or
-    /// an index beyond the family's queue count, or (0, 0) (that is `main`).
-    pub fn open(allow_subgroups: bool, mappable: bool, extra: &[(u32, u32)]) -> anyhow::Result<Self> {
-        let p = Prepared::new(allow_subgroups, mappable)?;
-        // SAFETY: the hal adapter is only used while `p.adapter` lives (this function).
+/// A `VkDevice` created with family 0 queue 0 plus extra queues, before any wgpu device wraps it.
+pub(crate) struct RawDevice {
+    pub raw: ash::Device,
+    pub owner: Arc<DeviceOwner>,
+    pub families: Vec<QueueFamily>,
+    pub memory: vk::PhysicalDeviceMemoryProperties,
+    exts: Vec<&'static CStr>,
+}
+
+impl RawDevice {
+    /// Creates the device `p` describes (what `open_with_callback` would create) with the extra
+    /// `(family, queue index)` queues. Errors on a non-Vulkan adapter, an unknown family, an
+    /// index beyond the family's queue count, or (0, 0).
+    pub fn new(p: &Prepared, extra: &[(u32, u32)]) -> anyhow::Result<Self> {
+        // SAFETY: the hal adapter is only used while `p.adapter` lives.
         let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
             .ok_or_else(|| anyhow!("multi-queue needs the Vulkan backend"))?;
         let instance = hal.shared_instance().raw_instance();
         let phd = hal.raw_physical_device();
-        // SAFETY: plain property query.
-        let families: Vec<QueueFamily> = unsafe { instance.get_physical_device_queue_family_properties(phd) }
-            .iter()
-            .enumerate()
-            .map(|(i, f)| QueueFamily { index: i as u32, flags: f.queue_flags, count: f.queue_count })
-            .collect();
+        let families = queue_families(&p.adapter);
         let mut counts = BTreeMap::from([(0u32, 1u32)]);
         for &(f, i) in extra {
             anyhow::ensure!((f, i) != (0, 0), "queue (0, 0) is the main queue");
@@ -75,13 +71,9 @@ impl MultiQueue {
             let c = counts.entry(f).or_insert(0);
             *c = (*c).max(i + 1);
         }
-
-        let features = p.required_features;
-        let limits = p.required_limits.clone();
-        let hints = wgpu::MemoryHints::default();
-        let exts = hal.required_device_extensions(features);
-        let mut phd_features = hal.physical_device_features(&exts, features);
-        // TEMP probe: GZC_PROBE_PRIO0 = the family-0 queues' priority (others 1.0).
+        let exts = hal.required_device_extensions(p.required_features);
+        let mut phd_features = hal.physical_device_features(&exts, p.required_features);
+        // Probe knob: GZC_PROBE_PRIO0 = the family-0 queues' priority (others 1.0).
         let p0: f32 = std::env::var("GZC_PROBE_PRIO0").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
         let prio: Vec<Vec<f32>> = counts.iter().map(|(&f, &n)| vec![if f == 0 { p0 } else { 1.0 }; n as usize]).collect();
         let infos: Vec<vk::DeviceQueueCreateInfo> = counts
@@ -94,35 +86,60 @@ impl MultiQueue {
             .add_to_device_create(vk::DeviceCreateInfo::default().queue_create_infos(&infos).enabled_extension_names(&ext_ptrs));
         // SAFETY: the create info is what `open_with_callback` builds, plus queues.
         let raw = unsafe { instance.create_device(phd, &info, None) }.context("vkCreateDevice")?;
+        // SAFETY: plain property query.
+        let memory = unsafe { instance.get_physical_device_memory_properties(phd) };
         let owner = Arc::new(DeviceOwner(raw.clone()));
+        Ok(Self { raw, owner, families, memory, exts })
+    }
 
-        let open = |family: u32, index: u32| -> anyhow::Result<GpuContext> {
-            let guard = owner.clone();
-            // SAFETY: `raw` was created from this adapter with `exts` and these features, and has
-            // this queue; it stays valid until the last drop callback (DeviceOwner).
-            let dev = unsafe {
-                hal.device_from_raw(
-                    raw.clone(),
-                    Some(Box::new(move || drop(guard))),
-                    &exts,
-                    features,
-                    &limits,
-                    &hints,
-                    family,
-                    index,
-                )
-            }
-            .map_err(|e| anyhow!("device_from_raw({family}, {index}): {e}"))?;
-            // SAFETY: `dev` was opened from `p.adapter`'s hal adapter with `p.descriptor()`'s
-            // features and limits.
-            let (device, queue) =
-                unsafe { p.adapter.create_device_from_hal(dev, &p.descriptor()) }.context("create_device_from_hal")?;
-            Ok(p.context(device, queue))
-        };
-        let main = open(0, 0)?;
-        let extra = extra.iter().map(|&(f, i)| open(f, i)).collect::<anyhow::Result<Vec<_>>>()?;
-        drop(owner);
-        Ok(Self { extra, main, families })
+    /// A `GpuContext` whose wgpu device and queue are queue `index` of `family` on this device.
+    pub fn context(&self, p: &Prepared, family: u32, index: u32) -> anyhow::Result<GpuContext> {
+        // SAFETY: as in `new`.
+        let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or_else(|| anyhow!("multi-queue needs the Vulkan backend"))?;
+        let guard = self.owner.clone();
+        let hints = wgpu::MemoryHints::default();
+        // SAFETY: `raw` was created from this adapter with `exts` and these features, and has
+        // this queue; it stays valid until the last owner reference drops (DeviceOwner).
+        let dev = unsafe {
+            hal.device_from_raw(
+                self.raw.clone(),
+                Some(Box::new(move || drop(guard))),
+                &self.exts,
+                p.required_features,
+                &p.required_limits,
+                &hints,
+                family,
+                index,
+            )
+        }
+        .map_err(|e| anyhow!("device_from_raw({family}, {index}): {e}"))?;
+        drop(hal);
+        // SAFETY: `dev` was opened from `p.adapter`'s hal adapter with `p.descriptor()`'s features
+        // and limits.
+        let (device, queue) =
+            unsafe { p.adapter.create_device_from_hal(dev, &p.descriptor()) }.context("create_device_from_hal")?;
+        Ok(p.context(device, queue))
+    }
+}
+
+/// Contexts sharing one `VkDevice`: `main` on family 0 queue 0 (what `GpuContext::new` would
+/// give) and one per requested extra queue, in request order (for the probes below).
+pub struct MultiQueue {
+    pub extra: Vec<GpuContext>,
+    pub main: GpuContext,
+    pub families: Vec<QueueFamily>,
+}
+
+impl MultiQueue {
+    /// Opens the adapter as `GpuContext::with_options(allow_subgroups, mappable)` does, with the
+    /// extra `(family, queue index)` queues each wrapped in a `GpuContext` (see `RawDevice::new`).
+    pub fn open(allow_subgroups: bool, mappable: bool, extra: &[(u32, u32)]) -> anyhow::Result<Self> {
+        let p = Prepared::new(allow_subgroups, mappable)?;
+        let rd = RawDevice::new(&p, extra)?;
+        let main = rd.context(&p, 0, 0)?;
+        let extra = extra.iter().map(|&(f, i)| rd.context(&p, f, i)).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { extra, main, families: rd.families.clone() })
     }
 }
 
@@ -132,7 +149,12 @@ mod tests {
     use crate::compressor::{BatchBuffers, GpuParams, Kernels};
     use gzc_core::block::chunk_file;
     use gzc_core::config::BLOCK_SIZE;
-    use gzc_core::params::LVL9;
+    use gzc_core::params::{LVL9, LVL9SEG, MatchParams};
+
+    /// The probes' match params: `GZC_PROBE_PRESET=lvl9seg` or lvl9 (default).
+    fn probe_params() -> MatchParams {
+        if std::env::var("GZC_PROBE_PRESET").is_ok_and(|v| v == "lvl9seg") { LVL9SEG } else { LVL9 }
+    }
     use std::time::Instant;
 
     /// Blocks from every `stride`-th file (sorted paths) under `dir`, until `n` blocks.
@@ -170,7 +192,7 @@ mod tests {
 
     fn upload(ctx: &GpuContext, blocks: &[Vec<u8>]) -> Set {
         let n = blocks.len() as u32;
-        let bufs = BatchBuffers::new(ctx, n, false, &LVL9);
+        let bufs = BatchBuffers::new(ctx, n, false, &probe_params());
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&crate::context::pack_blocks(&refs)));
         Set { bufs, n }
@@ -286,7 +308,7 @@ mod tests {
             extra.push((f, 0));
         }
         let mq = MultiQueue::open(true, false, &extra).unwrap();
-        let params = GpuParams { matching: LVL9, emit_frames: false, huffman: true };
+        let params = GpuParams { matching: probe_params(), emit_frames: false, huffman: true };
         // GZC_PROBE_SWAP=1: K3 runs on the last extra queue (the async family), the others on main.
         let swap = std::env::var("GZC_PROBE_SWAP").is_ok_and(|v| v == "1");
         let last = mq.extra.len() - 1;
@@ -464,7 +486,7 @@ mod tests {
         };
         let mq = MultiQueue::open(true, false, &[(fam, 0)]).unwrap();
         let (main, t) = (&mq.main, &mq.extra[0]);
-        let params = GpuParams { matching: LVL9, emit_frames: false, huffman: true };
+        let params = GpuParams { matching: probe_params(), emit_frames: false, huffman: true };
         let km = Kernels::new(main, params).unwrap();
         let (a, b) = (upload(main, a_blocks), upload(main, b_blocks));
         main.queue.submit([k12(main, &km, &a)]);
