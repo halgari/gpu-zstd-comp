@@ -88,6 +88,7 @@ pub struct PipelineStats {
 /// - `gpu_idle`: gaps between one batch's end marker and the next batch's start marker. This
 ///   includes the previous batch's timestamp resolve and its copy into staging (recorded after
 ///   its end marker; a few µs) and any barrier work at the start of a submission.
+///
 /// Producer thread (the one calling `run*` / `stream_frames`; its time is the critical path):
 /// - `host_upload_wait`: waiting for the next slot: its batch completed and released by the sink,
 ///   its upload buffer mapped again.
