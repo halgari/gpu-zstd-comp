@@ -84,3 +84,26 @@ lvl9 per-kernel at e511d6a (median run): K1 8.00 · K2 16.93 · K3 61.53 · K4 8
 block −17 %. rung1 is +25.6 % and lvl3 +47 %; lvl3 is now above M3's 1545.7. Tuning note: `GZC_K1_GROUPS` sets the
 live-table count. 224 is ~0.5 ms faster for lvl9 and 256 is 1 ms faster for lvl3; on 32 MB-L2 cards ~64–96 should
 be right (untested).
+
+### S2 fix round 1 + S1+S2 merged (merge aa17791 of b7dc7db, fixes c2bcd03), 2026-09-30 01:40–01:55, load avg 1.0–2.1
+
+Fix round 1 changes:
+- K1's head is now per-dispatch scratch. Each workgroup clears its table in-kernel at the start of a dispatch, and tags
+  are chain ordinal + 1, so there is no host tag state and no IMMEDIATES feature.
+- The subgroup kernel self-tests at `ChainsKernel::new` and falls back on mismatch.
+- Default live tables: 128 (32 MiB) for 32 MB-L2 target cards.
+
+"S1+S2 merged", lvl9, 3 clean runs each (no other GPU process), median:
+
+| Config | Batch | End-to-end MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Sum ms/batch (µs/block) |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| default (128 tables), `--batch max` | 2026 | 2384.8 / 2390.2 / 2402.7 | **2390.2** | 13.20 | 10.71 | 59.22 | 9.99 | 3.48 | 96.60 (47.7) |
+| `GZC_K1_GROUPS=256`, `--batch max` | 2026 | 2463.6 / 2477.8 / 2481.0 | 2477.8 | 9.80 | 10.60 | 59.23 | 9.64 | 3.61 | 93.00 (45.9) |
+| default (128 tables), b1638 | 1638 | 2140.5 / 2140.5 / 2139.6 | 2140.5 | 10.83 | 8.75 | 58.83 | 7.02 | 3.00 | 88.40 (54.0) |
+| fallback K1 (`GZC_NO_SUBGROUPS=1`), b1638 | 1638 | 2019.8 / 2017.6 / 2021.9 | 2019.8 | 16.42 | | | | | 93.92 |
+
+- The 5090 cost of the 128-table default (the controller's ruling for 8 GB-class cards) against 256 is +3.4 ms/batch of K1,
+  which is −3.5 % end-to-end (2390.2 against 2477.8 MB/s). `GZC_K1_GROUPS=256` recovers it on 96 MB-L2 GPUs.
+- The in-kernel table clear per dispatch costs nothing measurable. K1 at 1638 blocks is 10.8 ms with 128 tables, against
+  about 10–10.5 ms for 128 tables in the pre-fix sweep.
+- `--verify` of the merged default passed: 2383.2 MB/s.
