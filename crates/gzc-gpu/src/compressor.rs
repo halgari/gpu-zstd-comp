@@ -232,7 +232,7 @@ impl Kernels {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes: ts(2) });
         pass.set_pipeline(&self.parse);
         pass.set_bind_group(0, &k3, &[]);
-        pass.dispatch_workgroups(n_blocks.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
     }
 }
 

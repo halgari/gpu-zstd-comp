@@ -1,6 +1,8 @@
 // K3: greedy parse (== gzc_core::reference::greedy_parse), one thread per block, sequential.
-// Dispatch (ceil(n_blocks / 64), 1, 1). The host binds exactly n_blocks * 2 words of `counts`,
-// so arrayLength(&counts) / 2 is the batch size and surplus threads return.
+// Dispatch (n_blocks, 1, 1) with workgroup size 1: each block gets its own subgroup, so the
+// long, data-dependent per-block loops never diverge against each other (2.5-6x faster than
+// 64-wide workgroups on an RTX 5090). The host binds exactly n_blocks * 2 words of `counts`,
+// so arrayLength(&counts) / 2 is the batch size (the bounds check below is defensive).
 // Outputs per block b:
 //   seqs[(b*MAX_SEQS + i)*3 ..] = (lit_len, match_len, off_base) for i < n_seq
 //   lits[b*BLOCK_SIZE/4 ..]     = literal bytes packed little-endian
@@ -76,7 +78,7 @@ fn push_lits(base: u32, start: u32, end: u32) {
     n_lit += end - start;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = gid.x;
     if (b >= arrayLength(&counts) / 2u) { return; }
