@@ -3,7 +3,7 @@
 //! This is the bit-exact oracle the GPU kernels are tested against: a level-3-style
 //! greedy parse over a hash-chain match finder, using integer arithmetic only so the
 //! GPU mirrors it exactly.
-use crate::config::{BLOCK_SIZE, MIN_MATCH, NO_POS, PARSE_END};
+use crate::config::{BLOCK_SIZE, MATCH_SEARCH_CAP, MIN_MATCH, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash_long, hash_short};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
@@ -37,10 +37,23 @@ pub fn match_len(block: &[u8], p: usize, q: usize) -> usize {
     n
 }
 
+/// `match_len` that stops comparing at `MATCH_SEARCH_CAP` bytes:
+/// `min(match_len(block, p, q), MATCH_SEARCH_CAP)` without the cost of the full compare.
+pub fn match_len_capped(block: &[u8], p: usize, q: usize) -> usize {
+    let max = (BLOCK_SIZE - p).min(MATCH_SEARCH_CAP);
+    let mut n = 0usize;
+    while n < max && block[p + n] == block[q + n] {
+        n += 1;
+    }
+    n
+}
+
 /// For every `p < PARSE_END`, find the best match by walking up to `depth` candidates
 /// from the long-hash chain, then up to `depth` candidates from the short-hash chain,
-/// keeping the candidate with the largest length (ties broken by the larger `q`, i.e.
-/// the more recent/closer candidate). Positions `p >= PARSE_END` are left default.
+/// keeping the candidate with the largest length capped at `MATCH_SEARCH_CAP` (ties broken
+/// by the larger `q`, i.e. the more recent/closer candidate). The stored length is the capped
+/// one; `greedy_parse` extends matches that hit the cap. Positions `p >= PARSE_END` are left
+/// default.
 pub fn find_best(block: &[u8], pred_long: &[u32], pred_short: &[u32], params: RefParams) -> Vec<Match> {
     let mut best = vec![Match::default(); BLOCK_SIZE];
     for p in 0..PARSE_END {
@@ -53,7 +66,7 @@ pub fn find_best(block: &[u8], pred_long: &[u32], pred_short: &[u32], params: Re
                     break;
                 }
                 let qu = q as usize;
-                let len = match_len(block, p, qu);
+                let len = match_len_capped(block, p, qu);
                 if len > best_len || (len == best_len && qu > best_q) {
                     best_len = len;
                     best_q = qu;
@@ -69,7 +82,8 @@ pub fn find_best(block: &[u8], pred_long: &[u32], pred_short: &[u32], params: Re
 }
 
 /// Greedy parse: at each position, prefer a repeat-offset match (rep0) over the best
-/// hash-chain match; otherwise skip ahead with a mild acceleration as literal runs grow.
+/// hash-chain match (extended to its full length when `find_best` capped it);
+/// otherwise skip ahead with a mild acceleration as literal runs grow.
 /// Trailing bytes from the final anchor to `BLOCK_SIZE` become the last literal run.
 pub fn greedy_parse(block: &[u8], best: &[Match], params: RefParams) -> BlockOutput {
     let mut sequences = Vec::new();
@@ -100,7 +114,12 @@ pub fn greedy_parse(block: &[u8], best: &[Match], params: RefParams) -> BlockOut
         }
         if best[p].len as usize >= params.min_match {
             let m = best[p];
-            emit!(m.offset, m.len as usize);
+            let len = if m.len as usize == MATCH_SEARCH_CAP {
+                match_len(block, p, p - m.offset as usize)
+            } else {
+                m.len as usize
+            };
+            emit!(m.offset, len);
             continue;
         }
         p += 1 + ((p - anchor) >> 8);
@@ -158,6 +177,7 @@ mod tests {
                     }
                     let len = m.len as usize;
                     assert!(len >= MIN_MATCH, "p={p} len={len} below min_match");
+                    assert!(len <= MATCH_SEARCH_CAP, "p={p} len={len} above MATCH_SEARCH_CAP");
                     assert!(p + len <= BLOCK_SIZE, "p={p} len={len} runs past block end");
                     let q = p - m.offset as usize;
                     assert_eq!(&block[p..p + len], &block[q..q + len], "p={p} offset={} len={len} not a real match", m.offset);
@@ -182,6 +202,37 @@ mod tests {
         }
         let trailing = BLOCK_SIZE - pos as usize;
         assert!(ends_at_block || trailing < 8, "no match reaches block end, and trailing literal run is {trailing} bytes");
+    }
+
+    #[test]
+    fn zeros_is_one_long_match_found_fast() {
+        let block = synth::zeros(BLOCK_SIZE);
+        let pred_long = compute_preds(&block, hash_long);
+        let pred_short = compute_preds(&block, hash_short);
+        let t = std::time::Instant::now();
+        let best = find_best(&block, &pred_long, &pred_short, LVL3);
+        let elapsed = t.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(1), "find_best on zeros took {elapsed:?}");
+        assert_eq!(best[1], Match { offset: 1, len: MATCH_SEARCH_CAP as u32 });
+
+        // One literal, then one (rep0) match to the block end.
+        let out = greedy_parse(&block, &best, LVL3);
+        assert_eq!(out.sequences, vec![Sequence { lit_len: 1, match_len: BLOCK_SIZE as u32 - 1, off_base: 1 }]);
+        assert_eq!(out.literals, vec![0]);
+    }
+
+    #[test]
+    fn parse_extends_capped_best_match() {
+        // period3: no repcode matches, so p=3 takes best[3] (offset 3, len capped) and must
+        // extend it to the block end.
+        let (_, block) = synth::test_cases().into_iter().find(|(n, _)| *n == "period3").unwrap();
+        let pred_long = compute_preds(&block, hash_long);
+        let pred_short = compute_preds(&block, hash_short);
+        let best = find_best(&block, &pred_long, &pred_short, LVL3);
+        assert_eq!(best[3], Match { offset: 3, len: MATCH_SEARCH_CAP as u32 });
+        let out = greedy_parse(&block, &best, LVL3);
+        assert_eq!(out.sequences, vec![Sequence { lit_len: 3, match_len: BLOCK_SIZE as u32 - 3, off_base: 3 + 3 }]);
+        assert_eq!(out.literals, vec![1, 2, 3]);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! GpuContext: device/queue setup, buffer helpers, shader templating.
 use anyhow::{Context as _, anyhow};
-use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, MIN_MATCH, NO_POS, PARSE_END};
+use gzc_core::config::{
+    BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, MATCH_SEARCH_CAP, MIN_MATCH, NO_POS, PARSE_END,
+};
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
@@ -104,7 +106,8 @@ pub fn constants_wgsl() -> String {
          const MIN_MATCH: u32 = {MIN_MATCH}u;\n\
          const PARSE_END: u32 = {PARSE_END}u;\n\
          const HASHED_POSITIONS: u32 = {HASHED_POSITIONS}u;\n\
-         const NO_POS: u32 = 0x{NO_POS:08X}u;\n"
+         const NO_POS: u32 = 0x{NO_POS:08X}u;\n\
+         const MATCH_SEARCH_CAP: u32 = {MATCH_SEARCH_CAP}u;\n"
     )
 }
 
