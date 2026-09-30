@@ -1179,8 +1179,8 @@ const K2_VARIANTS: [MatchParams; 6] = [
 /// the 16-bit hash maps onto few buckets with many collisions.
 fn k2_fp_blocks() -> Vec<(String, Vec<u8>)> {
     let mut r = Lcg(0x58f);
-    let words: Vec<u32> = (0..12).map(|_| r.next() as u32).collect();
-    let pools: Vec<u32> = (0..4096).map(|_| r.next() as u32).collect();
+    let words: Vec<u32> = (0..12).map(|_| r.next()).collect();
+    let pools: Vec<u32> = (0..4096).map(|_| r.next()).collect();
     let mut out = Vec::new();
     for tail in [1usize, 2] {
         let mut b = Vec::with_capacity(BLOCK_SIZE + 8);
