@@ -40,6 +40,7 @@ fn highbit32(x: u32) -> i32 {
 /// 4 bytes differ or `off` is unusable. `off > p` cannot happen for a real rep history (zstd
 /// relies on its window check for that); it is guarded so nothing underflows.
 fn rep_len(block: &[u8], p: usize, off: u32) -> u32 {
+    debug_assert!(off as usize <= p, "rep offset {off} beyond position {p}");
     if off == 0 || off as usize > p {
         return 0;
     }
@@ -198,7 +199,16 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
                 // deviation: zstd stores this match with an explicit offBase (decoded as reps
                 // [o, o, r1]) and sets offset_2 = offset_1 = o. off_base_for stores it as
                 // repcode 1, which the decoder resolves without touching the history, so
-                // offset_2 stays the old reps[1]. The decoder semantics win.
+                // offset_2 becomes the old reps[1] (and, if it was still disabled, is enabled).
+                // The decoder semantics win: the immediate loop below then probes the old
+                // reps[1] where zstd would probe o, and can emit a (ll 0, repcode 1) match zstd
+                // would not (test `dedup_store_enables_old_rep1_immediate`).
+                // Common case: the first match of a block starting with a byte run (start 1,
+                // offset 1 == reps[0], ll 1) lands here and enables offset_2 = INITIAL_REPS[1]
+                // = 4, which zstd's maxRep rule keeps disabled. That one is output-equivalent
+                // while reps[0] == 1: a store ending an offset-1 run has block[E] != block[E-1]
+                // == block[E-4], so an offset-4 probe at its end can never match (test
+                // `dedup_store_at_block_start_byte_run`).
                 debug_assert_eq!(reps[0], zstd_view.0);
             } else {
                 debug_assert_eq!((reps[0], reps[1]), zstd_view, "rep history diverged from zstd's");
@@ -503,6 +513,87 @@ mod tests {
         best[296] = real(&block, 296, 20);
         assert_eq!((best[30].len, best[296].len), (8, 6));
         assert_eq!(run(&block, &best, &RUNG2), vec![seq(30, 8, 23), seq(258, 6, 1)]);
+    }
+
+    /// Deviation 3 changes output: the dedup store at 296 (offset 20 == reps[0]) leaves the
+    /// decoder's reps at [20, 1, 4], so offset_2 = 1 (zstd: offset_2 = offset_1 = 20). An
+    /// offset-1 run right after the match is then stored by the immediate loop as
+    /// (ll 0, repcode 1); zstd would probe offset 20 there, which does not match.
+    #[test]
+    fn dedup_store_enables_old_rep1_immediate() {
+        let mut block = background(61);
+        plant(&mut block, 30, 20, 8); // M0 → reps [20, 1, 4], anchor 38
+        block[301..307].fill(0x5A); // offset-1 run over 301..307 (301 is inside the match)
+        block[307] = 0xA5;
+        plant(&mut block, 296, 20, 6);
+        let mut best = empty_best();
+        best[30] = real(&block, 30, 20);
+        best[296] = real(&block, 296, 20);
+        assert_eq!((best[30].len, best[296].len), (8, 6));
+        assert_eq!(match_len(&block, 302, 301), 5, "offset-1 run at the match end");
+        assert_ne!(block[302], block[302 - 20], "zstd's offset_2 (20) must not match at 302");
+        let want = vec![seq(30, 8, 23), seq(258, 6, 1), seq(0, 5, 1)];
+        assert_eq!(run(&block, &best, &RUNG2), want);
+        assert_eq!(run(&block, &best, &LVL9), want);
+    }
+
+    /// The common deviation-3 case: a block starting with a byte run. At ip 1 the explicit
+    /// offset-1 match (start 1, 9 bytes) beats the ip+1 repcode (8 bytes); catch-up cannot
+    /// move (start == offset), so it is stored as (ll 1, repcode 1) with reps unchanged
+    /// [1, 4, 8] and offset_2 enabled as 4 (zstd keeps it at 1 after `offset_2 = offset_1`).
+    /// The offset-4 probe at the run's end cannot match, so the output equals zstd's.
+    #[test]
+    fn dedup_store_at_block_start_byte_run() {
+        let mut block = background(71);
+        block[0..10].fill(0x41);
+        block[10] = 0x14;
+        let mut best = empty_best();
+        best[1] = real(&block, 1, 1);
+        assert_eq!(best[1].len, 9);
+        let want = vec![seq(1, 9, 1)];
+        assert_eq!(run(&block, &best, &RUNG2), want);
+        assert_eq!(run(&block, &best, &LVL9), want);
+    }
+
+    /// Chained deferral: B wins at p+1, the parse `continue`s, and at p+2 C beats B by exactly
+    /// 1 under the step-1 `+4` rule. Falling through to lazy2's depth-2 check instead would
+    /// apply `+7` and keep B; `break` would store B.
+    #[test]
+    fn lazy2_chained_deferral_uses_step1_rule() {
+        let mut block = background(81);
+        plant(&mut block, 200, 14, 8); // A: offBase 17
+        plant(&mut block, 201, 28, 10); // B: offBase 31
+        plant(&mut block, 202, 130, 12); // C: offBase 133
+        let mut best = empty_best();
+        best[200] = real(&block, 200, 14);
+        best[201] = real(&block, 201, 28);
+        best[202] = real(&block, 202, 130);
+        assert_eq!((best[200].len, best[201].len, best[202].len), (8, 10, 12));
+        assert!(gain(10, 31) > gain(8, 17) + 4, "B wins at p+1");
+        assert_eq!(gain(12, 133), gain(10, 31) + 4 + 1, "C beats B by exactly 1 under +4");
+        assert!(gain(12, 133) <= gain(10, 31) + 7, "C would lose under +7");
+        let want = vec![seq(202, 12, 133)];
+        assert_eq!(run(&block, &best, &LVL9), want);
+        assert_eq!(run(&block, &best, &RUNG2), want);
+    }
+
+    /// A step-2 win also `continue`s: C wins at p+2 (+7 rule), then D at p+3 beats C under the
+    /// step-1 `+4` rule. `break` after C's win would store C.
+    #[test]
+    fn lazy2_step2_win_continues() {
+        let mut block = background(82);
+        plant(&mut block, 200, 14, 8); // A: offBase 17
+        plant(&mut block, 202, 28, 10); // C: offBase 31
+        plant(&mut block, 203, 130, 12); // D: offBase 133
+        let mut best = empty_best();
+        best[200] = real(&block, 200, 14);
+        best[202] = real(&block, 202, 28);
+        best[203] = real(&block, 203, 130);
+        assert_eq!((best[200].len, best[202].len, best[203].len), (8, 10, 12));
+        assert!(gain(10, 31) > gain(8, 17) + 7, "C wins at p+2");
+        assert!(gain(12, 133) > gain(10, 31) + 4, "D beats C at p+3");
+        assert_eq!(run(&block, &best, &LVL9), vec![seq(203, 12, 133)]);
+        assert_eq!(run(&block, &best, &RUNG2), vec![seq(200, 8, 17)], "lazy1 stops at p+1");
     }
 
     #[test]

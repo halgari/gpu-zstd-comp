@@ -88,6 +88,7 @@ pub fn preset(name: &str) -> Result<MatchParams, String> {
 /// Whether the CPU reference implements `p` (chains, best match and parse). Since Task 4
 /// (the lazy/lazy2 parse) it implements every preset and every valid `MatchParams`.
 pub fn cpu_supports(p: &MatchParams) -> bool {
+    // Now just `validate()`: kept as a separate hook for the CLI's per-engine preset check.
     p.validate().is_ok()
 }
 
