@@ -1,7 +1,7 @@
 //! GPU compressor benchmark runs (frame path: the GPU emits complete zstd frames).
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_gpu::compressor::GpuParams;
 use gzc_gpu::context::GpuContext;
-use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig, vram_bytes_with};
+use gzc_gpu::pipeline::{FrameSink, ParFrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
 use crate::corpus::Corpus;
 use crate::result::{RunResult, per_kind};
@@ -45,7 +45,8 @@ impl Frames {
     }
 }
 
-/// Copies each frame out of the mapped staging buffer and records it on the pipeline thread.
+/// Copies each frame out of the staging buffer and records it, on the pipeline's completion
+/// thread.
 struct InlineSink<'a>(&'a Frames);
 
 impl FrameSink for InlineSink<'_> {
@@ -54,13 +55,12 @@ impl FrameSink for InlineSink<'_> {
     }
 }
 
-/// Copies each frame out and hands it to the writer threads over a bounded channel.
-struct ChannelSink(mpsc::SyncSender<(usize, Vec<u8>)>);
+/// `InlineSink` for several delivery threads at once.
+struct ParSink<'a>(&'a Frames);
 
-impl FrameSink for ChannelSink {
-    fn put(&mut self, index: usize, frame: &[u8]) {
-        // The receiver lives until every worker exits, which is after this sink is dropped.
-        self.0.send((index, frame.to_vec())).expect("frame writers alive");
+impl ParFrameSink for ParSink<'_> {
+    fn put(&self, index: usize, frame: &[u8]) {
+        self.0.record(index, frame.to_vec());
     }
 }
 
@@ -72,9 +72,10 @@ impl FrameSink for Discard {
 
 /// Compresses every block of `corpus` with the streaming GPU pipeline on the frame path: the GPU
 /// emits each block's complete zstd frame (Huffman literals with `cfg.params.huffman`, else raw)
-/// and the host only copies the bytes out of the staging buffer. With `writer_threads == 0` the
-/// pipeline thread records each frame itself; with N > 0 it hands copies to N writer threads over
-/// a bounded channel (capacity `batch * inflight`). One untimed warmup batch runs first on the same pipeline; the
+/// and the host only copies the bytes out of the staging buffer (the stand-in for writing them
+/// out). The calling thread uploads; with `writer_threads == 0` the pipeline's completion thread
+/// copies and records every frame (`Pipeline::run_frames`), with N > 0 N delivery threads share
+/// each batch (`Pipeline::run_frames_par`). One untimed warmup batch runs first on the same pipeline; the
 /// timed region spans from the first upload to the last frame recorded. With `verify`, every frame
 /// is then decompressed with libzstd and compared with its padded block. `kernel_ms` holds the
 /// timed run's summed per-kernel GPU time (when the device supports timestamps); a per-batch
@@ -106,24 +107,7 @@ pub fn run_gpu(
     let stats = if writer_threads == 0 {
         pipe.run_frames(&blocks, &mut InlineSink(&frames))?
     } else {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(writer_threads).build()?;
-        let (tx, rx) = mpsc::sync_channel::<(usize, Vec<u8>)>((cfg.batch * cfg.inflight) as usize);
-        let rx = Mutex::new(rx);
-        pool.in_place_scope(|s| {
-            for _ in 0..writer_threads {
-                s.spawn(|_| {
-                    loop {
-                        let msg = rx.lock().unwrap().recv();
-                        let Ok((i, frame)) = msg else { break };
-                        frames.record(i, frame);
-                    }
-                });
-            }
-            let mut sink = ChannelSink(tx);
-            let stats = pipe.run_frames(&blocks, &mut sink);
-            drop(sink); // closes the channel: workers drain it and exit
-            stats
-        })?
+        pipe.run_frames_par(&blocks, &ParSink(&frames), writer_threads)?
     };
     let seconds = start.elapsed().as_secs_f64();
 

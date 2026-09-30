@@ -195,8 +195,8 @@ struct GpuSweepArgs {
     #[arg(long, value_delimiter = ',', default_value = "3")]
     inflight: Vec<u32>,
     /// Comma-separated number of CPU frame-writer threads. The GPU emits finished frames, so a
-    /// writer only records (in a real tool: writes out) the bytes it is handed; 0 = the pipeline
-    /// thread does that itself, N > 0 = N threads fed through a bounded channel.
+    /// writer only copies (in a real tool: writes out) the bytes it is handed; 0 = the pipeline's
+    /// completion thread does that itself, N > 0 = N threads share each completed batch.
     #[arg(long, value_delimiter = ',', default_value = "0")]
     writer_threads: Vec<usize>,
     /// GPU memory budget in MiB (default: an 8 GB card minus headroom). Every (batch, inflight)

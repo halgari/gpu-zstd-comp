@@ -11,6 +11,13 @@
 //! staging buffer is mapped once. Completed slots are handed to the sink in submission order while
 //! later batches keep the GPU busy.
 //!
+//! Threads: the caller's thread is the producer: it writes each batch into a slot's mapped upload
+//! buffer (itself with `stream_frames`, or `FrameStream::upload_blocks` copying from `&[&[u8]]`)
+//! and submits it. A completion thread (one per `run*` / `stream_frames` call) waits for the
+//! batches in submission order and lends each one's staging bytes to the sink (`Lease`,
+//! `FrameBatch`); a slot is reused once its batch is released, so delivery overlaps the next
+//! uploads instead of following them on one thread. Slot states live in `Shared`.
+//!
 //! Direct upload (`GpuContext::direct_upload`, full ReBAR): there is no shared `data` and no
 //! upload copy; each submission binds its slot's upload buffer (device-local, mapped for the
 //! host between submissions) as `data`.
@@ -30,11 +37,11 @@
 //! - frames (`run_frames`, `FrameSink`): K1→K2→K3→K5→K4, staging holds `frame_len` and the
 //!   `frames` region, either as a copy of the fixed-stride buffer or, with `GZC_PACK` (see
 //!   `PackKernel`), packed by a kernel that writes the frames contiguously straight into the
-//!   (mappable) staging buffer; the host only copies each frame's bytes out. K5 (the literals
+//!   (mappable) staging buffer; the sink reads each frame in place (`FrameBatch`). K5 (the literals
 //!   section, Huffman-coded with `GpuParams::huffman`) gathers the literals from `data` and writes
 //!   into the same `frames` / `frame_len` buffers, so it adds no memory.
-use std::collections::VecDeque;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::{Context as _, anyhow};
@@ -43,7 +50,7 @@ use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
     BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, data_bytes, decode_output,
-    frame_bytes, frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks, scratch_bytes, seqs_bytes,
+    frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks, scratch_bytes, seqs_bytes,
     slot_bytes,
 };
 use crate::context::GpuContext;
@@ -70,7 +77,7 @@ pub struct PipelineStats {
     pub batches: u32,
     /// Where the time outside the kernels goes, summed over all batches, in milliseconds (see
     /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (left out without them); the
-    /// `host_*` ones are wall time on the pipeline thread.
+    /// `host_*` ones are wall time on the producer or the completion thread.
     pub transfer_ms: Vec<(String, f64)>,
 }
 
@@ -81,14 +88,20 @@ pub struct PipelineStats {
 /// - `gpu_idle`: gaps between one batch's end marker and the next batch's start marker. This
 ///   includes the previous batch's timestamp resolve and its copy into staging (recorded after
 ///   its end marker; a few µs) and any barrier work at the start of a submission.
-/// - `host_upload_wait`: waiting for a slot's upload buffer to be mapped again.
-/// - `host_upload_write`: writing the blocks into the mapped upload buffer, plus unmap.
-/// - `host_submit`: recording and submitting the batch, plus the map requests.
-/// - `host_wait`: blocked in `device.poll` for the oldest batch.
-/// - `host_deliver`: handing a completed batch to the sink.
-/// - `host_unmap`: unmapping the staging buffer.
+/// Producer thread (the one calling `run*` / `stream_frames`; its time is the critical path):
+/// - `host_upload_wait`: waiting for the next slot: its batch completed and released by the sink,
+///   its upload buffer mapped again.
+/// - `host_upload_write`: from handing out the upload slot to its submission (the wrappers: the
+///   copy into the mapped upload buffer).
+/// - `host_submit`: unmapping, recording and submitting the batch, plus the map requests.
 /// - `host_fill`: from the start to the first submission.
-/// - `host_drain`: from the last `device.poll` returning to the end.
+///
+/// Completion thread (overlaps the producer):
+/// - `host_wait`: blocked on the GPU for the oldest batch.
+/// - `host_deliver`: handing a completed batch to the sink (for `stream_frames`: until `on_batch`
+///   returns; a sink that keeps the `FrameBatch` does its work after that).
+/// - `host_unmap`: releasing the batches (unmapping the staging buffer), on whichever thread.
+/// - `host_drain`: from the last batch's GPU completion to the end (its delivery and release).
 pub const TRANSFER_NAMES: [&str; 11] = [
     "gpu_upload_copy",
     "gpu_readback",
@@ -103,35 +116,24 @@ pub const TRANSFER_NAMES: [&str; 11] = [
     "host_drain",
 ];
 
-/// Accumulators behind `PipelineStats::transfer_ms`: GPU ticks and host seconds.
-#[derive(Default)]
-struct Profile {
-    /// Kernel ticks, per `Kernels::names`.
-    ticks: Vec<u64>,
-    upload_copy: u64,
-    readback: u64,
-    idle: u64,
-    /// End marker of the last batch finished (ticks), for `idle`.
-    last_end: Option<u64>,
-    upload_wait: f64,
-    upload_write: f64,
-    submit: f64,
-    wait: f64,
-    deliver: f64,
-    unmap: f64,
-    fill: f64,
-    drain: f64,
-}
-
-/// Receives each block's parse; called exactly once per index, in arbitrary order.
+/// Receives each block's parse; called exactly once per index, in arbitrary order. `Pipeline::run`
+/// calls it on the pipeline's completion thread (hence `Send` there).
 pub trait BlockSink {
     fn put(&mut self, index: usize, out: BlockOutput);
 }
 
-/// Receives each block's complete zstd frame; called exactly once per index, in arbitrary order.
-/// `frame` borrows the mapped staging buffer: copy it out before returning.
+/// Receives each block's complete zstd frame; called exactly once per index. `Pipeline::run_frames`
+/// calls it on the pipeline's completion thread (hence `Send` there), batch after batch in
+/// submission order and in index order within a batch, while the calling thread uploads the next
+/// batches. `frame` borrows the batch's staging buffer: copy (or write) it out before returning.
 pub trait FrameSink {
     fn put(&mut self, index: usize, frame: &[u8]);
+}
+
+/// A frame sink that several delivery threads call at once (`Pipeline::run_frames_par`): exactly
+/// once per index, in arbitrary order. `frame` borrows the staging buffer as in `FrameSink`.
+pub trait ParFrameSink: Sync {
+    fn put(&self, index: usize, frame: &[u8]);
 }
 
 /// Timestamp queries per slot: the kernels' begin/end pairs, then a start and an end marker (see
@@ -170,12 +172,13 @@ impl StagingLayout {
     }
 }
 
-/// Hands one completed batch to the caller's sink: `(first block index, block count, mapped
-/// staging bytes)`.
-type Deliver<'d> = dyn FnMut(usize, u32, &[u8]) -> anyhow::Result<()> + 'd;
+/// Hands one completed batch to the caller's sink on the completion thread: `(lease of the
+/// staging bytes, first block index, block count)`.
+type Handler<'d> = dyn FnMut(Lease, usize, u32) -> anyhow::Result<()> + Send + 'd;
 
-/// A submitted batch awaiting its staging map.
+/// A submitted batch, sent to the completion thread.
 struct Job {
+    slot: usize,
     first: usize,
     n: u32,
     submission: wgpu::SubmissionIndex,
@@ -183,13 +186,15 @@ struct Job {
     mapped: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     /// Transfer readback: the batch's value on the `Xfer` timelines.
     seq: u64,
+    staging: Arc<Staging>,
 }
 
 /// A slot's staging buffer: mapped through wgpu after the submission, or (transfer readback)
-/// host memory the transfer queue writes and that stays mapped.
+/// host memory the transfer queue writes and that stays mapped. Shared between the slot, the
+/// completion thread and the batch lent out of it (`Lease`).
 enum Staging {
     Wgpu(wgpu::Buffer),
-    Host(Box<RawBuffer>),
+    Host(RawBuffer),
 }
 
 #[cfg(test)]
@@ -210,20 +215,220 @@ struct Queries {
     raw: Option<RawBuffer>,
 }
 
+/// The producer's side of a slot; the staging side's state lives in `Shared`.
 struct Slot {
-    /// Persistent upload buffer (MAP_WRITE | COPY_SRC, `data_bytes(batch)`): the host writes a
+    /// Persistent upload buffer (MAP_WRITE | COPY_SRC, `data_bytes(batch)`): the producer writes a
     /// batch into it while it is mapped, and the submission copies it into the shared `data` (direct
     /// upload: MAP_WRITE | STORAGE, bound as `data` itself).
     /// After each submission it is re-mapped; `upload_mapped` receives that map's result (None:
-    /// mapped).
+    /// mapped, or `upload_unmapped`).
     upload: wgpu::Buffer,
     upload_mapped: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Unmapped with no re-map requested (a submission failed in between): mapped on next use.
+    upload_unmapped: bool,
     /// The submission that last used `upload` (to wait for its re-map).
     upload_submission: Option<wgpu::SubmissionIndex>,
-    staging: Staging,
+    staging: Arc<Staging>,
+    /// A wgpu staging map was requested since the slot was last free (`abandon` unmaps it).
+    staging_requested: bool,
     /// Query set and its resolve buffer, when timestamps are enabled.
     queries: Option<Queries>,
-    job: Option<Job>,
+}
+
+/// Where a slot's staging buffer is: free for the next submission, written by an in-flight batch,
+/// or lent out (`Lease`, e.g. inside a `FrameBatch`) until the sink drops it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotState {
+    Free,
+    InFlight,
+    Leased,
+}
+
+/// Slot states shared by the producer (the thread in `run*` / `stream_frames`), the completion
+/// thread and the leases, which may be dropped on any thread.
+struct Shared {
+    state: Mutex<SharedState>,
+    cv: Condvar,
+    /// Nanoseconds spent releasing leases (unmap), for `host_unmap`.
+    release_ns: AtomicU64,
+}
+
+struct SharedState {
+    slots: Vec<SlotState>,
+    /// Set when either side of a stream failed: the producer stops waiting for slots and the
+    /// completion thread stops delivering.
+    abort: bool,
+}
+
+impl Shared {
+    fn new(slots: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SharedState { slots: vec![SlotState::Free; slots], abort: false }),
+            cv: Condvar::new(),
+            release_ns: AtomicU64::new(0),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SharedState> {
+        // No critical section below can leave the state inconsistent.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, slot: usize, to: SlotState) {
+        self.lock().slots[slot] = to;
+        self.cv.notify_all();
+    }
+
+    fn abort(&self) {
+        self.lock().abort = true;
+        self.cv.notify_all();
+    }
+
+    fn aborted(&self) -> bool {
+        self.lock().abort
+    }
+
+    /// Blocks until `slot` is free; errors once the stream is aborted.
+    fn wait_free(&self, slot: usize) -> anyhow::Result<()> {
+        let mut g = self.lock();
+        loop {
+            anyhow::ensure!(!g.abort, "stream aborted");
+            if g.slots[slot] == SlotState::Free {
+                return Ok(());
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Blocks until no slot is lent out.
+    fn wait_released(&self) {
+        let mut g = self.lock();
+        while g.slots.contains(&SlotState::Leased) {
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Aborts the stream if the completion thread unwinds, so the producer never waits for a slot
+/// that will not come free.
+struct AbortOnPanic<'s>(&'s Shared);
+
+impl Drop for AbortOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.abort();
+        }
+    }
+}
+
+/// A completed batch's staging bytes, lent out until dropped: the slot takes no new batch before
+/// that. Dropping it unmaps a wgpu staging buffer and frees the slot.
+struct Lease {
+    shared: Arc<Shared>,
+    slot: usize,
+    staging: Arc<Staging>,
+    /// wgpu staging: its mapped range, which `ptr`/`len` point into.
+    view: Option<wgpu::BufferView>,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the bytes are immutable while the lease lives (the slot is not resubmitted, so neither
+// the GPU nor the transfer queue writes them, and wgpu keeps the range mapped); the other fields
+// are `Send + Sync`.
+unsafe impl Send for Lease {}
+unsafe impl Sync for Lease {}
+
+impl Lease {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: see the `Send` impl; `ptr`/`len` cover the mapping, alive as long as `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let t = Instant::now();
+        self.view.take();
+        if let Staging::Wgpu(b) = &*self.staging {
+            b.unmap();
+        }
+        self.shared.release_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.shared.set(self.slot, SlotState::Free);
+    }
+}
+
+/// A completed batch of zstd frames lent to the caller (`Pipeline::stream_frames`) without a copy:
+/// each frame points into the slot's staging buffer. The slot takes a new batch only once this is
+/// dropped, so a sink may hand it to writer threads (it is `Send + Sync`) and drop it when their
+/// writes are done; the producer blocks in `FrameStream::next_upload_slot` meanwhile. Keep at most
+/// `inflight - 1` batches alive, or the stream stalls.
+pub struct FrameBatch {
+    lease: Lease,
+    first: usize,
+    /// Per frame: byte offset in the staging buffer, and length.
+    spans: Vec<(usize, u32)>,
+}
+
+impl FrameBatch {
+    /// Checks every frame length (1..=FRAME_STRIDE) and locates the frames: at their fixed stride,
+    /// or (`packed`) one after another at `PACK_ALIGN` boundaries.
+    fn new(lease: Lease, first: usize, n: u32, layout: &StagingLayout, packed: bool) -> anyhow::Result<Self> {
+        let bytes = lease.bytes();
+        let lens: &[u32] = bytemuck::cast_slice(&bytes[..frame_len_bytes(n) as usize]);
+        let mut spans = Vec::with_capacity(n as usize);
+        let mut at = layout.a as usize;
+        for (b, &len) in lens.iter().enumerate() {
+            anyhow::ensure!(len > 0 && len as usize <= FRAME_STRIDE, "block {}: bad frame length {len}", first + b);
+            if packed {
+                spans.push((at, len));
+                at += (len as usize).next_multiple_of(PACK_ALIGN);
+            } else {
+                spans.push((layout.a as usize + b * FRAME_STRIDE, len));
+            }
+        }
+        Ok(Self { lease, first, spans })
+    }
+
+    /// Index of the batch's first block in the stream (blocks count from 0 per stream).
+    pub fn first_index(&self) -> usize {
+        self.first
+    }
+
+    /// Number of frames (blocks) in the batch.
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Frame `k` of the batch (block `first_index() + k`).
+    pub fn frame(&self, k: usize) -> &[u8] {
+        let (at, len) = self.spans[k];
+        &self.lease.bytes()[at..at + len as usize]
+    }
+
+    /// `(block index, frame)` for every frame, in index order.
+    pub fn frames(&self) -> impl ExactSizeIterator<Item = (usize, &[u8])> + '_ {
+        (0..self.len()).map(|k| (self.first + k, self.frame(k)))
+    }
+
+    /// Hands every frame to `sink` from `threads` threads (this one included), each taking a
+    /// contiguous share of the batch.
+    pub fn deliver_par(&self, sink: &impl ParFrameSink, threads: usize) {
+        let n = self.len();
+        let per = n.div_ceil(threads.clamp(1, n.max(1))).max(1);
+        std::thread::scope(|s| {
+            let mut shares = (0..n).step_by(per).map(|k| k..(k + per).min(n));
+            let mine = shares.next();
+            for share in shares {
+                s.spawn(move || share.for_each(|k| sink.put(self.first + k, self.frame(k))));
+            }
+            mine.into_iter().flatten().for_each(|k| sink.put(self.first + k, self.frame(k)));
+        });
+    }
 }
 
 /// Transfer readback (frame path, `GpuContext::transfer`, no packing): K4 writes `frames` /
@@ -239,7 +444,8 @@ struct Xfer {
     /// One command buffer per slot.
     cmds: Commands,
     k_done: Timeline,
-    t_done: Timeline,
+    /// Shared with the completion thread, which waits on it.
+    t_done: Arc<Timeline>,
     /// `seq` of the next batch (timeline values only grow, across runs).
     next_seq: u64,
     /// This pipeline's exclusive claim on the transfer queue (one transfer-readback `Pipeline`
@@ -259,6 +465,8 @@ pub struct Pipeline<'a> {
     bufs: BatchBuffers,
     layout: StagingLayout,
     slots: Vec<Slot>,
+    /// The slots' staging states (see `Shared`).
+    shared: Arc<Shared>,
     /// Frame path with `GpuContext::pack_frames` (opt-in, `GZC_PACK`): packs the frames into the
     /// staging buffer instead of copying the fixed-stride region.
     pack: Option<PackKernel>,
@@ -414,7 +622,7 @@ impl<'a> Pipeline<'a> {
                 frame_len: tq.buffer(frame_len_bytes(cfg.batch), shared, false)?,
                 cmds: tq.commands(cfg.inflight)?,
                 k_done: tq.timeline()?,
-                t_done: tq.timeline()?,
+                t_done: Arc::new(tq.timeline()?),
                 next_seq: 1,
                 tq,
             }),
@@ -423,7 +631,7 @@ impl<'a> Pipeline<'a> {
         let mut slots = Vec::with_capacity(cfg.inflight as usize);
         for _ in 0..cfg.inflight {
             let staging = match &xfer {
-                Some(x) => Staging::Host(Box::new(x.tq.buffer(layout.size, U::TRANSFER_DST, true)?)),
+                Some(x) => Staging::Host(x.tq.buffer(layout.size, U::TRANSFER_DST, true)?),
                 None => Staging::Wgpu(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.staging"),
                     size: layout.size,
@@ -468,10 +676,11 @@ impl<'a> Pipeline<'a> {
                     mapped_at_creation: true,
                 }),
                 upload_mapped: None,
+                upload_unmapped: false,
                 upload_submission: None,
-                staging,
+                staging: Arc::new(staging),
+                staging_requested: false,
                 queries,
-                job: None,
             });
         }
         // Direct upload: no shared `data`, each submission binds its slot's upload buffer (see
@@ -495,6 +704,7 @@ impl<'a> Pipeline<'a> {
             kernels,
             bufs,
             layout,
+            shared: Shared::new(slots.len()),
             slots,
             pack,
             direct,
@@ -532,13 +742,14 @@ impl<'a> Pipeline<'a> {
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's parse
-    /// to `sink` exactly once. Errors on a frame-path pipeline, and on wgpu validation or
-    /// out-of-memory errors.
-    pub fn run(&mut self, blocks: &[&[u8]], sink: &mut impl BlockSink) -> anyhow::Result<PipelineStats> {
+    /// to `sink` exactly once, on the completion thread. Errors on a frame-path pipeline, and on
+    /// wgpu validation or out-of-memory errors.
+    pub fn run(&mut self, blocks: &[&[u8]], sink: &mut (impl BlockSink + Send)) -> anyhow::Result<PipelineStats> {
         anyhow::ensure!(!self.layout.frames, "pipeline built with emit_frames: use run_frames");
+        check_blocks(blocks)?;
         let layout = self.layout;
-        self.run_with(blocks, &mut |first, n, view| {
-            let words: &[u32] = bytemuck::cast_slice(view);
+        let handler = move |lease: Lease, first: usize, n: u32| -> anyhow::Result<()> {
+            let words: &[u32] = bytemuck::cast_slice(lease.bytes());
             let seq_stride = 3 * MAX_SEQS as usize;
             for b in 0..n as usize {
                 let (n_seq, n_lit) = (words[2 * b], words[2 * b + 1]);
@@ -558,73 +769,162 @@ impl<'a> Pipeline<'a> {
                 sink.put(first + b, out);
             }
             Ok(())
-        })
+        };
+        self.stream_with(Box::new(handler), |stream| stream.upload_blocks(blocks))
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's zstd
-    /// frame (K4 output) to `sink` exactly once. Errors on a parse-path pipeline, and on wgpu
-    /// validation or out-of-memory errors.
-    pub fn run_frames(&mut self, blocks: &[&[u8]], sink: &mut impl FrameSink) -> anyhow::Result<PipelineStats> {
-        anyhow::ensure!(self.layout.frames, "pipeline built without emit_frames: use run");
-        let layout = self.layout;
-        let packed = self.pack.is_some();
-        self.run_with(blocks, &mut |first, n, view| {
-            let lens: &[u32] = bytemuck::cast_slice(&view[..frame_len_bytes(n) as usize]);
-            let frames = &view[layout.a as usize..layout.a as usize + n as usize * FRAME_STRIDE];
-            // Packed: each frame starts at the PACK_ALIGN boundary after the previous one, so
-            // (with every length at most FRAME_STRIDE) all of them lie inside `frames`.
-            let mut at = 0usize;
-            for (b, &len) in lens.iter().enumerate() {
-                let frame = if packed {
-                    let ok = len > 0 && len as usize <= FRAME_STRIDE;
-                    anyhow::ensure!(ok, "block {}: bad frame length {len}", first + b);
-                    let f = &frames[at..at + len as usize];
-                    at += (len as usize).next_multiple_of(PACK_ALIGN);
-                    f
-                } else {
-                    frame_bytes(frames, b, len).with_context(|| format!("block {}", first + b))?
-                };
-                sink.put(first + b, frame);
-            }
-            Ok(())
-        })
+    /// frame (K4 output) to `sink` exactly once, on the completion thread (see `FrameSink`) while
+    /// this thread uploads. Errors on a parse-path pipeline, and on wgpu validation or
+    /// out-of-memory errors.
+    pub fn run_frames(&mut self, blocks: &[&[u8]], sink: &mut (impl FrameSink + Send)) -> anyhow::Result<PipelineStats> {
+        check_blocks(blocks)?;
+        self.stream_frames(
+            |batch| {
+                batch.frames().for_each(|(i, frame)| sink.put(i, frame));
+                Ok(())
+            },
+            |stream| stream.upload_blocks(blocks),
+        )
     }
 
-    fn run_with(&mut self, blocks: &[&[u8]], deliver: &mut Deliver<'_>) -> anyhow::Result<PipelineStats> {
-        if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
-            anyhow::bail!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len());
-        }
+    /// `run_frames` with each completed batch's frames handed to `sink` from `threads` delivery
+    /// threads at once (`FrameBatch::deliver_par`), so that copying or writing the frames out
+    /// takes about a `threads`-th of the time.
+    pub fn run_frames_par(
+        &mut self,
+        blocks: &[&[u8]],
+        sink: &impl ParFrameSink,
+        threads: usize,
+    ) -> anyhow::Result<PipelineStats> {
+        check_blocks(blocks)?;
+        self.stream_frames(
+            |batch| {
+                batch.deliver_par(sink, threads);
+                Ok(())
+            },
+            |stream| stream.upload_blocks(blocks),
+        )
+    }
+
+    /// The streaming frame API, with no host copy on either side. `produce` runs on this thread:
+    /// it takes each upload slot in turn (`FrameStream::next_upload_slot`), writes blocks straight
+    /// into its mapped memory (`UploadSlot::blocks_mut`) and submits them (`UploadSlot::submit`,
+    /// any number up to the slot's capacity, e.g. when a flush timer fires); it blocks only when
+    /// every slot is in flight or still lent out. A completion thread waits for the batches in
+    /// submission order and hands each one to `on_batch` as a `FrameBatch`, whose frames point
+    /// into the slot's staging buffer; the slot is reused once the batch is dropped, which may
+    /// happen on any thread. Blocks count from 0 per stream. Returns once `produce` has returned,
+    /// every submitted batch went to `on_batch` and every `FrameBatch` was dropped. An error
+    /// from either side (or a panic in `on_batch`) aborts the stream: `produce` sees an error
+    /// from its next `FrameStream` call, no further batches are delivered, and the error is
+    /// returned (the completion side's first); the pipeline stays usable.
+    pub fn stream_frames<F, P>(&mut self, mut on_batch: F, produce: P) -> anyhow::Result<PipelineStats>
+    where
+        F: FnMut(FrameBatch) -> anyhow::Result<()> + Send,
+        P: FnOnce(&mut FrameStream<'_, 'a>) -> anyhow::Result<()>,
+    {
+        anyhow::ensure!(self.layout.frames, "pipeline built without emit_frames: use run");
+        let (layout, packed) = (self.layout, self.pack.is_some());
+        let handler = move |lease: Lease, first: usize, n: u32| on_batch(FrameBatch::new(lease, first, n, &layout, packed)?);
+        self.stream_with(Box::new(handler), produce)
+    }
+
+    /// Runs `produce` on this thread and the completion thread (`Completion`) beside it, which
+    /// owns `handler` and drops it when done (so a sink that forwards batches to its own threads
+    /// can release them on the channel's close); collects the profile. A panic on either side
+    /// is re-raised once the pipeline is cleaned up (`abandon`).
+    fn stream_with<P>(&mut self, handler: Box<Handler<'_>>, produce: P) -> anyhow::Result<PipelineStats>
+    where
+        P: FnOnce(&mut FrameStream<'_, 'a>) -> anyhow::Result<()>,
+    {
         let scopes = ErrorScopes::push(self.ctx);
         let start = Instant::now();
         let names = self.kernels.names();
-        let mut prof = Profile { ticks: vec![0u64; names.len()], ..Default::default() };
-        let result = self.stream(blocks, deliver, &mut prof, start);
-        let wall_s = start.elapsed().as_secs_f64();
+        // End query of the last kernel recorded: K4 on the frame path (K5 runs before it), K3 on
+        // the parse path.
+        let last = if self.layout.frames { "k4_entropy" } else { "k3_parse" };
+        #[cfg(test)]
+        let fail_after = self.fail_deliveries_after.take();
+        #[cfg(not(test))]
+        let fail_after = None;
+        let completion = Completion {
+            ctx: self.ctx,
+            xfer: self.xfer.as_ref().map(|x| (x.tq.clone(), x.t_done.clone())),
+            shared: self.shared.clone(),
+            layout: self.layout,
+            n_kernels: names.len(),
+            last_kernel_end: 2 * names.iter().position(|&k| k == last).expect("last kernel is timed") + 1,
+            timed: self.ctx.timestamps,
+            fail_after,
+        };
+        let shared = self.shared.clone();
+        shared.release_ns.store(0, Ordering::Relaxed);
+        let (produced, completed) = std::thread::scope(|s| {
+            let (tx, rx) = mpsc::channel();
+            let worker = s.spawn(move || completion.run(rx, handler));
+            let mut stream = FrameStream {
+                pipe: &mut *self,
+                tx,
+                next_slot: 0,
+                next_index: 0,
+                batches: 0,
+                start,
+                prof: ProducerProfile::default(),
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| produce(&mut stream)));
+            let FrameStream { tx, batches, prof, .. } = stream;
+            // Closing the channel ends the completion thread once it has drained the queue.
+            drop(tx);
+            if !matches!(r, Ok(Ok(()))) {
+                shared.abort();
+            }
+            (r.map(|r| r.map(|()| (batches, prof))), worker.join())
+        });
+        let (produced, (completed, cprof)) = match (produced, completed) {
+            (Ok(p), Ok(c)) => (p, c),
+            (p, c) => {
+                self.abandon();
+                std::panic::resume_unwind(p.err().or(c.err()).expect("one side panicked"))
+            }
+        };
+        #[cfg(test)]
+        {
+            self.fail_deliveries_after = cprof.fail_after;
+        }
+        // A completion-side error also explains the producer's "stream aborted".
+        let result = completed.and(produced);
         if result.is_err() {
             self.abandon();
+        } else {
+            self.shared.wait_released();
         }
+        let end = Instant::now();
+        let wall_s = (end - start).as_secs_f64();
         scopes.pop()?;
-        let batches = result?;
+        let (batches, pprof) = result?;
 
         let (kernel_ms, gpu_ms) = if self.ctx.timestamps {
             let period_ns = self.ctx.queue.get_timestamp_period() as f64;
             let ms = |t: u64| t as f64 * period_ns / 1e6;
             (
-                names.iter().zip(&prof.ticks).map(|(name, &t)| (name.to_string(), ms(t))).collect(),
-                vec![ms(prof.upload_copy), ms(prof.readback), ms(prof.idle)],
+                names.iter().zip(&cprof.ticks).map(|(name, &t)| (name.to_string(), ms(t))).collect(),
+                vec![ms(cprof.upload_copy), ms(cprof.readback), ms(cprof.idle)],
             )
         } else {
             (Vec::new(), Vec::new())
         };
+        let drain = cprof.last_wait.map_or(0.0, |t| (end - t).as_secs_f64());
+        let release = self.shared.release_ns.load(Ordering::Relaxed) as f64 / 1e9;
         let host_ms = [
-            prof.upload_wait,
-            prof.upload_write,
-            prof.submit,
-            prof.wait,
-            prof.deliver,
-            prof.unmap,
-            prof.fill,
-            prof.drain,
+            pprof.upload_wait,
+            pprof.upload_write,
+            pprof.submit,
+            cprof.wait,
+            cprof.deliver,
+            release,
+            pprof.fill,
+            drain,
         ]
         .map(|s| s * 1e3);
         let transfer_ms = TRANSFER_NAMES[..3]
@@ -636,136 +936,24 @@ impl<'a> Pipeline<'a> {
         Ok(PipelineStats { kernel_ms, wall_s, batches, transfer_ms })
     }
 
-    /// The submit / wait / deliver loop; returns the number of batches submitted.
-    fn stream(
-        &mut self,
-        blocks: &[&[u8]],
-        deliver: &mut Deliver<'_>,
-        prof: &mut Profile,
-        start: Instant,
-    ) -> anyhow::Result<u32> {
-        let batch = self.cfg.batch as usize;
-        let mut next = 0usize;
-        let mut batches = 0u32;
-        let mut last_wait = start;
-        // Busy slots, oldest submission first.
-        let mut busy: VecDeque<usize> = VecDeque::new();
-        loop {
-            while next < blocks.len() {
-                let Some(i) = self.slots.iter().position(|s| s.job.is_none()) else { break };
-                let n = batch.min(blocks.len() - next);
-                self.submit(i, next, &blocks[next..next + n], prof)?;
-                if batches == 0 {
-                    prof.fill = start.elapsed().as_secs_f64();
-                }
-                busy.push_back(i);
-                next += n;
-                batches += 1;
-            }
-            let Some(&oldest) = busy.front() else { break };
-            // Every slot is busy (or nothing is left to submit): block on the oldest batch...
-            let job = self.slots[oldest].job.as_ref().unwrap();
-            let t = Instant::now();
-            match &self.xfer {
-                Some(x) => {
-                    x.tq.wait(&x.t_done, job.seq)?;
-                    // Deliver the upload buffers' map callbacks of completed submissions.
-                    self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
-                }
-                None => {
-                    let submission = job.submission.clone();
-                    self.ctx
-                        .device
-                        .poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None })
-                        .context("device poll")?;
-                }
-            }
-            last_wait = Instant::now();
-            prof.wait += (last_wait - t).as_secs_f64();
-            // ...then drain it and every later batch that has also completed.
-            let mut waited_for = true;
-            while let Some(&i) = busy.front() {
-                let job = self.slots[i].job.as_ref().unwrap();
-                let ready = match (&self.xfer, &job.mapped) {
-                    (Some(x), _) => waited_for || x.tq.value(&x.t_done)? >= job.seq,
-                    (None, Some(rx)) => match rx.try_recv() {
-                        Ok(r) => {
-                            r.context("map staging buffer")?;
-                            true
-                        }
-                        Err(mpsc::TryRecvError::Empty) if !waited_for => false,
-                        Err(_) => anyhow::bail!("staging map callback not delivered after waiting for its submission"),
-                    },
-                    (None, None) => unreachable!("wgpu staging without a map request"),
-                };
-                if !ready {
-                    break;
-                }
-                self.finish(i, deliver, prof)?;
-                busy.pop_front();
-                waited_for = false;
-            }
-        }
-        prof.drain = last_wait.elapsed().as_secs_f64();
-        Ok(batches)
-    }
-
-    /// Uploads `blocks` into slot `i` and submits the upload copy, the kernels and the readback
-    /// into the slot's staging buffer (the fixed-stride copies, or the pack kernel, or with the
-    /// transfer readback the copies on the transfer queue), plus the resolved timestamps. Uses
-    /// the slot's persistent upload buffer rather than `queue.write_buffer`, which would allocate
-    /// a fresh staging buffer per call that lives until the submission completes.
-    fn submit(&mut self, i: usize, first: usize, blocks: &[&[u8]], prof: &mut Profile) -> anyhow::Result<()> {
+    /// Records the upload copy, the kernels and the readback of slot `i`'s first `n` blocks into
+    /// the slot's staging buffer (the fixed-stride copies, or the pack kernel, or with the transfer
+    /// readback the copies on the transfer queue), plus the resolved timestamps, submits them and
+    /// requests the maps; returns the batch for the completion thread. The slot's upload buffer
+    /// holds the blocks (mapped); it is persistent rather than `queue.write_buffer`, which would
+    /// allocate a fresh staging buffer per call that lives until the submission completes.
+    fn submit(&mut self, i: usize, first: usize, n: u32) -> anyhow::Result<Job> {
         if self.direct {
             // The kernels read this slot's upload buffer; the bind groups recorded below hold it.
             self.bufs.data = self.slots[i].upload.clone();
         }
         let (ctx, layout, bufs, direct) = (self.ctx, self.layout, &self.bufs, self.direct);
         let slot = &mut self.slots[i];
-        let n = blocks.len() as u32;
-        let t0 = Instant::now();
-        if let Some(rx) = slot.upload_mapped.take() {
-            // Its submission has completed (the slot is free), so the callback is normally in.
-            let r = match rx.try_recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    let wait = match slot.upload_submission.clone() {
-                        Some(s) => wgpu::PollType::Wait { submission_index: Some(s), timeout: None },
-                        None => wgpu::PollType::wait_indefinitely(),
-                    };
-                    ctx.device.poll(wait).context("device poll")?;
-                    rx.recv().context("upload map callback dropped")?
-                }
-            };
-            r.context("map upload buffer")?;
-        }
-        let t1 = Instant::now();
         let bytes = n as usize * BLOCK_SIZE;
-        {
-            let mut view = slot.upload.get_mapped_range_mut(..bytes as u64 + 4).context("upload mapped range")?;
-            // Several threads write their share of the blocks: one thread's stores into the
-            // (write-combined, ReBAR) upload buffer run at ~20 GB/s, which made this copy the
-            // pipeline thread's largest cost once the readback left the GPU's critical path.
-            let per = blocks.len().div_ceil(upload_threads()).max(64);
-            let mut rest = view.slice(..);
-            std::thread::scope(|s| {
-                for chunk in blocks.chunks(per) {
-                    let (mine, tail) = std::mem::take(&mut rest).split_at(chunk.len() * BLOCK_SIZE);
-                    rest = tail;
-                    let mine = SendWriteOnly(mine);
-                    s.spawn(move || {
-                        let mut mine = mine.into_inner();
-                        for (k, b) in chunk.iter().enumerate() {
-                            mine.slice(k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE).copy_from_slice(b);
-                        }
-                    });
-                }
-                // Trailing zero word after the last block (`data` may hold stale blocks beyond it).
-                rest.copy_from_slice(&[0u8; 4]);
-            });
-        }
         slot.upload.unmap();
-        let t2 = Instant::now();
+        slot.upload_unmapped = true;
+        // From here on the GPU may write the slot's staging buffer (`abandon` cleans up on error).
+        self.shared.set(i, SlotState::InFlight);
 
         let n_queries = 2 * self.kernels.names().len() as u32;
         let resolved = (n_queries + 2) as u64 * wgpu::QUERY_SIZE as u64;
@@ -789,7 +977,7 @@ impl<'a> Pipeline<'a> {
         if !direct {
             enc.copy_buffer_to_buffer(&slot.upload, 0, &bufs.data, 0, bytes as u64 + 4);
         }
-        let (submission, mapped, seq) = match (&mut self.xfer, &slot.staging) {
+        let (submission, mapped, seq) = match (&mut self.xfer, &*slot.staging) {
             (Some(x), Staging::Host(staging)) => {
                 let seq = x.next_seq;
                 x.next_seq += 1;
@@ -853,93 +1041,19 @@ impl<'a> Pipeline<'a> {
             }
             _ => unreachable!("host staging iff transfer readback"),
         };
+        slot.staging_requested = mapped.is_some();
         let (tx, upload_mapped) = mpsc::channel();
         slot.upload.map_async(wgpu::MapMode::Write, .., move |r| {
             let _ = tx.send(r);
         });
         slot.upload_mapped = Some(upload_mapped);
+        slot.upload_unmapped = false;
         slot.upload_submission = Some(submission.clone());
-        slot.job = Some(Job { first, n, submission, mapped, seq });
-        let t3 = Instant::now();
-        prof.upload_wait += (t1 - t0).as_secs_f64();
-        prof.upload_write += (t2 - t1).as_secs_f64();
-        prof.submit += (t3 - t2).as_secs_f64();
-        Ok(())
+        Ok(Job { slot: i, first, n, submission, mapped, seq, staging: slot.staging.clone() })
     }
 
-    /// Hands completed slot `i` to `deliver`, adds its timestamps to `prof`, unmaps (wgpu staging)
-    /// and frees the slot.
-    fn finish(&mut self, i: usize, deliver: &mut Deliver<'_>, prof: &mut Profile) -> anyhow::Result<()> {
-        let layout = self.layout;
-        // End query of the last kernel recorded: K4 on the frame path (K5 runs before it), K3 on
-        // the parse path.
-        let names = self.kernels.names();
-        let last = if layout.frames { "k4_entropy" } else { "k3_parse" };
-        let last_kernel_end = 2 * names.iter().position(|&k| k == last).expect("last kernel is timed") + 1;
-        #[cfg(test)]
-        let fail_now = match &mut self.fail_deliveries_after {
-            Some(0) => {
-                self.fail_deliveries_after = None;
-                true
-            }
-            Some(k) => {
-                *k -= 1;
-                false
-            }
-            None => false,
-        };
-        #[cfg(not(test))]
-        let fail_now = false;
-        let slot = &mut self.slots[i];
-        let job = slot.job.take().unwrap();
-        let t0 = Instant::now();
-        let mut t1 = t0;
-        let timed = slot.queries.is_some();
-        let mut use_view = |view: &[u8]| -> anyhow::Result<()> {
-            anyhow::ensure!(!fail_now, "injected delivery failure (test hook)");
-            deliver(job.first, job.n, view)?;
-            t1 = Instant::now();
-            if timed {
-                let nk = prof.ticks.len();
-                // Only 4-byte aligned in general (seqs_bytes(1) is not a multiple of 8).
-                let t = layout.ts as usize;
-                let stamps: Vec<u64> = view[t..t + (nk + 1) * 16]
-                    .chunks_exact(8)
-                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                for (k, acc) in prof.ticks.iter_mut().enumerate() {
-                    *acc += stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
-                }
-                let (m0, m1) = (stamps[2 * nk], stamps[2 * nk + 1]);
-                prof.upload_copy += stamps[0].saturating_sub(m0);
-                prof.readback += m1.saturating_sub(stamps[last_kernel_end]);
-                if let Some(end) = prof.last_end {
-                    prof.idle += m0.saturating_sub(end);
-                }
-                prof.last_end = Some(m1);
-            }
-            Ok(())
-        };
-        let result = match &slot.staging {
-            Staging::Wgpu(staging) => {
-                let r = match staging.get_mapped_range(..) {
-                    Ok(view) => use_view(&view[..]),
-                    Err(e) => Err(anyhow!("mapped range: {e}")),
-                };
-                staging.unmap();
-                r
-            }
-            // SAFETY: the transfer queue's copy into it completed (`stream` waited for t_done >=
-            // job.seq) and the slot's next copy is only submitted after this delivery.
-            Staging::Host(staging) => use_view(unsafe { staging.mapped() }),
-        };
-        let t2 = Instant::now();
-        prof.deliver += (t1 - t0).as_secs_f64();
-        prof.unmap += (t2 - t1).as_secs_f64();
-        result
-    }
-
-    /// After an error: wait for the GPU and unmap every busy slot so the pipeline stays usable.
+    /// After an error: wait for the GPU, unmap and free every slot still in flight so the
+    /// pipeline stays usable, then wait for the sink to drop the batches it still holds.
     fn abandon(&mut self) {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(x) = &self.xfer {
@@ -954,29 +1068,385 @@ impl<'a> Pipeline<'a> {
                 let _ = x.tq.catch_up(&x.t_done, x.next_seq - 1);
             }
         }
-        for slot in &mut self.slots {
-            if slot.job.take().is_some()
-                && let Staging::Wgpu(staging) = &slot.staging
-            {
-                staging.unmap();
+        {
+            let mut g = self.shared.lock();
+            for (i, slot) in self.slots.iter_mut().enumerate() {
+                if g.slots[i] == SlotState::InFlight {
+                    if slot.staging_requested
+                        && let Staging::Wgpu(staging) = &*slot.staging
+                    {
+                        staging.unmap();
+                    }
+                    slot.staging_requested = false;
+                    g.slots[i] = SlotState::Free;
+                }
             }
+            g.abort = false;
         }
+        self.shared.cv.notify_all();
+        self.shared.wait_released();
     }
 }
 
-/// A disjoint piece of a mapped upload range, handed to one writer thread. `WriteOnly<[u8]>` is
-/// not `Send` only because its `Send` impl needs a sized `T`; like `&mut [u8]`, a byte slice of
-/// it is safe to move to another thread.
-struct SendWriteOnly<'a>(wgpu::WriteOnly<'a, [u8]>);
+/// The completion thread of a stream: waits for each batch in submission order, adds its
+/// timestamps to the profile and lends its staging bytes to the handler.
+struct Completion<'c> {
+    ctx: &'c GpuContext,
+    /// Transfer readback: the queue and the `t_done` timeline to wait on.
+    xfer: Option<(Arc<TransferQueue>, Arc<Timeline>)>,
+    shared: Arc<Shared>,
+    layout: StagingLayout,
+    n_kernels: usize,
+    /// Index of the last kernel's end query.
+    last_kernel_end: usize,
+    timed: bool,
+    /// Test hook: the delivery after this many more fails (then the hook clears).
+    fail_after: Option<u32>,
+}
 
-// SAFETY: see above; the pieces come from `split_at`, so no two threads write the same bytes.
-unsafe impl Send for SendWriteOnly<'_> {}
+/// The completion thread's share of `PipelineStats::transfer_ms` (GPU ticks, host seconds).
+#[derive(Default)]
+struct CompletionProfile {
+    /// Kernel ticks, per `Kernels::names`.
+    ticks: Vec<u64>,
+    upload_copy: u64,
+    readback: u64,
+    idle: u64,
+    /// End marker of the last batch finished (ticks), for `idle`.
+    last_end: Option<u64>,
+    wait: f64,
+    deliver: f64,
+    /// When the last wait for the GPU returned, for `host_drain`.
+    last_wait: Option<Instant>,
+    fail_after: Option<u32>,
+}
 
-impl<'a> SendWriteOnly<'a> {
-    /// A method, so that a closure captures the whole wrapper rather than its non-`Send` field.
-    fn into_inner(self) -> wgpu::WriteOnly<'a, [u8]> {
-        self.0
+/// The producer's share of `PipelineStats::transfer_ms` (host seconds).
+#[derive(Default)]
+struct ProducerProfile {
+    upload_wait: f64,
+    upload_write: f64,
+    submit: f64,
+    fill: f64,
+}
+
+impl Completion<'_> {
+    /// Delivers every job; drops `handler` before returning.
+    fn run(mut self, jobs: mpsc::Receiver<Job>, mut handler: Box<Handler<'_>>) -> (anyhow::Result<()>, CompletionProfile) {
+        let shared = self.shared.clone();
+        let _abort = AbortOnPanic(&shared);
+        let mut prof = CompletionProfile { ticks: vec![0; self.n_kernels], ..Default::default() };
+        let r = self.drain(jobs, &mut *handler, &mut prof);
+        drop(handler);
+        if r.is_err() {
+            shared.abort();
+        }
+        prof.fail_after = self.fail_after;
+        (r, prof)
     }
+
+    fn drain(
+        &mut self,
+        jobs: mpsc::Receiver<Job>,
+        handler: &mut Handler<'_>,
+        prof: &mut CompletionProfile,
+    ) -> anyhow::Result<()> {
+        // Ends once the producer has dropped its sender and every job is taken.
+        for job in jobs {
+            if self.shared.aborted() {
+                // The producer failed: deliver nothing more (`abandon` frees the slots).
+                break;
+            }
+            let t = Instant::now();
+            match &self.xfer {
+                Some((tq, t_done)) => {
+                    tq.wait(t_done, job.seq)?;
+                    // Deliver the upload buffers' map callbacks of completed submissions.
+                    self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
+                }
+                None => {
+                    let wait = wgpu::PollType::Wait { submission_index: Some(job.submission.clone()), timeout: None };
+                    self.ctx.device.poll(wait).context("device poll")?;
+                }
+            }
+            let done = Instant::now();
+            prof.wait += (done - t).as_secs_f64();
+            prof.last_wait = Some(done);
+            let lease = self.lease(&job)?;
+            if self.timed {
+                self.add_timestamps(lease.bytes(), prof);
+            }
+            if let Some(k) = &mut self.fail_after {
+                if *k == 0 {
+                    self.fail_after = None;
+                    anyhow::bail!("injected delivery failure (test hook)");
+                }
+                *k -= 1;
+            }
+            let t = Instant::now();
+            handler(lease, job.first, job.n)?;
+            prof.deliver += t.elapsed().as_secs_f64();
+        }
+        Ok(())
+    }
+
+    /// Lends out `job`'s staging bytes (its batch completed).
+    fn lease(&self, job: &Job) -> anyhow::Result<Lease> {
+        let (view, ptr, len) = match &*job.staging {
+            Staging::Wgpu(staging) => {
+                let rx = job.mapped.as_ref().context("wgpu staging without a map request")?;
+                // The submission completed, so its map callback has run or is running (on
+                // whichever thread polled: the producer polls too).
+                rx.recv().context("staging map callback dropped")?.context("map staging buffer")?;
+                let view = staging.get_mapped_range(..).map_err(|e| anyhow!("mapped range: {e}"))?;
+                let (ptr, len) = (view.as_ptr(), view.len());
+                (Some(view), ptr, len)
+            }
+            Staging::Host(staging) => {
+                // SAFETY: the transfer queue's copy into it completed (waited for t_done >=
+                // job.seq), and the slot's next copy is only submitted once the lease is dropped.
+                let bytes = unsafe { staging.mapped() };
+                (None, bytes.as_ptr(), bytes.len())
+            }
+        };
+        self.shared.set(job.slot, SlotState::Leased);
+        Ok(Lease { shared: self.shared.clone(), slot: job.slot, staging: job.staging.clone(), view, ptr, len })
+    }
+
+    fn add_timestamps(&self, view: &[u8], prof: &mut CompletionProfile) {
+        let nk = self.n_kernels;
+        // Only 4-byte aligned in general (seqs_bytes(1) is not a multiple of 8).
+        let t = self.layout.ts as usize;
+        let stamps: Vec<u64> =
+            view[t..t + (nk + 1) * 16].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        for (k, acc) in prof.ticks.iter_mut().enumerate() {
+            *acc += stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
+        }
+        let (m0, m1) = (stamps[2 * nk], stamps[2 * nk + 1]);
+        prof.upload_copy += stamps[0].saturating_sub(m0);
+        prof.readback += m1.saturating_sub(stamps[self.last_kernel_end]);
+        if let Some(end) = prof.last_end {
+            prof.idle += m0.saturating_sub(end);
+        }
+        prof.last_end = Some(m1);
+    }
+}
+
+/// The producer's side of a stream (`Pipeline::stream_frames`): hands out the slots' mapped upload
+/// buffers in turn and submits them. Block indices count from 0 per stream, in submission order.
+pub struct FrameStream<'p, 'a> {
+    pipe: &'p mut Pipeline<'a>,
+    tx: mpsc::Sender<Job>,
+    next_slot: usize,
+    next_index: usize,
+    batches: u32,
+    start: Instant,
+    prof: ProducerProfile,
+}
+
+impl<'p, 'a> FrameStream<'p, 'a> {
+    /// Blocks per upload slot (the pipeline's batch size).
+    pub fn slot_capacity(&self) -> usize {
+        self.pipe.cfg.batch as usize
+    }
+
+    /// Blocks submitted so far: the index the next submitted block gets.
+    pub fn submitted_blocks(&self) -> usize {
+        self.next_index
+    }
+
+    /// The next upload slot, once it is free: the batch it held `inflight` submissions ago has
+    /// completed and its `FrameBatch` was dropped. Errors once the stream is aborted (the
+    /// completion side failed) and on a failed map.
+    pub fn next_upload_slot(&mut self) -> anyhow::Result<UploadSlot<'_, 'p, 'a>> {
+        let i = self.next_slot;
+        let t = Instant::now();
+        self.pipe.shared.wait_free(i)?;
+        let ctx = self.pipe.ctx;
+        let slot = &mut self.pipe.slots[i];
+        slot.staging_requested = false;
+        if slot.upload_unmapped {
+            let (tx, rx) = mpsc::channel();
+            slot.upload.map_async(wgpu::MapMode::Write, .., move |r| {
+                let _ = tx.send(r);
+            });
+            slot.upload_mapped = Some(rx);
+            slot.upload_unmapped = false;
+            slot.upload_submission = None;
+        }
+        if let Some(rx) = slot.upload_mapped.take() {
+            // Its submission has completed (the slot is free), so the callback is normally in.
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => {
+                    let wait = match slot.upload_submission.clone() {
+                        Some(s) => wgpu::PollType::Wait { submission_index: Some(s), timeout: None },
+                        None => wgpu::PollType::wait_indefinitely(),
+                    };
+                    ctx.device.poll(wait).context("device poll")?;
+                    rx.recv().context("upload map callback dropped")?
+                }
+            };
+            if r.is_err() {
+                slot.upload_unmapped = true;
+            }
+            r.context("map upload buffer")?;
+        }
+        let view = slot.upload.get_mapped_range_mut(..).context("upload mapped range")?;
+        self.prof.upload_wait += t.elapsed().as_secs_f64();
+        Ok(UploadSlot { stream: self, slot: i, view, acquired: Instant::now() })
+    }
+
+    /// Copies `blocks` (each BLOCK_SIZE bytes) into as many slots as they need and submits them:
+    /// the `&[&[u8]]` form of the API. The copy is split over `GZC_UPLOAD_THREADS` threads.
+    pub fn upload_blocks(&mut self, blocks: &[&[u8]]) -> anyhow::Result<()> {
+        check_blocks(blocks)?;
+        for chunk in blocks.chunks(self.slot_capacity()) {
+            let mut slot = self.next_upload_slot()?;
+            copy_blocks(slot.blocks_mut(), chunk);
+            slot.submit(chunk.len())?;
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, i: usize, n: u32) -> anyhow::Result<()> {
+        let t = Instant::now();
+        let job = self.pipe.submit(i, self.next_index, n)?;
+        let sent = self.tx.send(job);
+        self.prof.submit += t.elapsed().as_secs_f64();
+        if self.batches == 0 {
+            self.prof.fill = self.start.elapsed().as_secs_f64();
+        }
+        self.batches += 1;
+        self.next_index += n as usize;
+        self.next_slot = (i + 1) % self.pipe.slots.len();
+        sent.map_err(|_| anyhow!("stream aborted: the completion thread stopped"))
+    }
+}
+
+/// A free slot's mapped upload buffer (`FrameStream::next_upload_slot`): write up to `capacity()`
+/// blocks into it, then `submit` the first `n`. Dropped without submitting, the slot is handed out
+/// again by the next `next_upload_slot`.
+pub struct UploadSlot<'s, 'p, 'a> {
+    stream: &'s mut FrameStream<'p, 'a>,
+    slot: usize,
+    view: wgpu::BufferViewMut,
+    acquired: Instant,
+}
+
+impl UploadSlot<'_, '_, '_> {
+    /// Blocks the slot holds (the pipeline's batch size).
+    pub fn capacity(&self) -> usize {
+        self.stream.slot_capacity()
+    }
+
+    /// The slot's upload memory: `capacity()` blocks of BLOCK_SIZE bytes, block k at
+    /// `k * BLOCK_SIZE`, for the caller to write its blocks into directly (decode into it; split
+    /// it with `chunks_mut` to fill it from several threads). Every byte of each submitted block
+    /// must be written: the old contents are stale. With the direct upload this is write-combined
+    /// device memory (ReBAR): write it sequentially and never read it (reads are uncached and slow).
+    pub fn blocks_mut(&mut self) -> &mut [u8] {
+        let len = self.capacity() * BLOCK_SIZE;
+        let mut w = self.view.slice(..len);
+        // SAFETY: the view maps at least `len` bytes (`data_bytes(batch)`), which stay mapped and
+        // are ours alone while `self` is borrowed (only `submit` drops the view); mapped memory is
+        // initialized (wgpu zero-fills new buffers). wgpu hands out `WriteOnly` only to keep
+        // reads away from write-combined memory, which is a performance concern, not a safety one.
+        unsafe { &mut *w.as_raw_ptr().as_ptr() }
+    }
+
+    /// Block `k`'s BLOCK_SIZE bytes of `blocks_mut`.
+    pub fn block_mut(&mut self, k: usize) -> &mut [u8] {
+        &mut self.blocks_mut()[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE]
+    }
+
+    /// Splits `blocks_mut`, from block 0, into consecutive disjoint regions of `blocks[i]` whole
+    /// blocks each: one per payload (e.g. a file, or a decompressed chunk of one), so several
+    /// threads can write payloads spanning many blocks at once. Finish each with `pad_payload`;
+    /// submit the sum of the blocks. Errors if the regions exceed `capacity()`.
+    ///
+    /// A decompressor reads back its own recent output for its matches: writing its output
+    /// straight into a region reads write-combined memory (see `blocks_mut`), so decode through a
+    /// cached window (a streaming decoder) or a scratch buffer and let only the stores land here.
+    pub fn regions_mut(&mut self, blocks: &[usize]) -> anyhow::Result<Vec<&mut [u8]>> {
+        let (total, cap) = (blocks.iter().sum::<usize>(), self.capacity());
+        anyhow::ensure!(total <= cap, "regions of {total} blocks exceed the slot's {cap}");
+        let mut rest = self.blocks_mut();
+        let mut out = Vec::with_capacity(blocks.len());
+        for &b in blocks {
+            let (region, tail) = std::mem::take(&mut rest).split_at_mut(b * BLOCK_SIZE);
+            out.push(region);
+            rest = tail;
+        }
+        Ok(out)
+    }
+
+    /// Submits the slot's first `n` blocks (1..=capacity(): a partial batch, e.g. when a flush
+    /// timer fires, is fine); returns the index of its first block.
+    pub fn submit(self, n: usize) -> anyhow::Result<usize> {
+        let cap = self.capacity();
+        anyhow::ensure!((1..=cap).contains(&n), "cannot submit {n} blocks: not in 1..={cap}");
+        let UploadSlot { stream, slot, mut view, acquired } = self;
+        // Trailing zero word after the last block (the slot may hold stale blocks beyond it).
+        view.slice(n * BLOCK_SIZE..n * BLOCK_SIZE + 4).copy_from_slice(&[0u8; 4]);
+        drop(view);
+        stream.prof.upload_write += acquired.elapsed().as_secs_f64();
+        let first = stream.next_index;
+        stream.submit(slot, n as u32)?;
+        Ok(first)
+    }
+}
+
+/// Blocks a payload of `len` bytes occupies, as `gzc_core::block::chunk_file` splits a file (0
+/// for an empty one).
+pub fn payload_blocks(len: usize) -> usize {
+    len.div_ceil(BLOCK_SIZE)
+}
+
+/// The real length (`Block::real_len`) of each block of a `len`-byte payload: BLOCK_SIZE, and the
+/// rest for the last one.
+pub fn payload_real_lens(len: usize) -> impl ExactSizeIterator<Item = usize> {
+    (0..payload_blocks(len)).map(move |k| (len - k * BLOCK_SIZE).min(BLOCK_SIZE))
+}
+
+/// Finishes a `len`-byte payload written at the start of `region` (block-aligned, e.g. from
+/// `UploadSlot::regions_mut`): zero-fills the rest of its last block, the padding `chunk_file`
+/// gives a file's last block (the slot's old bytes would otherwise be compressed with it), and
+/// returns the blocks it occupies (`payload_blocks(len)`). Errors if they do not fit in `region`.
+pub fn pad_payload(region: &mut [u8], len: usize) -> anyhow::Result<usize> {
+    let blocks = payload_blocks(len);
+    let end = blocks * BLOCK_SIZE;
+    anyhow::ensure!(end <= region.len(), "a {len}-byte payload needs {blocks} blocks, the region has {}", region.len() / BLOCK_SIZE);
+    region[len..end].fill(0);
+    Ok(blocks)
+}
+
+/// Every block must be exactly BLOCK_SIZE bytes.
+fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
+    if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
+        anyhow::bail!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len());
+    }
+    Ok(())
+}
+
+/// Copies `blocks` back to back into `dst`, split over `upload_threads()` threads (this one
+/// included): one thread's stores into the (write-combined, ReBAR) upload buffer run at ~18 GB/s,
+/// two or more at the link's ~26 GB/s (RTX 5090).
+fn copy_blocks(dst: &mut [u8], blocks: &[&[u8]]) {
+    let copy = |dst: &mut [u8], src: &[&[u8]]| {
+        dst.chunks_exact_mut(BLOCK_SIZE).zip(src).for_each(|(d, b)| d.copy_from_slice(b));
+    };
+    let per = blocks.len().div_ceil(upload_threads()).max(64);
+    std::thread::scope(|s| {
+        let mut shares = blocks.chunks(per).zip(dst.chunks_mut(per * BLOCK_SIZE));
+        let mine = shares.next();
+        for (src, dst) in shares {
+            s.spawn(move || copy(dst, src));
+        }
+        if let Some((src, dst)) = mine {
+            copy(dst, src);
+        }
+    });
 }
 
 /// Threads writing a batch into its upload buffer: `GZC_UPLOAD_THREADS`, else 4 (at most the
@@ -1050,7 +1520,7 @@ pub fn compress_stream(
     ctx: &GpuContext,
     cfg: &PipelineConfig,
     blocks: &[&[u8]],
-    sink: &mut impl BlockSink,
+    sink: &mut (impl BlockSink + Send),
 ) -> anyhow::Result<PipelineStats> {
     Pipeline::new(ctx, cfg)?.run(blocks, sink)
 }
@@ -1061,7 +1531,7 @@ pub fn compress_stream_frames(
     ctx: &GpuContext,
     cfg: &PipelineConfig,
     blocks: &[&[u8]],
-    sink: &mut impl FrameSink,
+    sink: &mut (impl FrameSink + Send),
 ) -> anyhow::Result<PipelineStats> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     Pipeline::new(ctx, &cfg)?.run_frames(blocks, sink)
@@ -1430,5 +1900,340 @@ mod tests {
         assert!(pipe.run(&blocks, &mut Collect(vec![None; blocks.len()])).is_err());
         let mut parse_pipe = Pipeline::new(&ctx, &cfg(7, 1)).unwrap();
         assert!(parse_pipe.run_frames(&blocks, &mut CollectFrames(vec![None; blocks.len()])).is_err());
+    }
+
+    /// Frames of one `stream_frames` run, keyed by block index; checks exactly-once and batch order.
+    #[derive(Default)]
+    struct Batches {
+        frames: Vec<Option<Vec<u8>>>,
+        /// `(first index, len)` per batch, in delivery order.
+        order: Vec<(usize, usize)>,
+    }
+
+    impl Batches {
+        fn take(&mut self, batch: &FrameBatch) {
+            self.order.push((batch.first_index(), batch.len()));
+            for (i, frame) in batch.frames() {
+                if self.frames.len() <= i {
+                    self.frames.resize(i + 1, None);
+                }
+                assert!(self.frames[i].is_none(), "index {i} delivered twice");
+                self.frames[i] = Some(frame.to_vec());
+            }
+        }
+
+        /// Every index below `n` once, equal to `want(i)`; batches in submission order, contiguous.
+        fn check(&self, n: usize, want: impl Fn(usize) -> Vec<u8>, what: &str) {
+            assert_eq!(self.frames.len(), n, "{what}");
+            for (i, f) in self.frames.iter().enumerate() {
+                assert!(*f.as_ref().unwrap_or_else(|| panic!("{what}: index {i} never delivered")) == want(i), "{what}: index {i}");
+            }
+            let mut next = 0;
+            for &(first, len) in &self.order {
+                assert_eq!(first, next, "{what}: batches out of order: {:?}", self.order);
+                next += len;
+            }
+        }
+    }
+
+    /// The zero-copy API in every upload/readback mode: the producer writes blocks straight into
+    /// the slots (block by block, and some partial batches as a flush timer would submit), the
+    /// sink hands each `FrameBatch` to a writer thread that releases it later, and slots are
+    /// recycled many times over (far more batches than slots). Frames match the CPU's, each index
+    /// once, batches in submission order; the pipeline then runs again.
+    #[test]
+    fn stream_frames_zero_copy_every_mode() {
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL9S12SEG, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        // Batch sizes per submission: full (16), and partial ones as a flush timer would send.
+        let sizes = [16usize, 5, 16, 1, 16, 16, 9, 16, 16, 16, 3, 16];
+        let total: usize = sizes.iter().sum();
+        for (name, ctx) in &mode_contexts() {
+            let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
+            for round in 0..2 {
+                let (tx, rx) = mpsc::channel::<FrameBatch>();
+                let collected = std::thread::scope(|s| {
+                    // The writer: takes each batch, copies its frames, drops it (releasing the slot).
+                    let writer = s.spawn(move || {
+                        let mut got = Batches::default();
+                        for batch in rx {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            got.take(&batch);
+                        }
+                        got
+                    });
+                    let stats = pipe
+                        .stream_frames(
+                            move |batch| {
+                                tx.send(batch).map_err(|_| anyhow!("writer gone"))?;
+                                Ok(())
+                            },
+                            |stream| {
+                                assert_eq!(stream.slot_capacity(), 16);
+                                for &n in &sizes {
+                                    let first = stream.submitted_blocks();
+                                    let mut slot = stream.next_upload_slot()?;
+                                    for k in 0..n {
+                                        slot.block_mut(k).copy_from_slice(&distinct[(first + k) % distinct.len()]);
+                                    }
+                                    assert_eq!(slot.submit(n)?, first);
+                                }
+                                Ok(())
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+                    assert_eq!(stats.batches as usize, sizes.len(), "{name}");
+                    writer.join().unwrap()
+                });
+                assert_eq!(collected.order.len(), sizes.len(), "{name}");
+                collected.check(total, |i| want[i % distinct.len()].clone(), &format!("{name} round {round}"));
+            }
+        }
+    }
+
+    /// Payloads of arbitrary size spanning several blocks (and one of 0 bytes), written from
+    /// several threads into disjoint regions of a slot that holds stale bytes, then padded: the
+    /// frames equal the CPU's for `chunk_file` of each payload, and `payload_real_lens` gives
+    /// `chunk_file`'s real lengths.
+    #[test]
+    fn stream_frames_multi_block_payloads() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let params = GpuParams { matching: LVL9S12SEG, emit_frames: true, huffman: true };
+        let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
+        let bs = BLOCK_SIZE;
+        let sizes = [3 * bs + 100, 2 * bs, 1, 0, 5 * bs - 1, bs + 7];
+        let mut at = 0;
+        let payloads: Vec<&[u8]> = sizes
+            .iter()
+            .map(|&n| {
+                let p = &source[at % (source.len() - 6 * bs)..][..n];
+                at += n + 12345;
+                p
+            })
+            .collect();
+        let (mut want, mut want_lens) = (Vec::new(), Vec::new());
+        for p in &payloads {
+            let blocks = chunk_file(p);
+            want_lens.extend(blocks.iter().map(|b| b.real_len));
+            want.extend(blocks.iter().map(|b| cpu_frame(&b.data, params)));
+            assert_eq!(payload_blocks(p.len()), blocks.len());
+        }
+        let lens: Vec<usize> = payloads.iter().flat_map(|p| payload_real_lens(p.len())).collect();
+        assert_eq!(lens, want_lens, "per-block real lengths");
+        let blocks_each: Vec<usize> = payloads.iter().map(|p| payload_blocks(p.len())).collect();
+        let total: usize = blocks_each.iter().sum();
+
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 16, inflight: 2, params }).unwrap();
+        // Dirty both slots.
+        pipe.stream_frames(
+            |_batch| Ok(()),
+            |stream| {
+                for _ in 0..2 {
+                    let mut slot = stream.next_upload_slot()?;
+                    slot.blocks_mut().fill(0xAB);
+                    slot.submit(16)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut got = Batches::default();
+        pipe.stream_frames(
+            |batch| {
+                got.take(&batch);
+                Ok(())
+            },
+            |stream| {
+                for _ in 0..2 {
+                    let mut slot = stream.next_upload_slot()?;
+                    assert!(slot.regions_mut(&[slot.capacity() + 1]).is_err());
+                    let regions = slot.regions_mut(&blocks_each)?;
+                    std::thread::scope(|s| {
+                        for (region, p) in regions.into_iter().zip(&payloads) {
+                            s.spawn(move || {
+                                region[..p.len()].copy_from_slice(p);
+                                assert_eq!(pad_payload(region, p.len()).unwrap(), payload_blocks(p.len()));
+                                assert!(pad_payload(region, region.len() + 1).is_err());
+                            });
+                        }
+                    });
+                    slot.submit(total)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        got.check(2 * total, |i| want[i % total].clone(), "payloads");
+    }
+
+    /// A batch kept alive holds its slot: its frames stay intact while later batches reuse the
+    /// other slots, and the stream only waits for it once it needs that slot again. Holding
+    /// `inflight - 1` batches does not stall. An upload slot dropped without a submit is handed
+    /// out again.
+    #[test]
+    fn stream_frames_held_batches_keep_their_bytes() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        let blocks: Vec<&[u8]> = (0..8 * 10).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 8, inflight: 3, params }).unwrap();
+        let (tx, rx) = mpsc::channel::<FrameBatch>();
+        let got = std::thread::scope(|s| {
+            // Keeps the last two batches; releases the rest once the channel closes, which happens
+            // when the pipeline drops `on_batch` (before `stream_frames` waits for the releases).
+            let writer = s.spawn(move || {
+                let mut held = std::collections::VecDeque::new();
+                let mut got = Batches::default();
+                let mut check = |(batch, snap): (FrameBatch, Vec<Vec<u8>>)| {
+                    for (k, f) in snap.iter().enumerate() {
+                        assert!(batch.frame(k) == f.as_slice(), "held batch {} changed", batch.first_index());
+                    }
+                    got.take(&batch);
+                };
+                for batch in rx {
+                    // Snapshot at delivery; compare again once two more batches went by.
+                    let snap: Vec<Vec<u8>> = (0..batch.len()).map(|k| batch.frame(k).to_vec()).collect();
+                    held.push_back((batch, snap));
+                    if held.len() > 2 {
+                        check(held.pop_front().unwrap());
+                    }
+                }
+                held.into_iter().for_each(&mut check);
+                got
+            });
+            let stats = pipe
+                .stream_frames(
+                    move |batch| tx.send(batch).map_err(|_| anyhow!("writer gone")),
+                    |stream| {
+                        // Taken and dropped without a submit: the same slot comes back.
+                        drop(stream.next_upload_slot()?);
+                        stream.upload_blocks(&blocks)
+                    },
+                )
+                .unwrap();
+            assert_eq!(stats.batches, 10);
+            writer.join().unwrap()
+        });
+        got.check(blocks.len(), |i| want[i % distinct.len()].clone(), "held");
+    }
+
+    /// Errors mid-stream, from either side, surface from `stream_frames`, stop the other side and
+    /// leave the pipeline usable (every upload/readback mode): the sink failing on its third
+    /// batch; the producer failing after four submissions; a bad submit size; a panicking sink.
+    #[test]
+    fn stream_frames_errors_mid_stream() {
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        let blocks: Vec<&[u8]> = (0..200).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        for (name, ctx) in &mode_contexts() {
+            let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
+            // The sink fails on its third batch: the producer, blocked or not, gets an error.
+            let mut seen = 0;
+            let e = pipe
+                .stream_frames(
+                    |_batch| {
+                        seen += 1;
+                        anyhow::ensure!(seen < 3, "sink failed");
+                        Ok(())
+                    },
+                    |stream| stream.upload_blocks(&blocks),
+                )
+                .expect_err("sink error must surface");
+            assert!(e.to_string().contains("sink failed"), "{name}: {e:#}");
+            assert_eq!(seen, 3, "{name}: no delivery after the failing one");
+            // The producer fails after four submissions; batches may still be in flight.
+            let e = pipe
+                .stream_frames(
+                    |_batch| Ok(()),
+                    |stream| {
+                        stream.upload_blocks(&blocks[..64])?;
+                        anyhow::bail!("producer failed")
+                    },
+                )
+                .expect_err("producer error must surface");
+            assert!(e.to_string().contains("producer failed"), "{name}: {e:#}");
+            // Bad submit sizes are refused, and the slot stays usable.
+            let e = pipe
+                .stream_frames(
+                    |_batch| Ok(()),
+                    |stream| {
+                        let slot = stream.next_upload_slot()?;
+                        assert!(slot.capacity() == 16);
+                        slot.submit(17)
+                    }
+                    .map(|_| ()),
+                )
+                .expect_err("17 > capacity");
+            assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
+            let e = pipe
+                .stream_frames(|_batch| Ok(()), |stream| stream.next_upload_slot()?.submit(0).map(|_| ()))
+                .expect_err("0 blocks");
+            assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
+            // A panic on either side propagates without leaving the other side waiting.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipe.stream_frames(|_batch| panic!("sink panicked"), |stream| stream.upload_blocks(&blocks))
+            }));
+            assert!(r.is_err(), "{name}: the sink's panic propagates");
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipe.stream_frames(
+                    |_batch| Ok(()),
+                    |stream| {
+                        stream.upload_blocks(&blocks[..48])?;
+                        panic!("producer panicked")
+                    },
+                )
+            }));
+            assert!(r.is_err(), "{name}: the producer's panic propagates");
+            // After all of that the same pipeline delivers every frame right.
+            let mut sink = CollectFrames(vec![None; blocks.len()]);
+            pipe.run_frames(&blocks, &mut sink).unwrap();
+            for (i, got) in sink.0.into_iter().enumerate() {
+                assert!(got.unwrap() == want[i % distinct.len()], "{name}: index {i}");
+            }
+        }
+    }
+
+    /// Parallel delivery (`run_frames_par`): every index exactly once and right, whatever the
+    /// thread count (more threads than frames in a batch included), and actually from several
+    /// threads.
+    #[test]
+    fn run_frames_par_every_index_once() {
+        use std::sync::atomic::AtomicU32;
+        struct Par {
+            hits: Vec<AtomicU32>,
+            frames: Vec<Mutex<Vec<u8>>>,
+            threads: Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+        }
+        impl ParFrameSink for Par {
+            fn put(&self, index: usize, frame: &[u8]) {
+                self.hits[index].fetch_add(1, Ordering::Relaxed);
+                *self.frames[index].lock().unwrap() = frame.to_vec();
+                self.threads.lock().unwrap().insert(std::thread::current().id());
+            }
+        }
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL9, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        let blocks: Vec<&[u8]> = (0..150).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 32, inflight: 2, params }).unwrap();
+        for threads in [1, 3, 8, 64] {
+            let sink = Par {
+                hits: (0..blocks.len()).map(|_| AtomicU32::new(0)).collect(),
+                frames: (0..blocks.len()).map(|_| Mutex::new(Vec::new())).collect(),
+                threads: Default::default(),
+            };
+            let stats = pipe.run_frames_par(&blocks, &sink, threads).unwrap();
+            assert_eq!(stats.batches, 5);
+            for i in 0..blocks.len() {
+                assert_eq!(sink.hits[i].load(Ordering::Relaxed), 1, "threads {threads}: index {i}");
+                assert!(*sink.frames[i].lock().unwrap() == want[i % distinct.len()], "threads {threads}: index {i}");
+            }
+            let used = sink.threads.lock().unwrap().len();
+            assert!(if threads == 1 { used == 1 } else { used > 1 }, "threads {threads}: {used} delivery threads");
+        }
     }
 }
