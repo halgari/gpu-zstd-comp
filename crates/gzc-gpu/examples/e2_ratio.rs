@@ -1,6 +1,6 @@
 //! speed2 E2: CPU-oracle corpus ratio for lvl9 variants with other key widths / depths.
 //!
-//! `cargo run --release -p gzc-gpu --example e2_ratio -- <corpus dir> <hash_bits:depth>...`
+//! `cargo run --release -p gzc-gpu --example e2_ratio -- <corpus dir> <hash_bits:depth[:segment_log2]>...`
 //! Compresses every block of the corpus's .dds/.nif files with `reference::compress_block_to_frame`
 //! (lvl9 with the given `hash_bits` and `depth`) and prints real bytes / frame bytes, like
 //! `gzc-bench ref`. Files are streamed (per-file parallelism) instead of loaded at once.
@@ -30,8 +30,8 @@ fn main() {
     let variants: Vec<MatchParams> = args[2..]
         .iter()
         .map(|v| {
-            let (h, d) = v.split_once(':').expect("hash_bits:depth");
-            MatchParams { hash_bits: h.parse().unwrap(), depth: d.parse().unwrap(), ..LVL9 }
+            let f: Vec<u32> = v.split(':').map(|x| x.parse().unwrap()).collect();
+            MatchParams { hash_bits: f[0], depth: f[1], segment_log2: f.get(2).copied().unwrap_or(0), ..LVL9 }
         })
         .collect();
     let real = AtomicU64::new(0);
@@ -59,6 +59,6 @@ fn main() {
     let real = real.load(Ordering::Relaxed);
     for (v, c) in variants.iter().zip(&comp) {
         let c = c.load(Ordering::Relaxed);
-        println!("hash_bits {:2} depth {:2}: {real} / {c} = {:.5}", v.hash_bits, v.depth, real as f64 / c as f64);
+        println!("hash_bits {:2} depth {:2} seg {:2}: {real} / {c} = {:.5}", v.hash_bits, v.depth, v.segment_log2, real as f64 / c as f64);
     }
 }

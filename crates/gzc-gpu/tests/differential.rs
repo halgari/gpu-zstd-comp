@@ -10,7 +10,9 @@ use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases, segment_test_cases};
 use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL3, LVL9, LVL9D16, LVL9S12, LVL9S12SEG, LVL9S13, LVL9S13SEG, LVL9SEG, MatchParams, RUNG1, RUNG2};
+use gzc_core::params::{
+    LVL3, LVL9, LVL9D16, LVL9D16SEG, LVL9S12, LVL9S12D16SEG, LVL9S12SEG, LVL9S13, LVL9S13SEG, LVL9SEG, MatchParams, RUNG1, RUNG2,
+};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -46,7 +48,7 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
 }
 
 /// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 10] = [
+const GPU_PRESETS: [(&str, MatchParams); 12] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
@@ -57,6 +59,8 @@ const GPU_PRESETS: [(&str, MatchParams); 10] = [
     ("lvl9seg", LVL9SEG),
     ("lvl9s13seg", LVL9S13SEG),
     ("lvl9s12seg", LVL9S12SEG),
+    ("lvl9d16seg", LVL9D16SEG),
+    ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
 /// LVL3 with a deeper chain walk.

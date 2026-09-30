@@ -96,7 +96,6 @@ pub const LVL9: MatchParams =
 /// a parse that runs one GPU lane per segment. Ratio ~0.01 % below lvl9, above libzstd L9.
 pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
-
 /// `lvl9` with a 13-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^13 keys in workgroup memory) instead of 16-bit hash
 /// chains. Ratio -0.004 % vs lvl9 in the R5 sample.
@@ -109,9 +108,12 @@ pub const LVL9D16: MatchParams = MatchParams { depth: 16, ..LVL9 };
 /// The bucket-sorted finders with the segmented parse (E1 + E2).
 pub const LVL9S13SEG: MatchParams = MatchParams { hash_bits: 13, ..LVL9SEG };
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
+/// Depth 16 with the segmented parse (E4 + E1), and with the 12-bit sorted finder (E4 + E2 + E1).
+pub const LVL9D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9SEG };
+pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 10] = [
+pub const PRESETS: [(&str, MatchParams); 12] = [
     ("lvl3", LVL3),
     ("rung1", RUNG1),
     ("rung2", RUNG2),
@@ -122,6 +124,8 @@ pub const PRESETS: [(&str, MatchParams); 10] = [
     ("lvl9seg", LVL9SEG),
     ("lvl9s13seg", LVL9S13SEG),
     ("lvl9s12seg", LVL9S12SEG),
+    ("lvl9d16seg", LVL9D16SEG),
+    ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
 /// The preset called `name`; an unknown name is an error listing the valid ones.
