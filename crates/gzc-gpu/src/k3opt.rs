@@ -21,11 +21,15 @@
 //! Buffers per block: data (BLOCK_SIZE), candidate words (8 B per position; after the DP each
 //! segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace (8 B
 //! per position: K1's `pred` in the pipeline), seqs (`MAX_SEQS_OPT` × 12 B; the DP's series log
-//! until the fix-up), counts, and the price tables (`PRICE_WORDS` words).
+//! until the fix-up), counts, the price tables (`PRICE_WORDS` words), and the DP nodes' payload
+//! scratch (`scratch_bytes_per_block`, 6336 B at 64 KiB: only the nodes' prices stay in
+//! workgroup memory, M5 T3b).
 //!
 //! Workgroups: `K3OptConfig::wg` lanes (a power of two, 8..=256; a block's 16 segment lanes may
-//! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 log in
-//! `docs/results/m5-log.md`).
+//! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 and T3b
+//! logs in `docs/results/m5-log.md`). Residency: about 5 KB of workgroup memory and ≤ 100
+//! registers per wg16 workgroup (T3b), so one wave holds 20 warps/SM (3400 blocks on the 5090);
+//! a change that raises either past that splits a 2900-block batch into two waves.
 use crate::compressor::{K3_FIXUP_WGSL, counts_bytes, data_bytes, decode_output};
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use anyhow::{anyhow, ensure};
@@ -47,13 +51,14 @@ pub const PRICE_WORDS: usize = 256 + 36 + 53 + 32;
 /// Largest batch `parses_from_cands` runs at once.
 const BATCH_CAP: usize = 256;
 
-/// Where the DP rings live.
+/// Where the DP rings' prices live (the rest of each node is in `OptBuffers::scratch`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingMem {
     /// `var<workgroup>` (needs `ring_bytes(wg)` plus the price tables within the device's
     /// `max_compute_workgroup_storage_size`, which `GpuContext` requests at the adapter's limit).
     Workgroup,
-    /// `var<private>`: the fallback for small workgroup storage.
+    /// `var<private>`: the fallback for small workgroup storage (the price tables alone must
+    /// still fit).
     Private,
 }
 
@@ -109,23 +114,63 @@ fn n_seg(m: &MatchParams) -> u32 {
     (BLOCK_SIZE >> m.segment_log2) as u32
 }
 
-/// Workgroup bytes of `wg` lanes' rings: 16 B per node, `target_length + 1` nodes per lane.
+/// Workgroup bytes of `wg` lanes' price rings: 4 B per node, `target_length + 1` nodes per lane.
 pub fn ring_bytes(wg: u32, target_length: u32) -> u32 {
-    wg * (target_length + 1) * 16
+    wg * (target_length + 1) * 4
+}
+
+/// The ring's `sufficient_len` (`target_length`, at most 4095) of opt params `m`.
+fn suff_of(m: &MatchParams) -> u32 {
+    m.opt.map_or(32, |o| o.target_length).min(4095)
+}
+
+/// Bytes of the DP nodes' payload scratch (`OptBuffers::scratch`) per block: 12 B per node,
+/// `target_length + 1` nodes per segment lane.
+pub fn scratch_bytes_per_block(m: &MatchParams) -> u64 {
+    n_seg(m) as u64 * (suff_of(m) as u64 + 1) * 12
 }
 
 /// Workgroup bytes of the price tables (and the prologue's histogram and sums, which also hold a
 /// `hist_out` pass's histogram) for `bpw` blocks.
 fn price_table_bytes(bpw: u32, target_length: u32) -> u32 {
-    bpw * (256 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
+    bpw * (128 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
 }
 
 /// Workgroup bytes `K3Opt` needs with its rings in workgroup memory.
 pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
-    let suff = m.opt.map_or(32, |o| o.target_length).min(4095);
+    ring_bytes(cfg.wg, suff_of(m)) + table_bytes(m, cfg)
+}
+
+/// Workgroup bytes `K3Opt` needs besides the rings: the price tables (and the fix-up's arrays).
+fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     let n_seg = n_seg(m);
     let bpw = (cfg.wg / n_seg).max(1);
-    ring_bytes(cfg.wg, suff) + price_table_bytes(bpw, suff) + 3 * 4 * n_seg + 64
+    price_table_bytes(bpw, suff_of(m)) + 3 * 4 * n_seg + 64
+}
+
+/// The ring memory `K3Opt::new` uses for `cfg` under a workgroup storage limit of `limit` bytes:
+/// `cfg.ring`, or (`None`) `Workgroup` when `workgroup_bytes` fits, else `Private`. Fails cleanly
+/// (before any pipeline is created) when a forced `Workgroup` ring does not fit, or when the price
+/// tables alone do not.
+pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<RingMem> {
+    let tables = table_bytes(m, cfg);
+    ensure!(
+        tables <= limit,
+        "wg {}: the price tables need {tables} B of workgroup memory > limit {limit}",
+        cfg.wg
+    );
+    let wg_need = workgroup_bytes(m, cfg);
+    let ring = cfg.ring.unwrap_or(if wg_need <= limit {
+        RingMem::Workgroup
+    } else {
+        RingMem::Private
+    });
+    ensure!(
+        ring == RingMem::Private || wg_need <= limit,
+        "wg {}: the workgroup ring needs {wg_need} B > limit {limit}",
+        cfg.wg
+    );
+    Ok(ring)
 }
 
 /// The compiled K3opt pass.
@@ -138,6 +183,8 @@ pub struct K3Opt {
     pub prices: PriceSrc,
     pub level: u8,
     pub hist_out: bool,
+    /// The opt params the pass was built for (`OptBuffers::new` sizes the scratch by them).
+    pub params: MatchParams,
     n_seg: u32,
 }
 
@@ -154,6 +201,10 @@ pub struct OptBuffers {
     /// `PRICE_WORDS` words per block: `opt::Prices` (`PriceSrc::Buffer`) or `opt::Hist`
     /// (`PriceSrc::Hist`, `hist_out`), both as lit[256] ll[36] ml[53] of[32].
     pub prices: wgpu::Buffer,
+    /// The DP nodes' payload (`scratch_bytes_per_block` per block; K3opt-owned, dead between
+    /// passes).
+    pub scratch: wgpu::Buffer,
+    scratch_per_block: u64,
 }
 
 /// Bytes of the candidate words (and of the trace) per `n` blocks.
@@ -167,7 +218,10 @@ pub fn seqs_opt_bytes(n: u32) -> u64 {
 }
 
 impl OptBuffers {
-    pub fn new(ctx: &GpuContext, capacity: u32) -> Self {
+    /// Buffers for `capacity` blocks under opt params `m` (the scratch's size depends on the
+    /// segments per block and `target_length`).
+    pub fn new(ctx: &GpuContext, m: &MatchParams, capacity: u32) -> Self {
+        let scratch_per_block = scratch_bytes_per_block(m);
         Self {
             capacity,
             data: ctx.storage_buffer("k3opt.data", data_bytes(capacity), false),
@@ -180,6 +234,8 @@ impl OptBuffers {
                 capacity as u64 * PRICE_WORDS as u64 * 4,
                 true,
             ),
+            scratch: ctx.storage_buffer("k3opt.scratch", capacity as u64 * scratch_per_block, false),
+            scratch_per_block,
         }
     }
 
@@ -304,30 +360,14 @@ impl K3Opt {
             "wg {}: hist_out and PriceSrc::Prior need a block's {n_seg} segments in one workgroup",
             cfg.wg
         );
-        let limit = ctx.device.limits().max_compute_workgroup_storage_size;
-        let wg_need = workgroup_bytes(m, &cfg);
-        let ring = cfg.ring.unwrap_or(if wg_need <= limit {
-            RingMem::Workgroup
-        } else {
-            RingMem::Private
-        });
-        ensure!(
-            ring == RingMem::Private || wg_need <= limit,
-            "workgroup ring needs {wg_need} B > limit {limit}"
-        );
+        let ring = ring_for(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
         let ring_decl = match ring {
             RingMem::Workgroup => {
                 "var<workgroup> ring_p: array<i32, RING_N * WG>;\n\
-                 var<workgroup> ring_a: array<u32, RING_N * WG>;\n\
-                 var<workgroup> ring_b: array<u32, RING_N * WG>;\n\
-                 var<workgroup> ring_c: array<u32, RING_N * WG>;\n\
                  fn rix(s: u32) -> u32 { return s * WG + lane; }\n"
             }
             RingMem::Private => {
                 "var<private> ring_p: array<i32, RING_N>;\n\
-                 var<private> ring_a: array<u32, RING_N>;\n\
-                 var<private> ring_b: array<u32, RING_N>;\n\
-                 var<private> ring_c: array<u32, RING_N>;\n\
                  fn rix(s: u32) -> u32 { return s; }\n"
             }
         };
@@ -350,7 +390,7 @@ impl K3Opt {
         let layout = crate::compressor::storage_layout(
             ctx,
             "k3opt",
-            &[true, false, false, false, false, false],
+            &[true, false, false, false, false, false, false],
         );
         let module = if cfg.unbounded {
             ctx.shader_unbounded_loops("k3_opt", &body)
@@ -375,6 +415,7 @@ impl K3Opt {
             prices: cfg.prices,
             level: cfg.level,
             hist_out: cfg.hist_out,
+            params: *m,
             n_seg,
         })
     }
@@ -403,6 +444,10 @@ impl K3Opt {
         queries: Option<(&wgpu::QuerySet, u32)>,
     ) {
         assert!(n >= 1 && n <= bufs.capacity);
+        assert!(
+            bufs.scratch_per_block >= scratch_bytes_per_block(&self.params),
+            "k3opt: OptBuffers built for other opt params"
+        );
         let counts = wgpu::BufferBinding {
             buffer: &bufs.counts,
             offset: 0,
@@ -435,6 +480,10 @@ impl K3Opt {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: bufs.prices.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bufs.scratch.as_entire_binding(),
                 },
             ],
         });
@@ -518,7 +567,7 @@ pub fn parses_from_cands(
         return Ok(Vec::new());
     }
     crate::compressor::with_error_scopes(ctx, || {
-        let bufs = OptBuffers::new(ctx, blocks.len().min(BATCH_CAP) as u32);
+        let bufs = OptBuffers::new(ctx, &k.params, blocks.len().min(BATCH_CAP) as u32);
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {
             let at = i * BATCH_CAP;
@@ -635,6 +684,11 @@ impl OptPasses {
         self.kernels.iter().map(|k| &**k)
     }
 
+    /// The opt params the passes were built for.
+    pub fn params(&self) -> &MatchParams {
+        &self.kernels[0].params
+    }
+
     /// Number of DP passes (cheap passes + 1).
     pub fn n_passes(&self) -> usize {
         self.kernels.len()
@@ -687,7 +741,7 @@ pub fn parses_from_passes(
         return Ok((Vec::new(), hs));
     }
     crate::compressor::with_error_scopes(ctx, || {
-        let bufs = OptBuffers::new(ctx, blocks.len().min(BATCH_CAP) as u32);
+        let bufs = OptBuffers::new(ctx, p.params(), blocks.len().min(BATCH_CAP) as u32);
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {
             let at = i * BATCH_CAP;

@@ -14,7 +14,8 @@ use gzc_gpu::compressor::{GpuParams, Kernels, frames_from_parses};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::k3opt::{
     K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, parses_from_cands,
-    parses_from_passes, time_pass, time_passes, workgroup_bytes,
+    parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass, time_passes,
+    workgroup_bytes,
 };
 
 fn cfg(level: u8, ring: RingMem, prices: PriceSrc) -> K3OptConfig {
@@ -191,6 +192,33 @@ fn check_blocks_with(
         }
         eprintln!("{c:?} ring {:?}: {} blocks equal", k.ring, blocks.len());
     }
+}
+
+/// The ring-memory choice under small workgroup limits (M5 T3b): the price ring falls back to
+/// private memory when only the tables fit, and a limit below the tables fails cleanly in
+/// `ring_for` (before any pipeline is created). Also the footprint T3b is built around.
+#[test]
+fn k3opt_ring_choice() {
+    let auto = K3OptConfig::default();
+    let need = workgroup_bytes(&OPT16, &auto);
+    let tables = need - ring_bytes(auto.wg, 32);
+    if BLOCK_SIZE == 65536 {
+        assert!(need <= 5200, "wg16 workgroup footprint {need} B (one wave needs about 5 KB)");
+    }
+    assert_eq!(ring_for(&OPT16, &auto, need).unwrap(), RingMem::Workgroup);
+    assert_eq!(ring_for(&OPT16, &auto, need - 1).unwrap(), RingMem::Private);
+    assert_eq!(ring_for(&OPT16, &auto, tables).unwrap(), RingMem::Private);
+    assert!(ring_for(&OPT16, &auto, tables - 1).is_err());
+    let forced = K3OptConfig { ring: Some(RingMem::Workgroup), ..auto };
+    assert!(ring_for(&OPT16, &forced, need - 1).is_err());
+    let private = K3OptConfig { ring: Some(RingMem::Private), ..auto };
+    assert_eq!(ring_for(&OPT16, &private, tables).unwrap(), RingMem::Private);
+    let seg = BLOCK_SIZE as u64 >> OPT16.segment_log2;
+    assert_eq!(scratch_bytes_per_block(&OPT16), seg * 33 * 12);
+    // The fallback runs on this adapter too (the tests below build it explicitly).
+    let ctx = GpuContext::new().expect("GPU required");
+    let k = K3Opt::new(&ctx, &OPT16, private).expect("K3Opt::new");
+    assert_eq!(k.ring, RingMem::Private);
 }
 
 /// Every `opt::cases` run: explicit tables as given (or, for the preset runs, the oracle's final
@@ -427,7 +455,7 @@ fn k3opt_timing() {
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
-    let bufs = OptBuffers::new(&ctx, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
     // (wg, ring, level, prices, unbounded loops)
     let table: [(u32, RingMem, u8, PriceSrc, bool); 13] = [
         (16, RingMem::Workgroup, 2, PriceSrc::BlockInit, true),
@@ -674,7 +702,7 @@ fn k3opt_passes_corpus() {
 }
 
 /// Informal: GPU time of every pass of opt14 and opt16 (`GZC_CORPUS_BLOCKS`, default 2900 corpus
-/// blocks, one batch; wg16, the default ring).
+/// blocks, one batch; wg16, the default ring; `GZC_K3OPT_SORT`: heavy-first block order).
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_passes_timing -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -683,12 +711,29 @@ fn k3opt_passes_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2900);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(mut blocks) = corpus_blocks(n) else { return };
     let ctx = GpuContext::new().expect("GPU required");
-    let cands = cands_of(&blocks);
+    let mut cands = cands_of(&blocks);
+    if std::env::var("GZC_K3OPT_SORT").is_ok() {
+        // Heavy-first order (the K3opt performance study's cost proxy): blocks by descending
+        // Σ (min(max(lenA, lenB), 32) - 2) over their candidate words with a match.
+        let cost = |c: &[CandWords]| -> u64 {
+            c.iter()
+                .map(|w| {
+                    let (a, b) = gzc_core::reference::unpack_cands(*w);
+                    (a.len.max(b.len).min(32) as u64).saturating_sub(2)
+                })
+                .sum()
+        };
+        let mut idx: Vec<usize> = (0..blocks.len()).collect();
+        idx.sort_by_key(|&i| std::cmp::Reverse(cost(&cands[i])));
+        blocks = idx.iter().map(|&i| blocks[i].clone()).collect();
+        cands = idx.iter().map(|&i| cands[i].clone()).collect();
+        eprintln!("blocks in heavy-first order");
+    }
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
-    let bufs = OptBuffers::new(&ctx, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");

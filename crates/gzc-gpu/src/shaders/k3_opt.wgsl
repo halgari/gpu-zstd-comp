@@ -15,8 +15,11 @@
 //     `continue`) so that the lanes' get_all_matches calls run together; each trip issues its
 //     position's loads (data, candidate words) first.
 //   - The DP nodes live in a ring of RING_N = sufficient_len + 1 slots per lane (position pos of
-//     the series in slot pos % RING_N), in workgroup memory or in private memory (the fallback
-//     when the adapter's workgroup storage is too small); both declared by the host (rix).
+//     the series in slot pos % RING_N). Only the prices (ring_p) are in workgroup memory, or in
+//     private memory (the fallback when the adapter's workgroup storage is too small), both
+//     declared by the host (rix); the rest of each node is in the global scratch `scr` (M5 T3b:
+//     workgroup memory bounds K3opt's residency, and 4 B per node lets a 2900-block batch run in
+//     one wave on an RTX 5090).
 //   - `trace` (the dead K1 pred buffer, 2 words per position) gets (mlen | litlen << 8, offBase)
 //     of every node when it becomes final; the backward trace reads it, never the ring. The entry
 //     at iend (a node at the segment end) is never read and not written (it would be the next
@@ -58,7 +61,7 @@
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
 // (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
 // (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
-// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the ring declarations (ring_p/a/b/c, rix).
+// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the price ring's declaration (ring_p, rix).
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;
@@ -117,6 +120,10 @@ const_assert MIN_MATCH == 3u;
 // PRICE_MODE 1: opt::Prices per block; PRICE_MODE 3 / HIST_OUT: opt::Hist per block (the
 // previous pass's, replaced by this pass's). PRICE_WORDS == HIST_WORDS words per block.
 @group(0) @binding(5) var<storage, read_write> prices: array<u32>;
+// The DP nodes' payload (reps, litlen, mlen, offBase): 3 consecutive words per node, RING_N nodes
+// per lane (see six; lanes interleaved per slot measured 4 % slower, 16-byte nodes 0.5 %). Only
+// the price stays in ring_p.
+@group(0) @binding(6) var<storage, read_write> scr: array<u32>;
 
 // zstd LL_Code for lit_len < 64 (codes::ll_code).
 const LL_CODE: array<u32, 64> = array<u32, 64>(
@@ -126,7 +133,8 @@ const LL_CODE: array<u32, 64> = array<u32, 64>(
     24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u);
 
 // Price tables of the workgroup's blocks (local block pb at pb * size).
-var<workgroup> p_lit: array<i32, 256u * BPW>;
+// Literal prices as u16 pairs (byte 2e in the low half of word e; every price is in 0..65536).
+var<workgroup> p_lit: array<u32, 128u * BPW>;
 // ll_price(litlen) for litlen < 64.
 var<workgroup> p_lls: array<i32, 64u * BPW>;
 // LL price by code (litlen >= 64: code highbit(litlen) + 19).
@@ -147,6 +155,7 @@ var<private> base: u32;
 var<private> cbase: u32;
 var<private> tbase: u32;
 var<private> wbase: u32;
+var<private> sbase: u32;
 
 // Records of the last get_all_matches: (offBase, length), strictly increasing length.
 var<private> m_ob: array<u32, 5>;
@@ -163,6 +172,34 @@ var<private> ml_sum: u32;
 var<private> lbase: u32;
 var<private> n_series: u32;
 
+// load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
+// are loaded, the high one masked when aligned (data[w + 1] is in bounds, see load_u32_at).
+fn ld32(base: u32, byte_off: u32) -> u32 {
+    let w = base + (byte_off >> 2u);
+    let sh = (byte_off & 3u) * 8u;
+    let hi = data[w + 1u] << ((32u - sh) & 31u);
+    return (data[w] >> sh) | select(hi, 0u, sh == 0u);
+}
+
+// match_len on ld32.
+fn match_len_nb(base: u32, p: u32, q: u32, cap: u32) -> u32 {
+    let max = min(BLOCK_SIZE - p, cap);
+    var n = 0u;
+    // Terminates: n rises by 4 to max.
+    loop {
+        if (n + 4u > max) { break; }
+        let x = ld32(base, p + n) ^ ld32(base, q + n);
+        if (x != 0u) { return n + (countTrailingZeros(x) >> 3u); }
+        n += 4u;
+    }
+    // Terminates: n rises to max.
+    loop {
+        if (n >= max || load_byte(base, p + n) != load_byte(base, q + n)) { break; }
+        n += 1u;
+    }
+    return n;
+}
+
 // opt::frac_weight
 fn frac_weight(raw: u32) -> u32 {
     let stat = raw + 1u;
@@ -170,14 +207,16 @@ fn frac_weight(raw: u32) -> u32 {
     return hb * 256u + ((stat << 8u) >> hb);
 }
 
+// Branch-free: both tables read, the code index clamped (litlen <= 65536: code <= 35).
 fn ll_price(litlen: u32) -> i32 {
-    if (litlen < 64u) { return p_lls[pb * 64u + litlen]; }
-    return p_llc[pb * 36u + firstLeadingBit(litlen) + 19u];
+    let a = p_lls[pb * 64u + min(litlen, 63u)];
+    let b = p_llc[pb * 36u + min(firstLeadingBit(litlen | 64u) + 19u, 35u)];
+    return select(b, a, litlen < 64u);
 }
 
 // Literal price of byte value `c`.
 fn lit_cost(c: u32) -> i32 {
-    return p_lit[pb * 256u + c];
+    return i32((p_lit[pb * 128u + (c >> 1u)] >> ((c & 1u) * 16u)) & 0xFFFFu);
 }
 
 fn of_price(ob: u32) -> i32 {
@@ -189,15 +228,15 @@ fn match_price(ob: u32, mlen: u32) -> i32 {
 }
 
 // seq::apply_off_base on a history value: the reps after offBase `ob` with `ll` literals.
+// Branch-free: idx 0: r; 1: (r1, r0, r2); 2: (r2, r0, r1); 3: (r0 - 1, r0, r1);
+// ob > 3: (ob - 3, r0, r1).
 fn rep_after(r: vec3<u32>, ob: u32, ll: u32) -> vec3<u32> {
-    if (ob > 3u) { return vec3<u32>(ob - 3u, r.x, r.y); }
     let idx = ob - 1u + select(0u, 1u, ll == 0u);
-    switch (idx) {
-        case 0u: { return r; }
-        case 1u: { return vec3<u32>(r.y, r.x, r.z); }
-        case 2u: { return vec3<u32>(r.z, r.x, r.y); }
-        default: { return vec3<u32>(r.x - 1u, r.x, r.y); }
-    }
+    let rep = ob <= 3u;
+    let keep = rep && idx == 0u;
+    let first = select(select(select(r.x - 1u, r.z, idx == 2u), r.y, idx == 1u), ob - 3u, !rep);
+    let third = select(select(r.y, r.z, rep && idx == 1u), r.z, keep);
+    return vec3<u32>(select(first, r.x, keep), select(r.x, r.y, keep), third);
 }
 
 // opt::new_rep (ZSTD_newRep).
@@ -205,8 +244,8 @@ fn new_rep(r: vec3<u32>, ob: u32, ll0: bool) -> vec3<u32> {
     return rep_after(r, ob, select(1u, 0u, ll0));
 }
 
-// A DP node (opt::Node). In the ring: ring_p = price, ring_a = rep0 | rep1 << 16,
-// ring_b = rep2 | litlen << 16, ring_c = mlen | offBase << 8 (mlen <= SUFF, reps < 65536).
+// A DP node (opt::Node). ring_p = price; payload words (scr, six): rep0 | rep1 << 16,
+// rep2 | litlen << 16, mlen | offBase << 8 (mlen <= SUFF, reps < 65536).
 struct Node {
     price: i32,
     r: vec3<u32>,
@@ -217,12 +256,17 @@ struct Node {
 
 fn slot(pos: u32) -> u32 { return pos % RING_N; }
 
+// The payload words of the lane's slot s: scr[six(s)], scr[six(s) + SF], scr[six(s) + 2 SF].
+const SF: u32 = 1u;
+fn six(s: u32) -> u32 { return sbase + 3u * s; }
+
 fn ld(pos: u32) -> Node {
-    let i = rix(slot(pos));
-    let a = ring_a[i];
-    let b = ring_b[i];
-    let c = ring_c[i];
-    return Node(ring_p[i], vec3<u32>(a & 0xFFFFu, a >> 16u, b & 0xFFFFu), b >> 16u, c & 0xFFu, c >> 8u);
+    let s = slot(pos);
+    let j = six(s);
+    let a = scr[j];
+    let b = scr[j + SF];
+    let c = scr[j + 2u * SF];
+    return Node(ring_p[rix(s)], vec3<u32>(a & 0xFFFFu, a >> 16u, b & 0xFFFFu), b >> 16u, c & 0xFFu, c >> 8u);
 }
 
 fn ld_price(pos: u32) -> i32 {
@@ -230,18 +274,29 @@ fn ld_price(pos: u32) -> i32 {
 }
 
 fn st(pos: u32, n: Node) {
-    let i = rix(slot(pos));
-    ring_p[i] = n.price;
-    ring_a[i] = n.r.x | (n.r.y << 16u);
-    ring_b[i] = n.r.z | (n.litlen << 16u);
-    ring_c[i] = n.mlen | (n.ob << 8u);
+    let s = slot(pos);
+    let j = six(s);
+    ring_p[rix(s)] = n.price;
+    scr[j] = n.r.x | (n.r.y << 16u);
+    scr[j + SF] = n.r.z | (n.litlen << 16u);
+    scr[j + 2u * SF] = n.mlen | (n.ob << 8u);
+}
+
+// A relaxation's match node at slot s: price, rep0 | rep1 << 16, rep2 (litlen 0), mlen | ob << 8.
+fn st_match(s: u32, price: i32, ra: u32, rz: u32, mo: u32) {
+    let j = six(s);
+    ring_p[rix(s)] = price;
+    scr[j] = ra;
+    scr[j + SF] = rz;
+    scr[j + 2u * SF] = mo;
 }
 
 // The relaxation's fill: price MAX, litlen 1, the rest left as it was.
 fn fill(pos: u32) {
-    let i = rix(slot(pos));
-    ring_p[i] = MAXP;
-    ring_b[i] = (ring_b[i] & 0xFFFFu) | (1u << 16u);
+    let s = slot(pos);
+    let j = six(s) + SF;
+    ring_p[rix(s)] = MAXP;
+    scr[j] = (scr[j] & 0xFFFFu) | (1u << 16u);
 }
 
 fn push_match(ob: u32, len: u32) {
@@ -258,7 +313,7 @@ fn rep_probe(p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, be
     if (!valid || (d & 0xFFFFFFu) != 0u) { return false; }
     // lim >= 8 at every searched position (p <= ilimit = iend - 8).
     var rl = 3u;
-    if (d == 0u) { rl = 4u + match_len(base, p + 4u, p - ro + 4u, lim - 4u); }
+    if (d == 0u) { rl = 4u + match_len_nb(base, p + 4u, p - ro + 4u, lim - 4u); }
     if (rl <= *bestl) { return false; }
     *bestl = rl;
     push_match(ob, rl);
@@ -279,9 +334,9 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
     let v0 = ro0 - 1u < p;
     let v1 = ro1 - 1u < p;
     let v2 = ro2 - 1u < p;
-    let y0 = load_u32_at(base, p - select(0u, ro0, v0));
-    let y1 = load_u32_at(base, p - select(0u, ro1, v1));
-    let y2 = load_u32_at(base, p - select(0u, ro2, v2));
+    let y0 = ld32(base, p - select(0u, ro0, v0));
+    let y1 = ld32(base, p - select(0u, ro1, v1));
+    let y2 = ld32(base, p - select(0u, ro2, v2));
     if (rep_probe(p, lim, 1u, ro0, v0, x, y0, &bestl)) { return; }
     if (rep_probe(p, lim, 2u, ro1, v1, x, y1, &bestl)) { return; }
     if (rep_probe(p, lim, 3u, ro2, v2, x, y2, &bestl)) { return; }
@@ -290,7 +345,7 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
         let len = select(w0 >> 24u, (w0 >> 16u) & 0xFFu, j == 0u);
         if (len == 0u) { continue; }
         var l = min(len, lim);
-        if (len == SEARCH_CAP) { l = match_len(base, p, p - off, lim); }
+        if (len == SEARCH_CAP) { l = match_len_nb(base, p, p - off, lim); }
         if (l > bestl) {
             bestl = l;
             push_match(off + 3u, l);
@@ -478,8 +533,10 @@ fn prologue(valid: bool, b: u32) {
         }
         workgroupBarrier();
         let lb = frac_weight(max(atomicLoad(&hsum[blk * 5u]), 1u));
-        for (var e = kl; e < 256u; e += LPB) {
-            p_lit[blk * 256u + e] = lit_from(atomicLoad(&hist[blk * 256u + e]), lb);
+        for (var e = kl; e < 128u; e += LPB) {
+            let lo = lit_from(atomicLoad(&hist[blk * 256u + 2u * e]), lb);
+            let hi = lit_from(atomicLoad(&hist[blk * 256u + 2u * e + 1u]), lb);
+            p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
         }
         if (PRICE_MODE == 0u) {
             for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = BI_LL[c]; }
@@ -495,7 +552,7 @@ fn prologue(valid: bool, b: u32) {
     } else if (PRICE_MODE == 1u) {
         if (valid) {
             let q = b * PRICE_WORDS;
-            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = i32(prices[q + e]); }
+            for (var e = kl; e < 128u; e += LPB) { p_lit[blk * 128u + e] = prices[q + 2u * e] | (prices[q + 2u * e + 1u] << 16u); }
             for (var c = kl; c < 36u; c += LPB) { p_llc[blk * 36u + c] = i32(prices[q + 256u + c]); }
             for (var l = kl; l < 64u; l += LPB) { p_lls[blk * 64u + l] = i32(prices[q + 256u + LL_CODE[l]]); }
             for (var m = kl; m < RING_N; m += LPB) { p_ml[blk * RING_N + m] = i32(prices[q + 292u + max(m, 3u) - 3u]); }
@@ -526,7 +583,11 @@ fn prologue(valid: bool, b: u32) {
             let llb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 1u]), 1u));
             let mlb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 2u]), 1u));
             let ofb = frac_weight(max(atomicLoad(&hsum[blk * 5u + 3u]), 1u));
-            for (var e = kl; e < 256u; e += LPB) { p_lit[blk * 256u + e] = lit_from(seen(prices[q + e]), lb); }
+            for (var e = kl; e < 128u; e += LPB) {
+                let lo = lit_from(seen(prices[q + 2u * e]), lb);
+                let hi = lit_from(seen(prices[q + 2u * e + 1u]), lb);
+                p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
+            }
             for (var c = kl; c < 36u; c += LPB) {
                 p_llc[blk * 36u + c] = i32(LL_BITS[c] * 256u + llb - frac_weight(seen(prices[q + 256u + c])));
             }
@@ -622,6 +683,7 @@ fn dp(b: u32, k: u32) {
     cbase = 2u * b * BLOCK_SIZE;
     tbase = cbase;
     wbase = cbase + k * SEG_WORDS;
+    sbase = (b * NSEG + k) * (3u * RING_N);
     let s = k * SEG;
     let iend = s + SEG;
     let ilimit = iend - 8u;
@@ -653,7 +715,7 @@ fn dp(b: u32, k: u32) {
         // series may reach iend, where nothing is searched and x is unused).
         let p = select(st_ip, sip + cur, in_series);
         let pc = min(p, iend - 1u);
-        let x = load_u32_at(base, pc);
+        let x = ld32(base, pc);
         let xprev = load_byte(base, p - 1u);
         let ci = cbase + 2u * pc;
         let w0 = best[ci];
@@ -717,79 +779,99 @@ fn dp(b: u32, k: u32) {
         }
 
         // Part 2 (no `continue`: every lane reaches the end of the trip, so the lanes stay
-        // together for the next trip's get_all_matches).
-        if (!in_series) {
-            if (m_n == 0u) {
-                st_ip += 1u;
-            } else {
-                let ip = st_ip;
-                let litlen = ip - st_anchor;
-                let n0 = Node(ll_price(litlen), st_rep, litlen, 0u, 0u);
-                st(0u, n0);
-                trace_put(ip, n0);
-                let max_ob = m_ob[m_n - 1u];
-                let max_ml = m_len[m_n - 1u];
-                if (max_ml > SUFF) {
-                    // large match -> immediate encoding
-                    end_series(Node(0, new_rep(st_rep, max_ob, litlen == 0u), 0u, max_ml, max_ob), ip, max_ml);
-                } else {
-                    st(1u, Node(MAXP, vec3<u32>(0u), litlen + 1u, 0u, 0u));
-                    st(2u, Node(MAXP, vec3<u32>(0u), litlen + 2u, 0u, 0u));
-                    var pos = MIN_MATCH;
-                    for (var mi = 0u; mi < m_n; mi += 1u) {
-                        let ob = m_ob[mi];
-                        let end = m_len[mi];
-                        let mrep = new_rep(st_rep, ob, litlen == 0u);
-                        let mp = n0.price + of_price(ob) + MATCH_FEE + ll_p0;
-                        for (; pos <= end; pos += 1u) {
-                            st(pos, Node(mp + p_ml[pb * RING_N + pos], mrep, 0u, pos, ob));
-                        }
-                    }
-                    last_pos = pos - 1u;
-                    sip = ip;
-                    cur = 1u;
-                    in_series = true;
-                }
+        // together for the next trip's get_all_matches). Seeding and relaxation are one loop (M5
+        // T3b): a series start is a relaxation from a virtual node n0 at cur 0 with last_pos 0.
+        // - The records' target sets are disjoint (record i covers mlen in (len_{i-1}, len_i]),
+        //   so every target is compared against the ring as it was before this step, whatever the
+        //   order: target pos improves iff pos > lp0 || price < its ring price (a target above
+        //   lp0 is MAXP from the oracle's fill, or fresh). The optLevel-0 early abort stays per
+        //   record (lengths descending, nothing below the record's first non-improving length).
+        // - The oracle's fill of the slots in (lp0, cur + longest] leaves, besides the targets
+        //   (all written), only cur + 1 and cur + 2; a fresh series' slots 1 and 2 get litlen 1
+        //   (the oracle: litlen + 1, + 2), which nothing reads: price MAXP always loses to the
+        //   visit's literal extension, which overwrites the node, and `pm.litlen != 0` holds.
+        if (search) {
+            var src = n;
+            var c0 = cur;
+            var lp0 = last_pos;
+            if (!in_series) {
+                let litlen = st_ip - st_anchor;
+                src = Node(ll_price(litlen), st_rep, litlen, 0u, 0u);
+                c0 = 0u;
+                lp0 = 0u;
             }
-        } else if (search) {
-            let inr = sip + cur;
-            let ll0 = gll0;
             if (m_n == 0u) {
-                advance = true;
+                if (in_series) { advance = true; } else { st_ip += 1u; }
             } else {
                 let max_ob = m_ob[m_n - 1u];
                 let longest = m_len[m_n - 1u];
-                if (longest > SUFF || cur + longest >= OPT_NUM || inr + longest >= iend) {
-                    last_pos = cur + longest;
-                    end_series(Node(0, new_rep(n.r, max_ob, ll0), 0u, longest, max_ob), sip, last_pos);
+                if (!in_series) {
+                    st(0u, src);
+                    trace_put(st_ip, src);
+                }
+                if (longest > SUFF || (in_series && (cur + longest >= OPT_NUM || p + longest >= iend))) {
+                    // large match -> immediate encoding
+                    last_pos = c0 + longest;
+                    end_series(Node(0, new_rep(src.r, max_ob, gll0), 0u, longest, max_ob), select(st_ip, sip, in_series), last_pos);
                     in_series = false;
                 } else {
-                    // set prices using matches found at position == cur (lengths downward)
-                    let base_price = n.price + ll_p0;
-                    var start_ml = MIN_MATCH;
-                    for (var mi = 0u; mi < m_n; mi += 1u) {
-                        let ob = m_ob[mi];
-                        let last_ml = m_len[mi];
-                        let mrep = new_rep(n.r, ob, ll0);
+                    // Records last first, each record's lengths descending, 4 per step (a
+                    // record's lengths start at len_i >= lo, since lengths strictly increase).
+                    // Terminates: mi falls to 0; mlen falls by 4 per step, staying >= lo >= 3.
+                    let base_price = src.price + ll_p0;
+                    for (var mi = m_n; mi > 0u; mi -= 1u) {
+                        let ob = m_ob[mi - 1u];
                         let mp = base_price + of_price(ob) + MATCH_FEE;
-                        // Terminates: mlen falls to start_ml >= 3.
-                        for (var mlen = last_ml; mlen >= start_ml; mlen -= 1u) {
-                            let pos = cur + mlen;
-                            let price = mp + p_ml[pb * RING_N + mlen];
-                            if (pos > last_pos || price < ld_price(pos)) {
-                                // Terminates: last_pos rises to pos.
-                            while (last_pos < pos) {
-                                    last_pos += 1u;
-                                    fill(last_pos);
-                                }
-                                st(pos, Node(price, mrep, 0u, mlen, ob));
-                            } else if (LEVEL == 0u) {
-                                break; // early update abort
+                        let mrep = new_rep(src.r, ob, gll0);
+                        let ra = mrep.x | (mrep.y << 16u);
+                        let obs = ob << 8u;
+                        let lo = select(MIN_MATCH, m_len[max(mi, 2u) - 2u] + 1u, mi > 1u);
+                        var mlen = m_len[mi - 1u];
+                        loop {
+                            let v1 = mlen - 1u >= lo;
+                            let v2 = mlen - 2u >= lo;
+                            let v3 = mlen - 3u >= lo;
+                            let s0 = slot(c0 + mlen);
+                            let s1 = slot(c0 + mlen - 1u);
+                            let s2 = slot(c0 + mlen - 2u);
+                            let s3 = slot(c0 + mlen - 3u);
+                            let pr0 = mp + p_ml[pb * RING_N + mlen];
+                            let pr1 = mp + p_ml[pb * RING_N + mlen - 1u];
+                            let pr2 = mp + p_ml[pb * RING_N + mlen - 2u];
+                            let pr3 = mp + p_ml[pb * RING_N + mlen - 3u];
+                            let k0 = c0 + mlen > lp0 || pr0 < ring_p[rix(s0)];
+                            var k1 = v1 && (c0 + mlen - 1u > lp0 || pr1 < ring_p[rix(s1)]);
+                            var k2 = v2 && (c0 + mlen - 2u > lp0 || pr2 < ring_p[rix(s2)]);
+                            var k3 = v3 && (c0 + mlen - 3u > lp0 || pr3 < ring_p[rix(s3)]);
+                            if (LEVEL == 0u) {
+                                // early update abort: nothing below the record's first failure
+                                k1 = k1 && k0;
+                                k2 = k2 && k1;
+                                k3 = k3 && k2;
                             }
+                            // (!v3 implies mlen < lo + 3.)
+                            let stop = mlen < lo + 4u || (LEVEL == 0u && !k3);
+                            if (k0) { st_match(s0, pr0, ra, mrep.z, mlen | obs); }
+                            if (k1) { st_match(s1, pr1, ra, mrep.z, (mlen - 1u) | obs); }
+                            if (k2) { st_match(s2, pr2, ra, mrep.z, (mlen - 2u) | obs); }
+                            if (k3) { st_match(s3, pr3, ra, mrep.z, (mlen - 3u) | obs); }
+                            if (stop) { break; }
+                            mlen -= 4u;
                         }
-                        start_ml = last_ml + 1u;
                     }
-                    advance = true;
+                    // The fill's slots no record reaches (only c0 + 1, c0 + 2).
+                    if (c0 + longest > lp0) {
+                        // Terminates: q rises to c0 + MIN_MATCH.
+                        for (var q = lp0 + 1u; q < c0 + MIN_MATCH; q += 1u) { fill(q); }
+                        last_pos = c0 + longest;
+                    }
+                    if (in_series) {
+                        advance = true;
+                    } else {
+                        sip = st_ip;
+                        cur = 1u;
+                        in_series = true;
+                    }
                 }
             }
         }
