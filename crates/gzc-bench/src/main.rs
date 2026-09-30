@@ -9,7 +9,8 @@ mod gpurun;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use gzc_gpu::compressor::{GpuParams, max_batch_blocks};
+use gzc_core::params::{MatchParams, PRESETS, cpu_supports};
+use gzc_gpu::compressor::{GpuParams, gpu_supports, max_batch_blocks};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::pipeline::{PipelineConfig, vram_bytes};
 
@@ -22,6 +23,33 @@ const MAX_LEVEL: i64 = 16;
 
 fn level_parser() -> clap::builder::RangedI64ValueParser<i32> {
     clap::value_parser!(i32).range(..=MAX_LEVEL)
+}
+
+/// Default `--preset` list for `ref`, `gpu` and `all`.
+const DEFAULT_PRESETS: &str = "lvl3";
+
+/// A named `gzc_core::params` preset, as selected by `--preset`.
+#[derive(Clone, Copy, Debug)]
+struct Preset {
+    name: &'static str,
+    params: MatchParams,
+}
+
+/// `--preset` value parser: one of `gzc_core::params::PRESETS` by name.
+fn parse_preset(name: &str) -> Result<Preset, String> {
+    let params = gzc_core::params::preset(name)?;
+    let name = PRESETS.iter().find(|(n, _)| *n == name).map(|(n, _)| *n).expect("preset() found it");
+    Ok(Preset { name, params })
+}
+
+/// Errors on the first preset the selected engines (`cpu`: the reference compressor, `gpu`: the
+/// GPU kernels) do not implement yet. Run before any work starts.
+fn check_presets(presets: &[Preset], cpu: bool, gpu: bool) -> anyhow::Result<()> {
+    for p in presets {
+        anyhow::ensure!(!cpu || cpu_supports(&p.params), "preset '{}' is not implemented yet on cpu", p.name);
+        anyhow::ensure!(!gpu || gpu_supports(&p.params), "preset '{}' is not implemented yet on gpu", p.name);
+    }
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -37,7 +65,7 @@ enum Command {
     Cpu(CpuArgs),
     /// CPU reference compressor (the algorithm the GPU mirrors).
     Ref(RefArgs),
-    /// Streaming GPU compressor (level-3 greedy parse and complete zstd frames, Huffman
+    /// Streaming GPU compressor (match finding, parse and complete zstd frames, Huffman
     /// literals included, on the GPU).
     Gpu(GpuArgs),
     /// Every engine (cpu-libzstd, cpu-ref, gpu) into one report.
@@ -79,6 +107,9 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9).
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
+    preset: Vec<Preset>,
     /// Comma-separated thread counts.
     #[arg(long, value_delimiter = ',', default_value = "1,8")]
     threads: Vec<usize>,
@@ -114,6 +145,9 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9).
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
+    preset: Vec<Preset>,
     #[command(flatten)]
     sweep: GpuSweepArgs,
     /// Decompress every produced frame with libzstd after the timed pass and
@@ -129,6 +163,9 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9).
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
+    preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_LEVELS, value_parser = level_parser())]
     levels: Vec<i32>,
@@ -202,15 +239,30 @@ fn run_cpu_cmd(args: CpuArgs) -> anyhow::Result<()> {
     write_reports(&results, &args.out)
 }
 
+/// Runs the CPU reference for every preset and thread count, appending to `results`.
+fn run_ref_sweep(
+    corpus: &Corpus,
+    presets: &[Preset],
+    threads: &[usize],
+    verify: bool,
+    results: &mut Vec<result::RunResult>,
+) -> anyhow::Result<()> {
+    for p in presets {
+        for &threads in threads {
+            eprintln!("running cpu-ref {} @ {threads} threads (verify={verify})...", p.name);
+            results.push(refrun::run_ref(corpus, p.name, p.params, threads, verify)?);
+        }
+    }
+    Ok(())
+}
+
 fn run_ref_cmd(args: RefArgs) -> anyhow::Result<()> {
+    check_presets(&args.preset, true, false)?;
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
     let mut results = Vec::new();
-    for &threads in &args.threads {
-        eprintln!("running cpu-ref lvl3-greedy @ {threads} threads (verify={})...", args.verify);
-        results.push(refrun::run_ref(&corpus, threads, args.verify)?);
-    }
+    run_ref_sweep(&corpus, &args.preset, &args.threads, args.verify, &mut results)?;
 
     write_reports(&results, &args.out)
 }
@@ -228,18 +280,21 @@ fn check_vram(cfg: &PipelineConfig, budget_mb: u64) -> anyhow::Result<u64> {
     Ok(mib)
 }
 
-fn sweep_cfg(batch: u32, inflight: u32) -> PipelineConfig {
-    PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true, huffman: true } }
+fn sweep_cfg(matching: MatchParams, batch: u32, inflight: u32) -> PipelineConfig {
+    PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames: true, huffman: true } }
 }
 
-/// Validates every (batch, inflight) config of `sweep` against the VRAM budget, then opens the GPU
-/// and checks each batch against the device's limit. Run before any timed work so a bad config
-/// or a missing adapter fails fast.
-fn gpu_preflight(sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
-    for &batch in &sweep.batch {
-        for &inflight in &sweep.inflight {
-            anyhow::ensure!(inflight >= 1, "--inflight must be at least 1");
-            check_vram(&sweep_cfg(batch, inflight), sweep.vram_budget_mb)?;
+/// Checks every preset is implemented on the GPU and validates every (preset, batch, inflight)
+/// config of `sweep` against the VRAM budget, then opens the GPU and checks each batch against
+/// the device's limit. Run before any timed work so a bad config or a missing adapter fails fast.
+fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
+    check_presets(presets, false, true)?;
+    for p in presets {
+        for &batch in &sweep.batch {
+            for &inflight in &sweep.inflight {
+                anyhow::ensure!(inflight >= 1, "--inflight must be at least 1");
+                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb)?;
+            }
         }
     }
     let ctx = GpuContext::new()?;
@@ -250,24 +305,28 @@ fn gpu_preflight(sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
     Ok(ctx)
 }
 
-/// Runs every (batch, inflight, writer_threads) combination on `ctx`, appending to `results`.
-/// Configs must have passed `gpu_preflight`.
+/// Runs every (preset, batch, inflight, writer_threads) combination on `ctx`, appending to
+/// `results`. Configs must have passed `gpu_preflight`.
 fn run_gpu_sweep(
     ctx: &GpuContext,
     corpus: &Corpus,
+    presets: &[Preset],
     sweep: &GpuSweepArgs,
     verify: bool,
     results: &mut Vec<result::RunResult>,
 ) -> anyhow::Result<()> {
-    for &batch in &sweep.batch {
-        for &inflight in &sweep.inflight {
-            for &writers in &sweep.writer_threads {
-                let cfg = sweep_cfg(batch, inflight);
-                let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
-                eprintln!(
-                    "running gpu lvl3-greedy b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})..."
-                );
-                results.push(gpurun::run_gpu(ctx, corpus, &cfg, writers, verify)?);
+    for p in presets {
+        for &batch in &sweep.batch {
+            for &inflight in &sweep.inflight {
+                for &writers in &sweep.writer_threads {
+                    let cfg = sweep_cfg(p.params, batch, inflight);
+                    let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
+                    eprintln!(
+                        "running gpu {} b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})...",
+                        p.name
+                    );
+                    results.push(gpurun::run_gpu(ctx, corpus, p.name, &cfg, writers, verify)?);
+                }
             }
         }
     }
@@ -275,19 +334,21 @@ fn run_gpu_sweep(
 }
 
 fn run_gpu_cmd(args: GpuArgs) -> anyhow::Result<()> {
-    let ctx = gpu_preflight(&args.sweep)?;
+    let ctx = gpu_preflight(&args.preset, &args.sweep)?;
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
     let mut results = Vec::new();
-    run_gpu_sweep(&ctx, &corpus, &args.sweep, args.verify, &mut results)?;
+    run_gpu_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
 
     write_reports(&results, &args.out)
 }
 
 fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
-    // Fail on a bad GPU config or a missing adapter before the (long) CPU sweeps.
-    let ctx = gpu_preflight(&args.gpu)?;
+    // Fail on an unimplemented preset, a bad GPU config or a missing adapter before the (long)
+    // CPU sweeps.
+    check_presets(&args.preset, true, true)?;
+    let ctx = gpu_preflight(&args.preset, &args.gpu)?;
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
@@ -302,13 +363,10 @@ fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
         }
     }
 
-    for &threads in &args.threads {
-        eprintln!("running cpu-ref lvl3-greedy @ {threads} threads (verify={})...", args.verify);
-        results.push(refrun::run_ref(&corpus, threads, args.verify)?);
-    }
+    run_ref_sweep(&corpus, &args.preset, &args.threads, args.verify, &mut results)?;
 
     // A GPU failure still leaves the CPU results (and any finished GPU runs) on disk.
-    if let Err(gpu_err) = run_gpu_sweep(&ctx, &corpus, &args.gpu, args.verify, &mut results) {
+    if let Err(gpu_err) = run_gpu_sweep(&ctx, &corpus, &args.preset, &args.gpu, args.verify, &mut results) {
         eprintln!("gpu sweep failed: {gpu_err:#}; writing the results gathered so far");
         write_reports(&results, &args.out)?;
         return Err(gpu_err);
@@ -323,12 +381,41 @@ mod tests {
 
     #[test]
     fn vram_budget_rejects_configs_that_do_not_fit() {
-        let cfg = PipelineConfig { batch: 64, inflight: 2, params: GpuParams { depth: 1, emit_frames: false, huffman: true } };
+        let params = GpuParams { matching: gzc_core::params::LVL3, emit_frames: false, huffman: true };
+        let cfg = PipelineConfig { batch: 64, inflight: 2, params };
         let mib = check_vram(&cfg, 1 << 20).unwrap();
         assert!(mib > 0);
         assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
         let err = check_vram(&cfg, mib - 1).unwrap_err().to_string();
         assert!(err.contains("--vram-budget-mb") && err.contains("b64 i2"), "{err}");
+    }
+
+    #[test]
+    fn preset_flag_parses_list_and_rejects_unknown() {
+        for cmd in ["ref", "gpu", "all"] {
+            let presets = |extra: &[&str]| -> Result<Vec<Preset>, clap::Error> {
+                let argv = [&["gzc-bench", cmd, "--synthetic"], extra].concat();
+                Ok(match Cli::try_parse_from(argv)?.command {
+                    Command::Ref(a) => a.preset,
+                    Command::Gpu(a) => a.preset,
+                    Command::All(a) => a.preset,
+                    Command::Cpu(_) => unreachable!(),
+                })
+            };
+            let names = |extra: &[&str]| presets(extra).unwrap().iter().map(|p| p.name).collect::<Vec<_>>();
+            assert_eq!(names(&[]), ["lvl3"], "{cmd}: default");
+            assert_eq!(names(&["--preset", "lvl3,lvl9"]), ["lvl3", "lvl9"], "{cmd}");
+            assert_eq!(presets(&["--preset", "rung1"]).unwrap()[0].params, gzc_core::params::RUNG1, "{cmd}");
+            let err = presets(&["--preset", "lvl3,bogus"]).unwrap_err().to_string();
+            assert!(err.contains("bogus") && err.contains("lvl3") && err.contains("lvl9"), "{cmd}: {err}");
+        }
+        let lvl9 = parse_preset("lvl9").unwrap();
+        let lvl3 = parse_preset("lvl3").unwrap();
+        assert!(check_presets(&[lvl3], true, true).is_ok());
+        let err = check_presets(&[lvl3, lvl9], true, false).unwrap_err().to_string();
+        assert_eq!(err, "preset 'lvl9' is not implemented yet on cpu");
+        let err = check_presets(&[lvl9], false, true).unwrap_err().to_string();
+        assert_eq!(err, "preset 'lvl9' is not implemented yet on gpu");
     }
 
     #[test]

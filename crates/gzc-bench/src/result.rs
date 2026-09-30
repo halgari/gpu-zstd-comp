@@ -12,7 +12,7 @@ pub struct KindStat {
 pub struct RunResult {
     /// "cpu-libzstd" | "cpu-ref" | "gpu"
     pub engine: String,
-    /// e.g. "L3", "lvl3-greedy"
+    /// e.g. "L3", "lvl3", "lvl3 b512 i3"
     pub config: String,
     /// CPU threads used (for gpu: CPU threads used for host-side work).
     pub threads: Option<usize>,

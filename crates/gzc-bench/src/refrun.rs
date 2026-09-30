@@ -5,13 +5,14 @@ use rayon::prelude::*;
 
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::FrameOptions;
-use gzc_core::reference::{compress_block_to_frame, RefParams, LVL3};
+use gzc_core::params::MatchParams;
+use gzc_core::reference::compress_block_to_frame;
 
 use crate::corpus::Corpus;
 use crate::result::{per_kind, RunResult};
 
 /// Compresses every block in `corpus` to a zstd frame using the CPU reference
-/// compressor (`LVL3` calibration: level-3-style greedy parse), using a rayon
+/// compressor with `params` (the preset called `name`, which labels the run), using a rayon
 /// pool pinned to `threads` threads. Runs one untimed warmup pass over the
 /// first `min(corpus.len(), 64)` blocks (to pay JIT/allocator/cache warmup
 /// cost outside the timed region), then times a full pass over every block;
@@ -19,8 +20,8 @@ use crate::result::{per_kind, RunResult};
 /// every frame produced by the timed pass is decompressed with libzstd
 /// afterward and checked against the original (padded) block; any mismatch
 /// is an error.
-pub fn run_ref(corpus: &Corpus, threads: usize, verify: bool) -> anyhow::Result<RunResult> {
-    let params: RefParams = LVL3;
+/// `params` must be `cpu_supports`ed (`compress_block` panics otherwise).
+pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize, verify: bool) -> anyhow::Result<RunResult> {
     let opts = FrameOptions::default();
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
 
@@ -58,7 +59,7 @@ pub fn run_ref(corpus: &Corpus, threads: usize, verify: bool) -> anyhow::Result<
 
     Ok(RunResult {
         engine: "cpu-ref".to_string(),
-        config: "lvl3-greedy".to_string(),
+        config: name.to_string(),
         threads: Some(threads),
         real_bytes,
         compressed_bytes,
@@ -76,10 +77,10 @@ mod tests {
     #[test]
     fn ref_run_ratio_and_verify() {
         let corpus = Corpus::synthetic();
-        let result = run_ref(&corpus, 2, true).unwrap();
+        let result = run_ref(&corpus, "lvl3", gzc_core::params::LVL3, 2, true).unwrap();
 
         assert_eq!(result.engine, "cpu-ref");
-        assert_eq!(result.config, "lvl3-greedy");
+        assert_eq!(result.config, "lvl3");
         assert_eq!(result.threads, Some(2));
         assert!(result.ratio() > 1.0, "ratio was {}", result.ratio());
     }

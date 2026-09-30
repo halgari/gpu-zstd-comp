@@ -7,14 +7,15 @@
 //! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
 //! (`FrameOptions::default()`) with `huffman`, raw literals (K4 alone) without.
 use crate::chains::{self, ChainsKernel, head_bytes, pred_bytes};
-use crate::context::{GpuContext, pack_blocks};
+use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use anyhow::{Context as _, anyhow};
 use gzc_core::codes::{
     LL_BASE, LL_BITS, LL_DEFAULT_NORM, ML_BASE, ML_BITS, ML_DEFAULT_NORM, OF_DEFAULT_NORM, ll_code, ml_code,
 };
-use gzc_core::config::{BLOCK_SIZE, MIN_MATCH};
+use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::{FrameOptions, frame_header};
 use gzc_core::fse::FRAC;
+use gzc_core::params::{Hashes, MatchParams};
 use gzc_core::seq::{BlockOutput, Sequence};
 
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
@@ -26,8 +27,12 @@ const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 /// largest K4 emits.
 pub const FRAME_STRIDE: usize = BLOCK_SIZE + 64;
 
-/// Upper bound on sequences per block: every sequence covers at least MIN_MATCH bytes.
-pub const MAX_SEQS: u32 = (BLOCK_SIZE / MIN_MATCH) as u32 + 1;
+/// Shortest sequence (`MatchParams::min_seq_len`) any GPU-supported preset emits; `MAX_SEQS` is
+/// sized for it and `Kernels::new` rejects params that could emit shorter ones.
+pub const MAX_SEQS_MIN_SEQ_LEN: usize = 5;
+
+/// Upper bound on sequences per block: every sequence covers at least `MAX_SEQS_MIN_SEQ_LEN` bytes.
+pub const MAX_SEQS: u32 = (BLOCK_SIZE / MAX_SEQS_MIN_SEQ_LEN) as u32 + 1;
 
 /// Largest batch `compress_batch` allocates buffers for (~3.1 MiB per 128K block, ~800 MiB), even when
 /// the device limits would allow more.
@@ -41,15 +46,33 @@ pub const KERNEL_NAMES: [&str; 5] = ["k1_chains", "k2_best", "k3_parse", "k4_ent
 /// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
 pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
 
-/// Match-finder tuning for the GPU path. Level 3: `depth: 1` (== `reference::LVL3`).
+/// Parameters for the GPU path: the match finder / parse (`params::LVL3` etc., same meaning
+/// as for `reference::compress_block`) and which output stages run.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuParams {
-    pub depth: u32,
+    pub matching: MatchParams,
     /// Also run K4, which turns each block's parse into its complete zstd frame.
     pub emit_frames: bool,
     /// With `emit_frames`: also run K5, which Huffman-codes the literals (`FrameOptions::default()`);
     /// without it the frames keep raw literals (`huffman: false`).
     pub huffman: bool,
+}
+
+/// Whether the GPU kernels implement `p` (Task 1: the M3 dfast greedy path only).
+pub fn gpu_supports(p: &MatchParams) -> bool {
+    p.hashes == Hashes::Dfast && p.lazy == 0
+}
+
+/// Ok when `m` is valid, implemented on the GPU and its sequences fit `MAX_SEQS`.
+pub fn check_matching(m: &MatchParams) -> anyhow::Result<()> {
+    m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
+    anyhow::ensure!(gpu_supports(m), "match params {m:?} are not implemented yet on gpu");
+    anyhow::ensure!(
+        MAX_SEQS as usize * m.min_seq_len() as usize >= BLOCK_SIZE,
+        "min_seq_len {} needs more than MAX_SEQS {MAX_SEQS} sequences per block",
+        m.min_seq_len()
+    );
+    Ok(())
 }
 
 impl GpuParams {
@@ -303,17 +326,21 @@ fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayou
 }
 
 impl Kernels {
-    pub fn new(ctx: &GpuContext, params: GpuParams) -> Self {
+    /// Builds the pipelines for `params`, with its `MatchParams` injected as WGSL constants.
+    /// Errors if the params are invalid or not implemented on the GPU (`gpu_supports`).
+    pub fn new(ctx: &GpuContext, params: GpuParams) -> anyhow::Result<Self> {
+        let m = params.matching;
+        check_matching(&m)?;
+        let match_consts = params_wgsl(&m);
         let best_layout = storage_layout(ctx, "k2", &[true, true, false]);
-        let best = compute_pipeline(
-            ctx,
-            "k2_best",
-            &best_layout,
-            &format!("const DEPTH: u32 = {}u;\n{K2_WGSL}", params.depth),
-        );
+        let best = compute_pipeline(ctx, "k2_best", &best_layout, &format!("{match_consts}{K2_WGSL}"));
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
-        let parse =
-            compute_pipeline(ctx, "k3_parse", &parse_layout, &format!("const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}"));
+        let parse = compute_pipeline(
+            ctx,
+            "k3_parse",
+            &parse_layout,
+            &format!("{match_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}"),
+        );
         let (tab, consts) = k4_tables();
         let huffman = params.emit_frames && params.huffman;
         let entropy = params.emit_frames.then(|| {
@@ -334,7 +361,12 @@ impl Kernels {
             HuffmanKernel { pipeline, layout }
         });
         let params = GpuParams { huffman: huffman.is_some(), ..params };
-        Self { chains: ChainsKernel::new(ctx), best, best_layout, parse, parse_layout, entropy, huffman, params }
+        Ok(Self { chains: ChainsKernel::new(ctx), best, best_layout, parse, parse_layout, entropy, huffman, params })
+    }
+
+    /// The match params the kernels were built for.
+    pub fn matching(&self) -> MatchParams {
+        self.params.matching
     }
 
     /// True when K4 runs (built with `GpuParams::emit_frames`).
@@ -738,7 +770,21 @@ mod tests {
 
     #[test]
     fn max_seqs_bounds_minimal_sequences() {
-        assert!(MAX_SEQS as usize * MIN_MATCH >= BLOCK_SIZE);
+        for (name, p) in gzc_core::params::PRESETS {
+            if gpu_supports(&p) {
+                assert!(MAX_SEQS as usize * p.min_seq_len() as usize >= BLOCK_SIZE, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_supports_lvl3_only_for_now() {
+        use gzc_core::params::{LVL3, LVL9, RUNG1, RUNG2};
+        assert!(gpu_supports(&LVL3));
+        assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
+        for p in [RUNG1, RUNG2, LVL9] {
+            assert!(!gpu_supports(&p), "{p:?}");
+        }
     }
 
     #[test]

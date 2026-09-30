@@ -7,7 +7,7 @@
 //   seqs[(b*MAX_SEQS + i)*3 ..] = (lit_len, match_len, off_base) for i < n_seq
 //   lits[b*BLOCK_SIZE/4 ..]     = literal bytes packed little-endian
 //   counts[b*2 ..]              = (n_seq, n_lit)
-// MAX_SEQS is prepended by the host.
+// MAX_SEQS is prepended by the host; MIN_MATCH and SEARCH_CAP come from the injected MatchParams.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> best: array<u32>;
@@ -112,7 +112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (bl >= MIN_MATCH) {
                 off = best[bbase + p * 2u];
                 len = bl;
-                if (bl == MATCH_SEARCH_CAP) {
+                if (bl == SEARCH_CAP) {
                     // K2 stopped comparing at the cap: extend to the full length.
                     len = match_len(base, p, p - off, 0xFFFFFFFFu);
                 }

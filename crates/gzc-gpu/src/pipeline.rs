@@ -24,7 +24,7 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
-    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
+    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, check_matching, counts_bytes, decode_output,
     data_bytes, frame_bytes, frame_len_bytes, frames_bytes, k4_tables_bytes, lits_bytes, max_batch_blocks,
     scratch_bytes, seqs_bytes, slot_bytes,
 };
@@ -128,15 +128,18 @@ pub struct Pipeline<'a> {
 impl<'a> Pipeline<'a> {
     /// Compiles the kernels and allocates every slot, for the frame path when
     /// `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight` of 0,
-    /// a batch above `max_batch_blocks`, or a wgpu out-of-memory/validation error.
+    /// a batch above `max_batch_blocks`, match params the GPU does not support (see
+    /// `Kernels::new`), or a wgpu out-of-memory/validation error.
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
         let max = max_batch_blocks(&ctx.device.limits());
         anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
         anyhow::ensure!(cfg.batch >= 1 && cfg.batch <= max, "batch {} not in 1..={max} for this device", cfg.batch);
 
+        check_matching(&cfg.params.matching)?;
+
         let scopes = ErrorScopes::push(ctx);
         let frames = cfg.params.emit_frames;
-        let kernels = Kernels::new(ctx, cfg.params);
+        let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames);
         let mut bufs = vec![BatchBuffers::new(ctx, cfg.batch, frames)];
         for _ in 1..cfg.inflight {
@@ -400,8 +403,10 @@ impl<'a> Pipeline<'a> {
 
 /// Out-of-memory and validation error scopes, popped together.
 struct ErrorScopes {
-    oom: wgpu::ErrorScopeGuard,
+    // Fields drop in declaration order and wgpu requires scopes to pop in reverse push order:
+    // `validation` (pushed last) must come first, so an early return drops them correctly.
     validation: wgpu::ErrorScopeGuard,
+    oom: wgpu::ErrorScopeGuard,
 }
 
 impl ErrorScopes {
@@ -463,7 +468,8 @@ pub fn compress_stream_frames(
 mod tests {
     use super::*;
     use gzc_core::block::chunk_file;
-    use gzc_core::reference::{LVL3, compress_block};
+    use gzc_core::params::{LVL3, LVL9};
+    use gzc_core::reference::compress_block;
     use gzc_core::frame::write_frame;
     use gzc_core::synth::test_cases;
 
@@ -477,7 +483,7 @@ mod tests {
     }
 
     fn cfg(batch: u32, inflight: u32) -> PipelineConfig {
-        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false, huffman: true } }
+        PipelineConfig { batch, inflight, params: GpuParams { matching: LVL3, emit_frames: false, huffman: true } }
     }
 
     #[test]
@@ -535,6 +541,9 @@ mod tests {
         assert!(compress_stream(&ctx, &cfg(0, 2), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(8, 0), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(u32::MAX, 1), &[], &mut sink).is_err());
+        let lvl9 = PipelineConfig { params: GpuParams { matching: LVL9, ..cfg(8, 2).params }, ..cfg(8, 2) };
+        let e = Pipeline::new(&ctx, &lvl9).err().expect("lvl9 is not implemented on the GPU yet");
+        assert!(e.to_string().contains("not implemented yet on gpu"), "{e}");
     }
 
     struct CollectFrames(Vec<Option<Vec<u8>>>);
@@ -551,13 +560,13 @@ mod tests {
     }
 
     fn cpu_frame(block: &[u8], params: GpuParams) -> Vec<u8> {
-        write_frame(block, &compress_block(block, LVL3), params.frame_options())
+        write_frame(block, &compress_block(block, params.matching), params.frame_options())
     }
 
     #[test]
     fn vram_counts_scratch_once_and_slots_per_inflight() {
         let frames = |batch, inflight| {
-            PipelineConfig { params: GpuParams { depth: 1, emit_frames: true, huffman: true }, ..cfg(batch, inflight) }
+            PipelineConfig { params: GpuParams { matching: LVL3, emit_frames: true, huffman: true }, ..cfg(batch, inflight) }
         };
         let one = vram_bytes(&frames(100, 1));
         let per_slot = vram_bytes(&frames(100, 2)) - one;
@@ -610,7 +619,7 @@ mod tests {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = distinct.iter().map(|b| b.as_slice()).collect();
-        let params = GpuParams { depth: 1, emit_frames: true, huffman: false };
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: false };
         let frames_cfg = PipelineConfig { params, ..cfg(7, 1) };
         let mut pipe = Pipeline::new(&ctx, &frames_cfg).unwrap();
         for _ in 0..2 {

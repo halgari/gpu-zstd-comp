@@ -1,8 +1,7 @@
 //! GpuContext: device/queue setup, buffer helpers, shader templating.
 use anyhow::{Context as _, anyhow};
-use gzc_core::config::{
-    BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, MATCH_SEARCH_CAP, MIN_MATCH, NO_POS, PARSE_END,
-};
+use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, NO_POS, PARSE_END};
+use gzc_core::params::MatchParams;
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
@@ -97,17 +96,33 @@ impl GpuContext {
     }
 }
 
-/// WGSL `const` declarations mirroring `gzc_core::config`.
+/// WGSL `const` declarations mirroring `gzc_core::config` (compile-time block constants,
+/// shared by every shader).
 pub fn constants_wgsl() -> String {
     format!(
         "const BLOCK_SIZE: u32 = {BLOCK_SIZE}u;\n\
          const LOG2_BLOCK: u32 = {LOG2_BLOCK}u;\n\
          const HASH_BITS: u32 = {HASH_BITS}u;\n\
-         const MIN_MATCH: u32 = {MIN_MATCH}u;\n\
          const PARSE_END: u32 = {PARSE_END}u;\n\
          const HASHED_POSITIONS: u32 = {HASHED_POSITIONS}u;\n\
-         const NO_POS: u32 = 0x{NO_POS:08X}u;\n\
-         const MATCH_SEARCH_CAP: u32 = {MATCH_SEARCH_CAP}u;\n"
+         const NO_POS: u32 = 0x{NO_POS:08X}u;\n"
+    )
+}
+
+/// WGSL `const` declarations for one set of runtime `MatchParams`, prepended to the body of each
+/// params-dependent shader, so kernels built for different presets coexist in one process.
+pub fn params_wgsl(p: &MatchParams) -> String {
+    format!(
+        "const MIN_MATCH: u32 = {}u;\n\
+         const SEARCH_CAP: u32 = {}u;\n\
+         const DEPTH: u32 = {}u;\n\
+         const N_HASHES: u32 = {}u;\n\
+         const LAZY: u32 = {}u;\n",
+        p.min_match,
+        p.search_cap,
+        p.depth,
+        p.n_hashes(),
+        p.lazy
     )
 }
 

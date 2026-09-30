@@ -12,4 +12,6 @@ pub mod fse;
 pub mod frame;
 pub mod seqenc;
 pub mod huffman;
+pub mod params;
+pub mod lazy;
 pub mod reference;

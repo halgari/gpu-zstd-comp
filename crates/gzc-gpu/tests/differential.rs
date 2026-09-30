@@ -8,7 +8,8 @@ use gzc_core::frame::{FrameOptions, frame_header, write_frame, write_literals_ra
 use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
-use gzc_core::reference::{LVL3, RefParams, compress_block};
+use gzc_core::params::{LVL3, LVL9, MatchParams};
+use gzc_core::reference::compress_block;
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
@@ -32,11 +33,14 @@ fn case(name: &str) -> Vec<u8> {
     test_cases().into_iter().find(|(n, _)| *n == name).unwrap().1
 }
 
-fn setup(depth: u32) -> (GpuContext, Kernels) {
+fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let kernels = Kernels::new(&ctx, GpuParams { depth, emit_frames: false, huffman: false });
+    let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: false, huffman: false }).expect("Kernels::new");
     (ctx, kernels)
 }
+
+/// LVL3 with a deeper chain walk.
+const DEPTH4: MatchParams = MatchParams { depth: 4, ..LVL3 };
 
 fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
     let i = got.sequences.iter().zip(&want.sequences).position(|(a, b)| a != b);
@@ -59,7 +63,8 @@ fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
 }
 
 /// Runs one batch and compares every block against the CPU reference.
-fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)], params: RefParams) -> Vec<BlockOutput> {
+fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)], params: MatchParams) -> Vec<BlockOutput> {
+    assert_eq!(kernels.matching(), params, "kernels built for other params");
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let outs = compress_batch(ctx, kernels, &refs).expect("compress_batch");
     assert_eq!(outs.len(), blocks.len());
@@ -74,7 +79,7 @@ fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]
 
 #[test]
 fn gpu_matches_reference() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     // All blocks in one batch (every block has neighbours on both sides)...
     check_batch(&ctx, &kernels, &all_blocks(), LVL3);
     // ...and each block alone, so its end is followed only by the trailing zero word.
@@ -85,25 +90,24 @@ fn gpu_matches_reference() {
 
 #[test]
 fn gpu_matches_reference_depth4() {
-    let (ctx, kernels) = setup(4);
+    let (ctx, kernels) = setup(DEPTH4);
     let blocks: Vec<_> = all_blocks().into_iter().step_by(2).collect();
-    check_batch(&ctx, &kernels, &blocks, RefParams { depth: 4, ..LVL3 });
+    check_batch(&ctx, &kernels, &blocks, DEPTH4);
 }
 
-/// Depth 4, where MATCH_SEARCH_CAP changes the choice: at 2000 the long chain offers q=1500
+/// Depth 4, where search_cap changes the choice: at 2000 the long chain offers q=1500
 /// (80-byte match) then q=0 (200 bytes). Both cap to 64, so the tie goes to the closer q=1500,
 /// and the parse extends that match to its full 80 bytes.
 #[test]
 fn capped_search_prefers_closer_candidate() {
-    let (ctx, kernels) = setup(4);
+    let (ctx, kernels) = setup(DEPTH4);
     let mut block = random(20, BLOCK_SIZE);
     let s = random(21, 200);
     block[..200].copy_from_slice(&s);
     block[1500..1580].copy_from_slice(&s[..80]);
     block[2000..2200].copy_from_slice(&s);
     let blocks = [("capped".to_string(), block)];
-    let params = RefParams { depth: 4, ..LVL3 };
-    let out = check_batch(&ctx, &kernels, &blocks, params);
+    let out = check_batch(&ctx, &kernels, &blocks, DEPTH4);
     assert!(
         out[0].sequences.iter().any(|s| s.match_len == 80 && s.off_base == 500 + 3),
         "expected the extended capped match (offset 500, len 80): {:?}",
@@ -116,7 +120,7 @@ fn capped_search_prefers_closer_candidate() {
 /// past the end would see a mismatch).
 #[test]
 fn block_ends_with_adjacent_neighbours() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     let period3 = case("period3");
     // period3 continued across the boundary: its phase at BLOCK_SIZE.
     let mut period3_cont = period3.clone();
@@ -143,7 +147,7 @@ fn block_ends_with_adjacent_neighbours() {
 
 #[test]
 fn gpu_frames_roundtrip() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     let blocks = all_blocks();
     let outs = check_batch(&ctx, &kernels, &blocks, LVL3);
     for ((name, block), out) in blocks.iter().zip(&outs) {
@@ -155,14 +159,32 @@ fn gpu_frames_roundtrip() {
 
 #[test]
 fn batch_of_300_mixed() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     let blocks: Vec<_> = all_blocks().into_iter().cycle().take(300).collect();
     check_batch(&ctx, &kernels, &blocks, LVL3);
 }
 
+/// Kernels for different match params coexist in one process, and unsupported or invalid
+/// params are errors, not panics.
+#[test]
+fn kernels_per_params_coexist_and_reject_unsupported() {
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
+    let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
+    let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
+    let blocks = [("text".to_string(), text(12, BLOCK_SIZE))];
+    check_batch(&ctx, &lvl3, &blocks, LVL3);
+    check_batch(&ctx, &depth4, &blocks, DEPTH4);
+    check_batch(&ctx, &lvl3, &blocks, LVL3);
+    let e = Kernels::new(&ctx, gp(LVL9)).err().expect("lvl9 rejected");
+    assert!(e.to_string().contains("not implemented yet on gpu"), "{e}");
+    let e = Kernels::new(&ctx, gp(MatchParams { depth: 0, ..LVL3 })).err().expect("depth 0 rejected");
+    assert!(e.to_string().contains("depth"), "{e}");
+}
+
 #[test]
 fn empty_batch_is_empty() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     assert!(compress_batch(&ctx, &kernels, &[]).unwrap().is_empty());
 }
 
@@ -174,7 +196,7 @@ const NO_HUFFMAN: FrameOptions = FrameOptions { checksum: false, huffman: false 
 /// Frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
 fn setup_frames(huffman: bool) -> (GpuContext, Kernels) {
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let kernels = Kernels::new(&ctx, GpuParams { depth: 1, emit_frames: true, huffman });
+    let kernels = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: true, huffman }).expect("Kernels::new");
     assert_eq!(kernels.frame_options().huffman, huffman);
     (ctx, kernels)
 }
@@ -391,7 +413,7 @@ fn gpu_frames_batch_of_300_mixed() {
 
 #[test]
 fn compress_frames_needs_emit_frames() {
-    let (ctx, kernels) = setup(1);
+    let (ctx, kernels) = setup(LVL3);
     let block = zeros(BLOCK_SIZE);
     assert!(compress_frames(&ctx, &kernels, &[&block]).is_err());
     assert!(frames_from_parses(&ctx, &kernels, &[&block], &[BlockOutput::default()]).is_err());
