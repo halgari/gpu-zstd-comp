@@ -61,10 +61,9 @@ impl GpuContext {
         if subgroups {
             required_features |= wgpu::Features::SUBGROUP;
         }
-        // GZC_PACK (anything but 0): lets the pipeline pack frames straight into its mappable
-        // readback buffers (`pipeline::PackKernel`; slower than the copy on an RTX 5090).
-        let mappable_storage = adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
-            && std::env::var("GZC_PACK").is_ok_and(|v| v != "0");
+        // Lets the pipeline pack frames straight into its mappable readback buffers when asked to
+        // (`pipeline::PackKernel`). Only buffers created with both MAP_* and STORAGE are affected.
+        let mappable_storage = adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         if mappable_storage {
             required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         }

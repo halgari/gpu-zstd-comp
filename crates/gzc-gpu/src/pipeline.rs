@@ -280,8 +280,15 @@ impl<'a> Pipeline<'a> {
     /// Compiles the kernels and allocates the shared buffers and every slot, for the frame path
     /// when `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight`
     /// of 0, a batch above `max_batch_blocks`, match params the GPU does not support (see
-    /// `Kernels::new`), or a wgpu out-of-memory/validation error.
+    /// `Kernels::new`), or a wgpu out-of-memory/validation error. The frame path packs frames
+    /// (`PackKernel`) when the environment variable `GZC_PACK` is set to anything but `0` and the
+    /// device has `GpuContext::mappable_storage`.
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
+        Self::build(ctx, cfg, std::env::var("GZC_PACK").is_ok_and(|v| v != "0"))
+    }
+
+    /// `new`, packing frames iff `pack` (and the frame path, and `mappable_storage`).
+    fn build(ctx: &'a GpuContext, cfg: &PipelineConfig, pack: bool) -> anyhow::Result<Self> {
         let m = cfg.params.matching;
         let max = max_batch_blocks(&ctx.device.limits(), &m);
         anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
@@ -292,7 +299,7 @@ impl<'a> Pipeline<'a> {
         // Kernels::new validates the match params (`check_matching`) before any buffer is allocated.
         let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames);
-        let pack = (frames && ctx.mappable_storage).then(|| PackKernel::new(ctx, &layout));
+        let pack = (pack && frames && ctx.mappable_storage).then(|| PackKernel::new(ctx, &layout));
         let mut staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         if pack.is_some() {
             staging_usage |= wgpu::BufferUsages::STORAGE;
@@ -898,6 +905,32 @@ mod tests {
             let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"]);
             assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{:?}", stats.kernel_ms);
+        }
+    }
+
+    /// The packing readback (`GZC_PACK`) delivers the same frames: Huffman and raw literals,
+    /// raw (largest) frames from the random block, partial batches, odd batch sizes.
+    #[test]
+    fn stream_frames_packed_match_cpu() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        if !ctx.mappable_storage {
+            eprintln!("skipped: no MAPPABLE_PRIMARY_BUFFERS");
+            return;
+        }
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = (0..300).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        for (huffman, batch, inflight) in [(true, 64, 3), (false, 7, 1), (true, 13, 2)] {
+            let params = GpuParams { matching: LVL9, emit_frames: true, huffman };
+            let pcfg = PipelineConfig { batch, inflight, params };
+            let mut pipe = Pipeline::build(&ctx, &pcfg, true).unwrap();
+            assert!(pipe.pack.is_some());
+            assert_eq!(pipe.allocated_bytes(), vram_bytes(&pcfg), "packing needs no extra memory");
+            let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+            let mut sink = CollectFrames(vec![None; blocks.len()]);
+            pipe.run_frames(&blocks, &mut sink).unwrap();
+            for (i, got) in sink.0.into_iter().enumerate() {
+                assert!(got.unwrap() == want[i % distinct.len()], "index {i} huffman {huffman} b{batch}");
+            }
         }
     }
 
