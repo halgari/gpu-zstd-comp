@@ -90,6 +90,7 @@ pub fn run_gpu(
 ) -> anyhow::Result<RunResult> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     let mut pipe = Pipeline::new(ctx, &cfg)?;
+    eprintln!("  k3 mode: {:?}", gzc_gpu::compressor::k3_mode(ctx, &cfg.params.matching)?);
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();
 
     pipe.run_frames(&blocks[..blocks.len().min(cfg.batch as usize)], &mut Discard)?;

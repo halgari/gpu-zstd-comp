@@ -11,6 +11,8 @@ pub struct GpuContext {
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
     pub timestamps: bool,
+    /// True when the device was created with `Features::SUBGROUP` (S3: cooperative K3).
+    pub subgroups: bool,
 }
 
 impl GpuContext {
@@ -33,7 +35,12 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        let mut required_features = if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        // S3: subgroup operations for the cooperative K3 parse, when the adapter has them.
+        let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gzc"),
@@ -43,7 +50,7 @@ impl GpuContext {
         }))
         .context("request_device")?;
 
-        Ok(Self { device, queue, adapter_info: adapter.get_info(), timestamps })
+        Ok(Self { device, queue, adapter_info: adapter.get_info(), timestamps, subgroups })
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.

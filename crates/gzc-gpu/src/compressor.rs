@@ -23,6 +23,7 @@ use gzc_core::seq::{BlockOutput, Sequence};
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
+const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -256,6 +257,9 @@ pub struct Kernels {
     best_layout: wgpu::BindGroupLayout,
     parse: wgpu::ComputePipeline,
     parse_layout: wgpu::BindGroupLayout,
+    /// The subgroup-cooperative lazy K3 (`K3Mode::Coop`), used instead of `parse` when present.
+    parse_coop: Option<wgpu::ComputePipeline>,
+    k3_mode: K3Mode,
     entropy: Option<EntropyKernel>,
     huffman: Option<HuffmanKernel>,
     params: GpuParams,
@@ -329,19 +333,132 @@ fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::Bi
 }
 
 fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayout, body: &str) -> wgpu::ComputePipeline {
+    pipeline_from_module(ctx, label, layout, &ctx.shader(label, body), "main")
+}
+
+fn pipeline_from_module(
+    ctx: &GpuContext,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
+    entry_point: &str,
+) -> wgpu::ComputePipeline {
     let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
-    let module = ctx.shader(label, body);
     ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("main"),
+        module,
+        entry_point: Some(entry_point),
         compilation_options: Default::default(),
         cache: None,
+    })
+}
+
+/// How K3 runs the lazy / lazy2 parse (speed phase S3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum K3Mode {
+    /// `k3_parse.wgsl` + `k3_lazy.wgsl`: one lane per block. Always used for the greedy parse.
+    Seq,
+    /// `k3_coop.wgsl`: one subgroup of `w` lanes per block (needs `Features::SUBGROUP`).
+    Coop { w: u32 },
+}
+
+/// Ballot bits (x, y) of `w` active lanes 0..w.
+fn lane_mask(w: u32) -> (u32, u32) {
+    match w {
+        64 => (u32::MAX, u32::MAX),
+        32 => (u32::MAX, 0),
+        _ => ((1 << w) - 1, 0),
+    }
+}
+
+/// The K3 mode for `m` on `ctx`. Greedy presets and devices without subgroups use `Seq`.
+/// Otherwise `Coop` with W = the adapter's minimum subgroup size (clamped to 8..=64, a power of
+/// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
+/// ids 0..W-1 (else `Seq`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable) and
+/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size). The output never depends on it.
+pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
+    let forced = std::env::var("GZC_K3_MODE").ok();
+    match forced.as_deref() {
+        None | Some("") | Some("coop") | Some("seq") => {}
+        Some(v) => anyhow::bail!("GZC_K3_MODE={v}: expected seq or coop"),
+    }
+    let force_coop = forced.as_deref() == Some("coop");
+    if m.lazy == 0 || forced.as_deref() == Some("seq") {
+        return Ok(K3Mode::Seq);
+    }
+    let min = ctx.adapter_info.subgroup_min_size;
+    if !ctx.subgroups {
+        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: the device has no subgroup support");
+        return Ok(K3Mode::Seq);
+    }
+    let w = match std::env::var("GZC_K3_W") {
+        Ok(v) => {
+            let w: u32 = v.parse().map_err(|_| anyhow!("GZC_K3_W={v}: not a number"))?;
+            anyhow::ensure!(
+                w.is_power_of_two() && (4..=64).contains(&w) && w <= min,
+                "GZC_K3_W={w}: expected a power of two in 4..=64 and at most the minimum subgroup size {min}"
+            );
+            w
+        }
+        Err(_) => {
+            let w = min.clamp(8, 64);
+            1 << (31 - w.leading_zeros())
+        }
+    };
+    if !probe_lanes(ctx, w)? {
+        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}");
+        eprintln!("gzc: subgroup lane probe failed for W = {w}; using the sequential K3");
+        return Ok(K3Mode::Seq);
+    }
+    Ok(K3Mode::Coop { w })
+}
+
+/// Dispatches one `@workgroup_size(w)` workgroup that records each lane's local index, subgroup
+/// lane id, subgroup size and `subgroupBallot(true)`; true when they show one subgroup with lane
+/// id == local index, size >= w and exactly the w-lane ballot (what `k3_coop.wgsl` assumes).
+pub fn probe_lanes(ctx: &GpuContext, w: u32) -> anyhow::Result<bool> {
+    let src = format!(
+        "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+         @compute @workgroup_size({w})\n\
+         fn main(@builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) sid: u32,\n\
+                 @builtin(subgroup_size) sz: u32) {{\n\
+             let m = subgroupBallot(true);\n\
+             let o = lid * 5u;\n\
+             out[o] = lid; out[o + 1u] = sid; out[o + 2u] = sz; out[o + 3u] = m.x; out[o + 4u] = m.y;\n\
+         }}\n"
+    );
+    with_error_scopes(ctx, || {
+        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("k3_probe"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let layout = storage_layout(ctx, "k3_probe", &[false]);
+        let pipeline = pipeline_from_module(ctx, "k3_probe", &layout, &module, "main");
+        let buf = ctx.storage_buffer("k3_probe", 5 * 4 * w as u64, true);
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k3_probe"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+        });
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3_probe") });
+        {
+            let mut pass =
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3_probe"), timestamp_writes: None });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit([enc.finish()]);
+        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * w as usize);
+        let (mx, my) = lane_mask(w);
+        Ok(v.chunks(5)
+            .enumerate()
+            .all(|(i, l)| l[0] == i as u32 && l[1] == i as u32 && l[2] >= w && l[3] == mx && l[4] == my))
     })
 }
 
@@ -356,13 +473,22 @@ impl Kernels {
         let best_layout = storage_layout(ctx, "k2", &[true, true, false]);
         let best = compute_pipeline(ctx, "k2_best", &best_layout, &format!("{best_consts}{K2_WGSL}"));
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
-        let parse = compute_pipeline(
-            ctx,
-            "k3_parse",
-            &parse_layout,
-            // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
-            &format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}"),
-        );
+        // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
+        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}");
+        let parse = compute_pipeline(ctx, "k3_parse", &parse_layout, &k3_body);
+        let k3_mode = k3_mode(ctx, &m)?;
+        let parse_coop = match k3_mode {
+            K3Mode::Seq => None,
+            K3Mode::Coop { w } => {
+                let (mx, my) = lane_mask(w);
+                let body = format!(
+                    "const W: u32 = {w}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n{k3_body}\n{K3_COOP_WGSL}"
+                );
+                // Subgroup built-ins need Features::SUBGROUP on the device; naga 30 rejects `enable subgroups;`.
+                let module = ctx.shader("k3_coop", &body);
+                Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
+            }
+        };
         let (tab, consts) = k4_tables();
         let huffman = params.emit_frames && params.huffman;
         let entropy = params.emit_frames.then(|| {
@@ -384,7 +510,7 @@ impl Kernels {
         });
         let params = GpuParams { huffman: huffman.is_some(), ..params };
         let chains = ChainsKernel::new(ctx, &m)?;
-        Ok(Self { chains, best, best_layout, parse, parse_layout, entropy, huffman, params })
+        Ok(Self { chains, best, best_layout, parse, parse_layout, parse_coop, k3_mode, entropy, huffman, params })
     }
 
     /// Bytes of the buffers the kernels own (K4's constant tables when emitting frames).
@@ -395,6 +521,11 @@ impl Kernels {
     /// The match params the kernels were built for.
     pub fn matching(&self) -> MatchParams {
         self.params.matching
+    }
+
+    /// How K3 runs (see `k3_mode`).
+    pub fn k3_mode(&self) -> K3Mode {
+        self.k3_mode
     }
 
     /// True when K4 runs (built with `GpuParams::emit_frames`).
@@ -519,7 +650,7 @@ impl Kernels {
             ],
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
-        pass.set_pipeline(&self.parse);
+        pass.set_pipeline(self.parse_coop.as_ref().unwrap_or(&self.parse));
         pass.set_bind_group(0, &k3, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);
     }
