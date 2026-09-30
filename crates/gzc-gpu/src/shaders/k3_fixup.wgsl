@@ -2,7 +2,8 @@
 // parse, k3_opt.wgsl), plus the repeat-offset helpers both use. Appended to the kernel's body.
 // The kernel defines SEG, NSEG, SEG_WORDS (the `best` words each segment keeps its raw
 // sequences and 6-word trailer in: block b's segment k at best[(b * NSEG + k) * SEG_WORDS ..],
-// trailer at SEG_META = SEG_WORDS - 6), MAX_SEQS and the bindings best / seqs / counts.
+// trailer at SEG_META = SEG_WORDS - 6), RAW_REVERSED (the raw sequences are stored in order, or
+// last first), MAX_SEQS and the bindings best / seqs / counts.
 //
 // main_fixup (one workgroup per block): concatenates the segments' raw sequences into the block's
 //   `seqs` in the usual layout (all lanes copy lit_len / match_len; the first sequence of a
@@ -14,6 +15,12 @@
 //   counts = (n_seq, n_lit) as in k3_parse.wgsl.
 
 const FIXUP_WG: u32 = 64u;
+
+// Word index of raw sequence i of a segment whose n raw sequences start at word src
+// (RAW_REVERSED: the kernel stored them last first).
+fn raw_at(src: u32, n: u32, i: u32) -> u32 {
+    return src + 3u * select(i, n - 1u - i, RAW_REVERSED);
+}
 
 // Repeat-offset history (gzc_core::seq::Reps).
 var<private> r0: u32;
@@ -124,9 +131,10 @@ fn main_fixup(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
         let dst = sbase + seg_first[k] * 3u;
         let carry = seg_carry[k];
         for (var i = t; i < n; i += FIXUP_WG) {
-            seqs[dst + i * 3u] = best[src + i * 3u] + select(0u, carry, i == 0u);
-            seqs[dst + i * 3u + 1u] = best[src + i * 3u + 1u];
-            seqs[dst + i * 3u + 2u] = best[src + i * 3u + 2u];
+            let r = raw_at(src, n, i);
+            seqs[dst + i * 3u] = best[r] + select(0u, carry, i == 0u);
+            seqs[dst + i * 3u + 1u] = best[r + 1u];
+            seqs[dst + i * 3u + 2u] = best[r + 2u];
         }
     }
     storageBarrier();
@@ -148,8 +156,9 @@ fn main_fixup(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
             var i = 0u;
             loop {
                 if (i >= n || all(reps == spec)) { break; }
-                let ll = best[src + i * 3u] + select(0u, carry, i == 0u);
-                let spec_ob = best[src + i * 3u + 2u];
+                let r = raw_at(src, n, i);
+                let ll = best[r] + select(0u, carry, i == 0u);
+                let spec_ob = best[r + 2u];
                 let offset = offset_of(spec, spec_ob, ll);
                 spec = applied(spec, spec_ob, ll);
                 let ob = ob_for(reps, offset, ll);

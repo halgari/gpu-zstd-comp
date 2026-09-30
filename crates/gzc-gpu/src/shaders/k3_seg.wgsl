@@ -26,6 +26,7 @@ const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;
 // This kernel keeps each segment's raw sequences in its own SEG words of `best` (k3_fixup.wgsl).
 const SEG_WORDS: u32 = SEG;
 const SEG_META: u32 = SEG_WORDS - 6u;
+const RAW_REVERSED: bool = false;
 const_assert 3u * (SEG / 4u) <= SEG_META;
 const_assert NSEG * (SEG / 4u) <= MAX_SEQS;
 
