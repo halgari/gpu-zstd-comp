@@ -5,7 +5,7 @@
 //! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
 use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
-use crate::hash::{compute_preds, hash_long, hash_short};
+use crate::hash::{compute_preds, hash_long, hash_short, hash_width};
 use crate::params::{cpu_supports, Hashes, MatchParams};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
@@ -45,11 +45,15 @@ pub fn match_len_capped(block: &[u8], p: usize, q: usize, cap: usize) -> usize {
 }
 
 /// The predecessor chains `find_best` walks, in walk order: for `Dfast`, the long-hash
-/// (8-byte) chain then the short-hash (5-byte) chain. `Single` chains arrive in Task 2.
+/// (8-byte) chain then the short-hash (5-byte) chain; for `Single`, one chain over
+/// `hash_width(.., min_match)`.
 pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
     match p.hashes {
         Hashes::Dfast => vec![compute_preds(block, hash_long), compute_preds(block, hash_short)],
-        Hashes::Single => panic!("reference::chains: Single hashes are not implemented yet"),
+        Hashes::Single => {
+            let min_match = p.min_match;
+            vec![compute_preds(block, move |b: &[u8], pos: usize| hash_width(b, pos, min_match))]
+        }
     }
 }
 
@@ -166,6 +170,7 @@ pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOpt
 mod tests {
     use super::*;
     use crate::block::chunk_file;
+    use crate::params::RUNG1;
     use crate::seq::reconstruct;
     use crate::synth;
 
@@ -318,5 +323,72 @@ mod tests {
         let h = xxhash_rust::xxh64::xxh64(&all, 0);
         println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
         assert_eq!(h, M3_LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+    }
+
+    /// `rung1` (Single chain, min_match 4, greedy parse): every synthetic test case
+    /// round-trips both through `reconstruct` and through a libzstd frame decode.
+    #[test]
+    fn rung1_roundtrips_all_cases() {
+        for (name, bytes) in synth::test_cases() {
+            for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                let out = compress_block(&blk.data, RUNG1);
+                let got = reconstruct(&out).unwrap_or_else(|e| panic!("{name} block {i}: {e}"));
+                assert_eq!(got, blk.data, "{name} block {i}: reconstruct roundtrip mismatch");
+
+                let frame = compress_block_to_frame(&blk.data, RUNG1, FrameOptions::default());
+                let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                    .unwrap_or_else(|e| panic!("{name} block {i}: libzstd rejected frame: {e}"));
+                assert_eq!(dec, blk.data, "{name} block {i}: frame roundtrip mismatch");
+            }
+        }
+    }
+
+    /// A block of 5-byte tokens ("AAAA" + a byte cycling 0..255) has no 5-byte repeats
+    /// (the 5th byte of any two adjacent tokens always differs), but every 4-byte prefix
+    /// repeats. `rung1`'s Single hash sees only `min_match` (4) bytes, so it must find
+    /// these matches, each capped at exactly 4 bytes by the differing 5th byte.
+    #[test]
+    fn rung1_finds_4_byte_matches() {
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let ntoken = BLOCK_SIZE / 5;
+        for i in 0..ntoken {
+            let p = i * 5;
+            block[p..p + 4].copy_from_slice(b"AAAA");
+            block[p + 4] = (i % 256) as u8;
+        }
+        let out = compress_block(&block, RUNG1);
+        assert!(out.sequences.iter().any(|s| s.match_len == 4), "no length-4 sequence found");
+    }
+
+    /// Every token below shares the same 4-byte hash ("ABCD" ignores the 5th byte), so the
+    /// Single chain links every earlier token, nearest first. Only the 3rd-nearest token
+    /// (`q3`) shares a real 20-byte run with `p`; the two nearer ones (`q1`, `q2`) diverge
+    /// right after the 4-byte prefix, so `find_best` only reaches `q3`'s match at `depth >= 3`.
+    #[test]
+    fn rung1_depth_reaches_older_candidates() {
+        const W: usize = 30;
+        const N: usize = 10;
+        let long_match: &[u8; 20] = b"ABCDEFGHIJKLMNOPQRST";
+
+        let mut block = vec![0u8; BLOCK_SIZE];
+        for i in 0..=N {
+            let p = i * W;
+            if i == N || i == N - 3 {
+                block[p..p + long_match.len()].copy_from_slice(long_match);
+                // Diverge right after the shared run so the match can't run past 20 bytes.
+                block[p + long_match.len()] = i as u8;
+            } else {
+                block[p..p + 4].copy_from_slice(b"ABCD");
+                block[p + 4] = b'Z';
+            }
+        }
+        let p = N * W;
+
+        let depth1 = MatchParams { depth: 1, ..RUNG1 };
+        let best1 = find_best(&block, &chains(&block, &depth1), &depth1);
+        assert_eq!(best1[p], Match { offset: W as u32, len: 4 }, "depth 1 should only reach q1's 4-byte match");
+
+        let best8 = find_best(&block, &chains(&block, &RUNG1), &RUNG1);
+        assert_eq!(best8[p], Match { offset: (3 * W) as u32, len: 20 }, "depth 8 should reach q3's 20-byte match");
     }
 }

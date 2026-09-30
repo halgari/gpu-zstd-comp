@@ -86,9 +86,9 @@ pub fn preset(name: &str) -> Result<MatchParams, String> {
 }
 
 /// Whether the CPU reference implements `p` (chains, best match and parse).
-/// Task 1: only the M3 dfast greedy path (Tasks 2 and 4 add Single chains and the lazy parse).
+/// Task 2 adds the `Single` hash chain for the greedy parse; Task 4 adds the lazy parse.
 pub fn cpu_supports(p: &MatchParams) -> bool {
-    p.hashes == Hashes::Dfast && p.lazy == 0
+    p.lazy == 0
 }
 
 #[cfg(test)]
@@ -146,9 +146,11 @@ mod tests {
     }
 
     #[test]
-    fn cpu_supports_lvl3_only_for_now() {
+    fn cpu_supports_greedy_parses_only_for_now() {
         assert!(cpu_supports(&LVL3));
         assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
+        assert!(cpu_supports(&RUNG1));
+        assert!(!cpu_supports(&RUNG2));
         assert!(!cpu_supports(&LVL9));
     }
 }
