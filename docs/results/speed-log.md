@@ -288,3 +288,27 @@ however, grows on such cards. A 4060 is PCIe 4.0 ×8 (~13 GB/s), so 128 KiB up a
 per block, against a projected 60–80 µs of kernel time: 20–25 % of the wall time, all of it serial with the kernels on
 one queue. That is where `GZC_PACK` (26 % fewer readback bytes) should be re-measured, together with a non-ReBAR check of
 the upload path.
+
+### S3 fix round 1 + S1+S2+S3+S6 merged (a3a5708 fixes, a1aeb86 merge of cb26ed0), 2026-09-30, load avg 0.8–2.7, runs gated on an idle GPU
+
+Fix round 1:
+- `coop_push_lits` is wrap-safe. Before, a final push from an anchor past BLOCK_SIZE (only reachable with a best[] word
+  that claims a match past the block end; K2 never writes one) wrapped `end - start` to about 2^32 bytes.
+- Every `k3_coop.wgsl` loop carries a termination note (variant and bound), and the unsafe justification for building K3 without
+  naga's loop bounding references them.
+- `gzc-bench` prints the pipeline's actual K3 mode.
+- New tests: an anchor past the block end (fails without the clamp); scans restarting mid-regime; a full literal region
+  next to fast blocks; the in-kernel sequential fallback forced on (`GZC_K3_FORCE_FALLBACK=1`, test-only); the probe at 2
+  blocks per workgroup.
+
+**Stage E (`GZC_K3_BPW=2`) is kept opt-in, default off, as an explicit exception to the ≥ 3 % rule** (controller ruling). It
+targets Ada's limit of 24 resident workgroups per SM and cannot be measured on the 5090. The full suite passes with it.
+
+lvl9, `--batch max` (b2431), i3, median of 3. "seq" is the sequential K3 in the same binary (without loop bounding):
+
+| Config | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Kernel sum ms/b |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| seq K3 | 2642.3 / 2642.7 / 2666.8 | 2642.7 | 15.39 | 12.45 | 58.95 | 11.81 | 3.97 | 102.57 |
+| **coop K3 (default)** | 3497.3 / 3526.7 / 3551.6 | **3526.7** | 15.37 | 12.56 | 32.61 | 9.95 | 4.14 | 74.62 |
+
+`--verify`: 3481.5 MB/s, passed. Compressed bytes are equal in both modes (4,792,885,250).
