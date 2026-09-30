@@ -174,14 +174,16 @@ impl StagingLayout {
 }
 
 /// Hands one completed batch to the caller's sink on the completion thread: `(lease of the
-/// staging bytes, first block index, block count)`.
-type Handler<'d> = dyn FnMut(Lease, usize, u32) -> anyhow::Result<()> + Send + 'd;
+/// staging bytes, first block index, block count, the producer's tag)`.
+type Handler<'d> = dyn FnMut(Lease, usize, u32, u64) -> anyhow::Result<()> + Send + 'd;
 
 /// A submitted batch, sent to the completion thread.
 struct Job {
     slot: usize,
     first: usize,
     n: u32,
+    /// `UploadSlot::submit_with`'s tag (0 for `submit`).
+    tag: u64,
     submission: wgpu::SubmissionIndex,
     /// The staging map's result (wgpu staging), or None (transfer readback: wait for `seq`).
     mapped: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
@@ -297,7 +299,7 @@ impl Shared {
             if g.slots[slot] == SlotState::Free {
                 return Ok(());
             }
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            g = self.wait_logged(g, "a free upload slot");
         }
     }
 
@@ -305,8 +307,28 @@ impl Shared {
     fn wait_released(&self) {
         let mut g = self.lock();
         while g.slots.contains(&SlotState::Leased) {
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            g = self.wait_logged(g, "the stream's end");
         }
+    }
+
+    /// One condvar wait; a wait of `STALL_WARN` or longer logs how many batches the sink still
+    /// holds, so a leaked or over-held `FrameBatch` shows up instead of a silent hang.
+    fn wait_logged<'g>(
+        &self,
+        g: std::sync::MutexGuard<'g, SharedState>,
+        what: &str,
+    ) -> std::sync::MutexGuard<'g, SharedState> {
+        const STALL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+        let (g, timeout) = self.cv.wait_timeout(g, STALL_WARN).unwrap_or_else(|e| e.into_inner());
+        if timeout.timed_out() {
+            let held = g.slots.iter().filter(|&&s| s == SlotState::Leased).count();
+            eprintln!(
+                "gzc: pipeline waiting {}s+ for {what}: {held} FrameBatch(es) still held by the sink, {} batch(es) in flight",
+                STALL_WARN.as_secs(),
+                g.slots.iter().filter(|&&s| s == SlotState::InFlight).count()
+            );
+        }
+        g
     }
 }
 
@@ -351,6 +373,10 @@ impl Drop for Lease {
     fn drop(&mut self) {
         let t = Instant::now();
         self.view.take();
+        // wgpu error scopes are thread-local: the stream's scopes (`stream_with`) only see the
+        // producer thread, so an error from this unmap (on the completion thread or a writer
+        // thread) goes to the device's uncaptured-error handler. Unmapping a mapped buffer raises
+        // none.
         if let Staging::Wgpu(b) = &*self.staging {
             b.unmap();
         }
@@ -362,11 +388,14 @@ impl Drop for Lease {
 /// A completed batch of zstd frames lent to the caller (`Pipeline::stream_frames`) without a copy:
 /// each frame points into the slot's staging buffer. The slot takes a new batch only once this is
 /// dropped, so a sink may hand it to writer threads (it is `Send + Sync`) and drop it when their
-/// writes are done; the producer blocks in `FrameStream::next_upload_slot` meanwhile. Keep at most
-/// `inflight - 1` batches alive, or the stream stalls.
+/// writes are done; the producer blocks in `FrameStream::next_upload_slot` meanwhile. Holding
+/// `inflight` batches stalls the stream (every slot is lent out); holding `inflight - 1` keeps it
+/// going but serialises it (one batch in flight at a time), so release batches promptly. A
+/// batch never released makes `stream_frames` wait forever at its end (with a warning every 10 s).
 pub struct FrameBatch {
     lease: Lease,
     first: usize,
+    tag: u64,
     /// Per frame: byte offset in the staging buffer, and length.
     spans: Vec<(usize, u32)>,
 }
@@ -374,7 +403,7 @@ pub struct FrameBatch {
 impl FrameBatch {
     /// Checks every frame length (1..=FRAME_STRIDE) and locates the frames: at their fixed stride,
     /// or (`packed`) one after another at `PACK_ALIGN` boundaries.
-    fn new(lease: Lease, first: usize, n: u32, layout: &StagingLayout, packed: bool) -> anyhow::Result<Self> {
+    fn new(lease: Lease, first: usize, n: u32, tag: u64, layout: &StagingLayout, packed: bool) -> anyhow::Result<Self> {
         let bytes = lease.bytes();
         let lens: &[u32] = bytemuck::cast_slice(&bytes[..frame_len_bytes(n) as usize]);
         let mut spans = Vec::with_capacity(n as usize);
@@ -388,12 +417,18 @@ impl FrameBatch {
                 spans.push((layout.a as usize + b * FRAME_STRIDE, len));
             }
         }
-        Ok(Self { lease, first, spans })
+        Ok(Self { lease, first, tag, spans })
     }
 
     /// Index of the batch's first block in the stream (blocks count from 0 per stream).
     pub fn first_index(&self) -> usize {
         self.first
+    }
+
+    /// The tag the producer submitted the batch with (`UploadSlot::submit_with`; 0 for
+    /// `submit`), e.g. an index into its own table of the batch's payloads.
+    pub fn tag(&self) -> u64 {
+        self.tag
     }
 
     /// Number of frames (blocks) in the batch.
@@ -480,6 +515,10 @@ pub struct Pipeline<'a> {
     /// Test hook: the delivery after this many more fails (then the hook clears).
     #[cfg(test)]
     fail_deliveries_after: Option<u32>,
+    /// Test hook: the submission after this many more fails once its slot is marked in flight
+    /// (then the hook clears).
+    #[cfg(test)]
+    fail_submits_after: Option<u32>,
 }
 
 impl Drop for Pipeline<'_> {
@@ -712,6 +751,8 @@ impl<'a> Pipeline<'a> {
             xfer,
             #[cfg(test)]
             fail_deliveries_after: None,
+            #[cfg(test)]
+            fail_submits_after: None,
         })
     }
 
@@ -749,7 +790,7 @@ impl<'a> Pipeline<'a> {
         anyhow::ensure!(!self.layout.frames, "pipeline built with emit_frames: use run_frames");
         check_blocks(blocks)?;
         let layout = self.layout;
-        let handler = move |lease: Lease, first: usize, n: u32| -> anyhow::Result<()> {
+        let handler = move |lease: Lease, first: usize, n: u32, _tag: u64| -> anyhow::Result<()> {
             let words: &[u32] = bytemuck::cast_slice(lease.bytes());
             let seq_stride = 3 * MAX_SEQS as usize;
             for b in 0..n as usize {
@@ -809,17 +850,22 @@ impl<'a> Pipeline<'a> {
     }
 
     /// The streaming frame API, with no host copy on either side. `produce` runs on this thread:
-    /// it takes each upload slot in turn (`FrameStream::next_upload_slot`), writes blocks straight
-    /// into its mapped memory (`UploadSlot::blocks_mut`) and submits them (`UploadSlot::submit`,
-    /// any number up to the slot's capacity, e.g. when a flush timer fires); it blocks only when
-    /// every slot is in flight or still lent out. A completion thread waits for the batches in
-    /// submission order and hands each one to `on_batch` as a `FrameBatch`, whose frames point
-    /// into the slot's staging buffer; the slot is reused once the batch is dropped, which may
-    /// happen on any thread. Blocks count from 0 per stream. Returns once `produce` has returned,
-    /// every submitted batch went to `on_batch` and every `FrameBatch` was dropped. An error
-    /// from either side (or a panic in `on_batch`) aborts the stream: `produce` sees an error
-    /// from its next `FrameStream` call, no further batches are delivered, and the error is
-    /// returned (the completion side's first); the pipeline stays usable.
+    /// it takes each upload slot in turn (`FrameStream::next_upload_slot`), writes blocks into its
+    /// mapped memory (`UploadSlot::regions_mut`, or the `unsafe` `UploadSlot::blocks_mut`) and
+    /// submits them (`UploadSlot::submit` / `submit_with`, any number up to the slot's capacity,
+    /// e.g. when a flush timer fires); it blocks only when every slot is in flight or still lent
+    /// out. A completion thread waits for the batches in submission order and hands each one to
+    /// `on_batch` as a `FrameBatch`, whose frames point into the slot's staging buffer; the slot
+    /// is reused once the batch is dropped, which may happen on any thread. Blocks count from 0
+    /// per stream. Returns once `produce` has returned, every submitted batch went to `on_batch`
+    /// and every `FrameBatch` was dropped.
+    ///
+    /// An error from either side aborts the stream and is returned (the completion side's first);
+    /// every later `FrameStream` call errors. After an error from `on_batch` no further batch is
+    /// delivered; after one from `produce` (or a failed submit) the completion thread may still
+    /// deliver a batch or two it had already taken before it sees the abort. A panic on either side
+    /// also aborts the stream and is re-raised (not returned) once the pipeline is cleaned up. The
+    /// pipeline stays usable either way.
     pub fn stream_frames<F, P>(&mut self, mut on_batch: F, produce: P) -> anyhow::Result<PipelineStats>
     where
         F: FnMut(FrameBatch) -> anyhow::Result<()> + Send,
@@ -827,7 +873,9 @@ impl<'a> Pipeline<'a> {
     {
         anyhow::ensure!(self.layout.frames, "pipeline built without emit_frames: use run");
         let (layout, packed) = (self.layout, self.pack.is_some());
-        let handler = move |lease: Lease, first: usize, n: u32| on_batch(FrameBatch::new(lease, first, n, &layout, packed)?);
+        let handler = move |lease: Lease, first: usize, n: u32, tag: u64| {
+            on_batch(FrameBatch::new(lease, first, n, tag, &layout, packed)?)
+        };
         self.stream_with(Box::new(handler), produce)
     }
 
@@ -872,11 +920,17 @@ impl<'a> Pipeline<'a> {
                 batches: 0,
                 start,
                 prof: ProducerProfile::default(),
+                submit_error: None,
             };
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| produce(&mut stream)));
-            let FrameStream { tx, batches, prof, .. } = stream;
+            let FrameStream { tx, batches, prof, submit_error, .. } = stream;
             // Closing the channel ends the completion thread once it has drained the queue.
             drop(tx);
+            // A failed submission fails the stream even when `produce` swallowed its error.
+            let r = match (r, submit_error) {
+                (Ok(Ok(())), Some(e)) => Ok(Err(anyhow!("a submission failed (produce carried on): {e}"))),
+                (r, _) => r,
+            };
             if !matches!(r, Ok(Ok(()))) {
                 shared.abort();
             }
@@ -943,7 +997,7 @@ impl<'a> Pipeline<'a> {
     /// requests the maps; returns the batch for the completion thread. The slot's upload buffer
     /// holds the blocks (mapped); it is persistent rather than `queue.write_buffer`, which would
     /// allocate a fresh staging buffer per call that lives until the submission completes.
-    fn submit(&mut self, i: usize, first: usize, n: u32) -> anyhow::Result<Job> {
+    fn submit(&mut self, i: usize, first: usize, n: u32, tag: u64) -> anyhow::Result<Job> {
         if self.direct {
             // The kernels read this slot's upload buffer; the bind groups recorded below hold it.
             self.bufs.data = self.slots[i].upload.clone();
@@ -955,6 +1009,15 @@ impl<'a> Pipeline<'a> {
         slot.upload_unmapped = true;
         // From here on the GPU may write the slot's staging buffer (`abandon` cleans up on error).
         self.shared.set(i, SlotState::InFlight);
+        #[cfg(test)]
+        match &mut self.fail_submits_after {
+            Some(0) => {
+                self.fail_submits_after = None;
+                anyhow::bail!("injected submit failure (test hook)");
+            }
+            Some(k) => *k -= 1,
+            None => {}
+        }
 
         let n_queries = 2 * self.kernels.names().len() as u32;
         let resolved = (n_queries + 2) as u64 * wgpu::QUERY_SIZE as u64;
@@ -1050,7 +1113,7 @@ impl<'a> Pipeline<'a> {
         slot.upload_mapped = Some(upload_mapped);
         slot.upload_unmapped = false;
         slot.upload_submission = Some(submission.clone());
-        Ok(Job { slot: i, first, n, submission, mapped, seq, staging: slot.staging.clone() })
+        Ok(Job { slot: i, first, n, tag, submission, mapped, seq, staging: slot.staging.clone() })
     }
 
     /// After an error: wait for the GPU, unmap and free every slot still in flight so the
@@ -1185,7 +1248,7 @@ impl Completion<'_> {
                 *k -= 1;
             }
             let t = Instant::now();
-            handler(lease, job.first, job.n)?;
+            handler(lease, job.first, job.n, job.tag)?;
             prof.deliver += t.elapsed().as_secs_f64();
         }
         Ok(())
@@ -1243,6 +1306,8 @@ pub struct FrameStream<'p, 'a> {
     batches: u32,
     start: Instant,
     prof: ProducerProfile,
+    /// The first failed submission's error: the stream fails even if `produce` swallows it.
+    submit_error: Option<String>,
 }
 
 impl<'p, 'a> FrameStream<'p, 'a> {
@@ -1304,15 +1369,26 @@ impl<'p, 'a> FrameStream<'p, 'a> {
         check_blocks(blocks)?;
         for chunk in blocks.chunks(self.slot_capacity()) {
             let mut slot = self.next_upload_slot()?;
-            copy_blocks(slot.blocks_mut(), chunk);
+            let region = slot.regions_mut(&[chunk.len()])?.pop().expect("one region");
+            copy_blocks(region, chunk);
             slot.submit(chunk.len())?;
         }
         Ok(())
     }
 
-    fn submit(&mut self, i: usize, n: u32) -> anyhow::Result<()> {
+    /// Submits slot `i`'s first `n` blocks. Any failure aborts the stream: a slot whose
+    /// submission failed after it was marked in flight would never come free, so every later
+    /// call must error rather than wait for it.
+    fn submit(&mut self, i: usize, n: u32, tag: u64) -> anyhow::Result<()> {
         let t = Instant::now();
-        let job = self.pipe.submit(i, self.next_index, n)?;
+        let job = match self.pipe.submit(i, self.next_index, n, tag) {
+            Ok(job) => job,
+            Err(e) => {
+                self.pipe.shared.abort();
+                self.submit_error.get_or_insert_with(|| format!("{e:#}"));
+                return Err(e);
+            }
+        };
         let sent = self.tx.send(job);
         self.prof.submit += t.elapsed().as_secs_f64();
         if self.batches == 0 {
@@ -1321,13 +1397,22 @@ impl<'p, 'a> FrameStream<'p, 'a> {
         self.batches += 1;
         self.next_index += n as usize;
         self.next_slot = (i + 1) % self.pipe.slots.len();
-        sent.map_err(|_| anyhow!("stream aborted: the completion thread stopped"))
+        sent.map_err(|_| {
+            self.pipe.shared.abort();
+            anyhow!("stream aborted: the completion thread stopped")
+        })
     }
 }
 
 /// A free slot's mapped upload buffer (`FrameStream::next_upload_slot`): write up to `capacity()`
-/// blocks into it, then `submit` the first `n`. Dropped without submitting, the slot is handed out
-/// again by the next `next_upload_slot`.
+/// blocks into it (`regions_mut`, or the `unsafe` `blocks_mut`), then `submit` the first `n`.
+/// Dropped without submitting, the slot is handed out again by the next `next_upload_slot`.
+///
+/// The memory is mapped MAP_WRITE memory: device-local write-combined memory with the direct
+/// upload (ReBAR), and possibly uncached / write-combined host memory with the copy upload too.
+/// Write it sequentially and never read it back. A decompressor reads its own recent output for
+/// its matches, so do not decode into the slot: decode into a cached buffer (or a streaming
+/// decoder's window) and copy the result in.
 pub struct UploadSlot<'s, 'p, 'a> {
     stream: &'s mut FrameStream<'p, 'a>,
     slot: usize,
@@ -1341,50 +1426,67 @@ impl UploadSlot<'_, '_, '_> {
         self.stream.slot_capacity()
     }
 
-    /// The slot's upload memory: `capacity()` blocks of BLOCK_SIZE bytes, block k at
-    /// `k * BLOCK_SIZE`, for the caller to write its blocks into directly (decode into it; split
-    /// it with `chunks_mut` to fill it from several threads). Every byte of each submitted block
-    /// must be written: the old contents are stale. With the direct upload this is write-combined
-    /// device memory (ReBAR): write it sequentially and never read it (reads are uncached and slow).
-    pub fn blocks_mut(&mut self) -> &mut [u8] {
+    /// The slot's upload memory as a plain `&mut [u8]`: `capacity()` blocks of BLOCK_SIZE bytes,
+    /// block k at `k * BLOCK_SIZE` (split it with `chunks_mut` to fill it from several threads).
+    /// Every byte of each submitted block must be written: the bytes are whatever an earlier
+    /// batch left there. Prefer the safe `regions_mut`; this is for code that needs a slice (a
+    /// `Read::read` into it, say). Never read it: see the type's docs.
+    ///
+    /// # Safety
+    ///
+    /// wgpu hands out mapped-for-write memory only as `wgpu::WriteOnly`, whose contract says its
+    /// pointer must not be turned into a `&mut` or read. This does both (a `&mut [u8]` may be
+    /// read), which is sound only because of wgpu-core implementation details: its native
+    /// backends map a real host pointer that stays valid until `unmap`, and they zero-fill a
+    /// MAP_WRITE range that was never written when mapping it, so every byte is initialized (the
+    /// rest holds earlier batches' bytes); `upload_slot_bytes_are_initialized` pins this. The
+    /// caller must not use the slice to read uninitialized memory on any other wgpu backend, and
+    /// this must be rechecked on every wgpu upgrade.
+    pub unsafe fn blocks_mut(&mut self) -> &mut [u8] {
         let len = self.capacity() * BLOCK_SIZE;
         let mut w = self.view.slice(..len);
         // SAFETY: the view maps at least `len` bytes (`data_bytes(batch)`), which stay mapped and
-        // are ours alone while `self` is borrowed (only `submit` drops the view); mapped memory is
-        // initialized (wgpu zero-fills new buffers). wgpu hands out `WriteOnly` only to keep
-        // reads away from write-combined memory, which is a performance concern, not a safety one.
+        // are ours alone while `self` is borrowed (only `submit` drops the view); initialized per
+        // the caller's contract above.
         unsafe { &mut *w.as_raw_ptr().as_ptr() }
     }
 
     /// Block `k`'s BLOCK_SIZE bytes of `blocks_mut`.
-    pub fn block_mut(&mut self, k: usize) -> &mut [u8] {
-        &mut self.blocks_mut()[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE]
+    ///
+    /// # Safety
+    ///
+    /// As for `blocks_mut`.
+    pub unsafe fn block_mut(&mut self, k: usize) -> &mut [u8] {
+        // SAFETY: the caller's contract.
+        unsafe { &mut self.blocks_mut()[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE] }
     }
 
-    /// Splits `blocks_mut`, from block 0, into consecutive disjoint regions of `blocks[i]` whole
-    /// blocks each: one per payload (e.g. a file, or a decompressed chunk of one), so several
-    /// threads can write payloads spanning many blocks at once. Finish each with `pad_payload`;
-    /// submit the sum of the blocks. Errors if the regions exceed `capacity()`.
-    ///
-    /// A decompressor reads back its own recent output for its matches: writing its output
-    /// straight into a region reads write-combined memory (see `blocks_mut`), so decode through a
-    /// cached window (a streaming decoder) or a scratch buffer and let only the stores land here.
-    pub fn regions_mut(&mut self, blocks: &[usize]) -> anyhow::Result<Vec<&mut [u8]>> {
+    /// Splits the slot's memory, from block 0, into consecutive disjoint write-only regions of
+    /// `blocks[i]` whole blocks each: one per payload (a file, or a decompressed chunk of one),
+    /// which several threads can fill at once (`Region` is `Send`). Finish each payload with
+    /// `Region::pad`; submit the sum of the blocks. Errors if the regions exceed `capacity()`.
+    pub fn regions_mut(&mut self, blocks: &[usize]) -> anyhow::Result<Vec<Region<'_>>> {
         let (total, cap) = (blocks.iter().sum::<usize>(), self.capacity());
         anyhow::ensure!(total <= cap, "regions of {total} blocks exceed the slot's {cap}");
-        let mut rest = self.blocks_mut();
+        let mut rest = self.view.slice(..total * BLOCK_SIZE);
         let mut out = Vec::with_capacity(blocks.len());
         for &b in blocks {
-            let (region, tail) = std::mem::take(&mut rest).split_at_mut(b * BLOCK_SIZE);
-            out.push(region);
+            let (region, tail) = rest.split_at(b * BLOCK_SIZE);
+            out.push(Region(region));
             rest = tail;
         }
         Ok(out)
     }
 
     /// Submits the slot's first `n` blocks (1..=capacity(): a partial batch, e.g. when a flush
-    /// timer fires, is fine); returns the index of its first block.
+    /// timer fires, is fine); returns the index of its first block. Tag 0 (see `submit_with`).
     pub fn submit(self, n: usize) -> anyhow::Result<usize> {
+        self.submit_with(n, 0)
+    }
+
+    /// `submit`, tagging the batch with `tag`, which its `FrameBatch::tag` returns: e.g. an index
+    /// into the producer's table of which payloads (and real lengths) the batch holds.
+    pub fn submit_with(self, n: usize, tag: u64) -> anyhow::Result<usize> {
         let cap = self.capacity();
         anyhow::ensure!((1..=cap).contains(&n), "cannot submit {n} blocks: not in 1..={cap}");
         let UploadSlot { stream, slot, mut view, acquired } = self;
@@ -1393,8 +1495,59 @@ impl UploadSlot<'_, '_, '_> {
         drop(view);
         stream.prof.upload_write += acquired.elapsed().as_secs_f64();
         let first = stream.next_index;
-        stream.submit(slot, n as u32)?;
+        stream.submit(slot, n as u32, tag)?;
         Ok(first)
+    }
+}
+
+/// A write-only piece of an upload slot (`UploadSlot::regions_mut`), a whole number of blocks.
+pub struct Region<'a>(wgpu::WriteOnly<'a, [u8]>);
+
+// SAFETY: `WriteOnly<[u8]>` lacks `Send` only because wgpu's impl needs a sized `T`; like a
+// `&mut [u8]`, a byte range of it may move to another thread, and `regions_mut` hands out
+// disjoint ranges.
+unsafe impl Send for Region<'_> {}
+
+impl<'a> Region<'a> {
+    /// Bytes in the region.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Writes `bytes` at `offset` (panics past the end).
+    pub fn write(&mut self, offset: usize, bytes: &[u8]) {
+        self.0.slice(offset..offset + bytes.len()).copy_from_slice(bytes);
+    }
+
+    /// The region as wgpu's `WriteOnly`, for writers that take one.
+    pub fn write_only(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
+        self.0.slice(..)
+    }
+
+    /// Finishes a `len`-byte payload written at the start of the region: zero-fills the rest of
+    /// its last block, the padding `chunk_file` gives a file's last block (the slot's old bytes
+    /// would otherwise be compressed with it), and returns the blocks it occupies
+    /// (`payload_blocks(len)`; `payload_real_lens(len)` gives their real lengths). Errors if they
+    /// do not fit in the region.
+    pub fn pad(&mut self, len: usize) -> anyhow::Result<usize> {
+        let blocks = payload_blocks(len);
+        let end = blocks * BLOCK_SIZE;
+        anyhow::ensure!(
+            end <= self.len(),
+            "a {len}-byte payload needs {blocks} blocks, the region has {}",
+            self.len() / BLOCK_SIZE
+        );
+        self.0.slice(len..end).fill(0);
+        Ok(blocks)
+    }
+
+    fn split_at(self, mid: usize) -> (Region<'a>, Region<'a>) {
+        let (a, b) = self.0.split_at(mid);
+        (Region(a), Region(b))
     }
 }
 
@@ -1410,18 +1563,6 @@ pub fn payload_real_lens(len: usize) -> impl ExactSizeIterator<Item = usize> {
     (0..payload_blocks(len)).map(move |k| (len - k * BLOCK_SIZE).min(BLOCK_SIZE))
 }
 
-/// Finishes a `len`-byte payload written at the start of `region` (block-aligned, e.g. from
-/// `UploadSlot::regions_mut`): zero-fills the rest of its last block, the padding `chunk_file`
-/// gives a file's last block (the slot's old bytes would otherwise be compressed with it), and
-/// returns the blocks it occupies (`payload_blocks(len)`). Errors if they do not fit in `region`.
-pub fn pad_payload(region: &mut [u8], len: usize) -> anyhow::Result<usize> {
-    let blocks = payload_blocks(len);
-    let end = blocks * BLOCK_SIZE;
-    anyhow::ensure!(end <= region.len(), "a {len}-byte payload needs {blocks} blocks, the region has {}", region.len() / BLOCK_SIZE);
-    region[len..end].fill(0);
-    Ok(blocks)
-}
-
 /// Every block must be exactly BLOCK_SIZE bytes.
 fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
     if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
@@ -1433,18 +1574,27 @@ fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
 /// Copies `blocks` back to back into `dst`, split over `upload_threads()` threads (this one
 /// included): one thread's stores into the (write-combined, ReBAR) upload buffer run at ~18 GB/s,
 /// two or more at the link's ~26 GB/s (RTX 5090).
-fn copy_blocks(dst: &mut [u8], blocks: &[&[u8]]) {
-    let copy = |dst: &mut [u8], src: &[&[u8]]| {
-        dst.chunks_exact_mut(BLOCK_SIZE).zip(src).for_each(|(d, b)| d.copy_from_slice(b));
+fn copy_blocks(dst: Region<'_>, blocks: &[&[u8]]) {
+    let copy = |mut dst: Region<'_>, src: &[&[u8]]| {
+        for (k, b) in src.iter().enumerate() {
+            dst.write(k * BLOCK_SIZE, b);
+        }
     };
     let per = blocks.len().div_ceil(upload_threads()).max(64);
     std::thread::scope(|s| {
-        let mut shares = blocks.chunks(per).zip(dst.chunks_mut(per * BLOCK_SIZE));
-        let mine = shares.next();
-        for (src, dst) in shares {
+        let mut rest = dst;
+        let mut shares = Vec::new();
+        for src in blocks.chunks(per) {
+            let (mine, tail) = rest.split_at(src.len() * BLOCK_SIZE);
+            shares.push((mine, src));
+            rest = tail;
+        }
+        let mut shares = shares.into_iter();
+        let first = shares.next();
+        for (dst, src) in shares {
             s.spawn(move || copy(dst, src));
         }
-        if let Some((src, dst)) = mine {
+        if let Some((dst, src)) = first {
             copy(dst, src);
         }
     });
@@ -1976,7 +2126,10 @@ mod tests {
                                     let first = stream.submitted_blocks();
                                     let mut slot = stream.next_upload_slot()?;
                                     for k in 0..n {
-                                        slot.block_mut(k).copy_from_slice(&distinct[(first + k) % distinct.len()]);
+                                        // SAFETY: native wgpu-core backend (`blocks_mut`'s
+                                        // contract; pinned by `upload_slot_bytes_are_initialized`).
+                                        let block = unsafe { slot.block_mut(k) };
+                                        block.copy_from_slice(&distinct[(first + k) % distinct.len()]);
                                     }
                                     assert_eq!(slot.submit(n)?, first);
                                 }
@@ -2032,7 +2185,7 @@ mod tests {
             |stream| {
                 for _ in 0..2 {
                     let mut slot = stream.next_upload_slot()?;
-                    slot.blocks_mut().fill(0xAB);
+                    slot.regions_mut(&[16])?[0].write_only().fill(0xAB);
                     slot.submit(16)?;
                 }
                 Ok(())
@@ -2051,11 +2204,11 @@ mod tests {
                     assert!(slot.regions_mut(&[slot.capacity() + 1]).is_err());
                     let regions = slot.regions_mut(&blocks_each)?;
                     std::thread::scope(|s| {
-                        for (region, p) in regions.into_iter().zip(&payloads) {
+                        for (mut region, p) in regions.into_iter().zip(&payloads) {
                             s.spawn(move || {
-                                region[..p.len()].copy_from_slice(p);
-                                assert_eq!(pad_payload(region, p.len()).unwrap(), payload_blocks(p.len()));
-                                assert!(pad_payload(region, region.len() + 1).is_err());
+                                region.write(0, p);
+                                assert_eq!(region.pad(p.len()).unwrap(), payload_blocks(p.len()));
+                                assert!(region.pad(region.len() + 1).is_err());
                             });
                         }
                     });
@@ -2066,6 +2219,115 @@ mod tests {
         )
         .unwrap();
         got.check(2 * total, |i| want[i % total].clone(), "payloads");
+    }
+
+    /// Pins what `UploadSlot::blocks_mut`'s safety relies on, in every upload/readback mode: the
+    /// mapping is real host memory whose bytes are initialized: a new slot reads back all zeros,
+    /// and a reused one reads back exactly what was written into it before (and zeros where
+    /// nothing was), not garbage. Recheck on every wgpu upgrade.
+    #[test]
+    fn upload_slot_bytes_are_initialized() {
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let bs = BLOCK_SIZE;
+        for (name, ctx) in &mode_contexts() {
+            let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 4, inflight: 2, params }).unwrap();
+            pipe.stream_frames(
+                |_batch| Ok(()),
+                |stream| {
+                    // First use of both slots: zeros. Write block 0 only, submit it.
+                    for s in 0..2u8 {
+                        let mut slot = stream.next_upload_slot()?;
+                        // SAFETY: native wgpu-core backend; this test pins the contract.
+                        let bytes = unsafe { slot.blocks_mut() };
+                        assert!(bytes.iter().all(|&b| b == 0), "{name}: new slot {s} not zeroed");
+                        bytes[..bs].fill(0x50 + s);
+                        slot.submit(1)?;
+                    }
+                    // Reused: block 0 as written, the trailing zero word `submit` writes at
+                    // block 1's start, the rest still zero.
+                    for s in 0..2u8 {
+                        let mut slot = stream.next_upload_slot()?;
+                        // SAFETY: as above.
+                        let bytes = unsafe { slot.blocks_mut() };
+                        assert!(bytes[..bs].iter().all(|&b| b == 0x50 + s), "{name}: slot {s} lost its bytes");
+                        assert!(bytes[bs..].iter().all(|&b| b == 0), "{name}: slot {s} holds garbage");
+                        // Submitted, not dropped: a dropped slot would be handed out again.
+                        slot.submit(1)?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        }
+    }
+
+    /// A submission that fails after its slot was marked in flight aborts the stream: the
+    /// producer's later calls error instead of waiting for a slot that never comes free, even if
+    /// it swallowed the first error; `stream_frames` returns the error; the pipeline is reusable.
+    #[test]
+    fn failed_submit_is_sticky() {
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        let blocks: Vec<&[u8]> = (0..64).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        for (name, ctx) in &mode_contexts() {
+            let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
+            pipe.fail_submits_after = Some(1);
+            let e = pipe
+                .stream_frames(
+                    |_batch| Ok(()),
+                    |stream| {
+                        stream.upload_blocks(&blocks[..16])?;
+                        let e = stream.upload_blocks(&blocks[16..32]).expect_err("second submit fails");
+                        assert!(e.to_string().contains("injected submit"), "{name}: {e:#}");
+                        // Swallowed: every later call errors at once.
+                        for _ in 0..4 {
+                            let e = stream.next_upload_slot().err().expect("aborted stream hands out no slot");
+                            assert!(e.to_string().contains("aborted"), "{name}: {e:#}");
+                        }
+                        Ok(())
+                    },
+                )
+                .expect_err("a swallowed submit failure still fails the stream");
+            assert!(format!("{e:#}").contains("injected submit"), "{name}: {e:#}");
+            let mut sink = CollectFrames(vec![None; blocks.len()]);
+            pipe.run_frames(&blocks, &mut sink).unwrap();
+            for (i, got) in sink.0.into_iter().enumerate() {
+                assert!(got.unwrap() == want[i % distinct.len()], "{name}: index {i}");
+            }
+        }
+    }
+
+    /// `submit_with` tags reach `FrameBatch::tag` with their batch; `submit` tags 0.
+    #[test]
+    fn frame_batches_carry_their_tags() {
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 8, inflight: 3, params }).unwrap();
+        let mut seen = Vec::new();
+        pipe.stream_frames(
+            |batch| {
+                seen.push((batch.first_index(), batch.len(), batch.tag()));
+                Ok(())
+            },
+            |stream| {
+                for (k, n) in [8usize, 3, 8, 5, 1, 8].into_iter().enumerate() {
+                    let mut slot = stream.next_upload_slot()?;
+                    for (b, mut region) in slot.regions_mut(&vec![1; n])?.into_iter().enumerate() {
+                        region.write(0, &distinct[(k + b) % distinct.len()]);
+                    }
+                    if k == 4 {
+                        slot.submit(n)?;
+                    } else {
+                        slot.submit_with(n, 1000 + k as u64)?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, [(0, 8, 1000), (8, 3, 1001), (11, 8, 1002), (19, 5, 1003), (24, 1, 0), (25, 8, 1005)]);
     }
 
     /// A batch kept alive holds its slot: its frames stay intact while later batches reuse the

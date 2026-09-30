@@ -51,13 +51,20 @@ running them one after the other on one thread.
 | lvl9 i2 | new, w0 | 5820 / 5873 / 5779 | 5820 (+0.5 %) | 30 / 30 / 31 | slot wait 46.1; deliver 11.9 |
 | lvl9 i2 | new, w4 | 5862 / 5754 / 5778 | 5778 (0 %) | 26 / 27 / 29 | slot wait 44.8; deliver 6.4 |
 
+**Not like-for-like:** the "new, w4" rows compare 4 delivery threads against the baseline with
+**0** writer threads; the baseline with 4 writer threads (its channel hand-off) was not run in the
+interleaved set, so the w4 margins over base overstate what the new design adds. Compare "new, w0"
+with base for the design, and w4 with w0 for parallel delivery. **The i3 +2.2 % is noise-level**
+(base 9404–10430 overlaps new 10509–11036); the credible i3 result is the overhead drop
+(median 39 → 30 ms at w0). The i2 and under-load gains hold (base max below new min).
+
 Under CPU load (16 busy-spinning threads on the 32-thread CPU, load average 5–11), lvl9s12seg i3:
 
 | Variant | MB/s (3 runs) | median | overhead ms |
 |---|---|---:|---|
 | base | 10390 / 9784 / 10191 | 10191 | 65 / 89 / 62 |
 | new, w0 | 10802 / 10782 / 10802 | 10802 (+6.0 %) | 28 / 30 / 28 |
-| new, w4 | 10338 / 11034 / 10966 | 10966 (+7.6 %) | 51 / 26 / 23 |
+| new, w4 (not like-for-like, see above) | 10338 / 11034 / 10966 | 10966 (+7.6 %) | 51 / 26 / 23 |
 
 Earlier in the session, with faster kernels (28.6–28.9 ms/batch; sequential, not interleaved):
 base 10858 / 10934 / 10835, new w0 11306 / 11260 / 11261, new w4 11301 / 11279 / 11272 MB/s
@@ -69,7 +76,8 @@ base 10858 / 10934 / 10835, new w0 11306 / 11260 / 11261, new w4 11301 / 11279 /
 free slot (lvl9s12seg) instead of the GPU waiting for it, `gpu_idle` fell to ~0.04 ms/batch, and
 the host's share of the wall time is ~25 ms per run (the first batch's 13.5 ms upload before the
 GPU can start, plus the last batch's delivery) against 32–135 ms before. At `--inflight 3` on an
-idle box the old pipeline was only just host-bound, hence +2 %; at `--inflight 2` (less slack)
+idle box the old pipeline was only just host-bound, hence a noise-level +2 % in MB/s (the
+overhead drop is the real signal); at `--inflight 2` (less slack)
 and under CPU load it was clearly host-bound, hence +12–15 % and +6–8 %. lvl9 is GPU-bound and
 unchanged. What remains of the gap to the kernel-only rate is the fill (one batch's upload), which
 only a smaller first batch could hide, and that loses (below).
@@ -80,8 +88,9 @@ only a smaller first batch could hide, and that loses (below).
   overlaps the next upload; the slot is recycled only after the sink drops the batch.
 - **Parallel delivery** (`run_frames_par`, `FrameBatch::deliver_par`, bench `--writer-threads N`):
   +0–3 % at i3, +3 % at i2, halves drain; the bench default stays 0 (comparability).
-- **Zero-copy intake** (`FrameStream::next_upload_slot`, `UploadSlot::{blocks_mut, block_mut,
-  regions_mut, submit}`, `pad_payload`, `payload_real_lens`): the caller writes blocks or
+- **Zero-copy intake** (`FrameStream::next_upload_slot`, `UploadSlot::{regions_mut, submit,
+  submit_with}`, `Region::pad`, `payload_real_lens`, and the `unsafe` `blocks_mut` / `block_mut`
+  after review fix round 1): the caller writes blocks or
   multi-block payloads straight into the mapped upload buffer; `run*` copy in as before. The bench
   still copies (its corpus lives in RAM), so this is an API for real producers, not a bench gain.
 - **Zero-copy output** (`FrameBatch` frames borrow the staging buffer; a sink may hand the batch
@@ -108,3 +117,8 @@ recycle; an upload slot dropped without submit), `stream_frames_errors_mid_strea
 producer error, bad submit sizes, sink and producer panics; the pipeline stays usable, every
 mode), `run_frames_par_every_index_once`, `stream_frames_multi_block_payloads` (payloads spanning
 blocks, written from threads into a slot holding stale bytes, per-block real lengths).
+
+Review fix round 1 added `upload_slot_bytes_are_initialized` (pins the wgpu-core behaviour the
+`unsafe` `blocks_mut` relies on: new slots read zeros, reused ones exactly what was written, in
+every mode), `failed_submit_is_sticky` (test-only submit-failure hook; later calls error instead
+of hanging, even if `produce` swallows the error) and `frame_batches_carry_their_tags`.

@@ -198,21 +198,25 @@ and hands them to the sink, so frame delivery overlaps the next uploads.
 
 - `Pipeline::stream_frames(on_batch, produce)`: the zero-copy form. `produce` gets a
   `FrameStream`; `next_upload_slot()` blocks until a slot is free and returns an `UploadSlot`
-  whose `blocks_mut()` / `block_mut(k)` / `regions_mut(&[blocks…])` are the mapped upload memory
-  itself (write blocks, or payloads spanning many blocks, straight into it; finish a payload with
-  `pad_payload`, whose per-block real lengths `payload_real_lens` gives), then `submit(n)` any
-  `n` up to the capacity (a partial batch, e.g. on a flush timer, is fine). `on_batch` receives
-  each completed batch as a `FrameBatch`, whose frames point into the staging buffer; the slot
-  is reused once the batch is dropped, which may happen on a writer thread (keep at most
-  `inflight - 1` alive). Errors or panics on either side abort the stream and leave the pipeline
-  usable.
+  whose `regions_mut(&[blocks…])` splits the mapped upload memory itself into write-only,
+  `Send` regions (write blocks, or payloads spanning many blocks, straight into them; finish a
+  payload with `Region::pad`, whose per-block real lengths `payload_real_lens` gives), then
+  `submit(n)` / `submit_with(n, tag)` any `n` up to the capacity (a partial batch, e.g. on a
+  flush timer, is fine). `unsafe fn blocks_mut()` gives the same memory as a `&mut [u8]` (sound
+  only on wgpu-core's native backends; see its docs). `on_batch` receives each completed batch
+  as a `FrameBatch` (`first_index()`, `tag()`, `frame(k)`), whose frames point into the staging
+  buffer; the slot is reused once the batch is dropped, which may happen on a writer thread.
+  Holding `inflight` batches stalls the stream and `inflight - 1` serialises it. Errors on
+  either side abort the stream (returned); panics are re-raised; the pipeline stays usable.
 - `run_frames(&blocks, &mut FrameSink)` / `run_frames_par(&blocks, &ParFrameSink, threads)` /
   `run(&blocks, &mut BlockSink)`: the `&[&[u8]]` wrappers (the producer copies the blocks in,
-  `GZC_UPLOAD_THREADS` threads).
+  `GZC_UPLOAD_THREADS` threads). **Sinks passed to `run`, `run_frames` and `compress_stream*`
+  must now be `Send`**: they are called on the completion thread.
 
-The direct-upload slot is write-combined device memory: write it sequentially and never read it.
-A decompressor reads its own output back for matches, so decode through a streaming decoder's
-window or a cached scratch buffer and let only the stores land in the slot.
+The upload slot is MAP_WRITE memory: write-combined device memory with the direct upload, and
+possibly uncached or write-combined host memory with the copy upload too. Write it sequentially
+and never read it. A decompressor reads its own output back for matches, so do not decode into
+the slot: decode into a cached buffer and copy the result in.
 
 ## Tuning / diagnostics
 
