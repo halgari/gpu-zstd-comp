@@ -109,6 +109,87 @@ Fix round 1 changes:
   so any cost is within noise.
 - `--verify` of the merged default passed: 2383.2 MB/s.
 
+## S3 — Subgroup-cooperative K3 (kept), 2026-09-30 00:45–03:10, load avg 0.5–2.9, other agents on the GPU at times (contended runs re-run; a "c" marks a contended run kept in the three-run list)
+
+**Diagnosis, before building.** A CPU instrumentation of `lazy_parse` over all 51,216 corpus blocks shows that K3 was dominated by
+literal scanning, not by flat-block extensions:
+- Skip iterations per block: mean 73 K, max 121 K. Deferral visits: 17.5 K. Sequences: 8.5 K.
+- The dependent-step cost of the sequential parse is narrow, from mean 245 K to max 290 K.
+
+Measured on the GPU, with K3 on batches of one replicated block:
+- The sequential kernel takes 50–59 ms on *every* kind of block.
+- The cooperative kernel's time is set by sequence-dense blocks: 43 ms for a block with 20 K sequences.
+- K3 is **per-warp latency-bound**: the dense block still takes 38 ms at 1 warp per SM.
+
+A microbenchmark of WGSL dependent-op latencies on the 5090: L1 load 19 ns, L2 137 ns, `subgroupShuffle` +18 ns, `subgroupBallot` +32 ns.
+Per-sequence time after the scan change is therefore set by the length of the op chain, not by memory round trips.
+
+What changed:
+- `k3_coop.wgsl`: one block per W lanes, where W = the minimum subgroup size (32 here).
+  - Replicated parse state and uniform control flow.
+  - Cooperative match_len (`subgroupMin`), catch-up, literal scan (W skip-sequence candidates per step), literal copy, and a deferral window taken from the scan lanes.
+  - A cooperative greedy parse for lvl3/rung1.
+- Lane probe; the sequential K3 as fallback (`GZC_K3_MODE=seq`, no subgroups, `GZC_NO_SUBGROUPS=1`).
+- Both K3 modules are built without naga's forced loop bounding. Every K3 loop provably terminates; bounds checks stay on.
+- Report: `.superpowers/sdd/2026-09-30-speed-phase/s3-report.md`.
+
+Stages (lvl9, b1890, i3, before the S2 merge, median of 3):
+
+| Step | E2E MB/s (3 runs) | Median | K3 ms/b | Sum ms/b | |
+|---|---|---:|---:|---:|---|
+| seq baseline | 1993.0 / 1984.4 / 1980.1 | 1984.4 | 58.75 | 109.60 | |
+| A as designed | 1648.2 / 1662.5 / 1654.8 | 1654.8 | 81.32 | 132.81 | slower |
+| A + uniform first-word probe | 1997.0 / 1998.8 / 2015.4 | 1998.8 | 57.81 | 108.61 | kept (base for B) |
+| B cooperative literal scan | 2438.9 / 2429.0 / 2439.1 | 2438.9 | 37.88 | 87.72 | kept |
+| C as designed (byte head/tail) | 2339.3 / 2085.4c / 2348.5 | 2339.3 | 41.60 | 91.67 | dropped |
+| C′ one load per literal word | 2485.9 / 2474.1 / 2259.5c | 2474.1 | 36.11 | 86.30 | kept |
+| D window | 2486.1 / 2488.8 / 2489.6 | 2488.8 | 35.62 | 85.81 | |
+| + known first word, wide extension | 2493.7 / 2501.7 / 2513.7 | 2501.7 | 35.10 | 85.24 | |
+| + window from the scan lanes | 1984.3c / 2516.8 / 2510.7 | 2510.7 | 34.59 | 84.98 | |
+| + scan loads before the immediate probe | 2529.3 / 2507.3 / 2510.0 | 2510.0 | 34.55 | 84.97 | dropped |
+| + `subgroupMin` in match_len | 2577.2 / 2574.4 / 2547.6 | 2574.4 | 32.81 | 82.66 | D kept |
+| `subgroupMin` in catch-up | 2563.3 / 2558.0 / 2563.3 | 2563.3 | 33.28 | 83.16 | dropped |
+| `subgroupMin` in scan + catch-up | 2553.7 / 2546.0 / 2553.1 | 2553.1 | 33.42 | 83.35 | dropped |
+| E: 2 blocks / workgroup | 2552.6 / 1711.7c / 2227.9c | — | 33.34 | 83.32 | opt-in `GZC_K3_BPW=2` |
+| no forced loop bounding | 2618.0 / 2613.8 / 2594.0 | 2613.8 | 31.50 | 81.31 | kept |
+| peel first match step | 2608.1 / 2610.1 / 2597.3 | 2608.1 | 31.68 | 81.52 | dropped |
+
+b1638 at stage B: seq 1891.4 / 1891.9 / 1892.7 (K3 58.51) → coop 2352.6 / 2353.3 / 2355.0 (K3 37.66).
+
+Final, merged with S2 (d49d4d3 + bc7ff57), i3, median of 3. "seq + LB" is the pre-S3 K3 in the same binary.
+
+| Preset / config | Batch | E2E MB/s (3 runs) | Median | K3 ms/b | Sum ms/b |
+|---|---:|---|---:|---:|---:|
+| lvl9 seq + LB | 2026 | 2403.2 / 2406.3 / 2406.5 | 2406.3 | 58.98 | 96.07 |
+| lvl9 seq | 2026 | 2454.6 / 2460.2 / 2459.0 | 2459.0 | 56.70 | 93.73 |
+| **lvl9 coop W32** | 2026 | 3278.8 / 3282.9 / 3268.4 | **3278.8** | **31.97** | **68.42** |
+| lvl9 coop W16 | 2026 | 3266.8 / 3286.3 / 3279.5 | 3279.5 | 32.03 | 68.50 |
+| lvl9 coop W8 | 2026 | 3254.0 / 3290.6 / 3228.8 | 3254.0 | 32.36 | 69.02 |
+| lvl9 seq | 1638 | 2201.9 / 2203.5 / 2200.4 | 2201.9 | 56.35 | 85.73 |
+| **lvl9 coop** | 1638 | 3029.4 / 3031.9 / 3032.5 | **3031.9** | 31.41 | 60.70 |
+| rung1 seq + LB | 2026 | 2828.2 / 2874.6 / 2864.8 | 2864.8 | 46.64 | 79.46 |
+| rung1 seq | 2026 | 3437.5 / 3471.7 / 3428.6 | 3437.5 | 32.50 | 65.01 |
+| **rung1 coop** | 2026 | 4902.5 / 4852.3 / 4881.4 | **4881.4** | 12.01 | 43.35 |
+| lvl3 seq + LB | 1736 | 2418.2 / 2416.6 / 2418.1 | 2418.1 | 46.48 | 82.79 |
+| lvl3 seq | 1736 | 2887.9 / 2878.7 / 2886.0 | 2886.0 | 32.28 | 68.35 |
+| **lvl3 coop** | 1736 | 4211.1 / 4220.3 / 4110.9 | **4211.1** | 8.82 | 44.71 |
+
+lvl9 per-kernel ms/batch (b2026): K1 13.17 · K2 10.57 · K3 31.98 · K4 9.11 · K5 3.58 · sum 68.42 (33.8 µs/block, was 47.4).
+
+`--verify` passed: lvl9 3260.7, rung1 4736.5, lvl3 4165.7 MB/s. Compressed bytes are identical in every mode, width and batch
+(lvl9 4,792,885,250; rung1 4,834,508,359; lvl3 5,108,985,909).
+
+**Kept.** Against the S1+S2 log:
+- lvl9: 2390.2 → 3278.8 MB/s (**+37 %**); b1638: 2140.5 → 3031.9 (+42 %).
+- Kernel sum: 96.6 → 68.4 ms/batch.
+- rung1 +70 % and lvl3 +74 % against the same binary's pre-S3 K3.
+
+E (2 blocks per workgroup) cannot help on the 5090: 32 resident workgroups per SM are never the limit. It stays opt-in for
+Ada-class cards, where 24 resident workgroups per SM means about 3.3 K3 waves per batch. It is unmeasured there.
+
+4060 view: the gain is a shorter dependent chain per block, not width or bandwidth (W8 ≈ W32; K3 reads < 5 GB/s). So it
+should carry over roughly 1:1 per block: K3 about 190 → about 105 ms/batch for lvl9 at ~3.3 waves, and 2.5–3.5× for greedy.
+
 ## S6 — Transfer path (branch of `speed` @ 966a24f), 2026-09-30 02:00–03:30, load avg 0.9–2.9, runs gated on no other gzc process on the GPU
 
 ### Where the time outside the kernels goes (before S6: lvl9, b2026 i3, 26 batches)
@@ -207,3 +288,27 @@ however, grows on such cards. A 4060 is PCIe 4.0 ×8 (~13 GB/s), so 128 KiB up a
 per block, against a projected 60–80 µs of kernel time: 20–25 % of the wall time, all of it serial with the kernels on
 one queue. That is where `GZC_PACK` (26 % fewer readback bytes) should be re-measured, together with a non-ReBAR check of
 the upload path.
+
+### S3 fix round 1 + S1+S2+S3+S6 merged (a3a5708 fixes, a1aeb86 merge of cb26ed0), 2026-09-30, load avg 0.8–2.7, runs gated on an idle GPU
+
+Fix round 1:
+- `coop_push_lits` is wrap-safe. Before, a final push from an anchor past BLOCK_SIZE (only reachable with a best[] word
+  that claims a match past the block end; K2 never writes one) wrapped `end - start` to about 2^32 bytes.
+- Every `k3_coop.wgsl` loop carries a termination note (variant and bound), and the unsafe justification for building K3 without
+  naga's loop bounding references them.
+- `gzc-bench` prints the pipeline's actual K3 mode.
+- New tests: an anchor past the block end (fails without the clamp); scans restarting mid-regime; a full literal region
+  next to fast blocks; the in-kernel sequential fallback forced on (`GZC_K3_FORCE_FALLBACK=1`, test-only); the probe at 2
+  blocks per workgroup.
+
+**Stage E (`GZC_K3_BPW=2`) is kept opt-in, default off, as an explicit exception to the ≥ 3 % rule** (controller ruling). It
+targets Ada's limit of 24 resident workgroups per SM and cannot be measured on the 5090. The full suite passes with it.
+
+lvl9, `--batch max` (b2431), i3, median of 3. "seq" is the sequential K3 in the same binary (without loop bounding):
+
+| Config | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Kernel sum ms/b |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| seq K3 | 2642.3 / 2642.7 / 2666.8 | 2642.7 | 15.39 | 12.45 | 58.95 | 11.81 | 3.97 | 102.57 |
+| **coop K3 (default)** | 3497.3 / 3526.7 / 3551.6 | **3526.7** | 15.37 | 12.56 | 32.61 | 9.95 | 4.14 | 74.62 |
+
+`--verify`: 3481.5 MB/s, passed. Compressed bytes are equal in both modes (4,792,885,250).

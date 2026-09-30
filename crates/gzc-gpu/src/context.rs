@@ -13,7 +13,8 @@ pub struct GpuContext {
     pub timestamps: bool,
     /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
     /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
-    /// otherwise the workgroup-sort fallback.
+    /// otherwise the workgroup-sort fallback. K3 runs its cooperative kernel
+    /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
     pub subgroups: bool,
     /// True when the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS` (mappable
     /// buffers may also be storage buffers): only when frame packing was asked for (`GZC_PACK`,
@@ -96,6 +97,21 @@ impl GpuContext {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(src.into()),
         })
+    }
+
+    /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
+    /// must provably terminate (a loop that does not is undefined behaviour for the driver).
+    pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
+        let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates (the K3
+        // modules' argument is at their call site in `Kernels::new`).
+        unsafe {
+            self.device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },
+                checks,
+            )
+        }
     }
 
     /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from.
