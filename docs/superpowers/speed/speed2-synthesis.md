@@ -1,7 +1,6 @@
 # Speed phase 2: research synthesis
 
-Inputs are ten independent reports (`.superpowers/speed2/r1…r10`); R9, the domain report, is folded in when
-it lands. Baseline on `master` @ 6bedcff: lvl9 **4107 MB/s** (b2559 i3) on the RTX 5090. Kernel time per batch
+Inputs are ten independent reports (`.superpowers/speed2/r1…r10`). Baseline on `master` @ 6bedcff: lvl9 **4107 MB/s** (b2559 i3) on the RTX 5090. Kernel time per batch
 is K3 31.0, K1 16.0, K2 10.4, K5 5.4 and K4 2.6 ms, plus 9 ms of serial copies.
 
 ## Where the reports converge
@@ -33,6 +32,9 @@ is K3 31.0, K1 16.0, K2 10.4, K5 5.4 and K4 2.6 ms, plus 9 ms of serial copies.
   - Spent as speed, rung1 plus a window still beats L9.
   - This changes the output contract: blocks are no longer independently decodable. **That is the user's
     decision.**
+- **Domain structure pays** (R9): DDS here is 69 % DXT5 and 31 % DXT1, with no BC5/BC7. DXT1 matches sit on the
+  8-byte grid, and grid-aligned search *raises* DXT1's ratio 1.374 → 1.391 at ~0.08× the chain steps. A
+  per-format preset gives ratio 1.3582 with ~⅓ of the K2 work.
 - **Dead ends, measured:**
   - Adaptive per-block level (R10).
   - Pre-classifying blocks (R8: 0 RLE blocks, 0.04 % incompressible).
@@ -56,6 +58,7 @@ is K3 31.0, K1 16.0, K2 10.4, K5 5.4 and K4 2.6 ms, plus 9 ms of serial copies.
 | E9 | WGSL bounds checks off (unchecked shader modules) | R2 | identical | unknown, free test | S |
 | E10 | Multi-block frames with a sliding window | R10 | **format change: needs user OK** | +2–4.7 % ratio, or rung1-level speed at > L9 ratio | L |
 | E11 | CUDA K3 proof of concept | R2 | identical | 1.1–1.8× K3 (after E1, likely moot) | M |
+| E13 | **Per-format preset `lvl9dds`**: selected per block from the DDS header. DXT1 hashes/searches only phase {0,4} mod 8 at depth 2; DXT5 depth 8; NIF depth 8 | R9 | new preset, **ratio 1.3582** (> lvl9) | K2 walk 0.29–0.38×, K1 inserts 0.78× (≈ −13–15 % GPU) | M |
 | E12 | Optimal parse beyond L9 (btopt-class) | R8 | new preset | +3 % ratio (L19), free on 7z-bound installs | L |
 
 ## Execution plan
@@ -63,7 +66,7 @@ is K3 31.0, K1 16.0, K2 10.4, K5 5.4 and K4 2.6 ms, plus 9 ms of serial copies.
 Parallel tracks on branch `speed2` touch disjoint files. Each is measured with the same protocol and reviewed:
 
 - **Track A (K3):** E1 segmented parse.
-- **Track B (K1/K2):** E2 bucket-sorted finder, then E4.
+- **Track B (K1/K2):** E2 bucket-sorted finder, then E4, then E13 (per-format preset; same kernels).
 - **Track C (host/queues):** E3 multi-queue + E8 + E9.
 - **After A–C merge:** E6, E7, E5 (E5 needs the proxy mode; the defaults touch `chains.rs` after B).
 - **Needs a user decision first:** E10.
