@@ -45,9 +45,9 @@ impl HufTable {
 /// Normative construction:
 /// 1. sort present symbols by `(count asc, symbol asc)`;
 /// 2. two-queue Huffman merge, taking the leaf on count ties;
-/// 3. depths are made non-increasing along that order (a no-op for the two-queue tree, kept as a
-///    cheap guarantee), then limited to 11 with a port of libzstd's `HUF_setMaxHeight` run on the
-///    reversed (count-descending) order;
+/// 3. the two-queue tree's depths are already non-increasing along that order (debug-asserted);
+///    they are limited to 11 with a port of libzstd's `HUF_setMaxHeight` run on the reversed
+///    (count-descending) order;
 /// 4. canonical codes per RFC 8878 (see [`from_lengths`]).
 pub fn build_table(counts: &[u32; 256]) -> Option<HufTable> {
     // 1. ascending (count, symbol)
@@ -87,10 +87,10 @@ pub fn build_table(counts: &[u32; 256]) -> Option<HufTable> {
         depth[id] = depth[parent[id]] + 1;
     }
 
-    // 3. count-descending order with non-decreasing depths, then limit.
-    let mut depths: Vec<u32> = depth[..n].to_vec();
-    depths.sort_unstable_by(|a, b| b.cmp(a)); // longest codes go to the smallest counts
-    let mut nodes: Vec<(u32, u32)> = (0..n).rev().map(|i| (leaves[i].0, depths[i])).collect();
+    // 3. count-descending order with non-decreasing depths, then limit. The two-queue merge takes
+    // leaves in (count, symbol) order, so a later leaf is never deeper than an earlier one.
+    debug_assert!(depth[..n].windows(2).all(|w| w[0] >= w[1]), "leaf depths not non-increasing");
+    let mut nodes: Vec<(u32, u32)> = (0..n).rev().map(|i| (leaves[i].0, depth[i])).collect();
     set_max_height(&mut nodes, HUF_MAX_BITS);
 
     let mut nb_bits = [0u8; 256];
@@ -240,13 +240,14 @@ fn from_lengths(nb_bits: [u8; 256]) -> HufTable {
 }
 
 /// Huffman tree description (RFC 8878 §4.2.1.1): weights of symbols `0..max_symbol` (the last one
-/// is implied). Direct 4-bit form if `max_symbol < 128`, otherwise FSE-compressed weights.
+/// is implied). Direct 4-bit form if `max_symbol <= 128` (at most 128 weights, header byte up to
+/// 255, as RFC 8878 and libzstd allow), otherwise FSE-compressed weights.
 /// `None` if the table cannot be described: the FSE form needs at least two distinct weight values
 /// (and some value used twice) and must fit in 127 bytes.
 pub fn table_description(t: &HufTable) -> Option<Vec<u8>> {
     let weights: Vec<u8> = (0..t.max_symbol).map(|s| t.weight(s)).collect();
     let mut out = Vec::with_capacity(1 + weights.len().div_ceil(2));
-    if weights.len() < 128 {
+    if weights.len() <= 128 {
         out.push(127 + weights.len() as u8);
         for pair in weights.chunks(2) {
             out.push((pair[0] << 4) | pair.get(1).copied().unwrap_or(0));
@@ -350,9 +351,11 @@ pub(crate) fn write_raw_rle_header(lit_type: u32, n: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// Compressed_Literals_Block (type 2) for `lits`, or `None` if Huffman cannot code them.
+/// Compressed_Literals_Block (type 2) for `lits`, or `None` if Huffman cannot code them (fewer than
+/// two distinct symbols, or a table [`table_description`] cannot describe).
 /// One stream if `lits.len() < 256`, else four; the header size follows the larger of the two sizes.
-fn compressed_section(lits: &[u8]) -> Option<Vec<u8>> {
+/// Public so tests can pin the Compressed-vs-Raw size boundary.
+pub fn compressed_section(lits: &[u8]) -> Option<Vec<u8>> {
     let mut counts = [0u32; 256];
     for &b in lits {
         counts[b as usize] += 1;
@@ -377,6 +380,8 @@ fn compressed_section(lits: &[u8]) -> Option<Vec<u8>> {
         }
     }
     let size = regen.max(payload.len()) as u32;
+    // One stream: < 256 literals, and a payload of at most 129 + ceil(255 * 11 / 8) bytes.
+    assert!(!single || size < 1 << 10, "single-stream literals need size format 0");
     let (regen, comp) = (regen as u32, payload.len() as u32);
     let mut out = Vec::with_capacity(5 + payload.len());
     if size < 1 << 10 {
@@ -582,6 +587,28 @@ mod tests {
         assert_eq!(t.max_symbol, 255);
         let d = table_description(&t).unwrap();
         assert!(d[0] < 128 && d.len() == 1 + d[0] as usize, "header {}", d[0]);
+    }
+
+    #[test]
+    fn max_symbol_128_uses_direct_weights() {
+        // Symbols 0..=128, 128 present: exactly 128 weights, the largest direct form (header 255),
+        // as RFC 8878 and libzstd's HUF_writeCTable allow (maxSymbolValue <= 128).
+        let mut r = Lcg(128);
+        let mut lits: Vec<u8> = Vec::new();
+        for s in 0..=128u32 {
+            lits.extend(std::iter::repeat_n(s as u8, 1 + (s * s % 37) as usize));
+        }
+        lits.extend((0..3000).map(|_| (r.below(8) * r.below(8)) as u8));
+        let t = build_table(&histogram(&lits)).unwrap();
+        assert_eq!(t.max_symbol, 128);
+        let d = table_description(&t).unwrap();
+        assert_eq!((d[0], d.len()), (255, 1 + 64), "direct form with 128 weights");
+        let mut sec = Vec::new();
+        write_literals_section(&lits, &mut sec);
+        assert_eq!(section_type(&sec), 2, "compressed");
+        let hdr = [3, 3, 4, 5][((sec[0] >> 2) & 3) as usize];
+        assert_eq!(&sec[hdr..hdr + d.len()], &d[..]);
+        decode_literals(&sec, &lits);
     }
 
     #[test]
