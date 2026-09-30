@@ -120,9 +120,10 @@ Headline (speed phase 2, `docs/results/2026-09-30-speed2.md`, RTX 5090, 64 KiB b
 corpus, `--batch max --inflight 3`): GPU **`lvl9s12seg` reaches 10588 MB/s** (median of 8 runs) at
 ratio **1.33926**, above libzstd L9's 1.3379 on the same blocks (libzstd L9: 1754 MB/s on 32
 threads). `lvl9` does 5767 MB/s and `lvl9seg` 8809 MB/s; with `GZC_NO_SUBGROUPS=1`, `lvl9s12seg`
-does 8722 MB/s. At this speed the pipeline is **host-bound** (the pipeline thread writes uploads and
-delivers frames; the GPU waits ~2 ms per batch), so end-to-end numbers depend on the CPU and system
-load. The earlier phases are in `docs/results/2026-09-29-m4.md` and
+does 8722 MB/s. At that point the pipeline was **host-bound** (one thread wrote uploads and
+delivered frames; the GPU waited ~2 ms per batch); since the host track (`docs/results/host-log.md`)
+frames are delivered on a completion thread beside the uploading thread and the GPU is the
+bottleneck again, with the host's share of the wall time down from ~40–120 ms to ~25 ms per run. The earlier phases are in `docs/results/2026-09-29-m4.md` and
 `docs/results/2026-09-30-speed.md` (128 KiB blocks). All these numbers are measured on an RTX
 5090.
 
@@ -148,8 +149,10 @@ list is swept:
   the same number for every preset. Lists can mix the two, e.g. `--batch 512,max`.
   The resolved number is what shows up in the run's config label.
 - `--inflight K` batches in flight (default 3).
-- `--writer-threads W` CPU threads that receive finished frames (default 0: the
-  pipeline thread does it).
+- `--writer-threads W` CPU threads that copy out finished frames (default 0: the
+  pipeline's completion thread does it, beside the uploading thread; N > 0: N threads share each
+  completed batch, `Pipeline::run_frames_par`). On the RTX 5090 box 4 threads measured 0–3 % over
+  0 at `--inflight 3` and 3 % at `--inflight 2` (`docs/results/host-log.md`).
 - `--vram-budget-mb M` (default 6144, i.e. an ~8 GB card minus headroom): every
   (batch, inflight) config must fit, checked before anything runs.
 - `--verify` decompresses every frame with libzstd after the timed pass.
@@ -186,6 +189,34 @@ cargo run --release -p gzc-bench -- all \
   --levels 1,2,3,4,5,6,9 --threads 1,8,16,32 --preset lvl3,lvl9,lvl9s12seg \
   --batch max --inflight 3 --verify --out out
 ```
+
+## Streaming API (`gzc_gpu::pipeline`)
+
+A `Pipeline` owns `inflight` slots (a mapped upload buffer and a staging buffer each). The calling
+thread is the producer; a completion thread per run waits for the batches in submission order
+and hands them to the sink, so frame delivery overlaps the next uploads.
+
+- `Pipeline::stream_frames(on_batch, produce)`: the zero-copy form. `produce` gets a
+  `FrameStream`; `next_upload_slot()` blocks until a slot is free and returns an `UploadSlot`
+  whose `regions_mut(&[blocks…])` splits the mapped upload memory itself into write-only,
+  `Send` regions (write blocks, or payloads spanning many blocks, straight into them; finish a
+  payload with `Region::pad`, whose per-block real lengths `payload_real_lens` gives), then
+  `submit(n)` / `submit_with(n, tag)` any `n` up to the capacity (a partial batch, e.g. on a
+  flush timer, is fine). `unsafe fn blocks_mut()` gives the same memory as a `&mut [u8]` (sound
+  only on wgpu-core's native backends; see its docs). `on_batch` receives each completed batch
+  as a `FrameBatch` (`first_index()`, `tag()`, `frame(k)`), whose frames point into the staging
+  buffer; the slot is reused once the batch is dropped, which may happen on a writer thread.
+  Holding `inflight` batches stalls the stream and `inflight - 1` serialises it. Errors on
+  either side abort the stream (returned); panics are re-raised; the pipeline stays usable.
+- `run_frames(&blocks, &mut FrameSink)` / `run_frames_par(&blocks, &ParFrameSink, threads)` /
+  `run(&blocks, &mut BlockSink)`: the `&[&[u8]]` wrappers (the producer copies the blocks in,
+  `GZC_UPLOAD_THREADS` threads). **Sinks passed to `run`, `run_frames` and `compress_stream*`
+  must now be `Send`**: they are called on the completion thread.
+
+The upload slot is MAP_WRITE memory: write-combined device memory with the direct upload, and
+possibly uncached or write-combined host memory with the copy upload too. Write it sequentially
+and never read it. A decompressor reads its own output back for matches, so do not decode into
+the slot: decode into a cached buffer and copy the result in.
 
 ## Tuning / diagnostics
 
