@@ -85,10 +85,11 @@ pub fn preset(name: &str) -> Result<MatchParams, String> {
     })
 }
 
-/// Whether the CPU reference implements `p` (chains, best match and parse).
-/// Task 2 adds the `Single` hash chain for the greedy parse; Task 4 adds the lazy parse.
+/// Whether the CPU reference implements `p` (chains, best match and parse). Since Task 4
+/// (the lazy/lazy2 parse) it implements every preset and every valid `MatchParams`.
 pub fn cpu_supports(p: &MatchParams) -> bool {
-    p.lazy == 0
+    // Now just `validate()`: kept as a separate hook for the CLI's per-engine preset check.
+    p.validate().is_ok()
 }
 
 #[cfg(test)]
@@ -146,11 +147,12 @@ mod tests {
     }
 
     #[test]
-    fn cpu_supports_greedy_parses_only_for_now() {
-        assert!(cpu_supports(&LVL3));
+    fn cpu_supports_all_presets() {
+        for (name, p) in PRESETS {
+            assert!(cpu_supports(&p), "{name}");
+        }
         assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
-        assert!(cpu_supports(&RUNG1));
-        assert!(!cpu_supports(&RUNG2));
-        assert!(!cpu_supports(&LVL9));
+        assert!(cpu_supports(&MatchParams { min_match: 6, lazy: 1, ..RUNG2 }));
+        assert!(!cpu_supports(&MatchParams { lazy: 3, ..LVL9 }));
     }
 }

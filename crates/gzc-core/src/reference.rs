@@ -6,6 +6,7 @@
 use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash_long, hash_short, hash_width};
+use crate::lazy::lazy_parse;
 use crate::params::{cpu_supports, Hashes, MatchParams};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
@@ -90,11 +91,14 @@ pub fn find_best(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec
     best
 }
 
-/// Parse a block from its best matches: the greedy parse for `lazy == 0` (the lazy parse
-/// arrives in Task 4).
+/// Parse a block from its best matches: the greedy parse for `lazy == 0`, otherwise the
+/// libzstd lazy/lazy2 port (`lazy::lazy_parse`).
 pub fn parse(block: &[u8], best: &[Match], p: &MatchParams) -> BlockOutput {
-    assert!(p.lazy == 0, "reference::parse: lazy {} is not implemented yet", p.lazy);
-    greedy_parse(block, best, p)
+    if p.lazy == 0 {
+        greedy_parse(block, best, p)
+    } else {
+        lazy_parse(block, best, p)
+    }
 }
 
 /// Greedy parse: at each position, prefer a repeat-offset match (rep0) over the best
@@ -295,9 +299,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented yet on cpu")]
-    fn unsupported_params_panic_clearly() {
-        compress_block(&synth::zeros(BLOCK_SIZE), crate::params::LVL9);
+    #[should_panic(expected = "invalid params")]
+    fn invalid_params_panic_clearly() {
+        compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::params::LVL9 });
     }
 
     /// xxh64 of the concatenated lvl3 frames, captured on the unmodified M3 code (ddeee75).
