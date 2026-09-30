@@ -102,3 +102,10 @@ Then the whole-branch review.
     positions per thread, or prefetching pred[q] one step ahead);
   - K1's table-group count and tile loop.
   - Output is byte-identical.
+- **S9 — K4 sequence-entropy pass** (added after S4): K4 ≈ 10 ms/batch, dominated by thread 0's sequential
+  work (histogram → normalize → table builds → backward FSE bitstream).
+  - Split the bitstream encode: first a sequential pass of FSE state transitions only (cheap table lookups),
+    recording per-step (value, nbits) for states and extra bits.
+  - Then a prefix sum over bit counts and a parallel bit placement (atomicOr), as K5 already does.
+  - Also parallelize the normalize/cost loops where the oracle order allows it.
+  - Output is byte-identical.
