@@ -44,8 +44,10 @@ pub const MAX_SEQS_MIN_SEQ_LEN: usize = 4;
 /// At 128K this is 32769 > 0x7F00, so K4's 3-byte nbSeq header is reachable.
 pub const MAX_SEQS: u32 = (BLOCK_SIZE / MAX_SEQS_MIN_SEQ_LEN) as u32 + 1;
 
-/// Largest batch `compress_batch` allocates buffers for (~2.8 MiB per 128K block, ~700 MiB), even when
-/// the device limits would allow more.
+/// Largest batch `compress_batch`/`compress_frames` allocate buffers for, even when the device
+/// limits would allow more. At 128K blocks, worst case (dfast's two hash chains, `emit_frames`:
+/// `data_bytes` + `chains::head_bytes`/`pred_bytes` + `best_bytes` + `seqs_bytes` + `counts_bytes`
+/// + `frames_bytes` + `frame_len_bytes`) is ~2.6 MiB per block, ~672 MiB at this cap.
 const COMPRESS_BATCH_CAP: u32 = 256;
 
 /// Kernel names, in timestamp-query order, as reported in timing breakdowns (`k4_entropy` and
@@ -994,7 +996,10 @@ fn submit_from_best(
 }
 
 /// Runs `f` inside wgpu out-of-memory and validation error scopes, turning either into `Err`.
-fn with_error_scopes<T>(ctx: &GpuContext, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+/// `pub(crate)` so other modules that build+probe a pipeline outside `Kernels` (`chains`'
+/// subgroup-kernel self-test) can catch a wgpu validation error at its source, instead of letting
+/// it surface uncaptured (which wgpu may attribute to a later, unrelated error scope).
+pub(crate) fn with_error_scopes<T>(ctx: &GpuContext, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
     let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let result = f();

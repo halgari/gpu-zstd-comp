@@ -14,7 +14,7 @@
 //!
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
-use gzc_core::config::{BLOCK_SIZE, HASH_BITS, LOG2_BLOCK, NO_POS};
+use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, HASH_BITS, LOG2_BLOCK, NO_POS};
 use gzc_core::params::MatchParams;
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
@@ -130,6 +130,10 @@ pub struct ChainsKernel {
     n_hashes: u32,
     subgroups: bool,
     opts: ChainsOptions,
+    /// `GZC_K1_GROUPS`, parsed and validated once at construction (`build`), not per `record`
+    /// call: `None` if it's unset, else the workgroup count it named. A non-numeric or
+    /// non-positive value errors clearly here, the same way `GZC_K3_MODE`/`GZC_K3_W` do.
+    env_groups: Option<u32>,
 }
 
 impl ChainsKernel {
@@ -147,16 +151,32 @@ impl ChainsKernel {
         // subgroup, and reads ballots of up to 128 lanes.
         let info = &ctx.adapter_info;
         if ctx.subgroups && info.subgroup_min_size >= 32 && info.subgroup_max_size <= 128 {
-            let k = Self::build(ctx, params, opts, true);
-            match k.self_test(ctx, params) {
-                Ok(()) => return Ok(k),
-                Err(e) => eprintln!("gzc-gpu: K1 subgroup kernel failed its self-test ({e}); using the fallback K1"),
+            // Build + self-test inside their own error scope (like `probe_lanes`), so a wgpu
+            // validation error from the subgroup shader/pipeline (not just a wrong self-test
+            // result) also falls back here instead of surfacing uncaptured, which wgpu may
+            // attribute to a later, unrelated error scope (e.g. `Pipeline::new`'s).
+            let built = crate::compressor::with_error_scopes(ctx, || {
+                let k = Self::build(ctx, params, opts, true)?;
+                k.self_test(ctx, params)?;
+                Ok(k)
+            });
+            match built {
+                Ok(k) => return Ok(k),
+                Err(e) => eprintln!("gzc-gpu: K1 subgroup kernel failed to build or its self-test ({e}); using the fallback K1"),
             }
         }
-        Ok(Self::build(ctx, params, opts, false))
+        Self::build(ctx, params, opts, false)
     }
 
-    fn build(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions, subgroups: bool) -> Self {
+    fn build(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions, subgroups: bool) -> anyhow::Result<Self> {
+        let env_groups = match std::env::var("GZC_K1_GROUPS") {
+            Ok(v) => {
+                let g: u32 = v.parse().map_err(|_| anyhow::anyhow!("GZC_K1_GROUPS={v}: not a number"))?;
+                anyhow::ensure!(g > 0, "GZC_K1_GROUPS={v}: expected a positive number");
+                Some(g)
+            }
+            Err(_) => None,
+        };
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -197,13 +217,17 @@ impl ChainsKernel {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { pipeline, layout, n_hashes: params.n_hashes(), subgroups, opts }
+        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), subgroups, opts, env_groups })
     }
 
     /// Guards the subgroup kernel's assumptions (full, equally sized subgroups of >= 32 lanes
     /// covering the 256-lane workgroup, exact ballots): builds the chains of small-alphabet, text
     /// and texture-like blocks, twice on one head buffer and once with one workgroup building all
-    /// of them in a row, and compares them with `gzc_core::reference::chains`.
+    /// of them in a row, and compares them with `gzc_core::reference::chains` — both the decoded
+    /// predecessor (`pred_of_word`) and the raw K1 word (predecessor bits plus the `pred_fp`
+    /// fingerprint), so a subgroup kernel that gets the predecessor right but the fingerprint
+    /// wrong (K2 relies on it to skip candidates without loading bytes) still fails here and falls
+    /// back.
     fn self_test(&self, ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<()> {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         let alphabet: Vec<u8> = (0..BLOCK_SIZE)
@@ -217,6 +241,30 @@ impl ChainsKernel {
         let blocks = [alphabet, gzc_core::synth::text(11, BLOCK_SIZE), gzc_core::synth::dds_like(12, BLOCK_SIZE)];
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         let want: Vec<Vec<Vec<u32>>> = blocks.iter().map(|b| gzc_core::reference::chains(b, params)).collect();
+        // The raw K1 word `want` predicts for each block/chain/position: `pred_word(pr, fp)` from
+        // common.wgsl, i.e. PRED_POS with the fingerprint OR'd in when there's no predecessor
+        // (p < HASHED_POSITIONS), else plain PRED_POS.
+        let want_words: Vec<Vec<Vec<u32>>> = blocks
+            .iter()
+            .zip(&want)
+            .map(|(block, chains)| {
+                chains
+                    .iter()
+                    .map(|chain| {
+                        (0..BLOCK_SIZE)
+                            .map(|p| {
+                                if p < HASHED_POSITIONS {
+                                    let pr = chain[p];
+                                    (if pr == NO_POS { PRED_POS } else { pr }) | pred_fp(block, p)
+                                } else {
+                                    PRED_POS
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
         let n = blocks.len() as u32;
         let packed = pack_blocks(&refs);
         let data = ctx.storage_buffer("k1.selftest.data", (packed.len() * 4) as u64, false);
@@ -224,10 +272,20 @@ impl ChainsKernel {
         let head = ctx.storage_buffer("k1.selftest.head", head_bytes(n, self.n_hashes), false);
         let pred = ctx.storage_buffer("k1.selftest.pred", pred_bytes(n, self.n_hashes), true);
         let one_group = Self { opts: ChainsOptions { groups: Some(1), ..self.opts }, ..self.shallow_clone() };
+        let per_block = self.n_hashes as usize * BLOCK_SIZE;
         for (round, k) in [self, self, &one_group].into_iter().enumerate() {
-            let got = k.run(ctx, &data, &head, &pred, n);
+            let raw = k.run_words(ctx, &data, &head, &pred, n);
+            let got_words: Vec<Vec<Vec<u32>>> =
+                raw.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect();
+            let got: Vec<Vec<Vec<u32>>> = got_words
+                .iter()
+                .map(|block| block.iter().map(|chain| chain.iter().copied().map(pred_of_word).collect()).collect())
+                .collect();
             if let Some(b) = (0..blocks.len()).find(|&b| got[b] != want[b]) {
                 anyhow::bail!("pred of self-test block {b} differs from the CPU in round {round}");
+            }
+            if let Some(b) = (0..blocks.len()).find(|&b| got_words[b] != want_words[b]) {
+                anyhow::bail!("raw pred word (fingerprint bits) of self-test block {b} differs from the CPU in round {round}");
             }
         }
         Ok(())
@@ -240,6 +298,7 @@ impl ChainsKernel {
             n_hashes: self.n_hashes,
             subgroups: self.subgroups,
             opts: self.opts,
+            env_groups: self.env_groups,
         }
     }
 
@@ -325,8 +384,7 @@ impl ChainsKernel {
         let tables = (head.size() / TABLE_BYTES).min(HEAD_TABLES as u64) as u32;
         assert!(tables >= n_tasks.min(HEAD_TABLES), "head buffer smaller than head_bytes({n_blocks}, {})", self.n_hashes);
         let max_wg = ctx.device.limits().max_compute_workgroups_per_dimension;
-        let env = || std::env::var("GZC_K1_GROUPS").ok().and_then(|v| v.parse().ok()).filter(|&g: &u32| g > 0);
-        let wanted = self.opts.groups.or_else(env).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
+        let wanted = self.opts.groups.or(self.env_groups).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
         // At most MAX_TAG chains per workgroup (the subgroup kernel's tags).
         let groups = wanted.max(n_tasks.div_ceil(MAX_TAG)).min(n_tasks).min(tables).min(max_wg);
         assert!(n_tasks.div_ceil(groups) <= MAX_TAG, "{n_tasks} chains over {groups} workgroups");

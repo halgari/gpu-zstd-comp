@@ -26,7 +26,9 @@ impl GpuContext {
     /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
     /// enabling timestamp queries and subgroups when available. Setting the
     /// environment variable `GZC_NO_SUBGROUPS` to anything but `0` leaves subgroups off, which
-    /// selects K1's fallback kernel. `GZC_PACK` set to anything but `0` requests
+    /// selects K1's fallback kernel and, since `compressor::k3_mode` also checks `ctx.subgroups`,
+    /// forces the sequential K3 as well (`K3Mode::Seq`, not the subgroup-cooperative `k3_coop.wgsl`).
+    /// `GZC_PACK` set to anything but `0` requests
     /// `MAPPABLE_PRIMARY_BUFFERS` (see `with_options`), which turns on the pipeline's frame packing.
     pub fn new() -> anyhow::Result<Self> {
         let off = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v != "0");

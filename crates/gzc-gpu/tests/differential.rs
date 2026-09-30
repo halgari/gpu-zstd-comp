@@ -16,7 +16,7 @@ use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_bas
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
 use gzc_gpu::compressor::{
-    GpuParams, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
+    GpuParams, K3Mode, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
     parses_from_best,
 };
 use gzc_gpu::context::GpuContext;
@@ -448,6 +448,27 @@ fn gpu_frames_batch_of_300_mixed() {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup_frames_for(params, true);
         let blocks: Vec<_> = frame_blocks().into_iter().cycle().take(300).collect();
+        check_frames(&ctx, &kernels, &blocks);
+    }
+}
+
+/// With subgroups off (`GpuContext::with_subgroups(false)`), K1 builds only its fallback kernel
+/// (`ChainsKernel::with_options` only attempts the subgroup kernel when `ctx.subgroups`) and
+/// `compressor::k3_mode` (which also checks `ctx.subgroups`) picks the sequential K3 instead of
+/// the cooperative one — the code path a GPU without subgroup support runs everywhere. Runs the
+/// full frame pipeline for every preset on a few synthetic blocks, so plain `cargo test` covers
+/// fallback K1 and sequential K3 together, without needing such hardware.
+#[test]
+fn gpu_frames_identical_without_subgroups() {
+    let blocks: Vec<_> = frame_blocks().into_iter().step_by(4).collect();
+    assert!(blocks.len() >= 3, "expected a handful of synthetic blocks, got {}", blocks.len());
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let ctx = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
+        assert!(!ctx.subgroups, "with_subgroups(false) must disable subgroups");
+        let kernels =
+            Kernels::new(&ctx, GpuParams { matching: params, emit_frames: true, huffman: true }).expect("Kernels::new");
+        assert_eq!(kernels.k3_mode(), K3Mode::Seq, "{name}: with_subgroups(false) must force the sequential K3");
         check_frames(&ctx, &kernels, &blocks);
     }
 }

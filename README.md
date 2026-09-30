@@ -98,10 +98,12 @@ parameters (`gzc_core::params::PRESETS`), one run per preset:
 | `rung2` | single 4 B | 4 | 8 | lazy | L6 |
 | `lvl9` | single 4 B | 4 | 32 | lazy2 | L9 |
 
-All four presets run on both `cpu-ref` and the GPU. See
-`docs/results/2026-09-29-m4.md` for the full M4 measurement; the headline: GPU
-`lvl9` reaches ratio 1.3549 at 1611 MB/s, against libzstd L9 at 8 threads'
-1.3532 at 669 MB/s — matching L9's ratio at 2.4x its throughput.
+All four presets run on both `cpu-ref` and the GPU. See `docs/results/2026-09-29-m4.md`
+for the M4 measurement and `docs/results/2026-09-30-speed.md` for the speed-phase
+headline: GPU `lvl9` now reaches **4107 MB/s** at `--batch max --inflight 3` (**4260
+MB/s** at `--inflight 2`), ratio 1.355 — matching libzstd L9's ratio (1.3532) at 669
+MB/s on 8 threads of the same CPU. All these numbers are measured on an RTX 5090; the
+speed-phase doc also has a projection for an 8 GB-class card.
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -112,7 +114,7 @@ cargo run --release -p gzc-bench -- ref \
 ```
 
 `gzc-bench gpu` runs the streaming GPU compressor (engine `gpu`, config
-`<preset> b<batch> i<inflight>`, e.g. `lvl9 b1638 i3`): the GPU runs the whole parse and emits
+`<preset> b<batch> i<inflight>`, e.g. `lvl9 b2559 i3`): the GPU runs the whole parse and emits
 complete zstd frames (Huffman literals included), byte-identical to `cpu-ref`;
 the host only uploads blocks and copies finished frames out. Each comma-separated
 list is swept:
@@ -131,9 +133,16 @@ list is swept:
   (batch, inflight) config must fit, checked before anything runs.
 - `--verify` decompresses every frame with libzstd after the timed pass.
 
-At the default 6144 MiB budget and `--inflight 3`, `--batch max` resolves to
-b1365 for `lvl3` (its two hash chains cost more scratch per block) and b1638 for
-the single-hash presets (`rung1`, `rung2`, `lvl9`):
+At the default 6144 MiB budget, `--batch max` resolves (RTX 5090) to b2047 for
+`lvl3` (its two hash chains cost more scratch per block) and b2559 for the
+single-hash presets (`rung1`, `rung2`, `lvl9`) at `--inflight 3`; at `--inflight 2`
+it's b2047 for `lvl3` and b2860 for the single-hash presets. These depend on the
+pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes`), not just the device, so
+re-derive them for your own card/build with e.g.:
+
+```sh
+cargo run --release -p gzc-bench -- gpu --synthetic --preset lvl3,rung1,lvl9 --batch max --inflight 3
+```
 
 ```sh
 cargo run --release -p gzc-bench -- gpu --synthetic --verify   # smoke run
@@ -154,3 +163,31 @@ cargo run --release -p gzc-bench -- all \
   --levels 1,2,3,4,5,6 --threads 1,8,16,32 --preset lvl3,rung1,rung2,lvl9 \
   --batch max --inflight 3 --verify --out out
 ```
+
+## Tuning / diagnostics
+
+Environment knobs for the GPU kernels (`crates/gzc-gpu`), all read once at startup or
+kernel construction, never per record:
+
+- `GZC_NO_SUBGROUPS` (anything but `0`): forces the fallback K1 (`k1_chains.wgsl`)
+  **and** the sequential K3 (`k3_parse.wgsl`/`k3_lazy.wgsl`) — this is the code path
+  GPUs without subgroup support run, and the floor for throughput on this card (see
+  `docs/results/2026-09-30-speed.md`).
+- `GZC_K1_GROUPS=N`: live head tables (persistent workgroups) the subgroup K1 kernel
+  keeps resident; default 128, sized for the ~32 MB L2 of 8 GB-class cards. 256 is
+  about +7% on an RTX 5090 (96 MB L2).
+- `GZC_K3_MODE=seq|coop`: forces the sequential or subgroup-cooperative K3 kernel
+  (`coop` errors if the device/probe can't support it); default: auto-detected.
+- `GZC_K3_W=4|8|16|32|64`: cooperative K3's lanes per block (at most the device's
+  minimum subgroup size).
+- `GZC_K3_BPW=2`: two blocks per cooperative-K3 workgroup (needs min == max subgroup
+  size == W); opt-in, worthwhile on Ada's 24-workgroups-per-SM limit.
+- `GZC_PACK` (anything but `0`): GPU-side frame packing instead of the fixed-stride
+  copy; opt-in, since it's slower than the copy on an RTX 5090 but saves PCIe traffic
+  worth it on ×8-lane cards.
+- `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
+  time runs without per-kernel timestamp queries.
+- `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
+  the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
+  failed lane-layout guard takes), so tests can exercise it without a device that
+  actually fails the guard.
