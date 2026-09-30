@@ -35,29 +35,41 @@ fn load_u32_nb(base: u32, byte_off: u32) -> u32 {
 // lanes the sequential loop would still compare (n + 4k + 4 <= max) are a prefix of the lanes, so
 // the first lane that mismatches or is invalid is where the sequential word loop returns or
 // stops. The byte tail is the sequential one. Invalid lanes load at p / q (in the block).
-fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32) -> u32 {
+// mode: MATCH_PROBE first compares the first word uniformly (same address in every lane): most
+// rep probes end there, and then cost what the sequential probe costs. MATCH_FIRST_EQ: the caller
+// knows the first 4 bytes match and 4 <= max (the compare starts at 4). MATCH_WIDE: all words
+// cooperatively from 0 (capped extensions, which are long).
+const NO_DIFF: u32 = 0xFFFFFFFFu;
+const MATCH_PROBE: u32 = 0u;
+const MATCH_FIRST_EQ: u32 = 1u;
+const MATCH_WIDE: u32 = 2u;
+
+fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32, mode: u32) -> u32 {
     let max = min(BLOCK_SIZE - p, cap);
     var n = 0u;
-    // The sequential loop's first word, uniformly (same address in every lane): most calls are
-    // rep probes that end here, and then cost what the sequential probe costs.
-    if (4u <= max) {
+    if (mode == MATCH_FIRST_EQ) {
+        n = 4u;
+    } else if (mode == MATCH_PROBE && 4u <= max) {
         let x0 = load_u32_at(base, p) ^ load_u32_at(base, q);
         if (x0 != 0u) { return countTrailingZeros(x0) >> 3u; }
         n = 4u;
     }
+    // Lane k's candidate is 4k + (index of its first differing byte), or NO_DIFF; an invalid lane
+    // counts as differing at its byte 0. Candidates grow with k (4k + b < 4(k + 1)), so the
+    // minimum is the first lane that differs or is invalid; which of the two it is follows from
+    // its lane index m / 4.
     loop {
         let o = n + 4u * k;
         let valid = o + 4u <= max;
         let oc = select(0u, o, valid);
         var x = load_u32_nb(base, p + oc) ^ load_u32_nb(base, q + oc);
         x = select(0xFFFFFFFFu, x, valid);
-        let f = first_lane(subgroupBallot(x != 0u));
-        if (f < W) {
-            if (n + 4u * f + 4u <= max) {
-                let xf = subgroupShuffle(x, f);
-                return n + 4u * f + (countTrailingZeros(xf) >> 3u);
+        let m = subgroupMin(select(NO_DIFF, 4u * k + (countTrailingZeros(x) >> 3u), x != 0u));
+        if (m != NO_DIFF) {
+            if (n + (m & ~3u) + 4u <= max) {
+                return n + m;
             }
-            n += 4u * f;
+            n += m;
             break;
         }
         n += 4u * W;
@@ -72,8 +84,14 @@ fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32) -> u32 {
 // == rep_len (k3_lazy.wgsl).
 fn coop_rep_len(base: u32, p: u32, off: u32, k: u32) -> u32 {
     if (off == 0u || off > p) { return 0u; }
-    let l = coop_match_len(base, p, p - off, 0xFFFFFFFFu, k);
+    let l = coop_match_len(base, p, p - off, 0xFFFFFFFFu, k, MATCH_PROBE);
     return select(0u, l, l >= 4u);
+}
+
+// == rep_len(p, off) when its first 4 bytes are known to match (then off is usable, the result
+// is >= 4, and BLOCK_SIZE - p >= 8 at every call site).
+fn coop_rep_len_hit(base: u32, p: u32, off: u32, k: u32) -> u32 {
+    return coop_match_len(base, p, p - off, 0xFFFFFFFFu, k, MATCH_FIRST_EQ);
 }
 
 // == search_max (k3_lazy.wgsl) for the best[] word `w` at ip.
@@ -83,7 +101,7 @@ fn coop_search_max_w(base: u32, w: u32, ip: u32, k: u32) -> vec2<u32> {
     let off = best_off_of(w);
     var len = bl;
     if (bl == SEARCH_CAP) {
-        len = coop_match_len(base, ip, ip - off, 0xFFFFFFFFu, k);
+        len = coop_match_len(base, ip, ip - off, 0xFFFFFFFFu, k, MATCH_WIDE);
     }
     return vec2<u32>(len, off + 3u);
 }
@@ -156,6 +174,34 @@ fn coop_store_seq(base: u32, sbase: u32, n_seq: u32, anchor: u32, ll: u32, offse
     return n_seq + 1u;
 }
 
+// Deferral window: lane k holds best[win_b + k] and whether the rep probe at win_b + k + 1 matches
+// its first 4 bytes (== rep_len(win_b + k + 1, offset_1) > 0), for lanes k < win_n. Position P is
+// covered when 1 <= P - win_b < win_n. A literal scan with step 1 leaves exactly this in its lanes
+// (win_b = the scan's start), so the deferral after it usually needs no loads; otherwise the
+// window is filled from P - 1. offset_1 cannot change between the scan and the end of the deferral
+// loop. Filled positions are clamped below PARSE_END (never visited at or past it).
+var<private> win_b: u32;
+var<private> win_n: u32;
+var<private> win_bw: u32;
+var<private> win_rep4: u32;
+
+fn win_fill(base: u32, bbase: u32, p: u32, off1: u32, k: u32) {
+    win_b = p - 1u;
+    win_n = W;
+    win_bw = best[bbase + min(p - 1u + k, PARSE_END - 1u)];
+    let rp = min(p + k, PARSE_END - 1u);
+    let usable = off1 != 0u && off1 <= rp;
+    let src = select(rp, rp - off1, usable);
+    win_rep4 = select(0u, 1u, usable && load_u32_nb(base, rp) == load_u32_nb(base, src));
+}
+
+// (best[p], rep4 at p) from the window, refilled when p is not covered. p > win_b.
+fn win_at(base: u32, bbase: u32, p: u32, off1: u32, k: u32) -> vec2<u32> {
+    if (p - win_b == 0u || p - win_b >= win_n) { win_fill(base, bbase, p, off1, k); }
+    let i = p - win_b;
+    return vec2<u32>(subgroupShuffle(win_bw, i), subgroupShuffle(win_rep4, i - 1u));
+}
+
 // == lazy_parse (k3_lazy.wgsl): cooperative literal scan, match_len and catch-up.
 fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     var n_seq = 0u;
@@ -183,10 +229,16 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         let rep4 = usable && (load_u32_nb(base, rp) == load_u32_nb(base, src));
         let hit = valid && (best_len_of(bw) >= MIN_MATCH || rep4);
         let h = first_lane(subgroupBallot(hit));
+        let n_valid = first_lane(subgroupBallot(!valid));
         if (h == W) {
-            ip += first_lane(subgroupBallot(!valid)) * step;
+            ip += n_valid * step;
             continue;
         }
+        // The scan's lanes are the deferral window when it visited consecutive positions.
+        win_b = ip;
+        win_n = select(0u, n_valid, step == 1u);
+        win_bw = bw;
+        win_rep4 = select(0u, 1u, rep4);
         ip += h * step;
         let ip_bw = subgroupShuffle(bw, h);
         let ip_rep4 = subgroupShuffle(select(0u, 1u, rep4), h) != 0u;
@@ -197,7 +249,7 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         var start = ip + 1u;
 
         if (ip_rep4) {
-            match_length = coop_rep_len(base, ip + 1u, offset_1, k);
+            match_length = coop_rep_len_hit(base, ip + 1u, offset_1, k);
         }
         let m0 = coop_search_max_w(base, ip_bw, ip, k);
         if (m0.x > 0u && m0.x > match_length) {
@@ -215,7 +267,9 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         loop {
             if (ip + 1u >= PARSE_END) { break; }
             ip += 1u;
-            let ml_rep = coop_rep_len(base, ip, offset_1, k);
+            let d1 = win_at(base, bbase, ip, offset_1, k);
+            var ml_rep = 0u;
+            if (d1.y != 0u) { ml_rep = coop_rep_len_hit(base, ip, offset_1, k); }
             if (ml_rep >= 4u) {
                 let gain2 = i32(ml_rep * 3u);
                 let gain1 = i32(match_length * 3u) - highbit(off_base) + 1;
@@ -225,7 +279,7 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
                     start = ip;
                 }
             }
-            let m1 = coop_search_max_w(base, best[bbase + ip], ip, k);
+            let m1 = coop_search_max_w(base, d1.x, ip, k);
             if (m1.x > 0u) {
                 let gain2 = i32(m1.x * 4u) - highbit(m1.y);
                 let gain1 = i32(match_length * 4u) - highbit(off_base) + 4;
@@ -238,7 +292,9 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
             }
             if (LAZY == 2u && ip + 1u < PARSE_END) {
                 ip += 1u;
-                let ml_rep2 = coop_rep_len(base, ip, offset_1, k);
+                let d2 = win_at(base, bbase, ip, offset_1, k);
+                var ml_rep2 = 0u;
+                if (d2.y != 0u) { ml_rep2 = coop_rep_len_hit(base, ip, offset_1, k); }
                 if (ml_rep2 >= 4u) {
                     let gain2 = i32(ml_rep2 * 4u);
                     let gain1 = i32(match_length * 4u) - highbit(off_base) + 1;
@@ -248,7 +304,7 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
                         start = ip;
                     }
                 }
-                let m2 = coop_search_max_w(base, best[bbase + ip], ip, k);
+                let m2 = coop_search_max_w(base, d2.x, ip, k);
                 if (m2.x > 0u) {
                     let gain2 = i32(m2.x * 4u) - highbit(m2.y);
                     let gain1 = i32(match_length * 4u) - highbit(off_base) + 7;
