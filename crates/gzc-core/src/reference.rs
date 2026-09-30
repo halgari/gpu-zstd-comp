@@ -276,4 +276,29 @@ mod tests {
             }
         }
     }
+
+    /// xxh64 of the concatenated lvl3 frames, captured on the unmodified M3 code (ddeee75).
+    #[cfg(feature = "block-128k")]
+    const M3_LVL3_ANCHOR: u64 = 0xc8ea1f5b1315917e;
+    #[cfg(feature = "block-64k")]
+    const M3_LVL3_ANCHOR: u64 = 0x2e488c60ec5d4e73;
+    #[cfg(feature = "block-32k")]
+    const M3_LVL3_ANCHOR: u64 = 0x0eab410abe5b93ef;
+    #[cfg(feature = "block-16k")]
+    const M3_LVL3_ANCHOR: u64 = 0x8ac4e7dead6b2d84;
+
+    /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
+    /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.
+    #[test]
+    fn lvl3_frames_match_m3_anchor() {
+        let mut all = Vec::new();
+        for (_, bytes) in synth::test_cases() {
+            for blk in chunk_file(&bytes) {
+                all.extend_from_slice(&compress_block_to_frame(&blk.data, LVL3, FrameOptions::default()));
+            }
+        }
+        let h = xxhash_rust::xxh64::xxh64(&all, 0);
+        println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
+        assert_eq!(h, M3_LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+    }
 }
