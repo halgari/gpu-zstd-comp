@@ -104,6 +104,7 @@ Fix round 1 changes:
 
 - The 5090 cost of the 128-table default (the controller's ruling for 8 GB-class cards) against 256 is +3.4 ms/batch of K1,
   which is −3.5 % end-to-end (2390.2 against 2477.8 MB/s). `GZC_K1_GROUPS=256` recovers it on 96 MB-L2 GPUs.
-- The in-kernel table clear per dispatch costs nothing measurable. K1 at 1638 blocks is 10.8 ms with 128 tables, against
-  about 10–10.5 ms for 128 tables in the pre-fix sweep.
+- The in-kernel table clear per dispatch was not A/B-timed separately. It writes 32 MiB per dispatch (64 MiB at 256
+  tables); K1 at b1638 with 128 tables is 10.8 ms, in line with the pre-fix microbenchmark at 128 groups (about 10–11 ms),
+  so any cost is within noise.
 - `--verify` of the merged default passed: 2383.2 MB/s.
