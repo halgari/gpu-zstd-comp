@@ -102,3 +102,49 @@ MB/s at 64 / 32 / 16 KiB. libzstd L14/L16 ran at 423 / 381 MB/s at 64 KiB.
   - A 4-byte fingerprint mismatch may skip the compare only once `best >= 3`, because h4-chain collisions can be valid 3-byte records.
 - **gzc-gpu:** `ChainsKernel::with_options` rejects `opt` params until T2.
 - **Tests:** 130 gzc-core tests pass at 64, 32 and 16 KiB, and the workspace builds with `--all-targets`. The ratios are unchanged: the `Linear` engine was not touched.
+
+## T2: GPU candidates, K1 Opt3 chains + K2opt (stage S1), 2026-09-30
+
+Branch: T2 worktree based on `m5` at d4d05e2. Machine: RTX 5090, subgroups on unless stated. `uptime` load about 1.7.
+
+### What changed
+
+- `common.wgsl`: new `hash3` (== `hash::hash3`) and `pred_fp3`.
+- `pred_fp3` is the fingerprint of the h3 chain: bits 17..24 hold a 7-bit hash of bytes 0..3, and bits 24..32 hold byte 3.
+- K1 (both kernels) builds the Opt3 chains: `hash_width(4)` in chain 0 and `hash3` in chain 1 (`OPT3` constant from `finder_wgsl`). The T1 guard is gone. The K1 self-test checks the h3 fingerprints too (`chains::chain_fp`).
+- New `k2_opt.wgsl` (`main_opt`, appended to `k2_best.wgsl`) implements the merged nearest-first walk and writes 2 words per position. `OptCandKernel` in compressor.rs holds K1 + K2opt, and `cands_from_blocks` is the test harness.
+- The `best` buffer is 8 B per position for `opt` params (`best_words`, `best_bytes_for`), counted by `max_batch_blocks`, `BatchBuffers` and `scratch_bytes`, so it reaches `vram_bytes`.
+- `gpu_supports` still rejects `opt` presets.
+- **The fingerprint caveat never applies to our h4 hash.** `hash_width(.., 4) = (lo * 0x9E3779B1 * 0xC2B2AE3D) >> 16` is injective in byte 3 when bytes 0..3 are fixed: byte 3 only enters the top 8 bits, through a bijection. So two h4-chain entries whose first 4 bytes differ also differ in their first 3 bytes. K2opt therefore skips an h4 fingerprint-hash mismatch outright (c <= 2), not only once best >= 3.
+  - This is still byte-identical; the spec's "or when the first 3 bytes differ as well" clause covers it.
+  - `tests/cands.rs::h4_hash_is_injective_in_byte_3` checks the property exhaustively over byte 3.
+  - A mutation of the skip bounds (h4 byte-4 bound 4 → 3) fails the differential test at once.
+
+### Correctness
+
+| check | 64 KiB | 16 KiB |
+|---|---|---|
+| `tests/cands.rs`: synthetic + small-alphabet blocks; opt16, opt14, depth 1/4/64; subgroup and fallback K1 | pass | pass |
+| `tests/chains.rs`: Opt3 preds + raw pred words (fingerprints), both K1s | pass | pass |
+| corpus, 4000 blocks (`GZC_CORPUS=… cargo test --release -p gzc-gpu --test cands corpus -- --ignored`), subgroups | 4000 equal | 4000 equal |
+| same, `GZC_NO_SUBGROUPS=1` | 4000 equal | 4000 equal |
+| whole gzc-gpu suite (existing presets byte-identical) | pass | pass |
+| whole gzc-gpu suite with `GZC_NO_SUBGROUPS=1` | pass | cands + chains pass |
+
+### Time: K1 + K2opt vs lvl9 K1 + K2, 64 KiB, full corpus (100754 blocks, batch 2048)
+
+`cargo run --release -p gzc-gpu --example k2opt_bench -- data/corpus 2048`. For each batch, the per-kernel timestamps are the median of 3 reps; the table sums them over the corpus. Three full runs (µs per block):
+
+| run | lvl9 K1 | lvl9 K2 | lvl9 sum | opt16 K1 | opt16 K2opt | opt16 sum | lvl3 K1 (2 chains) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2.756 | 1.545 | 4.301 | 6.665 | 2.325 | 8.989 | – |
+| 2 | 2.765 | 1.553 | 4.317 | 6.675 | 2.346 | 9.021 | – |
+| 3 | 2.776 | 1.562 | 4.338 | 6.677 | 2.350 | 9.027 | 6.747 |
+| **median** | 2.765 | 1.553 | **4.317** | 6.675 | 2.346 | **9.021** | |
+
+- **K2opt costs 1.5× lvl9's K2.** It walks h4 32 deep plus h3 4 deep and writes 8 B per position instead of 4 B.
+- **K1 costs 2.4× lvl9's K1.** Two chains cost the same in Dfast (lvl3 K1 6.75 µs), so this is the existing two-chain K1 cost, not something Opt3 adds.
+- `GZC_K1_GROUPS=256` (the 5090's best setting): lvl9 1.95 + 1.56 = 3.51 µs, opt16 4.25 + 2.35 = 6.59 µs.
+- `GZC_NO_SUBGROUPS=1` (fallback K1): lvl9 6.40 µs, opt16 9.76 + 2.36 = 12.12 µs.
+- **Total: K1 + K2opt = 9.0 µs per block against 4.3 µs for lvl9 (+4.7 µs per block).**
+- **Possible follow-up:** build both chains in one K1 task, sharing the data words and the tile loop. Today each chain is a separate task that re-reads the block.

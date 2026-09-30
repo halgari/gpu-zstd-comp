@@ -7,7 +7,7 @@
 //! batches of `batch` (default 2048) blocks; per batch, runs each finder `REPS` times and keeps the
 //! median of its per-kernel timestamps; reports the sums over the corpus as µs per block.
 use gzc_core::config::BLOCK_SIZE;
-use gzc_core::params::{LVL9, OPT16};
+use gzc_core::params::{LVL3, LVL9, OPT16};
 use gzc_gpu::chains::{head_bytes, pred_bytes};
 use gzc_gpu::compressor::{BatchBuffers, GpuParams, Kernels, OptCandKernel, best_bytes_for, data_bytes};
 use gzc_gpu::context::{GpuContext, pack_blocks};
@@ -80,6 +80,9 @@ fn main() -> anyhow::Result<()> {
     // lvl9: the production K1 + K2 (Kernels, K3 recorded too but not counted).
     let lvl9 = Kernels::new(&ctx, GpuParams { matching: LVL9, emit_frames: false, huffman: false })?;
     let lvl9_bufs = BatchBuffers::new(&ctx, cap, false, &LVL9);
+    // lvl3 (Dfast): the other two-chain K1, for reference.
+    let lvl3 = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: false, huffman: false })?;
+    let lvl3_bufs = BatchBuffers::new(&ctx, cap, false, &LVL3);
     // opt16: K1 (Opt3) + K2opt.
     let opt = OptCandKernel::new(&ctx, &OPT16)?;
     let data = ctx.storage_buffer("data", data_bytes(cap), false);
@@ -87,18 +90,19 @@ fn main() -> anyhow::Result<()> {
     let pred = ctx.storage_buffer("pred", pred_bytes(cap, 2), false);
     let cands = ctx.storage_buffer("cands", best_bytes_for(cap, &OPT16), false);
 
-    // Sums of per-batch medians, ms: lvl9 K1, K2; opt K1, K2opt.
-    let mut sum = [0f64; 4];
+    // Sums of per-batch medians, ms: lvl9 K1, K2; opt K1, K2opt; lvl3 K1, K2.
+    let mut sum = [0f64; 6];
     let mut n_blocks = 0usize;
     let mut pending: Vec<Vec<u8>> = Vec::with_capacity(batch);
     let mut i = 0usize;
-    let run = |blocks: &[Vec<u8>], sum: &mut [f64; 4]| {
+    let run = |blocks: &[Vec<u8>], sum: &mut [f64; 6]| {
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         let packed = pack_blocks(&refs);
         let n = blocks.len() as u32;
         ctx.queue.write_buffer(&lvl9_bufs.data, 0, bytemuck::cast_slice(&packed));
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-        let (mut a, mut b, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        ctx.queue.write_buffer(&lvl3_bufs.data, 0, bytemuck::cast_slice(&packed));
+        let (mut a, mut b, mut c, mut d, mut e, mut f) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for _ in 0..REPS {
             let mut enc = ctx.device.create_command_encoder(&Default::default());
             lvl9.record_timed(&ctx, &mut enc, &lvl9_bufs, n, Some(&timer.set));
@@ -110,8 +114,13 @@ fn main() -> anyhow::Result<()> {
             let ms = timer.finish(&ctx, enc, 2);
             c.push(ms[0]);
             d.push(ms[1]);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            lvl3.record_timed(&ctx, &mut enc, &lvl3_bufs, n, Some(&timer.set));
+            let ms = timer.finish(&ctx, enc, 2);
+            e.push(ms[0]);
+            f.push(ms[1]);
         }
-        for (s, v) in sum.iter_mut().zip([a, b, c, d]) {
+        for (s, v) in sum.iter_mut().zip([a, b, c, d, e, f]) {
             *s += median(v);
         }
     };
@@ -139,5 +148,6 @@ fn main() -> anyhow::Result<()> {
     println!("{n_blocks} blocks of {} KiB, batch {batch}", BLOCK_SIZE / 1024);
     println!("lvl9  K1 {:.3} + K2    {:.3} = {:.3} us/block", us(sum[0]), us(sum[1]), us(sum[0] + sum[1]));
     println!("opt16 K1 {:.3} + K2opt {:.3} = {:.3} us/block", us(sum[2]), us(sum[3]), us(sum[2] + sum[3]));
+    println!("lvl3  K1 {:.3} + K2    {:.3} = {:.3} us/block (two-chain K1 reference)", us(sum[4]), us(sum[5]), us(sum[4] + sum[5]));
     Ok(())
 }
