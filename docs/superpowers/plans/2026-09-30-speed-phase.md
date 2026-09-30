@@ -91,3 +91,14 @@ overlapped copies. Matters on PCIe ×8 cards. Measure the host-overhead share be
 - remaining bottlenecks.
 
 Then the whole-branch review.
+
+## Added during execution
+
+- **S5 dropped** (ledger ruling): S6 measured zero copy/compute or dispatch overlap on wgpu's single queue on this
+  driver, and per-slot scratch would undo S6's VRAM savings.
+- **S8 — K1/K2 second pass** (added after S3): per-kernel profile at b4959f8, lvl9 b2431 i3 = K3 32.7, K1 15.5,
+  K2 13.0, K4 12.3, K5 4.7 ms/batch. Targets:
+  - K2's 32-deep dependent chain walk (memory-level parallelism, e.g. interleaving the walks of several
+    positions per thread, or prefetching pred[q] one step ahead);
+  - K1's table-group count and tile loop.
+  - Output is byte-identical.
