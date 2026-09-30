@@ -33,6 +33,9 @@ compression ratio than its CPU could at the same speed.
 | Integers in WGSL | u32 only; no dependency on `shader-int64` |
 
 Reference hardware: AMD Ryzen 9 9950X3D (16C/32T), NVIDIA RTX 5090 (32 GB), Linux, Vulkan.
+Target hardware (what headline numbers must reflect): a typical gaming PC with ~8 CPU cores and an
+~8 GB GPU. GPU pipeline configs are capped to a ~6 GB VRAM budget (batch × inflight × per-block
+footprint); the 5090's extra memory is not used for headline results.
 
 ## 3. Architecture
 
