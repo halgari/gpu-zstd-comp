@@ -45,6 +45,18 @@ pub const OF_DEFAULT_NORM: [i16; 29] = [
 ];
 pub const OF_DEFAULT_LOG: u32 = 5;
 
+/// Prior LL-code frequencies for the optimal parse's `Seed::Prior` (`opt::seed_prices`, preset
+/// `opt14`). Trained on blocks disjoint from the m5-opt-design evaluation sample (which is every
+/// 50th block, offset 0): the summed LL/ML/OF code histograms of `opt16`'s output over every 50th
+/// 64 KiB block at offset 25 of `data/corpus` (`--ext dds,nif` order, 2015 blocks), each table
+/// scaled to 65536 (round to nearest), produced by
+/// `cargo run --release -p gzc-core --example opt_sample -- train data/corpus 50 25`.
+pub const OPT_PRIOR_LL: [u32; 36] = [10175, 5362, 2777, 4261, 18544, 5612, 2888, 1485, 2814, 954, 666, 1004, 3403, 1926, 526, 248, 333, 190, 397, 187, 336, 561, 224, 238, 183, 181, 49, 13, 3, 0, 0, 0, 0, 0, 0, 0];
+/// Prior ML-code frequencies (see `OPT_PRIOR_LL`).
+pub const OPT_PRIOR_ML: [u32; 53] = [25759, 27428, 4277, 1151, 574, 3224, 654, 830, 269, 673, 131, 66, 68, 101, 18, 22, 24, 13, 6, 6, 12, 18, 5, 7, 9, 18, 5, 4, 4, 5, 5, 4, 6, 3, 7, 6, 9, 10, 9, 15, 15, 8, 12, 17, 11, 7, 3, 6, 0, 0, 0, 0, 0];
+/// Prior OF-code frequencies (see `OPT_PRIOR_LL`).
+pub const OPT_PRIOR_OF: [u32; 32] = [4961, 3407, 239, 594, 1319, 1327, 1638, 2138, 2903, 3911, 5472, 7608, 9595, 9986, 7960, 2479, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// Floor log2 of a nonzero value.
 fn highbit(v: u32) -> u32 {
     debug_assert!(v != 0);

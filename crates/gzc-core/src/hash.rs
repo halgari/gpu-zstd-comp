@@ -37,6 +37,13 @@ pub fn hash_width(b: &[u8], p: usize, width: u32) -> u32 {
     mix(read_u32(b, p), read_u32(b, p + 4) & mask)
 }
 
+/// zstd's `ZSTD_hash3Ptr` with `hBits = HASH_BITS` (16, zstd's hashLog3 at 64 KiB): the 3 bytes at
+/// `p`, `((MEM_readLE32(p) << 8) * 506832829) >> (32 - 16)` in wrapping u32 arithmetic. Reads 4
+/// bytes (`p + 4 <= BLOCK_SIZE`); byte `p + 3` is shifted out. The `Opt3` short chain's key.
+pub fn hash3(b: &[u8], p: usize) -> u32 {
+    (read_u32(b, p) << 8).wrapping_mul(506_832_829) >> (32 - HASH_BITS)
+}
+
 /// The top `bits` bits of a `HASH_BITS`-bit hash `h`: the match finder's key
 /// (`MatchParams::hash_bits`). `key(h, HASH_BITS) == h`.
 pub fn key(h: u32, bits: u32) -> u32 {
@@ -122,6 +129,25 @@ mod tests {
                 assert_eq!(hash_width(&b, p, 8), hash_long(&b, p), "p={p}");
             }
         }
+    }
+
+    #[test]
+    fn hash3_ignores_byte_3_and_matches_zstd() {
+        let mut b = crate::synth::random(4, crate::config::BLOCK_SIZE);
+        for p in (0..HASHED_POSITIONS).step_by(89) {
+            let h0 = hash3(&b, p);
+            assert!(h0 < 1 << HASH_BITS);
+            let original = b[p + 3];
+            for delta in 1u8..=255 {
+                b[p + 3] = original.wrapping_add(delta);
+                assert_eq!(hash3(&b, p), h0, "p={p}");
+            }
+            b[p + 3] = original;
+        }
+        // ((0x00636261 << 8) * 506832829) >> 16, computed by hand for "abc".
+        let mut v = vec![0u8; 8];
+        v[..4].copy_from_slice(b"abcX");
+        assert_eq!(hash3(&v, 0), (0x6362_6100u32.wrapping_mul(506_832_829)) >> 16);
     }
 
     #[test]

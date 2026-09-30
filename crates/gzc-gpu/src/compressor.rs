@@ -78,10 +78,10 @@ pub struct GpuParams {
 }
 
 /// Whether the GPU kernels implement `p`: since the K3 lazy/lazy2 port (M4 Task 5), every valid
-/// `MatchParams` (both hash modes, greedy, lazy and lazy2), so every preset.
+/// `MatchParams` (both hash modes, greedy, lazy and lazy2) except the M5 optimal parse
+/// (`p.opt`, presets `opt14`/`opt16`: CPU oracle only until the K2opt/K3opt kernels land).
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    // Now just `validate()`: kept as a separate hook for the CLI's per-engine preset check.
-    p.validate().is_ok()
+    p.validate().is_ok() && p.opt.is_none()
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `MAX_SEQS`.
@@ -1398,8 +1398,8 @@ mod tests {
     fn max_seqs_bounds_minimal_sequences() {
         assert_eq!(MAX_SEQS as usize, BLOCK_SIZE / 4 + 1);
         for (name, p) in gzc_core::params::PRESETS {
-            assert!(MAX_SEQS as usize * p.min_seq_len() as usize >= BLOCK_SIZE, "{name}");
             if gpu_supports(&p) {
+                assert!(MAX_SEQS as usize * p.min_seq_len() as usize >= BLOCK_SIZE, "{name}");
                 check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
@@ -1408,8 +1408,11 @@ mod tests {
     #[test]
     fn gpu_supports_all_presets() {
         for (name, p) in gzc_core::params::PRESETS {
-            assert!(gpu_supports(&p), "{name}");
-            check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // M5: the optimal-parse presets are CPU-only until K2opt/K3opt exist.
+            assert_eq!(gpu_supports(&p), p.opt.is_none(), "{name}");
+            if p.opt.is_none() {
+                check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
         }
         assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
