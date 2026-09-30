@@ -269,8 +269,9 @@ fn chains_over_short_keys() {
 
 /// The bucket-sorted K1 (speed2 E2): every slot equals `gzc_core::hash::bucket_sort` (position
 /// and fingerprint bits), for 11..=13-bit keys and min_match 4 and 6, in one batch and block by
-/// block. It is selected for the sorted presets whenever the device has >= 32-lane subgroups and
-/// the table fits its workgroup memory, and never without subgroups or for 16-bit keys.
+/// block, for both versions (subgroup and workgroup-memory). The sorted K1 is selected for the
+/// sorted presets whenever the table fits the device's workgroup memory, never for 16-bit keys;
+/// its subgroup version exactly when the device has subgroups of >= 32 lanes.
 #[test]
 fn sorted_k1_matches_bucket_sort() {
     use gzc_core::params::{LVL9S12, LVL9S13};
@@ -278,17 +279,17 @@ fn sorted_k1_matches_bucket_sort() {
     let blocks = all_blocks();
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
     let fallback = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
-    assert!(SortKernel::new(&fallback, &LVL9S13).unwrap().is_none(), "sorted K1 without subgroups");
     assert!(SortKernel::new(&ctx, &LVL9).unwrap().is_none(), "sorted K1 for a 16-bit key");
-    for params in [LVL9S13, LVL9S12, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }] {
-        let usable = ctx.subgroups
-            && ctx.adapter_info.subgroup_min_size >= 32
-            && ctx.device.limits().max_compute_workgroup_storage_size >= table_bytes(&params);
-        let Some(k1) = SortKernel::new(&ctx, &params).unwrap() else {
+    let variants = [LVL9S13, LVL9S12, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }];
+    for (ctx, params) in [&ctx, &fallback].into_iter().flat_map(|c| variants.map(|p| (c, p))) {
+        let usable = ctx.device.limits().max_compute_workgroup_storage_size >= table_bytes(&params);
+        let Some(k1) = SortKernel::new(ctx, &params).unwrap() else {
             assert!(!usable, "{params:?}: sorted K1 not selected on a device that supports it");
             eprintln!("{params:?}: sorted K1 unavailable on this device");
             continue;
         };
+        let want_sg = ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32;
+        assert_eq!(k1.uses_subgroups(), want_sg, "{params:?}: subgroup version selection");
         let n = blocks.len() as u32;
         let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
         let packed = pack_blocks(&refs);

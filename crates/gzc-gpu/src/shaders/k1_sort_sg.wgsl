@@ -1,42 +1,10 @@
-// K1, bucket-sorted candidates (speed2 E2, option C; == gzc_core::hash::bucket_sort): per block,
-// every hashed position p < HASHED_POSITIONS ordered by key (hash_width(p, MIN_MATCH) >> KEY_SHIFT,
-// KEY_BITS bits), ascending inside a key; slot s of block b holds the pred-style word
-// q | pred_fp(q) at sorted[b*BLOCK_SIZE + s] (slots HASHED_POSITIONS.. are not written). K2 walks
-// the slots below each position's own (k2_window.wgsl). Single hash only.
-//
-// One workgroup of 32 lanes per block, which must be one subgroup (subgroup size >= 32; checked
-// by the host's self-test). A counting sort over 2^KEY_BITS counters in workgroup memory, 16 bits
-// each (two per word) when blocks have at most 2^16 positions (a count or cursor is at most
-// HASHED_POSITIONS < 2^16 then, so an add never carries into the other half), else 32 bits:
-// 1. histogram: every lane adds its position's key (atomicAdd; one add per tile when all 32 keys
-//    are equal, as in constant runs);
-// 2. exclusive scan of the counters in place (32 at a time, subgroupExclusiveAdd);
-// 3. ranking, one 32-position tile at a time in position order: the lanes holding equal keys
-//    are found by bit-sliced ballots (KEY_BITS of them, skipped when all keys are equal); the
-//    lowest such lane advances its key's cursor by their count and the others take
-//    cursor + (equal lanes below them). A barrier after each tile orders one tile's cursor
-//    updates before the next tile's, so the order inside a key is the position order. Each
-//    position's slot is written to rankw[p] (coalesced) with its fingerprint;
-// 4. `scatter`, a second dispatch, moves every position to its slot.
-// No device-scope state: nothing is carried between blocks or dispatches.
-
-@group(0) @binding(0) var<storage, read> data: array<u32>;
-@group(0) @binding(1) var<storage, read_write> sorted: array<u32>;
-@group(0) @binding(2) var<storage, read_write> rankw: array<u32>;
-
-const NKEYS: u32 = 1u << KEY_BITS;
-const CNT16: bool = LOG2_BLOCK <= 16u;
-const NWORDS: u32 = select(NKEYS, NKEYS / 2u, CNT16);
-var<workgroup> cnt: array<atomic<u32>, NWORDS>;
-
-// Adds n to key k's counter and returns its old value.
-fn cnt_add(k: u32, n: u32) -> u32 {
-    if (CNT16) {
-        let sh = (k & 1u) * 16u;
-        return (atomicAdd(&cnt[k >> 1u], n << sh) >> sh) & 0xFFFFu;
-    }
-    return atomicAdd(&cnt[k], n);
-}
+// K1 bucket sort, subgroup version (`main_sg`), appended to k1_sort.wgsl (its bindings, counters
+// and `scatter`; the steps are described there) when the device has subgroups of >= 32 lanes: one
+// workgroup of 32 lanes per block, which must be one subgroup (checked by the host's self-test).
+// It loads each 128-position chunk's words once, one per lane, and builds the keys with shuffles;
+// the histogram adds once per tile when all 32 keys are equal (constant runs); the scan uses
+// subgroupExclusiveAdd; the ranking finds equal keys with bit-sliced ballots (KEY_BITS of them,
+// skipped when all keys are equal).
 
 // The 32 words of chunk c (bytes 128c .. 128c + 128 of the block), one per lane; past the block
 // they come from the next block (or the buffer's last word) and only reach dead positions.
@@ -103,7 +71,7 @@ fn match_key(k: u32, live: u32) -> u32 {
 const CHUNKS: u32 = (HASHED_POSITIONS + 127u) / 128u;
 
 @compute @workgroup_size(32)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {
+fn main_sg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {
     let b = wid.x;
     let base = block_base(b);
     let sb = b * BLOCK_SIZE;
@@ -175,17 +143,4 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_id) 
         w = wn;
         wn = wnn;
     }
-}
-
-// Scatter (second dispatch of the K1 pass, (BLOCK_SIZE / 256, n_blocks) like K2, so only ~2
-// blocks' 512 KiB output regions are live at a time and the L2 merges the scattered 4-byte
-// writes; scattering from `main` with ~500 blocks in flight was DRAM-bound): rankw[p] holds p's
-// slot | pred_fp(p) from `main`; sorted[slot] = p | pred_fp(p).
-@compute @workgroup_size(256)
-fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = gid.x;
-    if (p >= HASHED_POSITIONS) { return; }
-    let sb = gid.y * BLOCK_SIZE;
-    let w = rankw[sb + p];
-    sorted[sb + (w & PRED_POS)] = p | (w & ~PRED_POS);
 }

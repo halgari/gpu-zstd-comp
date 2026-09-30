@@ -10,17 +10,20 @@
 //! `gzc_core::reference::find_best`. VRAM is unchanged (the chain kernels' `head` buffer is left
 //! unused).
 //!
-//! Needs subgroups of at least 32 lanes, `table_bytes` of workgroup memory within the device's
-//! limit (the context keeps wgpu's default 16 KiB, so a 13-bit key needs blocks of at most 64 KiB)
-//! and a passing self-test; otherwise (or with `GZC_SORTED=0`) `Kernels` runs the chain kernels,
-//! which build the same chains over the same key (byte-identical, just slower: K2 walks the
-//! denser chains of the shorter key).
+//! K1 has a subgroup version (`k1_sort_sg.wgsl`: ballots and shuffles, subgroups of at least 32
+//! lanes) and a workgroup-memory version without subgroups (`k1_sort.wgsl`), picked like the chain
+//! K1's two kernels: the subgroup one when the device has suitable subgroups and it passes its
+//! self-test. Both need `table_bytes` of workgroup memory within the device's limit (the context
+//! keeps wgpu's default 16 KiB, so a 13-bit key needs blocks of at most 64 KiB); otherwise (or
+//! with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the same chains over the
+//! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK};
 use gzc_core::params::{Hashes, MatchParams};
 
-const K1_SORT_WGSL: &str = include_str!("shaders/k1_sort_sg.wgsl");
+const K1_SORT_WGSL: &str = include_str!("shaders/k1_sort.wgsl");
+const K1_SORT_SG_WGSL: &str = include_str!("shaders/k1_sort_sg.wgsl");
 
 /// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory at 64 KiB blocks,
 /// wgpu's default limit; 32 KiB at 128 KiB, which needs a raised limit).
@@ -43,25 +46,34 @@ pub struct SortKernel {
     pipeline: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    subgroups: bool,
 }
 
 impl SortKernel {
     /// Builds and self-tests the kernel; `Ok(None)` when `params` or the device do not suit it
-    /// (see the module doc) or `GZC_SORTED=0`. A failed build or self-test is reported on stderr
-    /// and also gives `None`.
+    /// (see the module doc) or `GZC_SORTED=0`. The subgroup version runs when `ctx.subgroups`, the
+    /// subgroups have at least 32 lanes and its self-test passes; otherwise the workgroup-memory
+    /// version (whose failed build or self-test, reported on stderr, also gives `None`).
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
-        if !sorted_params(params) || std::env::var("GZC_SORTED").is_ok_and(|v| v == "0") {
-            return Ok(None);
-        }
-        let limits = ctx.device.limits();
-        if !ctx.subgroups
-            || ctx.adapter_info.subgroup_min_size < 32
-            || limits.max_compute_workgroup_storage_size < table_bytes(params)
+        if !sorted_params(params)
+            || std::env::var("GZC_SORTED").is_ok_and(|v| v == "0")
+            || ctx.device.limits().max_compute_workgroup_storage_size < table_bytes(params)
         {
             return Ok(None);
         }
+        if ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 {
+            let built = crate::compressor::with_error_scopes(ctx, || {
+                let k = Self::build(ctx, params, true);
+                k.self_test(ctx, params)?;
+                Ok(k)
+            });
+            match built {
+                Ok(k) => return Ok(Some(k)),
+                Err(e) => eprintln!("gzc-gpu: sorted K1 subgroup kernel failed to build or its self-test ({e}); using the workgroup-memory one"),
+            }
+        }
         let built = crate::compressor::with_error_scopes(ctx, || {
-            let k = Self::build(ctx, params);
+            let k = Self::build(ctx, params, false);
             k.self_test(ctx, params)?;
             Ok(k)
         });
@@ -74,7 +86,12 @@ impl SortKernel {
         }
     }
 
-    fn build(ctx: &GpuContext, params: &MatchParams) -> Self {
+    /// True when this is the subgroup version (`main_sg`), false for the workgroup-memory one.
+    pub fn uses_subgroups(&self) -> bool {
+        self.subgroups
+    }
+
+    fn build(ctx: &GpuContext, params: &MatchParams, subgroups: bool) -> Self {
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -94,8 +111,14 @@ impl SortKernel {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let src = format!("{}const KEY_BITS: u32 = {}u;\n{K1_SORT_WGSL}", finder_wgsl(params), params.hash_bits);
-        let module = ctx.shader("k1_sort_sg", &src);
+        let consts = format!("{}const KEY_BITS: u32 = {}u;\n", finder_wgsl(params), params.hash_bits);
+        // naga (wgpu 30) takes subgroup operations from Features::SUBGROUP and rejects the
+        // `enable subgroups;` directive.
+        let module = if subgroups {
+            ctx.shader("k1_sort_sg", &format!("{consts}{K1_SORT_WGSL}\n{K1_SORT_SG_WGSL}"))
+        } else {
+            ctx.shader("k1_sort", &format!("{consts}{K1_SORT_WGSL}"))
+        };
         let make = |entry_point| {
             ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("k1_sort"),
@@ -106,8 +129,8 @@ impl SortKernel {
                 cache: None,
             })
         };
-        let (pipeline, scatter) = (make("main"), make("scatter"));
-        Self { pipeline, scatter, layout }
+        let (pipeline, scatter) = (make(if subgroups { "main_sg" } else { "main" }), make("scatter"));
+        Self { pipeline, scatter, layout, subgroups }
     }
 
     /// Sorts small-alphabet, text, texture-like, constant and random blocks and compares every
