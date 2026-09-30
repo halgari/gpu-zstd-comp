@@ -288,7 +288,8 @@ as zstd orders them (reps by increasing length, then `A`, then `B`) so the `star
 **Trace and outputs.** `trace[segment][4096]` × 8 B = 512 KiB per block, placed in the dead `pred` buffer
 (512 KiB after K2). The final pass writes sequences into the lane's slot of `best`/`seqs` like `main_seg` and
 runs `main_fixup` unchanged (prefix sum of counts, literal carry, `off_base` re-encode until the true reps meet
-the lane's). Intermediate passes (§2.4) never write sequences: their backward trace only feeds the histogram.
+the lane's). Intermediate passes (§2.4) also write their sequences, into dead `seqs` words (the series log), so
+the epilogue can histogram the fixed-up block parse; they skip the final `best` write-back.
 
 **Instruction count per trip:** the prototype does ~120 scalar operations per in-series position and ~40 per
 literal skip; with 2 records the relaxation loop is bounded by 30 and averages ~5 → an estimated 150–250
@@ -357,9 +358,10 @@ candidate words, then one 256-bin count per block: parse-free, one light pass ov
 global prior here does not, so the 1-pass variant is a stretch goal that needs per-kind tables selected from
 the DDS header (R9's mechanism).
 
-GPU form: pass `n` histograms its own sequences in the workgroup epilogue (shared-memory atomics into
+GPU form: pass `n` histograms its fixed-up block parse (literal carry across segments, `off_base` under the
+true decoder reps, i.e. a replay of `main_fixup`'s walk, as the oracle's `encode_raw` does) in the workgroup epilogue (shared-memory atomics into
 256 + 36 + 53 + 32 counters per block, written to a 1.5 KiB per-block table); pass `n+1`'s prologue converts
-them to `u16` prices in workgroup memory (one `WEIGHT` per lane per entry). Pass 0's prologue computes the
+them to prices in workgroup memory (i32 as built; u16 is a possible occupancy optimisation) (one `WEIGHT` per lane per entry). Pass 0's prologue computes the
 cover-literal histogram from the candidate words (or the raw-block histogram) and loads the constant prior
 tables. No extra dispatches; the same counts are what K4/K5 build anyway.
 

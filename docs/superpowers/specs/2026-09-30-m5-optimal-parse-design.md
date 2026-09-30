@@ -93,7 +93,8 @@ blocks, bit-exact with a CPU oracle and decodable by standard zstd:
   optLevel 0: the relaxation's early abort, the `+128` skip, and no match + 1 literal check. The final pass
   runs optLevel 2. (The measured recipe, 1.37211, was built this way.)
 - On the GPU, pass n histograms its own output in the workgroup epilogue (about 1.5 KiB per block), and pass
-  n+1's prologue turns that into u16 price tables. This needs no extra dispatch.
+  n+1's prologue turns that into price tables (i32 in workgroup memory as built; u16 is an optional occupancy
+  optimisation). "Its output" means the fixed-up block parse (literal carry, decoder reps), as the oracle histograms it. This needs no extra dispatch.
 
 ### 3.5 Downstream
 
