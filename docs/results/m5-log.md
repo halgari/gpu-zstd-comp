@@ -148,3 +148,125 @@ Branch: T2 worktree based on `m5` at d4d05e2. Machine: RTX 5090, subgroups on un
 - `GZC_NO_SUBGROUPS=1` (fallback K1): lvl9 6.40 µs, opt16 9.76 + 2.36 = 12.12 µs.
 - **Total: K1 + K2opt = 9.0 µs per block against 4.3 µs for lvl9 (+4.7 µs per block).**
 - **Possible follow-up:** build both chains in one K1 task, sharing the data words and the tile loop. Today each chain is a separate task that re-reads the block.
+
+## T3: K3opt single pass (stage S2), branch `worktree-agent-adc20584ad0360e20` (from `m5` d4d05e2), 2026-09-30
+
+`gzc-gpu`:
+
+- `shaders/k3_opt.wgsl`: one DP pass of `opt::dp_pass_with(.., Engine::Ring)`.
+  - One lane per 4 KiB segment; each trip of the flattened lane loop is a series-start probe or a series position.
+  - A 33-slot ring of 16 B nodes (price; rep0|rep1; rep2|litlen; mlen|offBase<<8) in workgroup memory, or in
+    `var<private>` as the fallback.
+  - The per-position trace goes in its own buffer (K1's `pred` in the pipeline, 8 B per position). The write at
+    `iend` is dropped.
+  - The end of a series only updates `ip`/`anchor`/reps and logs the series in `seqs`. The backward traces run
+    after the DP (phase 2), last series first, so each segment's raw sequences come out reversed.
+  - Prices come from the block-init rule (a literal histogram in a prologue; LL/ML/OF tables from the host) or
+    from explicit per-block tables (the `opt::cases` hook).
+- `shaders/k3_fixup.wgsl`: `main_fixup` and the rep helpers, moved out of `k3_seg.wgsl` unchanged except for
+  `SEG_WORDS` (words per segment in `best`) and `RAW_REVERSED`. lvl9seg is byte-identical (differential suite,
+  with and without subgroups).
+- `k3opt.rs`: `K3Opt` (config: level 0/2, `wg`, ring memory, price source), `OptBuffers`, `parses_from_cands`
+  (the `parses_from_best` counterpart, fed `find_cands` words from the host) and `time_pass`.
+- `context.rs`: requests the adapter's `max_compute_workgroup_storage_size` (48 KiB on the 5090).
+- Stored offBases are the DP's own. They are `off_base_for` under the DP's history, as `main_fixup` needs; the
+  argument is in `emit_series`. A test on every synthetic and corpus block confirms it.
+
+### Correctness (all byte-identical to the oracle, parses compared)
+
+| gate | 64 KiB | 16 KiB |
+|---|---|---|
+| every `opt::cases` run (27: 20 at level 2, 7 at level 0; explicit tables; the preset runs with the oracle's final-pass prices), workgroup + private ring | pass | pass |
+| synthetic blocks (15) × {wg16 L2, wg16 L0, private L2, private L0, buffer prices, wg32, wg8, wg8 private L0, checked loops} | pass | pass |
+| 4000 corpus blocks × {wg16 L2 block-init (+ K4/K5 frames == `write_frame`), wg16 L0, private ring L2, wg32 buffer prices} | pass | pass |
+
+Commands:
+
+- `cargo test --release -p gzc-gpu --test k3opt`;
+- `GZC_CORPUS=… cargo test --release -p gzc-gpu --test k3opt k3opt_corpus -- --ignored`;
+- the same with `--no-default-features --features block-16k`.
+
+The full `gzc-gpu` suite passes at 64K, and `differential` also passes with `GZC_NO_SUBGROUPS=1` and at 16K.
+
+### K3opt time per pass (RTX 5090, 64 KiB, 2900 corpus blocks ≈ the design's 6 GiB batch)
+
+Protocol:
+
+- `k3opt_timing` (ignored test), timestamp queries, median of 5 dispatches per run, three runs.
+- Candidate words re-uploaded before each dispatch.
+- The GPU was otherwise idle (gated on no other test or bench process; load average 1.9).
+- The fix-up adds 0.15 µs/block (0.24 at level 0).
+
+| variant | runs (µs/block) | median | ms/batch |
+|---|---|---:|---:|
+| **wg16, workgroup ring, level 2, block-init prologue** | 18.18 / 18.16 / 18.04 | **18.16** | 52.7 |
+| wg16, workgroup ring, level 2, table prices | 18.06 / 18.00 / 18.07 | 18.06 | 52.4 |
+| wg16, workgroup ring, level 0 (cheap pass) | 14.88 / 14.74 / 14.86 | 14.86 | 43.1 |
+| wg32, workgroup ring, level 2 | 30.21 / 30.17 / 30.16 | 30.17 | 87.5 |
+| wg32, workgroup ring, level 0 | 24.31 / 24.32 / 24.42 | 24.32 | 70.5 |
+| wg64, workgroup ring, level 2 | 30.43 / 30.44 / 30.43 | 30.43 | 88.2 |
+| wg8, workgroup ring, level 2 | 21.32 / 21.34 / 21.31 | 21.32 | 61.8 |
+| wg8, private ring | 25.84 / 25.76 / 25.86 | 25.84 | 74.9 |
+| wg16, private ring | 21.23 / 21.22 / 21.24 | 21.23 | 61.6 |
+| wg32, private ring | 19.85 / 20.06 / 20.11 | 20.06 | 58.2 |
+| wg64, private ring | 19.60 / 19.53 / 19.86 | 19.60 | 56.8 |
+| wg16, workgroup ring, naga loop bounding on | 19.24 / 19.21 / 19.22 | 19.22 | 55.7 |
+
+- 16 KiB (one run, 11600 blocks, the same bytes): wg16 L2 7.61 µs/block, L0 6.07, wg32 11.03, wg32 private 9.93.
+  That is 30 µs per 64 KiB of data: 4 blocks per workgroup of 16 carry 4 sets of price tables.
+- **Target ≤ 6 µs/block: missed by 3×.** The design projected 3.0–4.0 µs.
+
+### Where the time goes
+
+Batch scaling (wg16, workgroup ring, level 2):
+
+| blocks | 16 | 680 | 1360 | 2900 | 4000 |
+|---|---:|---:|---:|---:|---:|
+| ms | 18.0 | 24.7 | 25.9 | 52.4 | 81.7 |
+
+- The kernel is bound by per-lane latency. One lone warp per SM needs 18 ms for its 4096 trips (~4.4 µs per trip).
+  Up to one resident wave (~1400 blocks) costs little more; each further wave adds its full latency.
+- Residency is capped by the ring: 33 × 16 B = 528 B per lane, plus ~1.7 KiB of price tables per block.
+  - wg16: 8 workgroups per SM, about 1360 blocks per wave, so 2900 blocks take 2 waves.
+  - 16 B is the smallest node: price 30 bits, 3 reps × 16, litlen 13, mlen 6, offBase 17 is about 114 bits.
+- Per-lane latency grows with the active lanes per warp, from intra-warp divergence in the variable-length loops
+  (relaxation, series seeding, candidate extension):
+  - 16 blocks: wg8 14.9 ms, wg16 18.0 ms, wg32 22.9 ms;
+  - wg16 beats wg32 at the same lanes in flight.
+- Changes kept, in order (wg32 unless noted; the early figures were partly contended):
+  1. Deferring the backward traces out of the DP loop (series log + phase 2).
+  2. Storing the DP's offBases as they are: no per-sequence canonicalisation, one reversed write pass.
+     - 33.9 → 29.9 µs; phase 2 fell from ~15 to ~4 ms per 1360-block batch.
+  3. Removing `continue` from the trip loop, so every lane reaches the end of each trip: 29.9 → 21.4 µs.
+     This wg32 number did not survive later changes; it is 30.2 in the final table.
+  4. Issuing each trip's global loads first and the three rep-source loads together: no measurable change,
+     kept because it is simpler.
+- Ablations (test-only knob, since removed; 16 blocks, wg32; outputs wrong, time only):
+  - full: 22.9 ms;
+  - no relaxation: 17.8;
+  - no phase 2: 21.4;
+  - no trace writes: 22.3;
+  - no relaxation + no phase 2 + no trace: 15.4;
+  - reps only (no candidate words): 7.0;
+  - no rep probes: 68.6 (long matches then stay inside series);
+  - `best` bound read-only: −2 %.
+- Rejected:
+  - wg32/wg64 (divergence);
+  - the private ring (latency; better occupancy only above ~3000 blocks);
+  - wg8 (occupancy: 8-lane warps);
+  - naga loop bounding (+6 %).
+
+### Next steps (T4/T5 or a follow-up)
+
+- Cut per-lane latency:
+  - a subgroup-cooperative relaxation (lanes of a warp share one lane's up-to-30 relaxations), with the sequential
+    path as the non-subgroup fallback;
+  - fewer dependent shared-memory round trips per trip (the literal extension and relaxation read the ring
+    serially).
+- Raise residency:
+  - u16 price tables (−0.8 KiB per block);
+  - at 16 KiB, a smaller workgroup (4 blocks' tables per wg16 today; wg8 would halve that).
+- A profiler (Nsight Compute is not installed on this machine) would settle how the trip time splits.
+- Concern: during one of the experiments a kernel was killed with Xid 109 (CTX SWITCH TIMEOUT). The cause was an
+  experiment build that skipped the trailer, so `main_fixup` ran on garbage counts; the shipped kernel always writes
+  the trailer. No hang otherwise.

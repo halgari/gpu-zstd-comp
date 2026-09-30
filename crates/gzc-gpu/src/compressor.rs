@@ -32,6 +32,8 @@ const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
 const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
+/// `main_fixup` and the rep helpers, shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
+pub(crate) const K3_FIXUP_WGSL: &str = include_str!("shaders/k3_fixup.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -362,7 +364,7 @@ fn k4_tables() -> (Vec<u32>, String) {
     (tab, consts)
 }
 
-fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::BindGroupLayout {
+pub(crate) fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::BindGroupLayout {
     let entries: Vec<_> = read_only
         .iter()
         .enumerate()
@@ -385,7 +387,7 @@ fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayou
     pipeline_from_module(ctx, label, layout, &ctx.shader_trusted(label, body), "main")
 }
 
-fn pipeline_from_module(
+pub(crate) fn pipeline_from_module(
     ctx: &GpuContext,
     label: &str,
     layout: &wgpu::BindGroupLayout,
@@ -581,7 +583,7 @@ impl Kernels {
             let seg_log2 = m.segment_log2;
             let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
             let body = format!(
-                "{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst SEG_LOG2: u32 = {}u;\nconst SEG_WG: u32 = {K3_SEG_WG}u;\nconst SCAN_W: u32 = {K3_SEG_SCAN}u;\n{K3_SEG_WGSL}",
+                "{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst SEG_LOG2: u32 = {}u;\nconst SEG_WG: u32 = {K3_SEG_WG}u;\nconst SCAN_W: u32 = {K3_SEG_SCAN}u;\n{K3_SEG_WGSL}\n{K3_FIXUP_WGSL}",
                 seg_log2
             );
             let module = ctx.shader_unbounded_loops("k3_seg", &body);
