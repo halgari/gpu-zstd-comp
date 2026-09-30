@@ -94,20 +94,48 @@ impl GpuContext {
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
     pub fn shader(&self, label: &str, body: &str) -> wgpu::ShaderModule {
-        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
-        self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        })
+        self.shader_with(label, body, wgpu::ShaderRuntimeChecks::checked())
     }
 
     /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
     /// must provably terminate (a loop that does not is undefined behaviour for the driver).
     pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
-        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
         let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
-        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates (the K3
-        // modules' argument is at their call site in `Kernels::new`).
+        self.shader_with(label, body, checks)
+    }
+
+    /// `shader` without naga's forced loop bounding and without its index clamps (speed-2 E9):
+    /// indices into function-local and workgroup arrays are not clamped, and on backends without
+    /// hardware-robust buffer access neither are storage-buffer indices. Integer-division checks
+    /// stay on (turning them off measured nothing). The caller must guarantee, for every input
+    /// the kernel can be given, that
+    /// - every loop in `body` terminates, and
+    /// - every array index is in bounds (an out-of-bounds index is undefined behaviour, where the
+    ///   clamped module would have silently read/written a clamped element).
+    ///
+    /// K1 (both kernels), K2, K4 and K5 are built with this; their arguments are in
+    /// `.superpowers/speed2/e3-report.md` (E9). A loop or index added to them must come with the
+    /// same argument. On an RTX 5090 this took 2.6 ms of 63.3 per lvl9 batch (K1 −9 %, K2 −6 %,
+    /// K4 −17 %, K5 −5 %). K3 keeps `shader_unbounded_loops` (no gain from the index clamps).
+    /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
+    pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+        let checks = if std::env::var("GZC_CHECKED_SHADERS").is_ok_and(|v| v != "0") {
+            wgpu::ShaderRuntimeChecks::checked()
+        } else {
+            wgpu::ShaderRuntimeChecks {
+                bounds_checks: false,
+                force_loop_bounding: false,
+                ..wgpu::ShaderRuntimeChecks::checked()
+            }
+        };
+        self.shader_with(label, body, checks)
+    }
+
+    fn shader_with(&self, label: &str, body: &str, checks: wgpu::ShaderRuntimeChecks) -> wgpu::ShaderModule {
+        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
+        // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
+        // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
+        // the K3 argument is at its call site in `Kernels::new`).
         unsafe {
             self.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },

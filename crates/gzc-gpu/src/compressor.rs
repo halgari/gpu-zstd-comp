@@ -310,7 +310,8 @@ fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) -> wgpu::Bi
 }
 
 fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayout, body: &str) -> wgpu::ComputePipeline {
-    pipeline_from_module(ctx, label, layout, &ctx.shader(label, body), "main")
+    // K2, K4 and K5: loops terminate and indices stay in bounds for any input (`shader_trusted`).
+    pipeline_from_module(ctx, label, layout, &ctx.shader_trusted(label, body), "main")
 }
 
 fn pipeline_from_module(
