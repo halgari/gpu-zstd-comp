@@ -55,9 +55,11 @@ impl MatchParams {
         }
     }
 
-    /// Shortest sequence the parse can emit (bounds the sequence count per block).
+    /// Shortest sequence the parse can emit (bounds the sequence count per block): `min_match`
+    /// for the greedy parse; 4 for lazy/lazy2, whose repcode matches (zstd's `MEM_read32`
+    /// checks) need only 4 bytes whatever `min_match` is.
     pub fn min_seq_len(&self) -> u32 {
-        self.min_match
+        if self.lazy > 0 { 4 } else { self.min_match }
     }
 }
 
@@ -112,6 +114,8 @@ mod tests {
         assert_eq!(LVL9.n_hashes(), 1);
         assert_eq!(LVL3.min_seq_len(), 5);
         assert_eq!(LVL9.min_seq_len(), 4);
+        assert_eq!(MatchParams { min_match: 8, ..RUNG1 }.min_seq_len(), 8);
+        assert_eq!(MatchParams { min_match: 8, ..RUNG2 }.min_seq_len(), 4);
     }
 
     #[test]

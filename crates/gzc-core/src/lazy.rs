@@ -248,16 +248,27 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::chunk_file;
+
+/// Hand-built `best[]` cases pinning each branch of `lazy_parse` (gain boundaries, `continue`
+/// after a win, catch-up bounds, the dedup-store rep rule, the immediate offset_2 loop and the
+/// PARSE_END guards). Public (but hidden) so the GPU K3 tests replay exactly the same cases;
+/// every builder asserts its own gain arithmetic, so a case cannot drift silently.
+#[doc(hidden)]
+pub mod cases {
     use crate::config::{BLOCK_SIZE, PARSE_END};
-    use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{LVL9, RUNG1, RUNG2};
-    use crate::reference::{chains, compress_block, find_best, match_len};
-    use crate::seq::{reconstruct, Sequence};
+    use crate::params::{MatchParams, LVL9, RUNG2};
+    use crate::reference::{match_len, Match};
+    use crate::seq::Sequence;
     use crate::synth;
+
+    /// One block with its scripted `best[]` (BLOCK_SIZE entries) and the exact sequences
+    /// `lazy_parse` must produce for each listed params.
+    pub struct LazyCase {
+        pub name: String,
+        pub block: Vec<u8>,
+        pub best: Vec<Match>,
+        pub expect: Vec<(MatchParams, Vec<Sequence>)>,
+    }
 
     /// zstd `ZSTD_highbit32`.
     fn hb(x: u32) -> i32 {
@@ -301,21 +312,16 @@ mod tests {
         Match { offset: off as u32, len: match_len(block, p, p - off) as u32 }
     }
 
-    /// Parse and check that the output decodes back to `block`.
-    fn run(block: &[u8], best: &[Match], params: &MatchParams) -> Vec<Sequence> {
-        let out = lazy_parse(block, best, params);
-        let got = reconstruct(&out).expect("reconstruct");
-        assert_eq!(got, block, "lazy_parse output does not reconstruct the block");
-        out.sequences
-    }
-
     fn empty_best() -> Vec<Match> {
         vec![Match::default(); BLOCK_SIZE]
     }
 
+    fn case(name: &str, block: Vec<u8>, best: Vec<Match>, expect: Vec<(MatchParams, Vec<Sequence>)>) -> LazyCase {
+        LazyCase { name: name.to_string(), block, best, expect }
+    }
+
     /// Step 1: the match at ip+1 wins by exactly 1 over `gain1 + 4` → the parse defers.
-    #[test]
-    fn lazy_prefers_later_longer_match() {
+    pub fn lazy_prefers_later_longer_match() -> Vec<LazyCase> {
         let mut block = background(11);
         plant(&mut block, 200, 20, 8); // A: offBase 23, highbit 4
         plant(&mut block, 201, 130, 10); // B: offBase 133, highbit 7
@@ -324,12 +330,11 @@ mod tests {
         best[201] = real(&block, 201, 130);
         assert_eq!((best[200].len, best[201].len), (8, 10));
         assert_eq!(gain(10, 133), gain(8, 23) + 4 + 1, "B must win by exactly 1");
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(201, 10, 133)]);
+        vec![case("lazy_prefers_later_longer_match", block, best, vec![(RUNG2, vec![seq(201, 10, 133)])])]
     }
 
     /// Step 1: equal gains → the current match is kept.
-    #[test]
-    fn lazy_keeps_on_gain_tie() {
+    pub fn lazy_keeps_on_gain_tie() -> Vec<LazyCase> {
         let mut block = background(12);
         plant(&mut block, 200, 14, 8); // A: offBase 17, highbit 4
         plant(&mut block, 201, 28, 9); // B: offBase 31, highbit 4
@@ -338,13 +343,12 @@ mod tests {
         best[201] = real(&block, 201, 28);
         assert_eq!((best[200].len, best[201].len), (8, 9));
         assert_eq!(gain(9, 31), gain(8, 17) + 4, "B must tie");
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(200, 8, 17)]);
+        vec![case("lazy_keeps_on_gain_tie", block, best, vec![(RUNG2, vec![seq(200, 8, 17)])])]
     }
 
     /// Step 2 (lazy2): a match at ip+2 must beat `gain1 + 7`. Winning by 1 defers; a tie keeps.
     /// lazy1 never looks at ip+2.
-    #[test]
-    fn lazy2_second_step_threshold() {
+    pub fn lazy2_second_step_threshold() -> Vec<LazyCase> {
         // Win by 1: A at 200 (offBase 17, hb 4), nothing at 201, C at 202 (offBase 31, hb 4).
         let mut block = background(13);
         plant(&mut block, 200, 14, 8);
@@ -354,8 +358,13 @@ mod tests {
         best[202] = real(&block, 202, 28);
         assert_eq!((best[200].len, best[202].len), (8, 10));
         assert_eq!(gain(10, 31), gain(8, 17) + 7 + 1);
-        assert_eq!(run(&block, &best, &LVL9), vec![seq(202, 10, 31)]);
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(200, 8, 17)], "lazy1 must not search ip+2");
+        // lazy1 must not search ip+2.
+        let win = case(
+            "lazy2_second_step_threshold/win",
+            block,
+            best,
+            vec![(LVL9, vec![seq(202, 10, 31)]), (RUNG2, vec![seq(200, 8, 17)])],
+        );
 
         // Tie: C has offBase 43 (hb 5).
         let mut block = background(14);
@@ -366,7 +375,8 @@ mod tests {
         best[202] = real(&block, 202, 40);
         assert_eq!((best[200].len, best[202].len), (8, 10));
         assert_eq!(gain(10, 43), gain(8, 17) + 7);
-        assert_eq!(run(&block, &best, &LVL9), vec![seq(200, 8, 17)]);
+        let tie = case("lazy2_second_step_threshold/tie", block, best, vec![(LVL9, vec![seq(200, 8, 17)])]);
+        vec![win, tie]
     }
 
     /// A first match M0 (offset 45) sets offset_1; later the explicit match A at 120 competes
@@ -384,31 +394,35 @@ mod tests {
         (block, best)
     }
 
-    #[test]
-    fn lazy_rep_check_at_ip_plus_1() {
+    pub fn lazy_rep_check_at_ip_plus_1() -> Vec<LazyCase> {
+        let mut out = Vec::new();
         // ×3 rule: gain2 = mlRep*3 vs gain1 = ml*3 - highbit(offBase) + 1.
         // A offBase 23 (hb 4): 21 vs 24 - 4 + 1 = 21 → tie, keep A.
         let (block, best) = rep_block(21, 20, 121);
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(60, 10, 48), seq(50, 8, 23)]);
+        out.push(case("lazy_rep_check/x3_tie", block, best, vec![(RUNG2, vec![seq(60, 10, 48), seq(50, 8, 23)])]));
         // A offBase 35 (hb 5): 21 vs 20 → the repcode match at 121 wins by 1.
         let (block, best) = rep_block(22, 32, 121);
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(60, 10, 48), seq(51, 7, 1)]);
+        out.push(case("lazy_rep_check/x3_win", block, best, vec![(RUNG2, vec![seq(60, 10, 48), seq(51, 7, 1)])]));
 
         // lazy2 step 2, ×4 rule: gain2 = mlRep*4 vs gain1 = ml*4 - highbit(offBase) + 1.
         // A offBase 35 (hb 5): 28 vs 32 - 5 + 1 = 28 → tie, keep A.
         let (block, best) = rep_block(23, 32, 122);
-        assert_eq!(run(&block, &best, &LVL9), vec![seq(60, 10, 48), seq(50, 8, 35)]);
-        // A offBase 73 (hb 6): 28 vs 27 → the repcode match at 122 wins by 1.
+        out.push(case("lazy_rep_check/x4_tie", block, best, vec![(LVL9, vec![seq(60, 10, 48), seq(50, 8, 35)])]));
+        // A offBase 73 (hb 6): 28 vs 27 → the repcode match at 122 wins by 1; lazy1 never
+        // checks ip+2, so it keeps A.
         let (block, best) = rep_block(24, 70, 122);
-        assert_eq!(run(&block, &best, &LVL9), vec![seq(60, 10, 48), seq(52, 7, 1)]);
-        // lazy1 never checks ip+2: A is kept.
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(60, 10, 48), seq(50, 8, 73)]);
+        out.push(case(
+            "lazy_rep_check/x4_win",
+            block,
+            best,
+            vec![(LVL9, vec![seq(60, 10, 48), seq(52, 7, 1)]), (RUNG2, vec![seq(60, 10, 48), seq(50, 8, 73)])],
+        ));
+        out
     }
 
     /// Catch-up extends an explicit match backwards but never past `anchor` (the end of the
     /// previous match), even though the bytes before it still match.
-    #[test]
-    fn catch_up_stops_at_anchor() {
+    pub fn catch_up_stops_at_anchor() -> Vec<LazyCase> {
         let mut block = background(31);
         plant(&mut block, 200, 40, 10); // M0 → anchor 210
         // Offset-100 run covering 205..224: 5 bytes before anchor, 2 before the search hit.
@@ -421,24 +435,22 @@ mod tests {
         best[212] = real(&block, 212, 100);
         assert_eq!((best[200].len, best[212].len), (10, 12));
         assert_eq!(block[205..210], block[105..110], "run must extend past the anchor");
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(200, 10, 43), seq(0, 14, 103)]);
+        vec![case("catch_up_stops_at_anchor", block, best, vec![(RUNG2, vec![seq(200, 10, 43), seq(0, 14, 103)])])]
     }
 
     /// Catch-up stops when the match source reaches position 0 (`start - offset > 0`).
-    #[test]
-    fn catch_up_at_block_start() {
+    pub fn catch_up_at_block_start() -> Vec<LazyCase> {
         let mut block = background(32);
         plant(&mut block, 30, 30, 12); // source 0..12
         let mut best = empty_best();
         best[33] = real(&block, 33, 30);
         assert_eq!(best[33].len, 9);
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(30, 12, 33)]);
+        vec![case("catch_up_at_block_start", block, best, vec![(RUNG2, vec![seq(30, 12, 33)])])]
     }
 
     /// After a store, repeated `offset_2` matches are stored immediately as (ll 0, repcode 1),
     /// swapping offset_1 and offset_2 each time.
-    #[test]
-    fn immediate_offset2_repcode() {
+    pub fn immediate_offset2_repcode() -> Vec<LazyCase> {
         let mut block = background(41);
         plant(&mut block, 40, 25, 8); // M0 → reps [25, 1, 4]
         plant(&mut block, 150, 100, 8); // M1 → reps [100, 25, 1]
@@ -449,15 +461,13 @@ mod tests {
         best[150] = real(&block, 150, 100);
         assert_eq!((best[40].len, best[150].len), (8, 8));
         let want = vec![seq(40, 8, 28), seq(102, 8, 103), seq(0, 6, 1), seq(0, 5, 1)];
-        assert_eq!(run(&block, &best, &RUNG2), want);
-        assert_eq!(run(&block, &best, &LVL9), want);
+        vec![case("immediate_offset2_repcode", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
     }
 
     /// `best[]` is only valid below PARSE_END: deferral from the last parse positions must not
     /// look at `best[PARSE_END..]`. Poisoned entries there would win every gain comparison
     /// (and are not real matches, so using them breaks the reconstruct).
-    #[test]
-    fn lazy_near_parse_end() {
+    pub fn lazy_near_parse_end() -> Vec<LazyCase> {
         let pe = PARSE_END;
         let build = |with_b: bool| {
             let mut block = background(51);
@@ -488,23 +498,21 @@ mod tests {
         let (block, best) = build(true);
         assert_eq!((best[pe - 2].len, best[pe - 1].len), (6, 9));
         let want = vec![m0, seq(19, 9, (pe - 21 + 3) as u32)];
-        assert_eq!(run(&block, &best, &RUNG2), want);
-        assert_eq!(run(&block, &best, &LVL9), want);
+        let with_b = case("lazy_near_parse_end/b", block, best, vec![(RUNG2, want.clone()), (LVL9, want)]);
 
         // A at pe-2, nothing at pe-1: lazy2's step 2 must not search pe.
         let (block, best) = build(false);
         assert_eq!(best[pe - 2].len, 6);
         let want = vec![m0, seq(18, 6, (pe - 12 + 3) as u32)];
-        assert_eq!(run(&block, &best, &RUNG2), want);
-        assert_eq!(run(&block, &best, &LVL9), want);
+        let without_b = case("lazy_near_parse_end/no_b", block, best, vec![(RUNG2, want.clone()), (LVL9, want)]);
+        vec![with_b, without_b]
     }
 
     /// With literal skipping (step 2 after 256 literals) position 295 is never repcode-checked,
     /// so the search at 296 finds an explicit match whose offset equals offset_1. It is stored
     /// as repcode 1 (off_base_for), and the decoder's rep history (not zstd's
     /// `offset_2 = offset_1`) is what the parse continues with.
-    #[test]
-    fn explicit_match_at_rep0_uses_decoder_reps() {
+    pub fn explicit_match_at_rep0_uses_decoder_reps() -> Vec<LazyCase> {
         let mut block = background(61);
         plant(&mut block, 30, 20, 8); // M0 → reps [20, 1, 4], anchor 38
         plant(&mut block, 296, 20, 6);
@@ -512,15 +520,19 @@ mod tests {
         best[30] = real(&block, 30, 20);
         best[296] = real(&block, 296, 20);
         assert_eq!((best[30].len, best[296].len), (8, 6));
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(30, 8, 23), seq(258, 6, 1)]);
+        vec![case(
+            "explicit_match_at_rep0_uses_decoder_reps",
+            block,
+            best,
+            vec![(RUNG2, vec![seq(30, 8, 23), seq(258, 6, 1)])],
+        )]
     }
 
     /// Deviation 3 changes output: the dedup store at 296 (offset 20 == reps[0]) leaves the
     /// decoder's reps at [20, 1, 4], so offset_2 = 1 (zstd: offset_2 = offset_1 = 20). An
     /// offset-1 run right after the match is then stored by the immediate loop as
     /// (ll 0, repcode 1); zstd would probe offset 20 there, which does not match.
-    #[test]
-    fn dedup_store_enables_old_rep1_immediate() {
+    pub fn dedup_store_enables_old_rep1_immediate() -> Vec<LazyCase> {
         let mut block = background(61);
         plant(&mut block, 30, 20, 8); // M0 → reps [20, 1, 4], anchor 38
         block[301..307].fill(0x5A); // offset-1 run over 301..307 (301 is inside the match)
@@ -533,8 +545,7 @@ mod tests {
         assert_eq!(match_len(&block, 302, 301), 5, "offset-1 run at the match end");
         assert_ne!(block[302], block[302 - 20], "zstd's offset_2 (20) must not match at 302");
         let want = vec![seq(30, 8, 23), seq(258, 6, 1), seq(0, 5, 1)];
-        assert_eq!(run(&block, &best, &RUNG2), want);
-        assert_eq!(run(&block, &best, &LVL9), want);
+        vec![case("dedup_store_enables_old_rep1_immediate", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
     }
 
     /// The common deviation-3 case: a block starting with a byte run. At ip 1 the explicit
@@ -542,8 +553,7 @@ mod tests {
     /// move (start == offset), so it is stored as (ll 1, repcode 1) with reps unchanged
     /// [1, 4, 8] and offset_2 enabled as 4 (zstd keeps it at 1 after `offset_2 = offset_1`).
     /// The offset-4 probe at the run's end cannot match, so the output equals zstd's.
-    #[test]
-    fn dedup_store_at_block_start_byte_run() {
+    pub fn dedup_store_at_block_start_byte_run() -> Vec<LazyCase> {
         let mut block = background(71);
         block[0..10].fill(0x41);
         block[10] = 0x14;
@@ -551,15 +561,13 @@ mod tests {
         best[1] = real(&block, 1, 1);
         assert_eq!(best[1].len, 9);
         let want = vec![seq(1, 9, 1)];
-        assert_eq!(run(&block, &best, &RUNG2), want);
-        assert_eq!(run(&block, &best, &LVL9), want);
+        vec![case("dedup_store_at_block_start_byte_run", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
     }
 
     /// Chained deferral: B wins at p+1, the parse `continue`s, and at p+2 C beats B by exactly
     /// 1 under the step-1 `+4` rule. Falling through to lazy2's depth-2 check instead would
     /// apply `+7` and keep B; `break` would store B.
-    #[test]
-    fn lazy2_chained_deferral_uses_step1_rule() {
+    pub fn lazy2_chained_deferral_uses_step1_rule() -> Vec<LazyCase> {
         let mut block = background(81);
         plant(&mut block, 200, 14, 8); // A: offBase 17
         plant(&mut block, 201, 28, 10); // B: offBase 31
@@ -573,14 +581,12 @@ mod tests {
         assert_eq!(gain(12, 133), gain(10, 31) + 4 + 1, "C beats B by exactly 1 under +4");
         assert!(gain(12, 133) <= gain(10, 31) + 7, "C would lose under +7");
         let want = vec![seq(202, 12, 133)];
-        assert_eq!(run(&block, &best, &LVL9), want);
-        assert_eq!(run(&block, &best, &RUNG2), want);
+        vec![case("lazy2_chained_deferral_uses_step1_rule", block, best, vec![(LVL9, want.clone()), (RUNG2, want)])]
     }
 
     /// A step-2 win also `continue`s: C wins at p+2 (+7 rule), then D at p+3 beats C under the
     /// step-1 `+4` rule. `break` after C's win would store C.
-    #[test]
-    fn lazy2_step2_win_continues() {
+    pub fn lazy2_step2_win_continues() -> Vec<LazyCase> {
         let mut block = background(82);
         plant(&mut block, 200, 14, 8); // A: offBase 17
         plant(&mut block, 202, 28, 10); // C: offBase 31
@@ -592,8 +598,198 @@ mod tests {
         assert_eq!((best[200].len, best[202].len, best[203].len), (8, 10, 12));
         assert!(gain(10, 31) > gain(8, 17) + 7, "C wins at p+2");
         assert!(gain(12, 133) > gain(10, 31) + 4, "D beats C at p+3");
-        assert_eq!(run(&block, &best, &LVL9), vec![seq(203, 12, 133)]);
-        assert_eq!(run(&block, &best, &RUNG2), vec![seq(200, 8, 17)], "lazy1 stops at p+1");
+        // lazy1 stops at p+1.
+        vec![case(
+            "lazy2_step2_win_continues",
+            block,
+            best,
+            vec![(LVL9, vec![seq(203, 12, 133)]), (RUNG2, vec![seq(200, 8, 17)])],
+        )]
+    }
+
+    /// The immediate offset_2 loop runs while `ip <= PARSE_END` (zstd: `ip <= ilimit`): a store
+    /// ending exactly at PARSE_END is followed by a 6-byte offset_2 repeat there, stored as
+    /// (ll 0, repcode 1); only the last 2 bytes stay literals.
+    pub fn immediate_offset2_at_parse_end() -> Vec<LazyCase> {
+        let pe = PARSE_END;
+        let mut block = background(91);
+        // Offset-50 run over 100..pe-60 (found capped at 100): M0 → reps [50, 1, 4], anchor pe-60.
+        block[99] = block[49] ^ 0xFF;
+        for p in 100..pe - 60 {
+            block[p] = block[p - 50];
+        }
+        block[pe - 60] = block[pe - 110] ^ 0xFF;
+        plant(&mut block, pe, 50, 6); // offset_2 (= 50 after M1) repeat at PARSE_END
+        plant(&mut block, pe - 10, 30, 10); // M1: ends at PARSE_END → reps [30, 50, 1]
+        let mut best = empty_best();
+        best[100] = Match { offset: 50, len: RUNG2.search_cap };
+        best[pe - 10] = real(&block, pe - 10, 30);
+        assert_eq!(best[pe - 10].len, 10);
+        assert_eq!(match_len(&block, pe, pe - 50), 6);
+        assert!(match_len(&block, pe - 60, pe - 61) < 4, "no offset-1 repeat after M0");
+        let want = vec![seq(100, (pe - 160) as u32, 53), seq(50, 10, 33), seq(0, 6, 1)];
+        vec![case("immediate_offset2_at_parse_end", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
+    }
+
+    /// First search: `best[ip]` replaces the ip+1 repcode only when strictly longer. On a length
+    /// tie the deferral loop normally re-finds the repcode at ip+1 (x3 rule), which hides the
+    /// tie rule; at ip = PARSE_END-1 the deferral loop does not run, so the tie is visible: the
+    /// repcode at PARSE_END (6 bytes) is kept over the 6-byte explicit match at PARSE_END-1.
+    pub fn depth0_tie_keeps_repcode_at_parse_end() -> Vec<LazyCase> {
+        let pe = PARSE_END;
+        let mut block = background(92);
+        // Offset-50 run over 100..pe-60 (found capped at 100): M0 → offset_1 = 50, anchor pe-60.
+        block[99] = block[49] ^ 0xFF;
+        for p in 100..pe - 60 {
+            block[p] = block[p - 50];
+        }
+        block[pe - 60] = block[pe - 110] ^ 0xFF;
+        plant(&mut block, pe, 50, 6); // repcode (offset_1 = 50) match at PARSE_END
+        plant(&mut block, pe - 1, 30, 6); // explicit match at PARSE_END-1, same length
+        let mut best = empty_best();
+        best[100] = Match { offset: 50, len: RUNG2.search_cap };
+        best[pe - 1] = real(&block, pe - 1, 30);
+        assert_eq!(best[pe - 1].len, 6);
+        assert_eq!(match_len(&block, pe, pe - 50), 6);
+        assert!(match_len(&block, pe - 60, pe - 61) < 4, "no offset-1 repeat after M0");
+        let want = vec![seq(100, (pe - 160) as u32, 53), seq(60, 6, 1)];
+        vec![case("depth0_tie_keeps_repcode_at_parse_end", block, best, vec![(RUNG2, want.clone()), (LVL9, want)])]
+    }
+
+    /// Every hand-built case above, in order.
+    pub fn lazy_test_cases() -> Vec<LazyCase> {
+        [
+            lazy_prefers_later_longer_match,
+            lazy_keeps_on_gain_tie,
+            lazy2_second_step_threshold,
+            lazy_rep_check_at_ip_plus_1,
+            catch_up_stops_at_anchor,
+            catch_up_at_block_start,
+            immediate_offset2_repcode,
+            immediate_offset2_at_parse_end,
+            depth0_tie_keeps_repcode_at_parse_end,
+            lazy_near_parse_end,
+            explicit_match_at_rep0_uses_decoder_reps,
+            dedup_store_enables_old_rep1_immediate,
+            dedup_store_at_block_start_byte_run,
+            lazy2_chained_deferral_uses_step1_rule,
+            lazy2_step2_win_continues,
+        ]
+        .into_iter()
+        .flat_map(|f| f())
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cases::{self, LazyCase};
+    use super::*;
+    use crate::block::chunk_file;
+    use crate::frame::{write_frame, FrameOptions};
+    use crate::params::{LVL9, RUNG1, RUNG2};
+    use crate::reference::{chains, compress_block, find_best};
+    use crate::seq::reconstruct;
+    use crate::synth;
+
+    /// Parses every case with each of its params, checks the exact sequences and that the
+    /// output decodes back to the block.
+    fn check(cases: Vec<LazyCase>) {
+        for c in cases {
+            for (params, want) in &c.expect {
+                let out = lazy_parse(&c.block, &c.best, params);
+                let got = reconstruct(&out).expect("reconstruct");
+                assert_eq!(got, c.block, "{} lazy {}: output does not reconstruct the block", c.name, params.lazy);
+                assert_eq!(out.sequences, *want, "{} lazy {}", c.name, params.lazy);
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_prefers_later_longer_match() {
+        check(cases::lazy_prefers_later_longer_match());
+    }
+
+    #[test]
+    fn lazy_keeps_on_gain_tie() {
+        check(cases::lazy_keeps_on_gain_tie());
+    }
+
+    #[test]
+    fn lazy2_second_step_threshold() {
+        check(cases::lazy2_second_step_threshold());
+    }
+
+    #[test]
+    fn lazy_rep_check_at_ip_plus_1() {
+        check(cases::lazy_rep_check_at_ip_plus_1());
+    }
+
+    #[test]
+    fn catch_up_stops_at_anchor() {
+        check(cases::catch_up_stops_at_anchor());
+    }
+
+    #[test]
+    fn catch_up_at_block_start() {
+        check(cases::catch_up_at_block_start());
+    }
+
+    #[test]
+    fn immediate_offset2_repcode() {
+        check(cases::immediate_offset2_repcode());
+    }
+
+    #[test]
+    fn immediate_offset2_at_parse_end() {
+        check(cases::immediate_offset2_at_parse_end());
+    }
+
+    #[test]
+    fn depth0_tie_keeps_repcode_at_parse_end() {
+        check(cases::depth0_tie_keeps_repcode_at_parse_end());
+    }
+
+    #[test]
+    fn lazy_near_parse_end() {
+        check(cases::lazy_near_parse_end());
+    }
+
+    #[test]
+    fn explicit_match_at_rep0_uses_decoder_reps() {
+        check(cases::explicit_match_at_rep0_uses_decoder_reps());
+    }
+
+    #[test]
+    fn dedup_store_enables_old_rep1_immediate() {
+        check(cases::dedup_store_enables_old_rep1_immediate());
+    }
+
+    #[test]
+    fn dedup_store_at_block_start_byte_run() {
+        check(cases::dedup_store_at_block_start_byte_run());
+    }
+
+    #[test]
+    fn lazy2_chained_deferral_uses_step1_rule() {
+        check(cases::lazy2_chained_deferral_uses_step1_rule());
+    }
+
+    #[test]
+    fn lazy2_step2_win_continues() {
+        check(cases::lazy2_step2_win_continues());
+    }
+
+    /// `lazy_test_cases` (what the GPU tests replay) is exactly the union of the cases above.
+    #[test]
+    fn lazy_test_cases_lists_every_case() {
+        let all = cases::lazy_test_cases();
+        assert_eq!(all.len(), 20);
+        let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), all.len(), "case names are unique");
+        assert!(all.iter().all(|c| c.best.len() == BLOCK_SIZE && c.block.len() == BLOCK_SIZE && !c.expect.is_empty()));
     }
 
     #[test]

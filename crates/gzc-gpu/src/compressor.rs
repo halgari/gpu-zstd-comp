@@ -1,7 +1,8 @@
 //! Host side of the K2 (best match), K3 (parse), K5 (Huffman literals) and K4 (entropy + frame
 //! assembly) kernels; compress_batch / compress_frames entry points.
 //!
-//! K1 (hash chains) → K2 (`find_best`) → K3 (`greedy_parse`) reproduce
+//! K1 (hash chains) → K2 (`find_best`) → K3 (`reference::parse`: greedy, or `lazy::lazy_parse`
+//! when `MatchParams::lazy > 0`) reproduce
 //! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K5 writes each
 //! block's literals section into its frame and K4 completes the frame, byte-identical to
 //! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
@@ -16,10 +17,12 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::{FrameOptions, frame_header};
 use gzc_core::fse::FRAC;
 use gzc_core::params::MatchParams;
+use gzc_core::reference::Match;
 use gzc_core::seq::{BlockOutput, Sequence};
 
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
+const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -60,10 +63,11 @@ pub struct GpuParams {
     pub huffman: bool,
 }
 
-/// Whether the GPU kernels implement `p`: both hash modes with the greedy parse (the lazy parse
-/// arrives in Task 5).
+/// Whether the GPU kernels implement `p`: since the K3 lazy/lazy2 port (M4 Task 5), every valid
+/// `MatchParams` (both hash modes, greedy, lazy and lazy2), so every preset.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.lazy == 0
+    // Now just `validate()`: kept as a separate hook for the CLI's per-engine preset check.
+    p.validate().is_ok()
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `MAX_SEQS`.
@@ -348,7 +352,8 @@ impl Kernels {
             ctx,
             "k3_parse",
             &parse_layout,
-            &format!("{match_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}"),
+            // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
+            &format!("{match_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}"),
         );
         let (tab, consts) = k4_tables();
         let huffman = params.emit_frames && params.huffman;
@@ -449,6 +454,30 @@ impl Kernels {
                 wgpu::BindGroupEntry { binding: 2, resource: bufs.best.as_entire_binding() },
             ],
         });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: ts(1) });
+        pass.set_pipeline(&self.best);
+        pass.set_bind_group(0, &k2, &[]);
+        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
+        drop(pass);
+
+        self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
+
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
+    /// first `n_blocks` blocks. `n_blocks` is at least 1 and at most `bufs.capacity`.
+    fn record_parse(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites>,
+    ) {
+        debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity);
         // K3 derives the batch size from the bound length of `counts`.
         let counts = wgpu::BufferBinding { buffer: &bufs.counts, offset: 0, size: wgpu::BufferSize::new(counts_bytes(n_blocks)) };
         let k3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -462,22 +491,10 @@ impl Kernels {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Buffer(counts) },
             ],
         });
-
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: ts(1) });
-        pass.set_pipeline(&self.best);
-        pass.set_bind_group(0, &k2, &[]);
-        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
-        drop(pass);
-
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes: ts(2) });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
         pass.set_pipeline(&self.parse);
         pass.set_bind_group(0, &k3, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);
-        drop(pass);
-
-        if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
-        }
     }
 
     /// Records K5 (with `huffman`) then K4, on whatever parse (`seqs`, `lits`, `counts`) and
@@ -698,6 +715,100 @@ pub fn frames_from_parses(
     result
 }
 
+/// Uploads `blocks` and one caller-supplied `best[]` table per block (K2's output layout; entries
+/// past the table's end are zero, i.e. no match), then records K3 (and, with `frames`, K5/K4)
+/// into a new encoder and submits it. At most `max_batch_blocks` blocks (one batch).
+fn submit_from_best(
+    ctx: &GpuContext,
+    kernels: &Kernels,
+    blocks: &[&[u8]],
+    bests: &[Vec<Match>],
+    frames: bool,
+) -> anyhow::Result<BatchBuffers> {
+    anyhow::ensure!(blocks.len() == bests.len(), "one best[] table per block");
+    anyhow::ensure!(!blocks.is_empty(), "no blocks");
+    let n = blocks.len() as u32;
+    let m = kernels.matching();
+    anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
+    let bufs = BatchBuffers::new(ctx, n, frames, &m);
+    ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
+    for (b, best) in bests.iter().enumerate() {
+        anyhow::ensure!(
+            (gzc_core::config::PARSE_END..=BLOCK_SIZE).contains(&best.len()),
+            "best[] {b} has {} entries, not in PARSE_END..=BLOCK_SIZE",
+            best.len()
+        );
+        let mut words: Vec<u32> = best.iter().flat_map(|m| [m.offset, m.len]).collect();
+        words.resize(2 * BLOCK_SIZE, 0);
+        ctx.queue.write_buffer(&bufs.best, b as u64 * best_bytes(1), bytemuck::cast_slice(&words));
+    }
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("from_best") });
+    kernels.record_parse(ctx, &mut enc, &bufs, n, None);
+    if frames {
+        kernels.record_entropy(ctx, &mut enc, &bufs, n, None);
+    }
+    ctx.queue.submit([enc.finish()]);
+    Ok(bufs)
+}
+
+/// Runs `f` inside wgpu out-of-memory and validation error scopes, turning either into `Err`.
+fn with_error_scopes<T>(ctx: &GpuContext, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let result = f();
+    if let Some(e) = pollster::block_on(validation_scope.pop()) {
+        return Err(anyhow!("wgpu validation error: {e}"));
+    }
+    if let Some(e) = pollster::block_on(oom_scope.pop()) {
+        return Err(anyhow!("wgpu out of memory: {e}"));
+    }
+    result
+}
+
+/// Uploads blocks plus caller-supplied best[] tables, runs K3 (+K5+K4), returns frames. For
+/// branch-targeted tests: `bests[i]` (at least `PARSE_END` entries, missing ones are "no match")
+/// replaces K1/K2's output for `blocks[i]`, so the parse sees exactly the scripted matches. Errors
+/// unless `kernels` was built with `emit_frames`. At most `max_batch_blocks` blocks (one batch).
+pub fn frames_from_best(
+    ctx: &GpuContext,
+    kernels: &Kernels,
+    blocks: &[&[u8]],
+    bests: &[Vec<Match>],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    anyhow::ensure!(kernels.emits_frames(), "frames_from_best needs Kernels built with emit_frames");
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_error_scopes(ctx, || {
+        let bufs = submit_from_best(ctx, kernels, blocks, bests, true)?;
+        let n = blocks.len() as u32;
+        let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
+        let words = read_regions(ctx, &[(frame_len, 0, n as u64), (frames, 0, frames_bytes(n) / 4)])?;
+        let (lens, frames) = words.split_at(n as usize);
+        let bytes: &[u8] = bytemuck::cast_slice(frames);
+        lens.iter().enumerate().map(|(b, &len)| Ok(frame_bytes(bytes, b, len)?.to_vec())).collect()
+    })
+}
+
+/// `frames_from_best`, returning K3's parse of each block instead of its frame (works with or
+/// without `emit_frames`). Lets tests compare the parse itself, which a Raw frame would hide.
+pub fn parses_from_best(
+    ctx: &GpuContext,
+    kernels: &Kernels,
+    blocks: &[&[u8]],
+    bests: &[Vec<Match>],
+) -> anyhow::Result<Vec<BlockOutput>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_error_scopes(ctx, || {
+        let bufs = submit_from_best(ctx, kernels, blocks, bests, false)?;
+        let mut out = Vec::with_capacity(blocks.len());
+        read_outputs(ctx, &bufs, blocks.len() as u32, &mut out)?;
+        Ok(out)
+    })
+}
+
 /// Block `b`'s frame out of a fixed-stride frames region (`FRAME_STRIDE` bytes per block),
 /// checking K4's reported length.
 pub fn frame_bytes(frames: &[u8], b: usize, len: u32) -> anyhow::Result<&[u8]> {
@@ -809,20 +920,22 @@ mod tests {
     }
 
     #[test]
-    fn gpu_supports_greedy_parses_only_for_now() {
-        assert!(gpu_supports(&LVL3));
-        assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
-        assert!(gpu_supports(&RUNG1));
-        assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
-        for p in [RUNG2, LVL9] {
-            assert!(!gpu_supports(&p), "{p:?}");
-            assert!(check_matching(&p).unwrap_err().to_string().contains("not implemented yet on gpu"));
+    fn gpu_supports_all_presets() {
+        for (name, p) in gzc_core::params::PRESETS {
+            assert!(gpu_supports(&p), "{name}");
+            check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+        assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
+        assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
+        assert!(gpu_supports(&MatchParams { min_match: 6, ..RUNG2 }));
+        let bad = MatchParams { lazy: 3, ..LVL9 };
+        assert!(!gpu_supports(&bad));
+        assert!(check_matching(&bad).unwrap_err().to_string().contains("lazy 3"));
     }
 
     #[test]
     fn batch_fits_every_buffer() {
-        for m in [LVL3, RUNG1] {
+        for m in [LVL3, RUNG1, RUNG2, LVL9] {
             let nh = m.n_hashes();
             for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
                 let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &m);
@@ -842,14 +955,14 @@ mod tests {
 
     #[test]
     fn batch_respects_workgroup_cap() {
-        for m in [LVL3, RUNG1] {
+        for m in [LVL3, RUNG1, RUNG2, LVL9] {
             assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 3), &m), 3);
         }
     }
 
     #[test]
     fn batch_keeps_u32_indices_in_range() {
-        for m in [LVL3, RUNG1] {
+        for m in [LVL3, RUNG1, RUNG2, LVL9] {
             let nh = m.n_hashes() as u64;
             let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &m) as u64;
             assert!(n > 0);
@@ -863,7 +976,7 @@ mod tests {
 
     #[test]
     fn batch_is_zero_when_one_block_does_not_fit() {
-        for m in [LVL3, RUNG1] {
+        for m in [LVL3, RUNG1, RUNG2, LVL9] {
             assert_eq!(max_batch_blocks(&limits(BLOCK_SIZE as u64, u64::MAX, 65535), &m), 0);
         }
     }

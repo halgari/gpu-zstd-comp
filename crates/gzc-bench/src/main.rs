@@ -419,8 +419,8 @@ mod tests {
         let lvl3 = parse_preset("lvl3").unwrap();
         assert!(check_presets(&[lvl3], true, true).is_ok());
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
-        let err = check_presets(&[lvl9], false, true).unwrap_err().to_string();
-        assert_eq!(err, "preset 'lvl9' is not implemented yet on gpu");
+        let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
+        assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
     }
 
     #[test]

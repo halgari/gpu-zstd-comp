@@ -563,9 +563,10 @@ mod tests {
         assert!(compress_stream(&ctx, &cfg(0, 2), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(8, 0), &[], &mut sink).is_err());
         assert!(compress_stream(&ctx, &cfg(u32::MAX, 1), &[], &mut sink).is_err());
-        let lvl9 = PipelineConfig { params: GpuParams { matching: LVL9, ..cfg(8, 2).params }, ..cfg(8, 2) };
-        let e = Pipeline::new(&ctx, &lvl9).err().expect("lvl9 is not implemented on the GPU yet");
-        assert!(e.to_string().contains("not implemented yet on gpu"), "{e}");
+        let bad = MatchParams { lazy: 3, ..LVL9 };
+        let bad = PipelineConfig { params: GpuParams { matching: bad, ..cfg(8, 2).params }, ..cfg(8, 2) };
+        let e = Pipeline::new(&ctx, &bad).err().expect("lazy 3 is invalid");
+        assert!(e.to_string().contains("lazy 3"), "{e}");
     }
 
     struct CollectFrames(Vec<Option<Vec<u8>>>);
@@ -615,7 +616,7 @@ mod tests {
     #[test]
     fn vram_matches_params() {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-        for matching in [LVL3, RUNG1] {
+        for matching in [LVL3, RUNG1, LVL9] {
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg = PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
                 let pipe = Pipeline::new(&ctx, &cfg).unwrap();
