@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         let (mut a, mut b, mut c, mut d, mut e, mut f) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for _ in 0..REPS {
             let mut enc = ctx.device.create_command_encoder(&Default::default());
-            lvl9.record_timed(&ctx, &mut enc, &lvl9_bufs, n, Some(&timer.set));
+            lvl9.record_timed(&ctx, &mut enc, &lvl9_bufs, n, Some(&timer.set)).unwrap();
             let ms = timer.finish(&ctx, enc, 2);
             a.push(ms[0]);
             b.push(ms[1]);
@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
             c.push(ms[0]);
             d.push(ms[1]);
             let mut enc = ctx.device.create_command_encoder(&Default::default());
-            lvl3.record_timed(&ctx, &mut enc, &lvl3_bufs, n, Some(&timer.set));
+            lvl3.record_timed(&ctx, &mut enc, &lvl3_bufs, n, Some(&timer.set)).unwrap();
             let ms = timer.finish(&ctx, enc, 2);
             e.push(ms[0]);
             f.push(ms[1]);

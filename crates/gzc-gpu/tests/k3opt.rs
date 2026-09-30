@@ -200,8 +200,9 @@ fn check_blocks_with(
 #[test]
 fn k3opt_ring_choice() {
     let auto = K3OptConfig::default();
+    let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
-    let tables = need - ring_bytes(auto.wg, 32);
+    let tables = need - ring_bytes(auto.wg, target);
     if BLOCK_SIZE == 65536 {
         assert!(need <= 5200, "wg16 workgroup footprint {need} B (one wave needs about 5 KB)");
     }
@@ -214,7 +215,7 @@ fn k3opt_ring_choice() {
     let private = K3OptConfig { ring: Some(RingMem::Private), ..auto };
     assert_eq!(ring_for(&OPT16, &private, tables).unwrap(), RingMem::Private);
     let seg = BLOCK_SIZE as u64 >> OPT16.segment_log2;
-    assert_eq!(scratch_bytes_per_block(&OPT16), seg * 33 * 12);
+    assert_eq!(scratch_bytes_per_block(&OPT16), seg * (target as u64 + 1) * 12);
     // The fallback runs on this adapter too (the tests below build it explicitly).
     let ctx = GpuContext::new().expect("GPU required");
     let k = K3Opt::new(&ctx, &OPT16, private).expect("K3Opt::new");

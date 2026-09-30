@@ -515,3 +515,41 @@ runs stay noisier than 64K ones.
 - VRAM: add `scratch_bytes_per_block(m) × capacity` (6336 B/block at 64K, 18.4 MB at 2900 blocks).
 - Keep one K3opt batch at 3400 blocks or fewer on the 5090 (20 warps/SM at ≤ 100 registers, about 4.5 KB
   shared). Past that, a second wave costs a full heavy-block chain unless the blocks are ordered heavy-first.
+
+## T5: integration and measurement (stage S4), branch `worktree-agent-acef2efd020aefb65` (from `m5` 31d5d72), 2026-09-30
+
+Summary and tables: `docs/results/2026-09-30-m5.md`. RTX 5090, 64 KiB, full corpus, `--inflight 3`, GPU idle apart
+from an idle `parsecd` (sampled every 0.5 s during each run). The host ran two QEMU VMs and a `haskill` process
+(load average 5–30).
+
+### Throughput (three runs per row, MB/s end to end; median in bold)
+
+| config | run 1 | run 2 | run 3 | median | K1 / K2 / K3 / K4 / K5 ms/batch (median) |
+|---|---:|---:|---:|---:|---|
+| opt14 b2900 | 2176.7 | 2168.5 | 2165.6 | **2168.5** | 19.89 / 7.49 / 51.96 / 1.77 / 3.81 |
+| opt16 b2900 | 1428.3 | 1425.7 | 1419.9 | **1425.7** | 19.90 / 7.56 / 96.57 / 1.74 / 3.80 |
+| opt14 `--batch max` (b3586) | 1753.3 | 1745.8 | 1743.7 | **1745.8** | 23.90 / 9.02 / 88.26 / 2.12 / 4.47 |
+| opt16 `--batch max` (b3586) | 1096.1 | 1089.7 | 1089.1 | **1089.7** | 23.88 / 9.00 / 165.57 / 2.02 / 4.46 |
+| lvl9s12seg `--batch max` (b5403) | 10472.0 | 10423.9 | 10442.8 | **10442.8** | 6.46 / 10.96 / 6.84 / 1.79 / 5.16 |
+| libzstd L14, 32 threads | 573.5 | 579.4 | 577.6 | **577.6** | – |
+| libzstd L16, 32 threads | 496.6 | 495.2 | 498.0 | **496.6** | – |
+
+- Single runs: b3200 gave opt14 2237.0 and opt16 1474.9; b3400 gave 2248.2 and 1487.3.
+- The one-wave boundary (≈ 3400 blocks, T3b) holds in the pipeline. K3 per block:
+  - `opt14`: 17.9 µs at b2900 against 24.6 µs at b3586;
+  - `opt16`: 33.3 µs against 46.2 µs.
+- `k3opt_passes_timing` in the same session (2900 blocks):
+  - `opt14`: 9.09 + 9.28 + 0.27 = 18.64 µs;
+  - `opt16`: 8.23 + 8.17 + 8.24 + 9.20 + 0.26 = 34.10 µs.
+
+### Correctness and ratios
+
+- `gpu --verify` passed on the full corpus at 64, 32 and 16 KiB, and the GPU's compressed bytes equal `ref`'s at
+  each size. Ratios are unchanged from T1:
+  - 64 KiB: 1.37064 / 1.37144 against L14/L16 1.36827 / 1.37100;
+  - 32 KiB: 1.35105 / 1.35158 against 1.34797 / 1.35025;
+  - 16 KiB: 1.32765 / 1.32794 against 1.32606 / 1.32774.
+- `opt_pipeline` covers 4000 corpus blocks, opt14 and opt16, all four transfer modes, byte-identical. It passed
+  at 64 KiB and 16 KiB, with subgroups on and off.
+- Full `gzc-gpu` suites passed at 64 KiB, at 64 KiB with no subgroups, and at 16 KiB. `gzc-core` and `gzc-bench`
+  pass too.
