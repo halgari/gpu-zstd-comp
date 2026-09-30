@@ -111,7 +111,7 @@ const _: () = assert!(256 < 1u64 << (32 - BEST_OFF_BITS), "capped lengths must f
 
 /// Bytes of the `best` buffer: `[block][pos]` × one u32, `(capped len << BEST_OFF_BITS) | offset`
 /// (0 = no match).
-pub fn best_bytes(n_blocks: u32) -> u64 {
+pub const fn best_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * BLOCK_SIZE as u64 * 4
 }
 
@@ -257,6 +257,10 @@ struct SegParse {
     /// Segments per block.
     n_seg: u32,
 }
+
+// k3_seg.wgsl keeps each segment's sequences and trailer in that segment's own `best` words:
+// every block needs BLOCK_SIZE words there.
+const _: () = assert!(best_bytes(1) >= 4 * BLOCK_SIZE as u64, "k3_seg needs BLOCK_SIZE best words per block");
 
 /// Lanes per workgroup of `k3_seg.wgsl`'s `main_seg` (32: 4 % faster K3 than 64 or 128 on an
 /// RTX 5090 at 64 KiB blocks).
@@ -706,7 +710,12 @@ impl Kernels {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
             pass.set_bind_group(0, &k3, &[]);
             pass.set_pipeline(&sp.seg);
-            pass.dispatch_workgroups((n_blocks * sp.n_seg).div_ceil(K3_SEG_WG), 1, 1);
+            let groups = (n_blocks * sp.n_seg).div_ceil(K3_SEG_WG);
+            assert!(
+                groups <= ctx.device.limits().max_compute_workgroups_per_dimension,
+                "k3_seg: {groups} workgroups exceed the device's per-dimension limit"
+            );
+            pass.dispatch_workgroups(groups, 1, 1);
             pass.set_pipeline(&sp.fixup);
             pass.dispatch_workgroups(n_blocks, 1, 1);
             return;

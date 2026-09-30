@@ -107,10 +107,9 @@ fn search_max(base: u32, bbase: u32, ip: u32, lim: u32) -> vec2<u32> {
     if (bl == SEARCH_CAP) {
         len = match_len(base, ip, ip - off, lim - ip);
     }
-    if (ip + len > lim) {
-        len = lim - ip;
-        if (len < MIN_MATCH) { return vec2<u32>(0u, 0u); }
-    }
+    // Cut at lim; a capped entry's lim-bounded extension can also end below MIN_MATCH.
+    len = min(len, lim - ip);
+    if (len < MIN_MATCH) { return vec2<u32>(0u, 0u); }
     return vec2<u32>(len, off + 3u);
 }
 

@@ -1527,7 +1527,8 @@ fn stream_frames_match_cpu_non_lvl3_presets() {
 /// Informal (not in the normal suite; reads the real corpus): a few hundred real .dds/.nif blocks
 /// per preset, GPU frames against CPU frames.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test differential corpus_blocks -- --ignored --nocapture`
-/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks, spread over the files in sorted path order.
+/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks, spread over the files in sorted path order;
+/// `GZC_CORPUS_PRESETS` (comma-separated) limits the presets.
 #[test]
 #[ignore]
 fn corpus_blocks_match_cpu_per_preset() {
@@ -1563,7 +1564,12 @@ fn corpus_blocks_match_cpu_per_preset() {
     }
     blocks.truncate(want_blocks);
     eprintln!("{} blocks from {} files", blocks.len(), files.len());
+    // `GZC_CORPUS_PRESETS=lvl9seg,...` limits the run to those presets.
+    let only = std::env::var("GZC_CORPUS_PRESETS").ok();
     for (name, params) in GPU_PRESETS {
+        if only.as_ref().is_some_and(|o| !o.split(',').any(|p| p == name)) {
+            continue;
+        }
         let (ctx, kernels) = setup_frames_for(params, true);
         check_frames(&ctx, &kernels, &blocks);
         let total: usize = blocks

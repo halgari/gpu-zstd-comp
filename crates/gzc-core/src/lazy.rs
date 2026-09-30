@@ -56,7 +56,8 @@ fn rep_len(block: &[u8], p: usize, off: u32, lim: usize) -> u32 {
 /// `ZSTD_searchMax(ip)`: `(matchLength, offBase)` of `best[ip]`, or `None` when it has no
 /// match of at least `min_match`. A capped length is extended to the true match length (up to
 /// `seg.lim`). With `seg.clamp` (segmented parse) a match running past `seg.lim` is cut there
-/// and dropped when that leaves fewer than `min_match` bytes.
+/// and dropped when that (or the lim-bounded extension of a capped entry) leaves fewer than
+/// `min_match` bytes.
 fn search_max(block: &[u8], best: &[Match], ip: usize, params: &MatchParams, seg: &Seg) -> Option<(u32, u32)> {
     debug_assert!(ip < PARSE_END, "best[] read at {ip} >= PARSE_END");
     let m = best[ip];
@@ -68,8 +69,10 @@ fn search_max(block: &[u8], best: &[Match], ip: usize, params: &MatchParams, seg
     } else {
         m.len
     };
-    if seg.clamp && ip + len as usize > seg.lim {
-        len = (seg.lim - ip) as u32;
+    if seg.clamp {
+        // Cut at lim; a capped entry's extension is already bounded by lim and can also end
+        // below min_match there.
+        len = len.min((seg.lim - ip) as u32);
         if len < params.min_match {
             return None;
         }
@@ -810,6 +813,23 @@ pub mod cases {
         vec![case("seg_clamp_drops_short_match", block, best, vec![(p, vec![seq(SEG as u32, 15, 103)])])]
     }
 
+    /// min_match 6: a capped best[] entry 5 bytes before the segment end, whose extension stops
+    /// at lim with 5 bytes (< min_match), is dropped; segment 1 takes the rest (capped too).
+    pub fn seg_capped_extension_clamped_below_min_match() -> Vec<LazyCase> {
+        let p = MatchParams { min_match: 6, ..LVL9SEG };
+        let cap = p.search_cap;
+        let mut block = background(35);
+        plant(&mut block, SEG - 5, 100, 70);
+        let mut best = empty_best();
+        for q in [SEG - 5, SEG] {
+            let m = real(&block, q, 100);
+            best[q] = Match { offset: m.offset, len: m.len.min(cap) };
+        }
+        assert_eq!((best[SEG - 5].len, best[SEG].len, real(&block, SEG, 100).len), (cap, cap, 65));
+        let want = vec![seq(SEG as u32, 65, 103)];
+        vec![case("seg_capped_extension_clamped_below_min_match", block, best, vec![(p, want)])]
+    }
+
     /// Segments 1 and 2 are empty: the literals after segment 0's match run into segment 3's
     /// first sequence.
     pub fn seg_empty_segments_carry_literals() -> Vec<LazyCase> {
@@ -855,6 +875,7 @@ pub mod cases {
         [
             seg_match_clamped_at_segment_end,
             seg_clamp_drops_short_match,
+            seg_capped_extension_clamped_below_min_match,
             seg_empty_segments_carry_literals,
             seg_true_reps_across_segments,
         ]
@@ -1026,9 +1047,14 @@ mod tests {
     }
 
     #[test]
+    fn seg_capped_extension_clamped_below_min_match() {
+        check(cases::seg_capped_extension_clamped_below_min_match());
+    }
+
+    #[test]
     fn segment_test_cases_lists_every_case() {
         let all = cases::segment_test_cases();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert!(all.iter().all(|c| c.expect.iter().all(|(p, _)| p.segment_log2 > 0)));
     }
 

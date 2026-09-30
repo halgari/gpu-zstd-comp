@@ -27,7 +27,12 @@ Ratio checks:
 
 - **64 KiB:** libzstd L9 is 1.3379 (controller's number). lvl9seg is +0.105 % above it and −0.001 % below lvl9.
 - **128 KiB:** L9 is 1.3532. lvl9seg is +0.12 % above it and −0.008 % below lvl9.
-- **Equality and decoding:** `gzc-bench ref --preset lvl9seg --verify` at 64K produced exactly the GPU's bytes (4 848 642 982). `gpu --verify` at 64K passed.
+- **Equality and decoding:**
+  - `gzc-bench ref` and `gzc-bench gpu` report the same total size at 64K (4 848 642 982 bytes).
+  - Each engine's `--verify` passed. It round-trips that engine's own frames through libzstd; it does not compare the two
+    engines' bytes.
+  - Byte identity was checked per frame: at 64K, `corpus_blocks_match_cpu_per_preset` (`GZC_CORPUS_BLOCKS=4000
+    GZC_CORPUS_PRESETS=lvl9seg`) compared GPU and CPU frames on 4 000 real blocks from 3 172 files, and all were equal.
 
 Stages (K3 ms/batch):
 
