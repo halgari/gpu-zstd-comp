@@ -380,7 +380,8 @@ fn lane_mask(w: u32) -> (u32, u32) {
 /// The K3 mode for `m` on `ctx`. Greedy presets and devices without subgroups use `Seq`.
 /// Otherwise `Coop` with W = the adapter's minimum subgroup size (clamped to 8..=64, a power of
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
-/// ids 0..W-1 (else `Seq`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
+/// ids 0..W-1 (else `Seq`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable;
+/// `GZC_NO_SUBGROUPS=1` also selects seq unless coop is forced),
 /// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size) and `GZC_K3_BPW=1|2` (blocks per
 /// workgroup; 2 needs minimum == maximum subgroup size == W). The output never depends on them.
 pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
@@ -390,7 +391,9 @@ pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
         Some(v) => anyhow::bail!("GZC_K3_MODE={v}: expected seq or coop"),
     }
     let force_coop = forced.as_deref() == Some("coop");
-    if m.lazy == 0 || forced.as_deref() == Some("seq") {
+    // GZC_NO_SUBGROUPS=1 forces every subgroup kernel's fallback (shared with K1).
+    let no_subgroups = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v == "1");
+    if m.lazy == 0 || forced.as_deref() == Some("seq") || (no_subgroups && !force_coop) {
         return Ok(K3Mode::Seq);
     }
     let min = ctx.adapter_info.subgroup_min_size;
@@ -489,7 +492,12 @@ impl Kernels {
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
         // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
         let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}");
-        let parse = compute_pipeline(ctx, "k3_parse", &parse_layout, &k3_body);
+        // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
+        // naga adds so the driver may not assume termination): every K3 loop provably ends (each
+        // iteration advances ip, n, moved or i), and the counter costs 4 % (lazy2, cooperative),
+        // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090.
+        let parse =
+            pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main");
         let k3_mode = k3_mode(ctx, &m)?;
         let parse_coop = match k3_mode {
             K3Mode::Seq => None,
@@ -498,8 +506,9 @@ impl Kernels {
                 let body = format!(
                     "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n{k3_body}\n{K3_COOP_WGSL}"
                 );
-                // Subgroup built-ins need Features::SUBGROUP on the device; naga 30 rejects `enable subgroups;`.
-                let module = ctx.shader("k3_coop", &body);
+                // Subgroup built-ins need Features::SUBGROUP on the device (naga 30 rejects
+                // `enable subgroups;`).
+                let module = ctx.shader_unbounded_loops("k3_coop", &body);
                 Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
             }
         };

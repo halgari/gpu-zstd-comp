@@ -62,6 +62,20 @@ impl GpuContext {
         })
     }
 
+    /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
+    /// must provably terminate (a loop that does not is undefined behaviour for the driver).
+    pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
+        let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates.
+        unsafe {
+            self.device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },
+                checks,
+            )
+        }
+    }
+
     /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from.
     pub fn storage_buffer(&self, label: &str, size: u64, copy_src: bool) -> wgpu::Buffer {
         let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
