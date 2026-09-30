@@ -607,7 +607,7 @@ impl Kernels {
 
     /// Records K1 then K2 (timestamps as in `record_timed`) for the first `n_blocks` blocks of
     /// `bufs.data`, leaving the matches in `bufs.best`. `1 <= n_blocks <= bufs.capacity`.
-    fn record_best(
+    pub(crate) fn record_best(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
@@ -640,9 +640,31 @@ impl Kernels {
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
     }
 
+    /// K1 alone, or K2 alone on the chains already in `bufs.pred` (the E3 overlap probe).
+    #[cfg(test)]
+    pub(crate) fn record_k1_or_k2(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n: u32, k2: bool) {
+        if !k2 {
+            self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n, None);
+            return;
+        }
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k2"),
+            layout: &self.best_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.pred.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.best.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: None });
+        pass.set_pipeline(&self.best);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n, 1);
+    }
+
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
     /// first `n_blocks` blocks. `n_blocks` is at least 1 and at most `bufs.capacity`.
-    fn record_parse(
+    pub(crate) fn record_parse(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,

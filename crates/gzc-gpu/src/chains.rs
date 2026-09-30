@@ -205,9 +205,9 @@ impl ChainsKernel {
             if opts.break_subgroup_kernel {
                 src = src.replace("firstLeadingBit(lower)", "firstTrailingBit(lower)");
             }
-            ctx.shader_trusted("k1_chains_sg", &src)
+            ctx.shader("k1_chains_sg", &src)
         } else {
-            ctx.shader_trusted("k1_chains", &format!("{}{K1_WGSL}", params_wgsl(params)))
+            ctx.shader("k1_chains", &format!("{}{K1_WGSL}", params_wgsl(params)))
         };
         let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("k1_chains"),

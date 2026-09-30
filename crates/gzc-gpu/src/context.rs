@@ -58,6 +58,51 @@ impl GpuContext {
     /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards). The feature is also requested
     /// for the direct upload (`direct_upload`, on by default with full ReBAR).
     pub fn with_options(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
+        let p = Prepared::new(allow_subgroups, mappable)?;
+        let (device, queue) = pollster::block_on(p.adapter.request_device(&p.descriptor()))
+            .context("request_device")?;
+        Ok(p.context(device, queue))
+    }
+}
+
+/// The adapter and the device features/limits `GpuContext::with_options` settles on, before a
+/// device exists (shared with `multiqueue`, which creates the device itself).
+pub(crate) struct Prepared {
+    pub adapter: wgpu::Adapter,
+    pub info: wgpu::AdapterInfo,
+    pub timestamps: bool,
+    pub subgroups: bool,
+    pub mappable_storage: bool,
+    pub pack_frames: bool,
+    pub direct_upload: bool,
+    pub required_features: wgpu::Features,
+    pub required_limits: wgpu::Limits,
+}
+
+impl Prepared {
+    pub fn descriptor(&self) -> wgpu::DeviceDescriptor<'static> {
+        wgpu::DeviceDescriptor {
+            label: Some("gzc"),
+            required_features: self.required_features,
+            required_limits: self.required_limits.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub fn context(&self, device: wgpu::Device, queue: wgpu::Queue) -> GpuContext {
+        GpuContext {
+            device,
+            queue,
+            adapter_info: self.info.clone(),
+            timestamps: self.timestamps,
+            subgroups: self.subgroups,
+            mappable_storage: self.mappable_storage,
+            pack_frames: self.pack_frames,
+            direct_upload: self.direct_upload,
+        }
+    }
+
+    pub fn new(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -99,18 +144,21 @@ impl GpuContext {
         if mappable_storage {
             required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         }
-
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("gzc"),
+        Ok(Self {
+            adapter,
+            info,
+            timestamps,
+            subgroups,
+            mappable_storage,
+            pack_frames,
+            direct_upload,
             required_features,
             required_limits,
-            ..Default::default()
-        }))
-        .context("request_device")?;
-
-        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups, mappable_storage, pack_frames, direct_upload })
+        })
     }
+}
 
+impl GpuContext {
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
     pub fn shader(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         self.shader_with(label, body, wgpu::ShaderRuntimeChecks::checked())
@@ -132,10 +180,11 @@ impl GpuContext {
     /// - every array index is in bounds (an out-of-bounds index is undefined behaviour, where the
     ///   clamped module would have silently read/written a clamped element).
     ///
-    /// K1 (both kernels), K2, K4 and K5 are built with this; their arguments are in
-    /// `.superpowers/speed2/e3-report.md` (E9). A loop or index added to them must come with the
-    /// same argument. On an RTX 5090 this took 2.6 ms of 63.3 per lvl9 batch (K1 −9 %, K2 −6 %,
-    /// K4 −17 %, K5 −5 %). K3 keeps `shader_unbounded_loops` (no gain from the index clamps).
+    /// K2, K4 and K5 are built with this; their arguments are in `.superpowers/speed2/e3-report.md`
+    /// (E9). A loop or index added to them must come with the same argument. RTX 5090, lvl9,
+    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 % (128 KiB: −6 / −17 / −5 %). K1 stays checked: its
+    /// subgroup kernel got 7 % slower at 64 KiB (9 % faster at 128 KiB); K3 keeps
+    /// `shader_unbounded_loops` (the index clamps cost it nothing).
     /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
     pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let checks = if std::env::var("GZC_CHECKED_SHADERS").is_ok_and(|v| v != "0") {

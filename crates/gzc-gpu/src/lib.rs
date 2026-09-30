@@ -4,3 +4,4 @@ pub mod context;
 pub mod chains;
 pub mod compressor;
 pub mod pipeline;
+pub mod multiqueue;
