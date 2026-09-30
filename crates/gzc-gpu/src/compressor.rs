@@ -157,7 +157,8 @@ pub struct BatchBuffers {
     pub n_hashes: u32,
     /// Packed blocks (`pack_blocks` layout); written by the caller.
     pub data: wgpu::Buffer,
-    /// K1 hash heads, `[block][chain][2^HASH_BITS]`.
+    /// K1 scratch hash-head tables, `[table < chains::HEAD_TABLES][2^HASH_BITS]`
+    /// (`chains::head_bytes`: one table per chain, at most `HEAD_TABLES`).
     pub head: wgpu::Buffer,
     /// K1 predecessor chains, `[block][chain][pos]`.
     pub pred: wgpu::Buffer,
@@ -380,8 +381,8 @@ fn lane_mask(w: u32) -> (u32, u32) {
 /// The K3 mode for `m` on `ctx`. Greedy presets and devices without subgroups use `Seq`.
 /// Otherwise `Coop` with W = the adapter's minimum subgroup size (clamped to 8..=64, a power of
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
-/// ids 0..W-1 (else `Seq`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable;
-/// `GZC_NO_SUBGROUPS=1` also selects seq unless coop is forced),
+/// ids 0..W-1 (else `Seq`; `GZC_NO_SUBGROUPS` makes the context subgroup-less, see
+/// `GpuContext::new`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
 /// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size) and `GZC_K3_BPW=1|2` (blocks per
 /// workgroup; 2 needs minimum == maximum subgroup size == W). The output never depends on them.
 pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
@@ -391,9 +392,7 @@ pub fn k3_mode(ctx: &GpuContext, m: &MatchParams) -> anyhow::Result<K3Mode> {
         Some(v) => anyhow::bail!("GZC_K3_MODE={v}: expected seq or coop"),
     }
     let force_coop = forced.as_deref() == Some("coop");
-    // GZC_NO_SUBGROUPS=1 forces every subgroup kernel's fallback (shared with K1).
-    let no_subgroups = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v == "1");
-    if m.lazy == 0 || forced.as_deref() == Some("seq") || (no_subgroups && !force_coop) {
+    if m.lazy == 0 || forced.as_deref() == Some("seq") {
         return Ok(K3Mode::Seq);
     }
     let min = ctx.adapter_info.subgroup_min_size;
@@ -1195,12 +1194,13 @@ mod tests {
             }
         }
         let at_128m = |m: &MatchParams| max_batch_blocks(&limits(128 * MIB, 128 * MIB, 65535), m);
-        // pred: 1 MiB per block with two chains; one chain: pred/best 512 KiB.
+        // 128K: pred 1 MiB per block with two chains; one chain: pred/best 512 KiB.
         #[cfg(feature = "block-128k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 256));
-        // head: 512 KiB per block, 256 KiB with one chain.
+        // 16K: pred 128 KiB per block with two chains, pred/best 64 KiB with one (head is capped at
+        // chains::HEAD_TABLES tables).
         #[cfg(feature = "block-16k")]
-        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (256, 512));
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (1024, 2048));
     }
 
     #[test]
@@ -1220,7 +1220,7 @@ mod tests {
             assert!(n * BLOCK_SIZE as u64 <= 1 << 32, "best");
             assert!(n * nh * BLOCK_SIZE as u64 <= 1 << 32, "pred");
             assert!(n * MAX_SEQS as u64 * 3 <= 1 << 32, "seqs");
-            assert!((n * nh) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
+            assert!((n * nh).min(chains::HEAD_TABLES as u64) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
         }
     }
 

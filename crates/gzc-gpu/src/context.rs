@@ -11,14 +11,27 @@ pub struct GpuContext {
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
     pub timestamps: bool,
-    /// True when the device was created with `Features::SUBGROUP` (S3: cooperative K3).
+    /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
+    /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
+    /// otherwise the workgroup-sort fallback. Lazy K3 runs its cooperative kernel
+    /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
     pub subgroups: bool,
 }
 
 impl GpuContext {
     /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
-    /// enabling timestamp queries when available.
+    /// enabling timestamp queries and subgroups when available. Setting the
+    /// environment variable `GZC_NO_SUBGROUPS` to anything but `0` leaves subgroups off, which
+    /// selects K1's fallback kernel.
     pub fn new() -> anyhow::Result<Self> {
+        let off = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v != "0");
+        Self::with_subgroups(!off)
+    }
+
+    /// `new`, with subgroups (and so K1's subgroup kernel) enabled only if `allow` and the adapter
+    /// supports them. `with_subgroups(false)` gives the context a device without subgroup support
+    /// gets; tests use it to cover K1's fallback kernel.
+    pub fn with_subgroups(allow: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -27,6 +40,8 @@ impl GpuContext {
         .map_err(|e| anyhow!("no GPU adapter found (wgpu): {e}"))?;
 
         let al = adapter.limits();
+        let info = adapter.get_info();
+        let subgroups = allow && adapter.features().contains(wgpu::Features::SUBGROUP);
         let required_limits = wgpu::Limits {
             max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
             max_buffer_size: al.max_buffer_size,
@@ -35,9 +50,10 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let mut required_features = if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
-        // S3: subgroup operations for the cooperative K3 parse, when the adapter has them.
-        let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
+        let mut required_features = wgpu::Features::empty();
+        if timestamps {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         if subgroups {
             required_features |= wgpu::Features::SUBGROUP;
         }
@@ -50,7 +66,7 @@ impl GpuContext {
         }))
         .context("request_device")?;
 
-        Ok(Self { device, queue, adapter_info: adapter.get_info(), timestamps, subgroups })
+        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups })
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
