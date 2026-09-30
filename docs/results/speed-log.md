@@ -357,3 +357,89 @@ over roughly in proportion, since K3 is the kernel least hurt by fewer SMs. K5's
 parallel across 256 threads per block and scales with bandwidth like the rest of K5; its share stays small. The
 VRAM saving is worth more on an 8 GB card: 128 KiB per block is 5 % more blocks per batch, or headroom for
 per-slot scratch.
+
+### S9 — K4 sequence encode chunked and parallel (2e8a04f), 2026-09-30 04:28–04:36, load avg 1.2–1.6
+
+Profile first (lvl9 b2559, K4 = 10.2 ms/batch, each phase disabled or run twice in a scratch build):
+
+- the backward sequence encode loop on thread 0 took 9.3 ms (92 %). It was bound by global-load latency: 3 `seqs`
+  loads, then dependent `tab` lookups, then bit writes, for each sequence;
+- the full-block RLE check (every thread reads 1/64 of the 128 KiB block) took 0.46 ms;
+- the FSE table builds took about 0.3 ms (sequential spread plus state-table loops, 3 tables of up to 512 cells);
+- the histograms, mode choice, normalization, cost and ncount took about 0.25 ms together.
+
+K4 is latency-bound: per batch it takes 1.0 ms at b320 and b640 (under one wave), 1.65 ms at b1280 and 2.3 ms at b2559.
+The kernel time is set by the slowest blocks' serial path, not by bandwidth.
+
+What changed (K4 only; the output is unchanged):
+
+- **Chunked backward encode.** Chunks of 256 sequences, last chunk first:
+  1. all threads compute the codes, from sequences held in registers and loaded one chunk ahead;
+  2. threads 0..2 run only the FSE state transitions, one stream each, unrolled by four so the state-independent
+     `tt` loads go first, and record each step's (value, nbits);
+  3. all threads compute the per-sequence bit counts and a workgroup prefix sum (one barrier plus 16 `vec4` reads,
+     replacing a 12-barrier Hillis–Steele scan);
+  4. all threads place the bits with `atomicOr` into workgroup staging words and write the complete words to the
+     frame; the partial last word carries into the next chunk.
+
+  The Raw decision is the same: encoding stops once the sequences pass a Raw block's size.
+- **Parallel FSE table builds.** Visit j of the spread walk lands on the j-th `t` whose `(t * step) & mask` is at or
+  below `high`. Each thread takes a range of `t`, and a prefix sum is needed only when -1 symbols hold the top cells.
+  Thread s then fills symbol s's state-table slots in increasing cell order.
+- **RLE check with early exit.** It runs in rounds of 8 words per thread and stops after the first round that finds a
+  byte different from the first.
+- Workgroup memory: ~9.3 → ~14.9 KiB, still under 16 KiB.
+
+Step by step, K4 ms/batch at b2559 (single runs): 10.2 → chunked encode 3.85 → chain unrolled ×4 2.85 → RLE early exit
+2.38 → parallel builds 2.28–2.38 (sequential builds in the same kernel: 2.49) → barrier-light scan 2.16–2.25.
+
+Tried and dropped:
+
+- **Speculative segmented state chains** (16 segments per stream from guessed states, then a sequential fix-up until
+  the true chain meets the recorded one): 3.8 ms. The tANS chains almost never meet within 16 steps, and a warm-up
+  of 4 or 16 steps made no difference.
+- **Per-stream parallel mode choice** (threads 0..2): no change.
+- **Unrolled histogram loop**: no change.
+- **Codes of the next chunk computed in step 4**, one barrier interval fewer: 2.8 ms, slower.
+- **C = 128**, 3.2 KiB less workgroup memory: no change.
+
+lvl9 `--batch max` (b2559), i3, base (a3c5f8b) and S9 interleaved. The per-kernel columns come from each row's median
+run:
+
+| Config | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Kernel sum ms/b |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| base | 3676.9 / 3679.5 / 3673.1 | 3676.9 | 16.12 | 13.07 | 30.83 | 9.86 | 4.65 | 74.54 |
+| **S9** | 4048.5 / 4041.7 / 4033.7 | **4041.7 (+9.9 %)** | 16.10 | 12.96 | 30.86 | **2.28** | 4.74 | **66.94 (−10.2 %)** |
+
+K4 over the whole corpus: 207–212 ms → 47–48 ms (−77 %).
+
+rung1 `--batch max`, i3, interleaved:
+
+- base: 5225.4 / 5275.0 / 5227.4, median **5227.4** (K4 9.5–10.1 ms/b, kernel sum 49.6);
+- S9: 6024.1 / 5993.8 / 5989.7, median **5993.8** (+14.7 %; K4 2.24–2.30, kernel sum 41.7).
+
+Below one wave (b640), K4 per batch goes 5.56 → 0.99 ms, so a block's serial path is ~5.6× shorter.
+
+`--verify` lvl9: 3979.6 MB/s, and every block round-trips. A first `--verify` run measured 2140 MB/s while another
+GPU job was running. Compressed bytes are identical: lvl9 4,792,885,250; rung1 4,834,508,359.
+
+Tests: the full workspace suite passes at 128K and at 16K, with `GZC_PACK=1`, with `GZC_K3_MODE=seq`, and on the
+ignored corpus test (300 MB, every preset). A new test, `k4_chunk_boundaries_match_cpu`, covers:
+
+- n_seq 1 to 1025 around multiples of 256;
+- 16-bit extra fields.
+
+It catches a wrong chunk split and a corrupted carry word.
+
+**Kept** (+9.9 % lvl9, +14.7 % rung1).
+
+4060-class carry-over. K4 was, and still is, latency-bound per block. On a 24-SM card with 100 KB of shared memory
+per SM:
+
+- residency falls from ~9 to ~6 K4 workgroups per SM, because of the larger workgroup memory plus the 1 KiB per
+  block that the driver reserves. That means ~12 → ~18 waves for 2559 blocks;
+- each block's serial path is ~5.6× shorter.
+
+The net should be ~3.5× less K4 time. Cutting workgroup memory, for example a u16 state table or aliasing
+`hist`/`sp` with the staging words, would win back residency there. The only such cut tried here, C = 128
+(−3.2 KiB), measured neutral on the 5090.
