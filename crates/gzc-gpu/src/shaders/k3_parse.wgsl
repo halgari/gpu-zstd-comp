@@ -9,8 +9,12 @@
 //   seqs[(b*MAX_SEQS + i)*3 ..] = (lit_len, match_len, off_base) for i < n_seq
 //   lits[b*BLOCK_SIZE/4 ..]     = literal bytes packed little-endian
 //   counts[b*2 ..]              = (n_seq, n_lit)
-// MAX_SEQS is prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come from the injected
-// MatchParams.
+// MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come
+// from the injected MatchParams. best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset
+// (K2's layout; 0 = no match).
+
+fn best_len_of(w: u32) -> u32 { return w >> BEST_OFF_BITS; }
+fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> best: array<u32>;
@@ -87,7 +91,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (b >= arrayLength(&counts) / 2u) { return; }
     let base = block_base(b);
     let sbase = b * MAX_SEQS * 3u;
-    let bbase = b * BLOCK_SIZE * 2u;
+    let bbase = b * BLOCK_SIZE;
 
     r0 = 1u;
     r1 = 4u;
@@ -127,9 +131,10 @@ fn greedy_parse(base: u32, sbase: u32, bbase: u32) -> u32 {
             }
         }
         if (len == 0u) {
-            let bl = best[bbase + p * 2u + 1u];
+            let w = best[bbase + p];
+            let bl = best_len_of(w);
             if (bl >= MIN_MATCH) {
-                off = best[bbase + p * 2u];
+                off = best_off_of(w);
                 len = bl;
                 if (bl == SEARCH_CAP) {
                     // K2 stopped comparing at the cap: extend to the full length.

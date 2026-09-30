@@ -27,9 +27,10 @@ fn rep_len(base: u32, p: u32, off: u32) -> u32 {
 // == lazy.rs search_max: (matchLength, offBase) of best[ip], matchLength 0 when best[ip] has no
 // match of at least MIN_MATCH. A capped length is extended to the true match length.
 fn search_max(base: u32, bbase: u32, ip: u32) -> vec2<u32> {
-    let bl = best[bbase + ip * 2u + 1u];
+    let w = best[bbase + ip];
+    let bl = best_len_of(w);
     if (bl < MIN_MATCH) { return vec2<u32>(0u, 0u); }
-    let off = best[bbase + ip * 2u];
+    let off = best_off_of(w);
     var len = bl;
     if (bl == SEARCH_CAP) {
         len = match_len(base, ip, ip - off, 0xFFFFFFFFu);

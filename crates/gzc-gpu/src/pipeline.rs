@@ -62,6 +62,9 @@ pub trait FrameSink {
     fn put(&mut self, index: usize, frame: &[u8]);
 }
 
+/// Alignment of each region of a slot's staging buffer (see `StagingLayout::new`).
+const STAGING_ALIGN: u64 = 256;
+
 /// Byte offsets of one slot's staging buffer, laid out for `cap` blocks. Parse path:
 /// `[counts][seqs][lits][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the
 /// regions keep the GPU buffers' fixed per-block stride.
@@ -78,14 +81,18 @@ struct StagingLayout {
 
 impl StagingLayout {
     fn new(cap: u32, frames: bool) -> Self {
+        // Every region starts STAGING_ALIGN-aligned: a GPU->staging copy to a destination that is
+        // only 4-byte aligned runs several times slower (RTX 5090 / Vulkan: 6-10 ms more per
+        // batch for the ~200 MB frames region), which showed up as a batch-size-dependent loss.
+        let al = |x: u64| x.next_multiple_of(STAGING_ALIGN);
         let (a, b, ts) = if frames {
-            let a = frame_len_bytes(cap);
-            let ts = a + frames_bytes(cap);
+            let a = al(frame_len_bytes(cap));
+            let ts = al(a + frames_bytes(cap));
             (a, ts, ts)
         } else {
-            let a = counts_bytes(cap);
-            let b = a + seqs_bytes(cap);
-            (a, b, b + lits_bytes(cap))
+            let a = al(counts_bytes(cap));
+            let b = al(a + seqs_bytes(cap));
+            (a, b, al(b + lits_bytes(cap)))
         };
         Self { frames, a, b, ts, size: ts + KERNEL_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
     }
@@ -271,7 +278,7 @@ impl<'a> Pipeline<'a> {
         Ok(PipelineStats { kernel_ms, wall_s, batches })
     }
 
-    /// The submit / wait / deliver loop; returns the number of batches submitted.
+/// The submit / wait / deliver loop; returns the number of batches submitted.
     fn stream(
         &mut self,
         blocks: &[&[u8]],
@@ -587,6 +594,19 @@ mod tests {
     }
 
     #[test]
+    fn staging_regions_are_aligned() {
+        for cap in [1, 7, 1365, 1535, 1890] {
+            for frames in [true, false] {
+                let l = StagingLayout::new(cap, frames);
+                assert!([l.a, l.b, l.ts].iter().all(|x| x % STAGING_ALIGN == 0), "cap {cap} frames {frames}");
+                let end = if frames { l.a + frames_bytes(cap) } else { l.b + lits_bytes(cap) };
+                assert!(l.a >= if frames { frame_len_bytes(cap) } else { counts_bytes(cap) } && end <= l.ts);
+                assert!(frames || l.a + seqs_bytes(cap) <= l.b);
+            }
+        }
+    }
+
+    #[test]
     fn vram_counts_scratch_once_and_slots_per_inflight() {
         let frames = |batch, inflight| {
             PipelineConfig { params: GpuParams { matching: LVL3, emit_frames: true, huffman: true }, ..cfg(batch, inflight) }
@@ -604,9 +624,9 @@ mod tests {
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
         #[cfg(feature = "block-128k")]
         {
-            // ~2.9 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
+            // ~2.5 MiB of scratch per block, ~0.5 MiB per block per slot on the frame path.
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((2.9..3.1).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
+            assert!((2.4..2.6).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
             assert!((0.49..0.51).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
     }

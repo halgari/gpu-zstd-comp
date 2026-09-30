@@ -39,7 +39,7 @@ pub const MAX_SEQS_MIN_SEQ_LEN: usize = 4;
 /// At 128K this is 32769 > 0x7F00, so K4's 3-byte nbSeq header is reachable.
 pub const MAX_SEQS: u32 = (BLOCK_SIZE / MAX_SEQS_MIN_SEQ_LEN) as u32 + 1;
 
-/// Largest batch `compress_batch` allocates buffers for (~3.1 MiB per 128K block, ~800 MiB), even when
+/// Largest batch `compress_batch` allocates buffers for (~2.8 MiB per 128K block, ~700 MiB), even when
 /// the device limits would allow more.
 const COMPRESS_BATCH_CAP: u32 = 256;
 
@@ -94,9 +94,16 @@ pub fn data_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * BLOCK_SIZE as u64 + 4
 }
 
-/// Bytes of the `best` buffer: `[block][pos]` × (offset, len) u32.
+/// Low bits of a `best[]` word holding the match offset; the (capped) length sits above them.
+pub const BEST_OFF_BITS: u32 = 17;
+const _: () = assert!(BLOCK_SIZE <= 1 << BEST_OFF_BITS, "offsets must fit BEST_OFF_BITS");
+// MatchParams::validate bounds search_cap to 8..=256.
+const _: () = assert!(256 < 1u64 << (32 - BEST_OFF_BITS), "capped lengths must fit above the offset");
+
+/// Bytes of the `best` buffer: `[block][pos]` × one u32, `(capped len << BEST_OFF_BITS) | offset`
+/// (0 = no match).
 pub fn best_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * BLOCK_SIZE as u64 * 8
+    n_blocks as u64 * BLOCK_SIZE as u64 * 4
 }
 
 /// Bytes of the `seqs` buffer: `[block][MAX_SEQS]` × (lit_len, match_len, off_base) u32.
@@ -128,8 +135,8 @@ pub fn frame_len_bytes(n_blocks: u32) -> u64 {
 /// may take under `limits`: K1's bound (`chains::max_blocks_per_batch` for `m.n_hashes()`: data,
 /// head and pred buffers, the workgroups-per-dimension limit used by K1's x and K2's y dispatch,
 /// u32 head/pred indices) further limited so the best, seqs, lits, counts and frames buffers each
-/// fit one storage binding and one buffer and their u32 word indices (at most 2*BLOCK_SIZE words
-/// per block, in `best`; `seqs` has 3*MAX_SEQS < 2*BLOCK_SIZE) cannot wrap. 0 if one block doesn't fit.
+/// fit one storage binding and one buffer and their u32 word indices (at most BLOCK_SIZE words
+/// per block, in `best`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap. 0 if one block doesn't fit.
 pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let by_k1 = chains::max_blocks_per_batch(limits, m.n_hashes()) as u64;
@@ -138,7 +145,7 @@ pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
         .map(|per_block| limit / per_block)
         .min()
         .unwrap();
-    let by_index = (1u64 << 32) / (2 * BLOCK_SIZE as u64);
+    let by_index = (1u64 << 32) / BLOCK_SIZE as u64;
     by_k1.min(by_buffers).min(by_index) as u32
 }
 
@@ -153,7 +160,7 @@ pub struct BatchBuffers {
     pub head: wgpu::Buffer,
     /// K1 predecessor chains, `[block][chain][pos]`.
     pub pred: wgpu::Buffer,
-    /// K2 output, `[block][pos]` × (offset, len); len 0 = none.
+    /// K2 output, `[block][pos]` × `(capped len << BEST_OFF_BITS) | offset`; 0 = none.
     pub best: wgpu::Buffer,
     /// K3 output, `[block][MAX_SEQS]` × (lit_len, match_len, off_base).
     pub seqs: wgpu::Buffer,
@@ -345,15 +352,16 @@ impl Kernels {
         let m = params.matching;
         check_matching(&m)?;
         let match_consts = params_wgsl(&m);
+        let best_consts = format!("{match_consts}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\n");
         let best_layout = storage_layout(ctx, "k2", &[true, true, false]);
-        let best = compute_pipeline(ctx, "k2_best", &best_layout, &format!("{match_consts}{K2_WGSL}"));
+        let best = compute_pipeline(ctx, "k2_best", &best_layout, &format!("{best_consts}{K2_WGSL}"));
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false, false]);
         let parse = compute_pipeline(
             ctx,
             "k3_parse",
             &parse_layout,
             // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
-            &format!("{match_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}"),
+            &format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}"),
         );
         let (tab, consts) = k4_tables();
         let huffman = params.emit_frames && params.huffman;
@@ -443,6 +451,32 @@ impl Kernels {
         if n_blocks == 0 {
             return;
         }
+        self.record_best(ctx, enc, bufs, n_blocks, queries);
+        self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
+
+        if self.emits_frames() {
+            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
+        }
+    }
+
+    /// Records K1 then K2 (timestamps as in `record_timed`) for the first `n_blocks` blocks of
+    /// `bufs.data`, leaving the matches in `bufs.best`. `1 <= n_blocks <= bufs.capacity`.
+    fn record_best(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        queries: Option<&wgpu::QuerySet>,
+    ) {
+        let ts = |k: u32| {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(2 * k),
+                end_of_pass_write_index: Some(2 * k + 1),
+            })
+        };
+        debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity);
         self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n_blocks, ts(0));
 
         let k2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -458,13 +492,6 @@ impl Kernels {
         pass.set_pipeline(&self.best);
         pass.set_bind_group(0, &k2, &[]);
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
-        drop(pass);
-
-        self.record_parse(ctx, enc, bufs, n_blocks, ts(2));
-
-        if self.emits_frames() {
-            self.record_entropy(ctx, enc, bufs, n_blocks, queries);
-        }
     }
 
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
@@ -764,8 +791,7 @@ fn submit_from_best(
                 m.search_cap
             );
         }
-        let mut words: Vec<u32> = best.iter().flat_map(|m| [m.offset, m.len]).collect();
-        words.resize(2 * BLOCK_SIZE, 0);
+        let words = encode_best(best)?;
         ctx.queue.write_buffer(&bufs.best, b as u64 * best_bytes(1), bytemuck::cast_slice(&words));
     }
     let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("from_best") });
@@ -833,6 +859,46 @@ pub fn parses_from_best(
         read_outputs(ctx, &bufs, blocks.len() as u32, &mut out)?;
         Ok(out)
     })
+}
+
+/// Runs K1 and K2 on `blocks` (one batch, at most `max_batch_blocks`) and returns each block's
+/// `best[]` table (BLOCK_SIZE entries, K2's layout decoded), for tests that check K2 against
+/// `reference::find_best` directly.
+pub fn best_from_blocks(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<Match>>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = blocks.len() as u32;
+    let m = kernels.matching();
+    anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
+    with_error_scopes(ctx, || {
+        let bufs = BatchBuffers::new(ctx, n, false, &m);
+        ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("best_from_blocks") });
+        kernels.record_best(ctx, &mut enc, &bufs, n, None);
+        ctx.queue.submit([enc.finish()]);
+        let words = read_regions(ctx, &[(&bufs.best, 0, best_bytes(n) / 4)])?;
+        Ok(words.chunks(best_bytes(1) as usize / 4).map(decode_best).collect())
+    })
+}
+
+/// Decodes one block's `best[]` words (K2's layout) into matches.
+pub fn decode_best(words: &[u32]) -> Vec<Match> {
+    let mask = (1 << BEST_OFF_BITS) - 1;
+    words.iter().map(|&w| Match { offset: w & mask, len: w >> BEST_OFF_BITS }).collect()
+}
+
+/// Encodes one block's matches into `best[]` words (K2's layout), padded with "no match" to
+/// BLOCK_SIZE entries. Entries with len 0 encode as 0 (no match), whatever their offset.
+/// Every entry must have `offset < BLOCK_SIZE` and `len <= 256` (checked).
+pub fn encode_best(best: &[Match]) -> anyhow::Result<Vec<u32>> {
+    let mut words = Vec::with_capacity(BLOCK_SIZE);
+    for (i, m) in best.iter().enumerate() {
+        anyhow::ensure!((m.offset as usize) < BLOCK_SIZE && m.len <= 256, "best[{i}] {m:?} does not fit a best[] word");
+        words.push(if m.len == 0 { 0 } else { (m.len << BEST_OFF_BITS) | m.offset });
+    }
+    words.resize(BLOCK_SIZE, 0);
+    Ok(words)
 }
 
 /// Block `b`'s frame out of a fixed-stride frames region (`FRAME_STRIDE` bytes per block),
@@ -971,9 +1037,9 @@ mod tests {
             }
         }
         let at_128m = |m: &MatchParams| max_batch_blocks(&limits(128 * MIB, 128 * MIB, 65535), m);
-        // pred/best: 1 MiB per block (best alone with one chain).
+        // pred: 1 MiB per block with two chains; one chain: pred/best 512 KiB.
         #[cfg(feature = "block-128k")]
-        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 128));
+        assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (128, 256));
         // head: 512 KiB per block, 256 KiB with one chain.
         #[cfg(feature = "block-16k")]
         assert_eq!((at_128m(&LVL3), at_128m(&RUNG1)), (256, 512));
@@ -993,7 +1059,7 @@ mod tests {
             let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &m) as u64;
             assert!(n > 0);
             // Largest word index of each buffer indexed by the kernels.
-            assert!(n * BLOCK_SIZE as u64 * 2 <= 1 << 32, "best");
+            assert!(n * BLOCK_SIZE as u64 <= 1 << 32, "best");
             assert!(n * nh * BLOCK_SIZE as u64 <= 1 << 32, "pred");
             assert!(n * MAX_SEQS as u64 * 3 <= 1 << 32, "seqs");
             assert!((n * nh) << gzc_core::config::HASH_BITS <= 1 << 32, "head");
@@ -1005,6 +1071,26 @@ mod tests {
         for m in [LVL3, RUNG1, RUNG2, LVL9] {
             assert_eq!(max_batch_blocks(&limits(BLOCK_SIZE as u64, u64::MAX, 65535), &m), 0);
         }
+    }
+
+    #[test]
+    fn best_words_round_trip_at_the_bounds() {
+        let last = BLOCK_SIZE as u32 - 1;
+        let best = [
+            Match { offset: 1, len: 4 },
+            Match { offset: last, len: 256 },
+            Match { offset: last, len: 1 },
+            Match::default(),
+            Match { offset: 7, len: 0 },
+        ];
+        let words = encode_best(&best).unwrap();
+        assert_eq!(words.len(), BLOCK_SIZE);
+        assert_eq!(words[4], 0, "len 0 is no match whatever the offset");
+        let back = decode_best(&words);
+        assert_eq!(back[..4], best[..4]);
+        assert!(back[4..].iter().all(|m| *m == Match::default()));
+        assert!(encode_best(&[Match { offset: BLOCK_SIZE as u32, len: 4 }]).is_err());
+        assert!(encode_best(&[Match { offset: 1, len: 257 }]).is_err());
     }
 
     #[test]
