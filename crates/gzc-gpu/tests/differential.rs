@@ -11,12 +11,13 @@ use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases};
 use gzc_core::lazy::lazy_parse;
 use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
-use gzc_core::reference::{Match, compress_block};
+use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
 use gzc_gpu::compressor::{
-    GpuParams, Kernels, compress_batch, compress_frames, frames_from_best, frames_from_parses, parses_from_best,
+    GpuParams, K3Mode, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
+    parses_from_best,
 };
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
@@ -451,6 +452,27 @@ fn gpu_frames_batch_of_300_mixed() {
     }
 }
 
+/// With subgroups off (`GpuContext::with_subgroups(false)`), K1 builds only its fallback kernel
+/// (`ChainsKernel::with_options` only attempts the subgroup kernel when `ctx.subgroups`) and
+/// `compressor::k3_mode` (which also checks `ctx.subgroups`) picks the sequential K3 instead of
+/// the cooperative one — the code path a GPU without subgroup support runs everywhere. Runs the
+/// full frame pipeline for every preset on a few synthetic blocks, so plain `cargo test` covers
+/// fallback K1 and sequential K3 together, without needing such hardware.
+#[test]
+fn gpu_frames_identical_without_subgroups() {
+    let blocks: Vec<_> = frame_blocks().into_iter().step_by(4).collect();
+    assert!(blocks.len() >= 3, "expected a handful of synthetic blocks, got {}", blocks.len());
+    for (name, params) in GPU_PRESETS {
+        eprintln!("preset {name}");
+        let ctx = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
+        assert!(!ctx.subgroups, "with_subgroups(false) must disable subgroups");
+        let kernels =
+            Kernels::new(&ctx, GpuParams { matching: params, emit_frames: true, huffman: true }).expect("Kernels::new");
+        assert_eq!(kernels.k3_mode(), K3Mode::Seq, "{name}: with_subgroups(false) must force the sequential K3");
+        check_frames(&ctx, &kernels, &blocks);
+    }
+}
+
 #[test]
 fn compress_frames_needs_emit_frames() {
     let (ctx, kernels) = setup(LVL3);
@@ -548,6 +570,47 @@ fn k4_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+/// K4 encodes the sequences in chunks of 256, last chunk first: sequence counts on both sides of
+/// chunk multiples (so the chunk holding the initializing last sequence is full or partial), wide
+/// code palettes (bit counts per sequence varying across the staging words), and sequences with
+/// 16-bit literal-length, match-length and offset extra fields next to each other.
+#[test]
+fn k4_chunk_boundaries_match_cpu() {
+    let mut r = Lcg(0xc4c);
+    let mut cases = Vec::new();
+    for (i, &n_seq) in [1usize, 2, 4, 5, 255, 256, 257, 259, 511, 512, 513, 1000, 1024, 1025].iter().enumerate() {
+        let mut script = Vec::new();
+        let mut pos = 0u32;
+        let budget = BLOCK_SIZE as u32 - 1024;
+        for _ in 0..n_seq {
+            let ll = [0, r.below(4), r.below(12)][r.below(3) as usize].max((pos == 0) as u32);
+            let ml = 3 + [r.below(2), r.below(8), r.below(30)][r.below(3) as usize];
+            let off = (1 + [r.below(4), r.below(200), r.below(20000)][r.below(3) as usize]).min(pos + ll);
+            if pos + ll + ml > budget {
+                break;
+            }
+            script.push((ll, off, ml));
+            pos += ll + ml;
+        }
+        assert_eq!(script.len(), n_seq, "script {i} did not fit");
+        let (block, parse) = scripted(&script, 0x100 + i as u64);
+        cases.push((format!("chunks{n_seq}"), block, parse));
+    }
+    // Wide fields (128K blocks): 16-bit literal-length and offset and 15-bit match-length extra
+    // bits in one sequence, a 16-bit offset in another, short sequences between them.
+    if BLOCK_SIZE >= 1 << 17 {
+        let mut script = vec![(65600, 65550, 33000)];
+        script.extend((0..300).map(|i| (i % 5, 1 + (i * 37) % 900, 4 + i % 11)));
+        script.push((0, 90000, 20000));
+        let (block, parse) = scripted(&script, 0x16);
+        cases.push(("wide_fields".to_string(), block, parse));
+    }
+    for huffman in [false, true] {
+        let (ctx, kernels) = setup_frames(huffman);
+        check_scripted(&ctx, &kernels, &cases);
+    }
 }
 
 /// With `min_match = 4` a 128K block can hold more than 0x7F00 sequences (`MAX_SEQS` is
@@ -1087,6 +1150,239 @@ fn k5_random_scripts_match_cpu() {
         cases.push((format!("script{i}"), block, parse));
     }
     check_scripted(&ctx, &kernels, &cases);
+}
+
+/// K5 gathers the literals from the block through a per-thread index over groups of
+/// G = ceil(n_seq / 256) sequences (speed phase S4). Scripts with hundreds to thousands of
+/// sequences (G > 1), mostly empty literal runs (so group starts and seeks land on runs of
+/// length 0) with a few long ones (runs across group and thread boundaries), trailing literals of
+/// every size including none; Raw and Huffman (1 and 4 streams) sections; K5 with and without
+/// Huffman. Only these cases reach a seek that walks more than one run.
+#[test]
+fn k5_gather_many_sequences_match_cpu() {
+    let mut r = Lcg(0x5a4);
+    let mut cases = Vec::new();
+    let most = BLOCK_SIZE as u32 / 8;
+    for (i, &target) in [255u32, 256, 257, 511, 700, 2000, most, most].iter().cycle().take(32).enumerate() {
+        let mut script = Vec::new();
+        let mut pos = 0u32;
+        let zero_share = [2u32, 6, 9][r.below(3) as usize];
+        for _ in 0..target {
+            let ll = if r.below(10) < zero_share {
+                0
+            } else {
+                [1 + r.below(3), 1 + r.below(40), 50 + r.below(BLOCK_SIZE as u32 / 320)][r.below(3) as usize]
+            }
+            .max((pos == 0) as u32);
+            let ml = 4 + r.below(4);
+            if (pos + ll + ml) as usize + 16 > BLOCK_SIZE {
+                break;
+            }
+            script.push((ll, (1 + r.below(64)).min(pos + ll), ml));
+            pos += ll + ml;
+        }
+        // Every fourth script ends with a match up to the block's last byte (no trailing literals).
+        if i % 4 == 0 {
+            let room = BLOCK_SIZE as u32 - pos;
+            script.push((1, 1 + r.below(pos + 1), room - 1));
+        }
+        let style = r.below(4);
+        let mut lr = Lcg(2000 + i as u64);
+        let (block, parse) = scripted_with(&script, || match style {
+            0 => lr.next() as u8,
+            1 => (lr.below(6) * lr.below(6)) as u8,
+            2 => 0x42,
+            _ => [1u8, 2, 3, 200][lr.below(4) as usize],
+        });
+        assert!(parse.sequences.len() >= 255, "script {i}: {} sequences", parse.sequences.len());
+        cases.push((format!("many{i}"), block, parse));
+    }
+    for huffman in [true, false] {
+        let (ctx, kernels) = setup_frames(huffman);
+        check_scripted(&ctx, &kernels, &cases);
+    }
+}
+
+/// The literal stream is the block bytes the sequences leave uncovered (what K5 and the parse
+/// path gather instead of reading K3 output): true of every CPU parse, every preset.
+#[test]
+fn literals_are_the_uncovered_block_bytes() {
+    for (name, block) in all_blocks() {
+        for (preset, params) in GPU_PRESETS {
+            let parse = compress_block(&block, params);
+            let got = gzc_gpu::compressor::gather_literals(&block, &parse.sequences);
+            assert!(got == parse.literals, "{name} {preset}: gathered literals differ");
+        }
+    }
+}
+
+// ---- K2 ----
+
+/// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
+/// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), and a Single
+/// chain with a small cap.
+const K2_VARIANTS: [MatchParams; 6] = [
+    MatchParams { depth: 4, ..LVL3 },
+    MatchParams { depth: 16, search_cap: 8, ..LVL3 },
+    MatchParams { depth: 8, search_cap: 16, ..LVL3 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
+    // skips only against a best of >= 4) and 6.
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64 },
+];
+
+/// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
+/// bytes (hash collisions), candidates equal in 4 bytes that differ at byte 4 (the byte field),
+/// and ties of length 4 and 5 between candidates. `words-tail1`: 4-byte words from 12 values, each
+/// followed by one of 3 bytes (so a word recurs with a different fifth byte); `words-tail2`: the
+/// same with two trailing bytes; `alphabet2`/`alphabet3`: random bytes of 2 or 3 values (dense
+/// chains with every length 0..=cap); `collide`: 4-byte random words drawn from 4096 values, which
+/// the 16-bit hash maps onto few buckets with many collisions.
+fn k2_fp_blocks() -> Vec<(String, Vec<u8>)> {
+    let mut r = Lcg(0x58f);
+    let words: Vec<u32> = (0..12).map(|_| r.next()).collect();
+    let pools: Vec<u32> = (0..4096).map(|_| r.next()).collect();
+    let mut out = Vec::new();
+    for tail in [1usize, 2] {
+        let mut b = Vec::with_capacity(BLOCK_SIZE + 8);
+        while b.len() < BLOCK_SIZE {
+            b.extend_from_slice(&words[r.below(12) as usize].to_le_bytes());
+            for _ in 0..tail {
+                b.push([7u8, 9, 200][r.below(3) as usize]);
+            }
+        }
+        b.truncate(BLOCK_SIZE);
+        out.push((format!("words-tail{tail}"), b));
+    }
+    for alphabet in [2u32, 3] {
+        out.push((format!("alphabet{alphabet}"), (0..BLOCK_SIZE).map(|_| r.below(alphabet) as u8).collect()));
+    }
+    let mut b = Vec::with_capacity(BLOCK_SIZE);
+    while b.len() < BLOCK_SIZE {
+        b.extend_from_slice(&pools[r.below(4096) as usize].to_le_bytes());
+    }
+    out.push(("collide".to_string(), b));
+    out
+}
+
+/// CPU mirror of K2's walk with the cap early-out (stop the whole walk, all chains, at the first
+/// candidate reaching search_cap).
+fn find_best_early_out(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<Match> {
+    let mut best = vec![Match::default(); BLOCK_SIZE];
+    let (depth, cap) = (params.depth, params.search_cap as usize);
+    for (p, slot) in best.iter_mut().enumerate().take(gzc_core::config::PARSE_END) {
+        let (mut best_len, mut best_q) = (0usize, 0usize);
+        'walk: for preds in chains {
+            let mut q = preds[p];
+            for _ in 0..depth {
+                if q == gzc_core::config::NO_POS {
+                    break;
+                }
+                let len = match_len_capped(block, p, q as usize, cap);
+                if len > best_len || (len == best_len && q as usize > best_q) {
+                    (best_len, best_q) = (len, q as usize);
+                    if len == cap {
+                        break 'walk;
+                    }
+                }
+                q = preds[q as usize];
+            }
+        }
+        if best_len >= params.min_match as usize {
+            *slot = Match { offset: (p - best_q) as u32, len: best_len as u32 };
+        }
+    }
+    best
+}
+
+/// Dfast blocks where both chains offer candidates at the same p = 5000: there a 200-byte string
+/// `s`; further back (q = 1000) its full copy (on the long chain, caps); nearer (q = 3000) a
+/// prefix of `s` of 5..=9 bytes and then a break (on the short chain, and on the long chain too
+/// once it is >= 8 bytes). The background seed is picked so no hash collision gets in the way:
+/// the first long-chain candidate at 5000 is 3000 (near >= 8) or 1000, the first short-chain one
+/// is 3000.
+fn k2_chain_blocks() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for near in [5usize, 6, 7, 8, 9] {
+        let block = (0u64..)
+            .map(|seed| {
+                let mut block = random(40 + 100 * seed + near as u64, BLOCK_SIZE);
+                let s = random(50, 200);
+                block[1000..1200].copy_from_slice(&s);
+                block[3000..3000 + near].copy_from_slice(&s[..near]);
+                block[3000 + near] = s[near] ^ 0x55;
+                block[5000..5200].copy_from_slice(&s);
+                block
+            })
+            .find(|block| {
+                let ch = chains(block, &LVL3);
+                ch[0][5000] == if near >= 8 { 3000 } else { 1000 } && ch[1][5000] == 3000
+            })
+            .unwrap();
+        out.push((format!("chain-near{near}"), block));
+    }
+    out
+}
+
+/// The early-out walk equals `find_best` on every test block, for every preset and K2 variant.
+#[test]
+fn k2_cap_early_out_matches_find_best_cpu() {
+    let mut blocks = all_blocks();
+    blocks.extend(k2_chain_blocks());
+    blocks.extend(k2_fp_blocks());
+    for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
+        for (name, block) in &blocks {
+            let ch = chains(block, &params);
+            assert!(find_best_early_out(block, &ch, &params) == find_best(block, &ch, &params), "{params:?} {name}");
+        }
+    }
+}
+
+/// K2's best[] equals `find_best` exactly, for every preset and K2 variant.
+#[test]
+fn k2_best_matches_find_best() {
+    let mut blocks = all_blocks();
+    blocks.extend(k2_chain_blocks());
+    blocks.extend(k2_fp_blocks());
+    let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+    for params in GPU_PRESETS.iter().map(|p| p.1).chain(K2_VARIANTS) {
+        let (ctx, kernels) = setup(params);
+        let got = best_from_blocks(&ctx, &kernels, &refs).expect("best_from_blocks");
+        for ((name, block), got) in blocks.iter().zip(&got) {
+            let want = find_best(block, &chains(block, &params), &params);
+            if let Some(p) = (0..BLOCK_SIZE).find(|&p| got[p] != want[p]) {
+                panic!("{params:?} {name}: best[{p}] gpu {:?} cpu {:?}", got[p], want[p]);
+            }
+        }
+    }
+}
+
+/// Dfast, the case the cross-chain early-out must get right: the long chain caps at a far
+/// candidate while the short chain holds a nearer (larger q) one. A nearer candidate shorter
+/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one of
+/// >= 8 bytes is on the long chain too, ahead of the far copy, and wins there (with search_cap
+/// 8 it caps first, and the far copy is never compared).
+#[test]
+fn k2_dfast_nearer_short_chain_candidate() {
+    for params in [LVL3, MatchParams { search_cap: 8, ..LVL3 }] {
+        let (ctx, kernels) = setup(params);
+        let blocks = k2_chain_blocks();
+        let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
+        let got = best_from_blocks(&ctx, &kernels, &refs).expect("best_from_blocks");
+        for ((name, block), got) in blocks.iter().zip(&got) {
+            let near: u32 = name.trim_start_matches("chain-near").parse().unwrap();
+            let want = find_best(block, &chains(block, &params), &params);
+            assert_eq!(got[5000], want[5000], "{params:?} {name}");
+            // Depth 1: the long chain's first candidate is the nearer copy once it is >= 8 bytes.
+            let expect = if near >= 8 {
+                Match { offset: 2000, len: near.min(params.search_cap) }
+            } else {
+                Match { offset: 4000, len: params.search_cap }
+            };
+            assert_eq!(got[5000], expect, "{params:?} {name}");
+        }
+    }
 }
 
 // ---- K3 lazy / lazy2 ----

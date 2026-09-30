@@ -11,12 +11,43 @@ pub struct GpuContext {
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
     pub timestamps: bool,
+    /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
+    /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
+    /// otherwise the workgroup-sort fallback. K3 runs its cooperative kernel
+    /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
+    pub subgroups: bool,
+    /// True when the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS` (mappable
+    /// buffers may also be storage buffers): only when frame packing was asked for (`GZC_PACK`,
+    /// `with_options`), which frame-path pipelines then do.
+    pub mappable_storage: bool,
 }
 
 impl GpuContext {
     /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
-    /// enabling timestamp queries when available.
+    /// enabling timestamp queries and subgroups when available. Setting the
+    /// environment variable `GZC_NO_SUBGROUPS` to anything but `0` leaves subgroups off, which
+    /// selects K1's fallback kernel and, since `compressor::k3_mode` also checks `ctx.subgroups`,
+    /// forces the sequential K3 as well (`K3Mode::Seq`, not the subgroup-cooperative `k3_coop.wgsl`).
+    /// `GZC_PACK` set to anything but `0` requests
+    /// `MAPPABLE_PRIMARY_BUFFERS` (see `with_options`), which turns on the pipeline's frame packing.
     pub fn new() -> anyhow::Result<Self> {
+        let off = std::env::var("GZC_NO_SUBGROUPS").is_ok_and(|v| v != "0");
+        let pack = std::env::var("GZC_PACK").is_ok_and(|v| v != "0");
+        Self::with_options(!off, pack)
+    }
+
+    /// `new`, with subgroups (and so K1's subgroup kernel) enabled only if `allow` and the adapter
+    /// supports them. `with_subgroups(false)` gives the context a device without subgroup support
+    /// gets; tests use it to cover K1's fallback kernel. Frame packing as in `new`.
+    pub fn with_subgroups(allow: bool) -> anyhow::Result<Self> {
+        Self::with_options(allow, std::env::var("GZC_PACK").is_ok_and(|v| v != "0"))
+    }
+
+    /// Subgroups as in `with_subgroups(allow_subgroups)`; with `mappable`, also the native-only
+    /// `MAPPABLE_PRIMARY_BUFFERS` feature when the adapter has it (`mappable_storage`), with which
+    /// frame-path pipelines pack their frames (`pipeline::PackKernel`, opt-in: slower than the
+    /// fixed-stride copy on an RTX 5090, kept for PCIe x8 cards).
+    pub fn with_options(allow_subgroups: bool, mappable: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -25,6 +56,8 @@ impl GpuContext {
         .map_err(|e| anyhow!("no GPU adapter found (wgpu): {e}"))?;
 
         let al = adapter.limits();
+        let info = adapter.get_info();
+        let subgroups = allow_subgroups && adapter.features().contains(wgpu::Features::SUBGROUP);
         let required_limits = wgpu::Limits {
             max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
             max_buffer_size: al.max_buffer_size,
@@ -32,8 +65,21 @@ impl GpuContext {
             max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage,
             ..wgpu::Limits::default()
         };
-        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        // GZC_NO_TIMESTAMPS (anything but 0) leaves timestamp queries off, to time runs without them.
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            && !std::env::var("GZC_NO_TIMESTAMPS").is_ok_and(|v| v != "0");
+        let mut required_features = wgpu::Features::empty();
+        if timestamps {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
+        // Native-only feature, requested only when frame packing is wanted (`pipeline::PackKernel`).
+        let mappable_storage = mappable && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        if mappable_storage {
+            required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gzc"),
@@ -43,7 +89,7 @@ impl GpuContext {
         }))
         .context("request_device")?;
 
-        Ok(Self { device, queue, adapter_info: adapter.get_info(), timestamps })
+        Ok(Self { device, queue, adapter_info: info, timestamps, subgroups, mappable_storage })
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
@@ -53,6 +99,21 @@ impl GpuContext {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(src.into()),
         })
+    }
+
+    /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
+    /// must provably terminate (a loop that does not is undefined behaviour for the driver).
+    pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+        let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
+        let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+        // SAFETY: bounds checks stay enabled; the caller guarantees every loop terminates (the K3
+        // modules' argument is at their call site in `Kernels::new`).
+        unsafe {
+            self.device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },
+                checks,
+            )
+        }
     }
 
     /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from.

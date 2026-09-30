@@ -1,8 +1,8 @@
 // K3 lazy / lazy2 parse (LAZY 1 or 2): a statement-by-statement mirror of
 // gzc_core::lazy::lazy_parse, itself a port of libzstd 1.5.7 ZSTD_compressBlock_lazy_generic
 // (noDict, depth = LAZY). Appended by the host after k3_parse.wgsl, whose bindings, rep history
-// (r0/r1/r2), off_base_for / apply_off_base and literal accumulator (push_lits) it shares; the
-// seqs / lits / counts layout is the greedy parse's. Names follow zstd (ip, anchor, start,
+// (r0/r1/r2), off_base_for / apply_off_base and literal count (push_lits) it shares; the
+// seqs / counts layout is the greedy parse's. Names follow zstd (ip, anchor, start,
 // offBase, matchLength, offset_1, offset_2, ilimit = PARSE_END). Every `// deviation:` of the CPU
 // oracle is mirrored here (see lazy.rs for the full notes):
 //   - deferral only while ip + 1 < PARSE_END (best[] is valid below PARSE_END only);
@@ -27,9 +27,10 @@ fn rep_len(base: u32, p: u32, off: u32) -> u32 {
 // == lazy.rs search_max: (matchLength, offBase) of best[ip], matchLength 0 when best[ip] has no
 // match of at least MIN_MATCH. A capped length is extended to the true match length.
 fn search_max(base: u32, bbase: u32, ip: u32) -> vec2<u32> {
-    let bl = best[bbase + ip * 2u + 1u];
+    let w = best[bbase + ip];
+    let bl = best_len_of(w);
     if (bl < MIN_MATCH) { return vec2<u32>(0u, 0u); }
-    let off = best[bbase + ip * 2u];
+    let off = best_off_of(w);
     var len = bl;
     if (bl == SEARCH_CAP) {
         len = match_len(base, ip, ip - off, 0xFFFFFFFFu);
@@ -42,7 +43,7 @@ fn search_max(base: u32, bbase: u32, ip: u32) -> vec2<u32> {
 fn store_seq(base: u32, sbase: u32, n_seq: u32, anchor: u32, ll: u32, offset: u32, ml: u32) -> u32 {
     let ob = off_base_for(offset, ll);
     apply_off_base(ob, ll);
-    push_lits(base, anchor, anchor + ll);
+    push_lits(anchor, anchor + ll);
     let s = sbase + n_seq * 3u;
     seqs[s] = ll;
     seqs[s + 1u] = ml;
@@ -171,6 +172,6 @@ fn lazy_parse(base: u32, sbase: u32, bbase: u32) -> u32 {
         }
     }
     // last literals
-    push_lits(base, anchor, BLOCK_SIZE);
+    push_lits(anchor, BLOCK_SIZE);
     return n_seq;
 }
