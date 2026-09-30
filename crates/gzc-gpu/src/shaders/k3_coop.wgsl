@@ -3,7 +3,8 @@
 // accumulator, off_base_for / apply_off_base, highbit and sequential lazy_parse it reuses), and
 // compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
 // subgroup size, or GZC_K3_W) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
-// `main_coop`, one block per workgroup of W lanes, which form one (possibly partial) subgroup.
+// `main_coop`, one block per W lanes, which form one (possibly partial) subgroup; BPW (1 or 2)
+// blocks per workgroup.
 //
 // Every lane holds the same parse state (r0/r1/r2, ip, anchor, ...). Per-lane values reach
 // control flow only through subgroupBallot / subgroupShuffle / subgroupAll, so all branch and loop
@@ -348,14 +349,17 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     return n_seq;
 }
 
-@compute @workgroup_size(W)
+@compute @workgroup_size(W * BPW)
 fn main_coop(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lid: u32,
     @builtin(subgroup_invocation_id) sid: u32,
     @builtin(subgroup_size) sg_size: u32,
 ) {
-    let b = wid.x;
+    // BPW blocks per workgroup, one per subgroup of W lanes (BPW > 1 only when every subgroup has
+    // exactly W lanes). li: the lane within this block's W lanes.
+    let li = lid % W;
+    let b = wid.x * BPW + lid / W;
     if (b >= arrayLength(&counts) / 2u) { return; }
     let base = block_base(b);
     let sbase = b * MAX_SEQS * 3u;
@@ -370,18 +374,18 @@ fn main_coop(
     lit_w = b * (BLOCK_SIZE / 4u);
     n_lit = 0u;
 
-    // Lane-layout guard: the workgroup is one subgroup whose lane ids are 0..W-1.
+    // Lane-layout guard: this block's W lanes are one subgroup whose lane ids are 0..W-1.
     let m = subgroupBallot(true);
-    let lanes_ok = sg_size >= W && sid == lid && m.x == W_MASK_X && m.y == W_MASK_Y;
+    let lanes_ok = sg_size >= W && sid == li && m.x == W_MASK_X && m.y == W_MASK_Y;
     var n_seq = 0u;
     if (subgroupAll(lanes_ok)) {
         n_seq = coop_lazy_parse(base, sbase, bbase, k);
     } else {
         // Unexpected lane layout: the exact sequential parse on one lane.
-        if (lid != 0u) { return; }
+        if (li != 0u) { return; }
         n_seq = lazy_parse(base, sbase, bbase);
     }
-    if (lid == 0u) {
+    if (li == 0u) {
         if (acc_n > 0u) {
             lits[lit_w] = acc;
         }
