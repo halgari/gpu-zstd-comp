@@ -57,6 +57,7 @@ var<workgroup> cumul: array<u32, 54>;
 var<workgroup> not_rle: atomic<u32>;
 var<workgroup> rle_flag: u32;
 var<workgroup> raw_flag: u32;
+var<workgroup> section_wg: u32;
 
 // ---- stream parameters (k: 0 = LL, 1 = OF, 2 = ML) ----
 
@@ -393,9 +394,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let n_lit = counts[2u * b + 1u];
     let sbase = b * MAX_SEQS * 3u;
     let lbase = b * (BLOCK_SIZE / 4u);
-    // K5's literals section length, read before thread 0 overwrites frame_len[b].
-    var section = RAW_SECTION;
-    if (HUFFMAN) { section = frame_len[b]; }
+    // K5's literals section length. Thread 0 alone reads frame_len[b] (it alone overwrites it
+    // later) and shares it through workgroup memory: a per-invocation storage read would race
+    // with that write, since workgroupBarrier does not order storage accesses.
+    if (lid == 0u) { section_wg = select(RAW_SECTION, frame_len[b], HUFFMAN); }
+    let section = workgroupUniformLoad(&section_wg);
     let in_frame = section != RAW_SECTION;
 
     // ---- histograms and the RLE-block check ----

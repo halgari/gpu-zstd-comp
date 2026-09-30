@@ -9,10 +9,20 @@ mod gpurun;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use gzc_gpu::compressor::GpuParams;
+use gzc_gpu::compressor::{GpuParams, max_batch_blocks};
+use gzc_gpu::context::GpuContext;
 use gzc_gpu::pipeline::{PipelineConfig, vram_bytes};
 
 use corpus::{Corpus, LoadOpts};
+
+/// Default libzstd levels benchmarked by `cpu` and `all`.
+const DEFAULT_LEVELS: &str = "1,2,3,4,5,6";
+/// Highest libzstd level the benchmark accepts: levels above this are out of scope.
+const MAX_LEVEL: i64 = 16;
+
+fn level_parser() -> clap::builder::RangedI64ValueParser<i32> {
+    clap::value_parser!(i32).range(..=MAX_LEVEL)
+}
 
 #[derive(Parser)]
 #[command(name = "gzc-bench", about = "Benchmark CPU/GPU zstd compression over a corpus")]
@@ -54,8 +64,8 @@ struct CorpusArgs {
 struct CpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated zstd compression levels.
-    #[arg(long, value_delimiter = ',', default_value = "1,3,5,7,9,12,15,19")]
+    /// Comma-separated zstd compression levels (at most 16).
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_LEVELS, value_parser = level_parser())]
     levels: Vec<i32>,
     /// Comma-separated thread counts.
     #[arg(long, value_delimiter = ',', default_value = "1,8,16,32")]
@@ -119,8 +129,8 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated zstd compression levels (cpu-libzstd only).
-    #[arg(long, value_delimiter = ',', default_value = "1,3,5,7,9,12,15,19")]
+    /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_LEVELS, value_parser = level_parser())]
     levels: Vec<i32>,
     /// Comma-separated thread counts, used by both cpu-libzstd and cpu-ref.
     #[arg(long, value_delimiter = ',', default_value = "1,8,16,32")]
@@ -218,26 +228,46 @@ fn check_vram(cfg: &PipelineConfig, budget_mb: u64) -> anyhow::Result<u64> {
     Ok(mib)
 }
 
-/// Runs every (batch, inflight, writer_threads) combination, appending to `results`. Every
-/// config is checked against the VRAM budget before anything runs.
-fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &mut Vec<result::RunResult>) -> anyhow::Result<()> {
-    let cfg = |batch, inflight| {
-        PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true, huffman: true } }
-    };
+fn sweep_cfg(batch: u32, inflight: u32) -> PipelineConfig {
+    PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true, huffman: true } }
+}
+
+/// Validates every (batch, inflight) config of `sweep` against the VRAM budget, then opens the GPU
+/// and checks each batch against the device's limit. Run before any timed work so a bad config
+/// or a missing adapter fails fast.
+fn gpu_preflight(sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
     for &batch in &sweep.batch {
         for &inflight in &sweep.inflight {
-            check_vram(&cfg(batch, inflight), sweep.vram_budget_mb)?;
+            anyhow::ensure!(inflight >= 1, "--inflight must be at least 1");
+            check_vram(&sweep_cfg(batch, inflight), sweep.vram_budget_mb)?;
         }
     }
+    let ctx = GpuContext::new()?;
+    let max = max_batch_blocks(&ctx.device.limits());
+    for &batch in &sweep.batch {
+        anyhow::ensure!(batch >= 1 && batch <= max, "--batch {batch} not in 1..={max} for this device");
+    }
+    Ok(ctx)
+}
+
+/// Runs every (batch, inflight, writer_threads) combination on `ctx`, appending to `results`.
+/// Configs must have passed `gpu_preflight`.
+fn run_gpu_sweep(
+    ctx: &GpuContext,
+    corpus: &Corpus,
+    sweep: &GpuSweepArgs,
+    verify: bool,
+    results: &mut Vec<result::RunResult>,
+) -> anyhow::Result<()> {
     for &batch in &sweep.batch {
         for &inflight in &sweep.inflight {
             for &writers in &sweep.writer_threads {
-                let cfg = cfg(batch, inflight);
+                let cfg = sweep_cfg(batch, inflight);
                 let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
                 eprintln!(
                     "running gpu lvl3-greedy b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})..."
                 );
-                results.push(gpurun::run_gpu(corpus, &cfg, writers, verify)?);
+                results.push(gpurun::run_gpu(ctx, corpus, &cfg, writers, verify)?);
             }
         }
     }
@@ -245,16 +275,19 @@ fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &
 }
 
 fn run_gpu_cmd(args: GpuArgs) -> anyhow::Result<()> {
+    let ctx = gpu_preflight(&args.sweep)?;
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
     let mut results = Vec::new();
-    run_gpu_sweep(&corpus, &args.sweep, args.verify, &mut results)?;
+    run_gpu_sweep(&ctx, &corpus, &args.sweep, args.verify, &mut results)?;
 
     write_reports(&results, &args.out)
 }
 
 fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
+    // Fail on a bad GPU config or a missing adapter before the (long) CPU sweeps.
+    let ctx = gpu_preflight(&args.gpu)?;
     let corpus = load_corpus(&args.corpus)?;
     log_corpus(&corpus);
 
@@ -274,7 +307,12 @@ fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
         results.push(refrun::run_ref(&corpus, threads, args.verify)?);
     }
 
-    run_gpu_sweep(&corpus, &args.gpu, args.verify, &mut results)?;
+    // A GPU failure still leaves the CPU results (and any finished GPU runs) on disk.
+    if let Err(gpu_err) = run_gpu_sweep(&ctx, &corpus, &args.gpu, args.verify, &mut results) {
+        eprintln!("gpu sweep failed: {gpu_err:#}; writing the results gathered so far");
+        write_reports(&results, &args.out)?;
+        return Err(gpu_err);
+    }
 
     write_reports(&results, &args.out)
 }
@@ -291,5 +329,23 @@ mod tests {
         assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
         let err = check_vram(&cfg, mib - 1).unwrap_err().to_string();
         assert!(err.contains("--vram-budget-mb") && err.contains("b64 i2"), "{err}");
+    }
+
+    #[test]
+    fn levels_default_to_1_through_6_and_reject_above_16() {
+        for cmd in ["cpu", "all"] {
+            let levels = |extra: &[&str]| -> Result<Vec<i32>, clap::Error> {
+                let argv = [&["gzc-bench", cmd, "--synthetic"], extra].concat();
+                Ok(match Cli::try_parse_from(argv)?.command {
+                    Command::Cpu(a) => a.levels,
+                    Command::All(a) => a.levels,
+                    _ => unreachable!(),
+                })
+            };
+            assert_eq!(levels(&[]).unwrap(), (1..=6).collect::<Vec<_>>(), "{cmd}");
+            assert_eq!(levels(&["--levels", "3,16"]).unwrap(), vec![3, 16], "{cmd}");
+            assert!(levels(&["--levels", "17"]).is_err(), "{cmd}: 17 must be rejected");
+            assert!(levels(&["--levels", "1,19"]).is_err(), "{cmd}: 19 must be rejected");
+        }
     }
 }

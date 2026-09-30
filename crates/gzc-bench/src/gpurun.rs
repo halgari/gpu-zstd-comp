@@ -79,10 +79,15 @@ impl FrameSink for Discard {
 /// is then decompressed with libzstd and compared with its padded block. `kernel_ms` holds the
 /// timed run's summed per-kernel GPU time (when the device supports timestamps); a per-batch
 /// breakdown is printed to stderr. `cfg.params.emit_frames` is forced on.
-pub fn run_gpu(corpus: &Corpus, cfg: &PipelineConfig, writer_threads: usize, verify: bool) -> anyhow::Result<RunResult> {
+pub fn run_gpu(
+    ctx: &GpuContext,
+    corpus: &Corpus,
+    cfg: &PipelineConfig,
+    writer_threads: usize,
+    verify: bool,
+) -> anyhow::Result<RunResult> {
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
-    let ctx = GpuContext::new()?;
-    let mut pipe = Pipeline::new(&ctx, &cfg)?;
+    let mut pipe = Pipeline::new(ctx, &cfg)?;
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();
 
     pipe.run_frames(&blocks[..blocks.len().min(cfg.batch as usize)], &mut Discard)?;
@@ -179,10 +184,11 @@ mod tests {
             let opts = FrameOptions { checksum: false, huffman };
             corpus.blocks.iter().map(|b| write_frame(&b.data, &compress_block(&b.data, LVL3), opts).len() as u64).sum()
         };
+        let ctx = GpuContext::new().unwrap();
         for (writers, huffman) in [(0, true), (2, true), (0, false)] {
             let params = GpuParams { depth: 1, emit_frames: false, huffman };
             let cfg = PipelineConfig { batch: 4, inflight: 2, params };
-            let r = run_gpu(&corpus, &cfg, writers, true).unwrap();
+            let r = run_gpu(&ctx, &corpus, &cfg, writers, true).unwrap();
             assert_eq!(r.engine, "gpu");
             assert_eq!(r.config, if huffman { "lvl3-greedy b4 i2" } else { "lvl3-greedy rawlit b4 i2" });
             assert_eq!(r.threads, Some(writers));
