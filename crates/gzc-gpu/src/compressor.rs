@@ -28,6 +28,7 @@ const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
+const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -238,11 +239,27 @@ pub struct Kernels {
     parse_layout: wgpu::BindGroupLayout,
     /// The subgroup-cooperative K3 (`K3Mode::Coop`), used instead of `parse` when present.
     parse_coop: Option<wgpu::ComputePipeline>,
+    /// The segmented K3 (`MatchParams::segment_log2 > 0`), used instead of both when present.
+    parse_seg: Option<SegParse>,
     k3_mode: K3Mode,
     entropy: Option<EntropyKernel>,
     huffman: Option<HuffmanKernel>,
     params: GpuParams,
 }
+
+/// K3 for a segmented parse (`k3_seg.wgsl`): one lane per segment, then one workgroup per block
+/// concatenating the segments and encoding the offsets. Its `best` binding is read-write: the
+/// segment lanes keep their raw sequences in their own part of `best` (K3 is its last reader).
+struct SegParse {
+    seg: wgpu::ComputePipeline,
+    fixup: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    /// Segments per block.
+    n_seg: u32,
+}
+
+/// Lanes per workgroup of `k3_seg.wgsl`'s `main_seg`.
+const K3_SEG_WG: u32 = 64;
 
 /// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
 /// comes from gzc_core, so the GPU mirrors the CPU tables exactly.
@@ -502,6 +519,23 @@ impl Kernels {
                 Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
             }
         };
+        // Segmented parse: loops as in k3_lazy.wgsl, bounded by the segment's lim instead of
+        // BLOCK_SIZE (match_len's n grows to max <= lim - p), the skip by exactly 1; the fixup
+        // loops count up to NSEG and to the segments' sequence counts.
+        let parse_seg = (m.segment_log2 > 0).then(|| {
+            let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
+            let body = format!(
+                "{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\nconst SEG_LOG2: u32 = {}u;\n{K3_SEG_WGSL}",
+                m.segment_log2
+            );
+            let module = ctx.shader_unbounded_loops("k3_seg", &body);
+            SegParse {
+                seg: pipeline_from_module(ctx, "k3_seg", &layout, &module, "main_seg"),
+                fixup: pipeline_from_module(ctx, "k3_seg_fixup", &layout, &module, "main_fixup"),
+                layout,
+                n_seg: (BLOCK_SIZE >> m.segment_log2) as u32,
+            }
+        });
         let (tab, consts) = k4_tables();
         let huffman = params.emit_frames && params.huffman;
         let consts = format!("{consts}const HUFFMAN: bool = {huffman};\n");
@@ -527,6 +561,7 @@ impl Kernels {
             parse,
             parse_layout,
             parse_coop,
+            parse_seg,
             k3_mode,
             entropy,
             huffman: huffman_kernel,
@@ -652,6 +687,25 @@ impl Kernels {
         debug_assert!(n_blocks >= 1 && n_blocks <= bufs.capacity);
         // K3 derives the batch size from the bound length of `counts`.
         let counts = wgpu::BufferBinding { buffer: &bufs.counts, offset: 0, size: wgpu::BufferSize::new(counts_bytes(n_blocks)) };
+        if let Some(sp) = &self.parse_seg {
+            let k3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("k3_seg"),
+                layout: &sp.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bufs.best.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bufs.seqs.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(counts) },
+                ],
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
+            pass.set_bind_group(0, &k3, &[]);
+            pass.set_pipeline(&sp.seg);
+            pass.dispatch_workgroups((n_blocks * sp.n_seg).div_ceil(K3_SEG_WG), 1, 1);
+            pass.set_pipeline(&sp.fixup);
+            pass.dispatch_workgroups(n_blocks, 1, 1);
+            return;
+        }
         let k3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k3"),
             layout: &self.parse_layout,

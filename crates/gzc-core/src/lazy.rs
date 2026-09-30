@@ -19,7 +19,7 @@
 //!   bookkeeping would differ).
 use crate::config::{BLOCK_SIZE, PARSE_END};
 use crate::params::MatchParams;
-use crate::reference::{match_len, Match};
+use crate::reference::{match_len_capped, Match};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Reps, Sequence, INITIAL_REPS};
 
 /// zstd `REPCODE1_TO_OFFBASE`.
@@ -36,15 +36,16 @@ fn highbit32(x: u32) -> i32 {
 }
 
 /// Repeat-offset probe at `p`: zstd's `(off > 0) & (MEM_read32(p) == MEM_read32(p - off))`
-/// then `ZSTD_count(p+4, p+4-off, iend) + 4`. Returns the match length, or 0 when the first
-/// 4 bytes differ or `off` is unusable. `off > p` cannot happen for a real rep history (zstd
-/// relies on its window check for that); it is guarded so nothing underflows.
-fn rep_len(block: &[u8], p: usize, off: u32) -> u32 {
+/// then `ZSTD_count(p+4, p+4-off, iend) + 4`, with `iend = lim` (the block end, or the segment
+/// end of a segmented parse). Returns the match length, or 0 when the first 4 bytes differ or
+/// `off` is unusable. `off > p` cannot happen for a real rep history (zstd relies on its window
+/// check for that); it is guarded so nothing underflows.
+fn rep_len(block: &[u8], p: usize, off: u32, lim: usize) -> u32 {
     debug_assert!(off as usize <= p, "rep offset {off} beyond position {p}");
     if off == 0 || off as usize > p {
         return 0;
     }
-    let l = match_len(block, p, p - off as usize);
+    let l = match_len_capped(block, p, p - off as usize, lim - p);
     if l >= 4 {
         l as u32
     } else {
@@ -53,44 +54,153 @@ fn rep_len(block: &[u8], p: usize, off: u32) -> u32 {
 }
 
 /// `ZSTD_searchMax(ip)`: `(matchLength, offBase)` of `best[ip]`, or `None` when it has no
-/// match of at least `min_match`. A capped length is extended to the true match length.
-fn search_max(block: &[u8], best: &[Match], ip: usize, params: &MatchParams) -> Option<(u32, u32)> {
+/// match of at least `min_match`. A capped length is extended to the true match length (up to
+/// `seg.lim`). With `seg.clamp` (segmented parse) a match running past `seg.lim` is cut there
+/// and dropped when that leaves fewer than `min_match` bytes.
+fn search_max(block: &[u8], best: &[Match], ip: usize, params: &MatchParams, seg: &Seg) -> Option<(u32, u32)> {
     debug_assert!(ip < PARSE_END, "best[] read at {ip} >= PARSE_END");
     let m = best[ip];
     if m.len < params.min_match {
         return None;
     }
-    let len = if m.len == params.search_cap { match_len(block, ip, ip - m.offset as usize) as u32 } else { m.len };
+    let mut len = if m.len == params.search_cap {
+        match_len_capped(block, ip, ip - m.offset as usize, seg.lim - ip) as u32
+    } else {
+        m.len
+    };
+    if seg.clamp && ip + len as usize > seg.lim {
+        len = (seg.lim - ip) as u32;
+        if len < params.min_match {
+            return None;
+        }
+    }
     Some((len, m.offset + ZSTD_REP_NUM))
 }
 
-/// Appends one sequence (`lit_len` literals from `anchor`, then `ml` bytes at `offset`) with
-/// the decoder's rep bookkeeping, like `greedy_parse`.
-fn store(out: &mut BlockOutput, reps: &mut Reps, block: &[u8], anchor: usize, lit_len: usize, offset: u32, ml: u32) {
+/// One parsed sequence before its offset is encoded: (lit_len, match_len, offset). The literals
+/// are implicit (the bytes between matches).
+pub type RawSeq = (u32, u32, u32);
+
+/// Where and how `lazy_core` parses: the byte range `[anchor0, lim)` (matches never reach past
+/// `lim`), starting at `ip0` with rep history `reps0`. The whole-block parse is
+/// `Seg::whole_block()`; `lazy_parse_segmented` uses `Seg::segment`.
+#[derive(Clone, Copy, Debug)]
+pub struct Seg {
+    pub ip0: usize,
+    pub anchor0: usize,
+    pub reps0: Reps,
+    /// End of the parsed range: match lengths are bounded by it.
+    pub lim: usize,
+    /// zstd's `ilimit`: the parse loop runs while `ip < pend` (`PARSE_END` for the whole block).
+    pub pend: usize,
+    /// zstd's literal-run skip acceleration `step = ((ip - anchor) >> 8) + 1` (else step 1).
+    pub accel: bool,
+    /// Cut `best[]` matches that run past `lim` (segmented parse only; see `search_max`).
+    pub clamp: bool,
+}
+
+impl Seg {
+    /// Today's `lazy_parse`: the whole block, zstd's start (`ip = 1`, `INITIAL_REPS`).
+    pub fn whole_block() -> Self {
+        Seg { ip0: 1, anchor0: 0, reps0: INITIAL_REPS, lim: BLOCK_SIZE, pend: PARSE_END, accel: true, clamp: false }
+    }
+
+    /// Segment `k` of `1 << log2` bytes: segment 0 keeps the block start (`ip = 1`,
+    /// `INITIAL_REPS`), later ones start at `ip = anchor = k << log2` with an empty rep history
+    /// (all zero: no rep probe can hit until the segment's first explicit match). The last
+    /// segment ends at `BLOCK_SIZE` / `PARSE_END`, the others at their end / end - 4. No skip
+    /// acceleration.
+    pub fn segment(k: usize, log2: u32) -> Self {
+        let n = BLOCK_SIZE >> log2;
+        assert!(k < n, "segment {k} of {n}");
+        let s = k << log2;
+        let last = k + 1 == n;
+        let lim = if last { BLOCK_SIZE } else { s + (1 << log2) };
+        let pend = if last { PARSE_END } else { lim - 4 };
+        let (ip0, reps0) = if k == 0 { (1, INITIAL_REPS) } else { (s, [0; 3]) };
+        Seg { ip0, anchor0: s, reps0, lim, pend, accel: false, clamp: true }
+    }
+}
+
+/// Appends one raw sequence (`lit_len` literals from the anchor, then `ml` bytes at `offset`)
+/// and applies the decoder's rep bookkeeping to the parse's own history `reps`.
+fn store(out: &mut Vec<RawSeq>, reps: &mut Reps, lit_len: usize, offset: u32, ml: u32) {
     let ll = lit_len as u32;
     let ob = off_base_for(offset, ll, reps);
     apply_off_base(reps, ob, ll);
-    out.literals.extend_from_slice(&block[anchor..anchor + lit_len]);
-    out.sequences.push(Sequence { lit_len: ll, match_len: ml, off_base: ob });
+    out.push((ll, ml, offset));
 }
 
 /// Lazy / lazy2 parse over precomputed best[] (spec §3.4). params.lazy ∈ {1,2}.
+/// Whole-block parse: `lazy_core` over `Seg::whole_block()`, then `encode_raw`.
 pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOutput {
+    let mut raw = Vec::new();
+    lazy_core(block, best, params, &Seg::whole_block(), &mut raw);
+    encode_raw(block, &raw)
+}
+
+/// The segmented lazy / lazy2 parse (`params.segment_log2 > 0`, preset `lvl9seg`): each
+/// `Seg::segment` is parsed on its own by `lazy_core`; the raw sequences are concatenated, each
+/// segment's trailing literals carried into the first sequence of the next non-empty segment,
+/// and `encode_raw` assigns every `off_base` from the block's true decoder rep history.
+pub fn lazy_parse_segmented(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOutput {
+    let log2 = params.segment_log2;
+    assert!(log2 > 0, "lazy_parse_segmented: segment_log2 0");
+    let mut raw = Vec::new();
+    // End of the last sequence so far (start of the pending literal run).
+    let mut prev_end = 0usize;
+    let mut part = Vec::new();
+    for k in 0..BLOCK_SIZE >> log2 {
+        let seg = Seg::segment(k, log2);
+        part.clear();
+        let end = lazy_core(block, best, params, &seg, &mut part);
+        if let Some(first) = part.first_mut() {
+            first.0 += (seg.anchor0 - prev_end) as u32;
+            prev_end = end;
+        }
+        raw.extend_from_slice(&part);
+    }
+    encode_raw(block, &raw)
+}
+
+/// Encodes raw sequences with the decoder's rep history from `INITIAL_REPS` (`off_base_for` /
+/// `apply_off_base`) and gathers the literals they leave uncovered.
+pub fn encode_raw(block: &[u8], raw: &[RawSeq]) -> BlockOutput {
+    let mut out = BlockOutput::default();
+    let mut reps: Reps = INITIAL_REPS;
+    let mut pos = 0usize;
+    for &(ll, ml, offset) in raw {
+        let ob = off_base_for(offset, ll, &reps);
+        apply_off_base(&mut reps, ob, ll);
+        out.literals.extend_from_slice(&block[pos..pos + ll as usize]);
+        out.sequences.push(Sequence { lit_len: ll, match_len: ml, off_base: ob });
+        pos += (ll + ml) as usize;
+    }
+    // last literals
+    out.literals.extend_from_slice(&block[pos..BLOCK_SIZE]);
+    out
+}
+
+/// The lazy / lazy2 parse of `seg` (see `Seg`), appending raw sequences to `out`; returns the
+/// final anchor (the end of the last sequence, or `seg.anchor0` if none). `lit_len` of the first
+/// sequence counts from `seg.anchor0`.
+pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, out: &mut Vec<RawSeq>) -> usize {
     assert!(params.lazy == 1 || params.lazy == 2, "lazy_parse: lazy {} not in 1..=2", params.lazy);
     assert_eq!(block.len(), BLOCK_SIZE);
     assert!(best.len() >= PARSE_END);
+    assert!(seg.ip0 >= seg.anchor0 && seg.lim <= BLOCK_SIZE && seg.pend <= PARSE_END.min(seg.lim), "{seg:?}");
     let depth = params.lazy;
-    let ilimit = PARSE_END;
+    let ilimit = seg.pend;
+    let lim = seg.lim;
 
-    let mut out = BlockOutput::default();
-    let mut reps: Reps = INITIAL_REPS;
-    let mut anchor = 0usize;
+    let mut reps: Reps = seg.reps0;
+    let mut anchor = seg.anchor0;
     // zstd: `ip += (dictAndPrefixLength == 0)`. Every block is a fresh frame, so the parse
-    // starts at 1.
-    let mut ip = 1usize;
+    // starts at 1 (a later segment starts at its anchor).
+    let mut ip = seg.ip0;
     // zstd noDict: offsets larger than `maxRep = curr - windowLow` (= ip = 1 here) start
     // disabled as 0. INITIAL_REPS = [1, 4, 8], so offset_1 = 1 is live and offset_2 is 0
-    // (off) until the first explicit match sets it.
+    // (off) until the first explicit match sets it. (A later segment's reps are all 0.)
     let max_rep = ip as u32;
     let mut offset_1 = if reps[0] <= max_rep { reps[0] } else { 0 };
     let mut offset_2 = if reps[1] <= max_rep { reps[1] } else { 0 };
@@ -103,13 +213,13 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
         let mut start = ip + 1;
 
         // check repCode (at ip+1). With depth >= 1 zstd does not `goto _storeSequence` here.
-        let l = rep_len(block, ip + 1, offset_1);
+        let l = rep_len(block, ip + 1, offset_1, lim);
         if l > 0 {
             match_length = l;
         }
 
         // first search (depth 0)
-        if let Some((ml2, ob)) = search_max(block, best, ip, params) {
+        if let Some((ml2, ob)) = search_max(block, best, ip, params, seg) {
             if ml2 > match_length {
                 match_length = ml2;
                 start = ip;
@@ -119,7 +229,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
 
         if match_length < 4 {
             // jump faster over incompressible sections
-            ip += ((ip - anchor) >> K_SEARCH_STRENGTH) + 1;
+            ip += if seg.accel { ((ip - anchor) >> K_SEARCH_STRENGTH) + 1 } else { 1 };
             // deviation: zstd also sets `ms->lazySkipping = step > kLazySkippingStep`, which
             // only stops hash-table insertion of skipped positions. K2 searched every
             // position, so it cannot change what `best[]` holds; not applicable.
@@ -133,7 +243,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
         while ip + 1 < ilimit {
             ip += 1;
             // search depth 1: repcode at ip, ×3 rule. (zstd's `(offBase) &&` is always true.)
-            let ml_rep = rep_len(block, ip, offset_1);
+            let ml_rep = rep_len(block, ip, offset_1, lim);
             if ml_rep >= 4 {
                 let gain2 = (ml_rep * 3) as i32;
                 let gain1 = (match_length * 3) as i32 - highbit32(off_base) + 1;
@@ -143,7 +253,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
                     start = ip;
                 }
             }
-            if let Some((ml2, ob)) = search_max(block, best, ip, params) {
+            if let Some((ml2, ob)) = search_max(block, best, ip, params, seg) {
                 let gain2 = (ml2 * 4) as i32 - highbit32(ob); // raw approx
                 let gain1 = (match_length * 4) as i32 - highbit32(off_base) + 4;
                 if ml2 >= 4 && gain2 > gain1 {
@@ -158,7 +268,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
             if depth == 2 && ip + 1 < ilimit {
                 ip += 1;
                 // search depth 2: repcode at ip, ×4 rule.
-                let ml_rep = rep_len(block, ip, offset_1);
+                let ml_rep = rep_len(block, ip, offset_1, lim);
                 if ml_rep >= 4 {
                     let gain2 = (ml_rep * 4) as i32;
                     let gain1 = (match_length * 4) as i32 - highbit32(off_base) + 1;
@@ -168,7 +278,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
                         start = ip;
                     }
                 }
-                if let Some((ml2, ob)) = search_max(block, best, ip, params) {
+                if let Some((ml2, ob)) = search_max(block, best, ip, params, seg) {
                     let gain2 = (ml2 * 4) as i32 - highbit32(ob); // raw approx
                     let gain1 = (match_length * 4) as i32 - highbit32(off_base) + 7;
                     if ml2 >= 4 && gain2 > gain1 {
@@ -194,7 +304,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
             let lit_len = start - anchor;
             let zstd_view = (offset, offset_1);
             let dedup = lit_len > 0 && offset == reps[0];
-            store(&mut out, &mut reps, block, anchor, lit_len, offset, match_length);
+            store(out, &mut reps, lit_len, offset, match_length);
             if dedup {
                 // deviation: zstd stores this match with an explicit offBase (decoded as reps
                 // [o, o, r1]) and sets offset_2 = offset_1 = o. off_base_for stores it as
@@ -221,8 +331,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
             let lit_len = start - anchor;
             debug_assert!(lit_len > 0);
             let before = reps;
-            store(&mut out, &mut reps, block, anchor, lit_len, offset_1, match_length);
-            debug_assert_eq!(out.sequences.last().unwrap().off_base, REPCODE1_TO_OFFBASE);
+            store(out, &mut reps, lit_len, offset_1, match_length);
             debug_assert_eq!(reps, before);
         }
         anchor = start + match_length as usize;
@@ -231,21 +340,18 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
         // check immediate repcode: an offset_2 match at ip is stored as (ll 0, repcode 1),
         // which the decoder resolves to reps[1] and swaps into reps[0] — zstd's swap.
         while ip <= ilimit && offset_2 > 0 {
-            let ml = rep_len(block, ip, offset_2);
+            let ml = rep_len(block, ip, offset_2, lim);
             if ml == 0 {
                 break;
             }
             (offset_1, offset_2) = (offset_2, offset_1); // swap repcodes
-            store(&mut out, &mut reps, block, anchor, 0, offset_1, ml);
-            debug_assert_eq!(out.sequences.last().unwrap().off_base, REPCODE1_TO_OFFBASE);
+            store(out, &mut reps, 0, offset_1, ml);
             debug_assert_eq!((reps[0], reps[1]), (offset_1, offset_2));
             ip += ml as usize;
             anchor = ip;
         }
     }
-    // last literals
-    out.literals.extend_from_slice(&block[anchor..BLOCK_SIZE]);
-    out
+    anchor
 }
 
 
@@ -256,7 +362,7 @@ pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOu
 #[doc(hidden)]
 pub mod cases {
     use crate::config::{BLOCK_SIZE, PARSE_END};
-    use crate::params::{MatchParams, LVL9, RUNG2};
+    use crate::params::{MatchParams, LVL9, LVL9SEG, RUNG2};
     use crate::reference::{match_len, Match};
     use crate::seq::Sequence;
     use crate::synth;
@@ -674,6 +780,89 @@ pub mod cases {
         vec![case("rung2_min_match6_byte_run_at_start", block, best, vec![(params, want)])]
     }
 
+    /// Segment size of `LVL9SEG` (4 KiB: every case fits the 4 segments of a 16 KiB block).
+    const SEG: usize = 1 << LVL9SEG.segment_log2;
+
+    /// A match running across the end of segment 0 is cut at the segment end (length 6 of 20);
+    /// segment 1 then starts with the rest (ll 0), which the true reps store explicitly (offset
+    /// == reps[0] with ll 0 is not a repcode).
+    pub fn seg_match_clamped_at_segment_end() -> Vec<LazyCase> {
+        let mut block = background(31);
+        plant(&mut block, SEG - 6, 100, 20);
+        let mut best = empty_best();
+        best[SEG - 6] = real(&block, SEG - 6, 100);
+        best[SEG] = real(&block, SEG, 100);
+        assert_eq!((best[SEG - 6].len, best[SEG].len), (20, 14));
+        let want = vec![seq(SEG as u32 - 6, 6, 103), seq(0, 14, 103)];
+        vec![case("seg_match_clamped_at_segment_end", block, best, vec![(LVL9SEG, want)])]
+    }
+
+    /// min_match 6: a match 5 bytes before the segment end is cut below min_match and dropped;
+    /// segment 1 takes the rest, its literals carried over the whole of segment 0.
+    pub fn seg_clamp_drops_short_match() -> Vec<LazyCase> {
+        let p = MatchParams { min_match: 6, ..LVL9SEG };
+        let mut block = background(32);
+        plant(&mut block, SEG - 5, 100, 20);
+        let mut best = empty_best();
+        best[SEG - 5] = real(&block, SEG - 5, 100);
+        best[SEG] = real(&block, SEG, 100);
+        assert_eq!(best[SEG].len, 15);
+        vec![case("seg_clamp_drops_short_match", block, best, vec![(p, vec![seq(SEG as u32, 15, 103)])])]
+    }
+
+    /// Segments 1 and 2 are empty: the literals after segment 0's match run into segment 3's
+    /// first sequence.
+    pub fn seg_empty_segments_carry_literals() -> Vec<LazyCase> {
+        let mut block = background(33);
+        plant(&mut block, 100, 50, 10);
+        let far = 3 * SEG + 200;
+        plant(&mut block, far, 300, 12);
+        let mut best = empty_best();
+        best[100] = real(&block, 100, 50);
+        best[far] = real(&block, far, 300);
+        let want = vec![seq(100, 10, 53), seq((far - 110) as u32, 12, 303)];
+        vec![case("seg_empty_segments_carry_literals", block, best, vec![(LVL9SEG, want)])]
+    }
+
+    /// Segment 1 parses with empty reps (its first match is explicit there), but the true
+    /// history makes it repcode 1 (ll > 0, offset == reps[0]); and a segment starting with a
+    /// match at its first byte (ll 0) at the true reps[1] becomes repcode 1 as well.
+    pub fn seg_true_reps_across_segments() -> Vec<LazyCase> {
+        let mut block = background(34);
+        plant(&mut block, 100, 50, 10);
+        plant(&mut block, SEG - 6, 70, 6);
+        plant(&mut block, SEG, 50, 10);
+        plant(&mut block, 2 * SEG + 300, 50, 10);
+        let mut best = empty_best();
+        for p in [100, SEG, 2 * SEG + 300] {
+            best[p] = real(&block, p, 50);
+        }
+        best[SEG - 6] = real(&block, SEG - 6, 70);
+        assert_eq!(best[SEG - 6].len, 6);
+        let want = vec![
+            seq(100, 10, 53),
+            seq(SEG as u32 - 116, 6, 73),
+            // reps [70, 50, 1]: ll 0 and offset reps[1] → repcode 1, reps [50, 70, 1]
+            seq(0, 10, 1),
+            // ll > 0 and offset reps[0] → repcode 1
+            seq(SEG as u32 + 300 - 10, 10, 1),
+        ];
+        vec![case("seg_true_reps_across_segments", block, best, vec![(LVL9SEG, want)])]
+    }
+
+    /// Every segmented-parse case above, in order.
+    pub fn segment_test_cases() -> Vec<LazyCase> {
+        [
+            seg_match_clamped_at_segment_end,
+            seg_clamp_drops_short_match,
+            seg_empty_segments_carry_literals,
+            seg_true_reps_across_segments,
+        ]
+        .into_iter()
+        .flat_map(|f| f())
+        .collect()
+    }
+
     /// Every hand-built case above, in order.
     pub fn lazy_test_cases() -> Vec<LazyCase> {
         [
@@ -706,7 +895,7 @@ mod tests {
     use super::*;
     use crate::block::chunk_file;
     use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{LVL9, RUNG1, RUNG2};
+    use crate::params::{LVL9, LVL9SEG, RUNG1, RUNG2};
     use crate::reference::{chains, compress_block, find_best};
     use crate::seq::reconstruct;
     use crate::synth;
@@ -716,7 +905,7 @@ mod tests {
     fn check(cases: Vec<LazyCase>) {
         for c in cases {
             for (params, want) in &c.expect {
-                let out = lazy_parse(&c.block, &c.best, params);
+                let out = crate::reference::parse(&c.block, &c.best, params);
                 let got = reconstruct(&out).expect("reconstruct");
                 assert_eq!(got, c.block, "{} lazy {}: output does not reconstruct the block", c.name, params.lazy);
                 assert_eq!(out.sequences, *want, "{} lazy {}", c.name, params.lazy);
@@ -814,6 +1003,76 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), all.len(), "case names are unique");
         assert!(all.iter().all(|c| c.best.len() == BLOCK_SIZE && c.block.len() == BLOCK_SIZE && !c.expect.is_empty()));
+    }
+
+    #[test]
+    fn seg_match_clamped_at_segment_end() {
+        check(cases::seg_match_clamped_at_segment_end());
+    }
+
+    #[test]
+    fn seg_clamp_drops_short_match() {
+        check(cases::seg_clamp_drops_short_match());
+    }
+
+    #[test]
+    fn seg_empty_segments_carry_literals() {
+        check(cases::seg_empty_segments_carry_literals());
+    }
+
+    #[test]
+    fn seg_true_reps_across_segments() {
+        check(cases::seg_true_reps_across_segments());
+    }
+
+    #[test]
+    fn segment_test_cases_lists_every_case() {
+        let all = cases::segment_test_cases();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|c| c.expect.iter().all(|(p, _)| p.segment_log2 > 0)));
+    }
+
+    /// `lazy_parse` is `lazy_core` over the whole block followed by `encode_raw`, and a
+    /// one-segment `lazy_core` run from the block start with `Seg::whole_block` limits but no
+    /// acceleration equals the segmented parse with `segment_log2 == LOG2_BLOCK`.
+    #[test]
+    fn one_segment_is_the_unaccelerated_whole_block_parse() {
+        use crate::config::LOG2_BLOCK;
+        let p = MatchParams { segment_log2: LOG2_BLOCK, ..LVL9 };
+        for (name, bytes) in synth::test_cases() {
+            for blk in chunk_file(&bytes) {
+                let best = find_best(&blk.data, &chains(&blk.data, &p), &p);
+                let mut raw = Vec::new();
+                let seg = Seg { accel: false, clamp: true, ..Seg::whole_block() };
+                let end = lazy_core(&blk.data, &best, &p, &seg, &mut raw);
+                assert_eq!(end, raw.iter().map(|q| (q.0 + q.1) as usize).sum::<usize>(), "{name}");
+                assert_eq!(encode_raw(&blk.data, &raw), lazy_parse_segmented(&blk.data, &best, &p), "{name}");
+            }
+        }
+    }
+
+    /// The segmented parse (4 KiB lazy2 = lvl9seg, and 1 KiB lazy1) round-trips through libzstd,
+    /// and no match crosses a segment boundary.
+    #[test]
+    fn segmented_roundtrip_and_matches_stay_in_their_segment() {
+        for params in [LVL9SEG, MatchParams { segment_log2: 10, ..RUNG2 }] {
+            let seg = 1usize << params.segment_log2;
+            for (name, bytes) in synth::test_cases() {
+                for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                    let out = compress_block(&blk.data, params);
+                    let mut pos = 0usize;
+                    for q in &out.sequences {
+                        let start = pos + q.lit_len as usize;
+                        pos = start + q.match_len as usize;
+                        assert_eq!(start / seg, (pos - 1) / seg, "{name}[{i}]: match {start}..{pos} crosses a segment");
+                    }
+                    let frame = write_frame(&blk.data, &out, FrameOptions::default());
+                    let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                        .unwrap_or_else(|e| panic!("{params:?} {name}[{i}]: libzstd rejected frame: {e}"));
+                    assert_eq!(dec, blk.data, "{params:?} {name}[{i}]: frame mismatch");
+                }
+            }
+        }
     }
 
     #[test]

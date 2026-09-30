@@ -8,9 +8,9 @@ use gzc_core::frame::{FrameOptions, frame_header, write_frame, write_literals_ra
 use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
-use gzc_core::lazy::cases::{LazyCase, lazy_test_cases};
+use gzc_core::lazy::cases::{LazyCase, lazy_test_cases, segment_test_cases};
 use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL3, LVL9, MatchParams, RUNG1, RUNG2};
+use gzc_core::params::{LVL3, LVL9, LVL9SEG, MatchParams, RUNG1, RUNG2};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -46,7 +46,8 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
 }
 
 /// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 4] = [("lvl3", LVL3), ("rung1", RUNG1), ("rung2", RUNG2), ("lvl9", LVL9)];
+const GPU_PRESETS: [(&str, MatchParams); 5] =
+    [("lvl3", LVL3), ("rung1", RUNG1), ("rung2", RUNG2), ("lvl9", LVL9), ("lvl9seg", LVL9SEG)];
 
 /// LVL3 with a deeper chain walk.
 const DEPTH4: MatchParams = MatchParams { depth: 4, ..LVL3 };
@@ -1225,11 +1226,11 @@ const K2_VARIANTS: [MatchParams; 6] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, segment_log2: 0 },
     // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
     // skips only against a best of >= 4) and 6.
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, segment_log2: 0 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, segment_log2: 0 },
 ];
 
 /// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
@@ -1389,9 +1390,12 @@ fn k2_dfast_nearer_short_chain_candidate() {
 
 /// Lazy parses off the preset table: `min_match` above 4 (repcode matches may still be 4 bytes)
 /// and a small `search_cap`, so the parse extends many capped `best[]` entries.
-const LAZY_VARIANTS: [MatchParams; 2] = [
+const LAZY_VARIANTS: [MatchParams; 4] = [
     MatchParams { min_match: 6, ..RUNG2 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, segment_log2: 0 },
+    // Segmented: 1 KiB lazy1 with min_match 6, and 2 KiB lazy2 extending many capped matches.
+    MatchParams { min_match: 6, segment_log2: 10, ..RUNG2 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, segment_log2: 11 },
 ];
 
 #[test]
@@ -1433,6 +1437,52 @@ fn k3_lazy_hand_built_best_matches_cpu() {
         let all: Vec<&LazyCase> = cases.iter().collect();
         check(&all);
         for c in &all {
+            check(std::slice::from_ref(c));
+        }
+    }
+}
+
+/// The segmented parse (k3_seg.wgsl) on hand-built `best[]`: the segment-boundary cases under
+/// their own params, and every lazy case under lvl9seg and a 1 KiB lazy1 variant. The K3 parse
+/// must equal `reference::parse` (and the pinned sequences), the frame `write_frame` of it.
+/// Batched and one by one.
+#[test]
+fn k3_seg_hand_built_best_matches_cpu() {
+    let seg_cases = segment_test_cases();
+    let lazy_cases = lazy_test_cases();
+    let mut runs: Vec<(MatchParams, Vec<&LazyCase>)> = Vec::new();
+    for c in &seg_cases {
+        for (p, _) in &c.expect {
+            match runs.iter_mut().find(|(q, _)| q == p) {
+                Some((_, v)) => v.push(c),
+                None => runs.push((*p, vec![c])),
+            }
+        }
+    }
+    for p in [LVL9SEG, MatchParams { segment_log2: 10, ..RUNG2 }] {
+        let all: Vec<&LazyCase> = lazy_cases.iter().chain(&seg_cases).filter(|c| c.expect.iter().all(|(q, _)| q.min_match == p.min_match)).collect();
+        runs.push((p, all));
+    }
+    for (params, cases) in runs {
+        eprintln!("{params:?}: {} cases", cases.len());
+        let (ctx, kernels) = setup_frames_for(params, true);
+        let check = |cases: &[&LazyCase]| {
+            let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
+            let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
+            let parses = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("parses_from_best");
+            let frames = frames_from_best(&ctx, &kernels, &blocks, &bests).expect("frames_from_best");
+            for ((c, got), frame) in cases.iter().zip(&parses).zip(&frames) {
+                let want = gzc_core::reference::parse(&c.block, &c.best, &params);
+                assert!(*got == want, "{}: K3 != reference parse; {}", c.name, first_diff(got, &want));
+                if let Some((_, pinned)) = c.expect.iter().find(|(p, _)| *p == params) {
+                    assert_eq!(got.sequences, *pinned, "{}: pinned sequences", c.name);
+                }
+                let want_frame = write_frame(&c.block, &want, kernels.frame_options());
+                assert!(*frame == want_frame, "{}: frame; {}", c.name, first_byte_diff(frame, &want_frame));
+            }
+        };
+        check(&cases);
+        for c in &cases {
             check(std::slice::from_ref(c));
         }
     }
