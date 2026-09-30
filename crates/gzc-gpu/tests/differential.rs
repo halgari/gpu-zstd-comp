@@ -1090,6 +1090,70 @@ fn k5_random_scripts_match_cpu() {
     check_scripted(&ctx, &kernels, &cases);
 }
 
+/// K5 gathers the literals from the block through a per-thread index over groups of
+/// G = ceil(n_seq / 256) sequences (speed phase S4). Scripts with hundreds to thousands of
+/// sequences (G > 1), mostly empty literal runs (so group starts and seeks land on runs of
+/// length 0) with a few long ones (runs across group and thread boundaries), trailing literals of
+/// every size including none; Raw and Huffman (1 and 4 streams) sections; K5 with and without
+/// Huffman. Only these cases reach a seek that walks more than one run.
+#[test]
+fn k5_gather_many_sequences_match_cpu() {
+    let mut r = Lcg(0x5a4);
+    let mut cases = Vec::new();
+    let most = BLOCK_SIZE as u32 / 8;
+    for (i, &target) in [255u32, 256, 257, 511, 700, 2000, most, most].iter().cycle().take(32).enumerate() {
+        let mut script = Vec::new();
+        let mut pos = 0u32;
+        let zero_share = [2u32, 6, 9][r.below(3) as usize];
+        for _ in 0..target {
+            let ll = if r.below(10) < zero_share {
+                0
+            } else {
+                [1 + r.below(3), 1 + r.below(40), 50 + r.below(BLOCK_SIZE as u32 / 320)][r.below(3) as usize]
+            }
+            .max((pos == 0) as u32);
+            let ml = 4 + r.below(4);
+            if (pos + ll + ml) as usize + 16 > BLOCK_SIZE {
+                break;
+            }
+            script.push((ll, (1 + r.below(64)).min(pos + ll), ml));
+            pos += ll + ml;
+        }
+        // Every fourth script ends with a match up to the block's last byte (no trailing literals).
+        if i % 4 == 0 {
+            let room = BLOCK_SIZE as u32 - pos;
+            script.push((1, 1 + r.below(pos + 1), room - 1));
+        }
+        let style = r.below(4);
+        let mut lr = Lcg(2000 + i as u64);
+        let (block, parse) = scripted_with(&script, || match style {
+            0 => lr.next() as u8,
+            1 => (lr.below(6) * lr.below(6)) as u8,
+            2 => 0x42,
+            _ => [1u8, 2, 3, 200][lr.below(4) as usize],
+        });
+        assert!(parse.sequences.len() >= 255, "script {i}: {} sequences", parse.sequences.len());
+        cases.push((format!("many{i}"), block, parse));
+    }
+    for huffman in [true, false] {
+        let (ctx, kernels) = setup_frames(huffman);
+        check_scripted(&ctx, &kernels, &cases);
+    }
+}
+
+/// The literal stream is the block bytes the sequences leave uncovered (what K5 and the parse
+/// path gather instead of reading K3 output): true of every CPU parse, every preset.
+#[test]
+fn literals_are_the_uncovered_block_bytes() {
+    for (name, block) in all_blocks() {
+        for (preset, params) in GPU_PRESETS {
+            let parse = compress_block(&block, params);
+            let got = gzc_gpu::compressor::gather_literals(&block, &parse.sequences);
+            assert!(got == parse.literals, "{name} {preset}: gathered literals differ");
+        }
+    }
+}
+
 // ---- K2 ----
 
 /// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long

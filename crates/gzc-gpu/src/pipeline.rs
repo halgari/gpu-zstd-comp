@@ -13,13 +13,14 @@
 //!
 //! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
 //! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
-//!   `seqs` and `lits` regions; the host decodes a `BlockOutput` per block.
-//! - frames (`run_frames`, `FrameSink`): K1→K2→K3(→K5)→K4, staging holds `frame_len` and the
+//!   `seqs` region; the host decodes a `BlockOutput` per block, gathering its literals from the
+//!   block (K3 writes no literals).
+//! - frames (`run_frames`, `FrameSink`): K1→K2→K3→K5→K4, staging holds `frame_len` and the
 //!   `frames` region, either as a copy of the fixed-stride buffer or, with `GZC_PACK` (see
 //!   `PackKernel`), packed by a kernel that writes the frames contiguously straight into the
-//!   (mappable) staging buffer; the host only copies each frame's bytes out. K5 (Huffman
-//!   literals, `GpuParams::huffman`) writes into the same `frames` / `frame_len` buffers, so it
-//!   adds no memory.
+//!   (mappable) staging buffer; the host only copies each frame's bytes out. K5 (the literals
+//!   section, Huffman-coded with `GpuParams::huffman`) gathers the literals from `data` and writes
+//!   into the same `frames` / `frame_len` buffers, so it adds no memory.
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -30,7 +31,7 @@ use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
     BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
-    data_bytes, frame_bytes, frame_len_bytes, frames_bytes, k4_tables_bytes, lits_bytes, max_batch_blocks,
+    data_bytes, frame_bytes, frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks,
     scratch_bytes, seqs_bytes, slot_bytes,
 };
 use crate::context::GpuContext;
@@ -128,15 +129,13 @@ const PIPELINE_QUERIES: u32 = KERNEL_QUERIES + 2;
 const STAGING_ALIGN: u64 = 256;
 
 /// Byte offsets of one slot's staging buffer, laid out for `cap` blocks. Parse path:
-/// `[counts][seqs][lits][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the
-/// regions keep the GPU buffers' fixed per-block stride (packed frames need at most that much).
+/// `[counts][seqs][timestamps]`; frame path: `[frame_len][frames][timestamps]`; the regions keep
+/// the GPU buffers' fixed per-block stride (packed frames need at most that much).
 #[derive(Clone, Copy)]
 struct StagingLayout {
     frames: bool,
     /// Parse path: seqs region. Frame path: frames region.
     a: u64,
-    /// Parse path: lits region. Frame path: unused (== ts).
-    b: u64,
     ts: u64,
     size: u64,
 }
@@ -147,16 +146,14 @@ impl StagingLayout {
         // only 4-byte aligned runs several times slower (RTX 5090 / Vulkan: 6-10 ms more per
         // batch for the ~200 MB frames region), which showed up as a batch-size-dependent loss.
         let al = |x: u64| x.next_multiple_of(STAGING_ALIGN);
-        let (a, b, ts) = if frames {
+        let (a, ts) = if frames {
             let a = al(frame_len_bytes(cap));
-            let ts = al(a + frames_bytes(cap));
-            (a, ts, ts)
+            (a, al(a + frames_bytes(cap)))
         } else {
             let a = al(counts_bytes(cap));
-            let b = al(a + seqs_bytes(cap));
-            (a, b, al(b + lits_bytes(cap)))
+            (a, al(a + seqs_bytes(cap)))
         };
-        Self { frames, a, b, ts, size: ts + PIPELINE_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
+        Self { frames, a, ts, size: ts + PIPELINE_QUERIES as u64 * wgpu::QUERY_SIZE as u64 }
     }
 }
 
@@ -349,7 +346,7 @@ impl<'a> Pipeline<'a> {
     fn allocated_bytes(&self) -> u64 {
         let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, |b| b.size());
         let s = &self.bufs;
-        let shared = [&s.data, &s.head, &s.pred, &s.best, &s.seqs, &s.lits, &s.counts].iter().map(|b| b.size()).sum::<u64>()
+        let shared = [&s.data, &s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| b.size()).sum::<u64>()
             + opt(&s.frames)
             + opt(&s.frame_len);
         let per_slot: u64 = self.slots.iter().map(|slot| slot.upload.size() + slot.staging.size()).sum();
@@ -365,7 +362,6 @@ impl<'a> Pipeline<'a> {
         self.run_with(blocks, &mut |first, n, view| {
             let words: &[u32] = bytemuck::cast_slice(view);
             let seq_stride = 3 * MAX_SEQS as usize;
-            let lit_stride = BLOCK_SIZE / 4;
             for b in 0..n as usize {
                 let (n_seq, n_lit) = (words[2 * b], words[2 * b + 1]);
                 anyhow::ensure!(
@@ -374,8 +370,14 @@ impl<'a> Pipeline<'a> {
                     first + b
                 );
                 let s = (layout.a / 4) as usize + b * seq_stride;
-                let l = (layout.b / 4) as usize + b * lit_stride;
-                sink.put(first + b, decode_output(&words[s..s + seq_stride], &words[l..l + lit_stride], n_seq, n_lit));
+                let out = decode_output(blocks[first + b], &words[s..s + seq_stride], n_seq);
+                let got = out.literals.len();
+                anyhow::ensure!(
+                    got == n_lit as usize,
+                    "block {}: K3 counted {n_lit} literals, the sequences leave {got}",
+                    first + b
+                );
+                sink.put(first + b, out);
             }
             Ok(())
         })
@@ -577,7 +579,6 @@ impl<'a> Pipeline<'a> {
         } else {
             enc.copy_buffer_to_buffer(&bufs.counts, 0, &slot.staging, 0, counts_bytes(n));
             enc.copy_buffer_to_buffer(&bufs.seqs, 0, &slot.staging, layout.a, seqs_bytes(n));
-            enc.copy_buffer_to_buffer(&bufs.lits, 0, &slot.staging, layout.b, lits_bytes(n));
         }
         marker(&mut enc, n_queries + 1);
         if let Some((set, resolve)) = &slot.queries {
@@ -836,10 +837,9 @@ mod tests {
         for cap in [1, 7, 1365, 1535, 1890] {
             for frames in [true, false] {
                 let l = StagingLayout::new(cap, frames);
-                assert!([l.a, l.b, l.ts].iter().all(|x| x % STAGING_ALIGN == 0), "cap {cap} frames {frames}");
-                let end = if frames { l.a + frames_bytes(cap) } else { l.b + lits_bytes(cap) };
+                assert!([l.a, l.ts].iter().all(|x| x % STAGING_ALIGN == 0), "cap {cap} frames {frames}");
+                let end = l.a + if frames { frames_bytes(cap) } else { seqs_bytes(cap) };
                 assert!(l.a >= if frames { frame_len_bytes(cap) } else { counts_bytes(cap) } && end <= l.ts);
-                assert!(frames || l.a + seqs_bytes(cap) <= l.b);
             }
         }
     }
@@ -855,16 +855,16 @@ mod tests {
         // A slot owns only its upload and staging buffers; data, frames and frame_len are shared.
         assert_eq!(per_slot, data_bytes(100) + StagingLayout::new(100, true).size);
         assert_eq!(one, scratch_bytes(100, &LVL3) + slot_bytes(100, true) + per_slot + k4_tables_bytes());
-        // The parse path reads back the fixed-stride seqs and lits instead of the frames.
+        // The parse path reads back the fixed-stride seqs instead of the frames.
         assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
         // K5 (Huffman literals) needs no buffers of its own.
         let raw_lits = PipelineConfig { params: GpuParams { huffman: false, ..frames(100, 2).params }, ..frames(100, 2) };
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
         #[cfg(feature = "block-128k")]
         {
-            // ~2.5 MiB of scratch per block, ~0.25 MiB per block per slot on the frame path.
+            // ~2.4 MiB of scratch per block, ~0.25 MiB per block per slot on the frame path.
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((2.4..2.6).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
+            assert!((2.3..2.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
             assert!((0.24..0.26).contains(&mib(per_slot)), "{}", mib(per_slot));
         }
     }
@@ -941,7 +941,8 @@ mod tests {
 
     #[test]
     fn stream_frames_odd_batch_single_slot_and_reuse() {
-        // Raw literals (no K5): the huffman: false frame path stays covered end to end.
+        // Raw literals (K5 writes Raw sections only): the huffman: false frame path stays covered
+        // end to end.
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = distinct.iter().map(|b| b.as_slice()).collect();

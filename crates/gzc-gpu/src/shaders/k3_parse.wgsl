@@ -7,8 +7,11 @@
 // so arrayLength(&counts) / 2 is the batch size (the bounds check below is defensive).
 // Outputs per block b:
 //   seqs[(b*MAX_SEQS + i)*3 ..] = (lit_len, match_len, off_base) for i < n_seq
-//   lits[b*BLOCK_SIZE/4 ..]     = literal bytes packed little-endian
 //   counts[b*2 ..]              = (n_seq, n_lit)
+// The literals themselves are not written: they are the block bytes the sequences leave
+// uncovered (literal run i = block[anchor_i .. anchor_i + lit_len_i), anchor_i = the sum of
+// lit_len + match_len over the sequences before i, then block[anchor_n_seq .. BLOCK_SIZE)), and
+// K5 / the host gather them from there (speed phase S4).
 // MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come
 // from the injected MatchParams. best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset
 // (K2's layout; 0 = no match).
@@ -19,18 +22,14 @@ fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> best: array<u32>;
 @group(0) @binding(2) var<storage, read_write> seqs: array<u32>;
-@group(0) @binding(3) var<storage, read_write> lits: array<u32>;
-@group(0) @binding(4) var<storage, read_write> counts: array<u32>;
+@group(0) @binding(3) var<storage, read_write> counts: array<u32>;
 
 // Repeat-offset history (gzc_core::seq::Reps).
 var<private> r0: u32;
 var<private> r1: u32;
 var<private> r2: u32;
 
-// Literal byte accumulator: `acc` holds `acc_n` pending bytes; full words go to lits[lit_w].
-var<private> acc: u32;
-var<private> acc_n: u32;
-var<private> lit_w: u32;
+// Literals of the parse so far.
 var<private> n_lit: u32;
 
 // == gzc_core::seq::off_base_for
@@ -70,19 +69,10 @@ fn apply_off_base(off_base: u32, lit_len: u32) {
     }
 }
 
-// Appends block bytes [start, end) to the literal stream.
-fn push_lits(base: u32, start: u32, end: u32) {
-    for (var i = start; i < end; i++) {
-        acc |= load_byte(base, i) << (acc_n * 8u);
-        acc_n += 1u;
-        if (acc_n == 4u) {
-            lits[lit_w] = acc;
-            lit_w += 1u;
-            acc = 0u;
-            acc_n = 0u;
-        }
-    }
-    n_lit += end - start;
+// Counts block bytes [start, end) as literals (none when start >= end: a final push from an
+// anchor past BLOCK_SIZE, only reachable with a best[] word that claims a match past the block end).
+fn push_lits(start: u32, end: u32) {
+    if (end > start) { n_lit += end - start; }
 }
 
 @compute @workgroup_size(1)
@@ -96,20 +86,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     r0 = 1u;
     r1 = 4u;
     r2 = 8u;
-    acc = 0u;
-    acc_n = 0u;
-    lit_w = b * (BLOCK_SIZE / 4u);
     n_lit = 0u;
 
-    // Each parse pushes every literal including the trailing ones and returns n_seq.
+    // Each parse counts every literal including the trailing ones and returns n_seq.
     var n_seq: u32;
     if (LAZY == 0u) {
         n_seq = greedy_parse(base, sbase, bbase);
     } else {
         n_seq = lazy_parse(base, sbase, bbase);
-    }
-    if (acc_n > 0u) {
-        lits[lit_w] = acc;
     }
     counts[b * 2u] = n_seq;
     counts[b * 2u + 1u] = n_lit;
@@ -150,7 +134,7 @@ fn greedy_parse(base: u32, sbase: u32, bbase: u32) -> u32 {
         let ll = p - anchor;
         let ob = off_base_for(off, ll);
         apply_off_base(ob, ll);
-        push_lits(base, anchor, p);
+        push_lits(anchor, p);
         let s = sbase + n_seq * 3u;
         seqs[s] = ll;
         seqs[s + 1u] = len;
@@ -159,6 +143,6 @@ fn greedy_parse(base: u32, sbase: u32, bbase: u32) -> u32 {
         p += len;
         anchor = p;
     }
-    push_lits(base, anchor, BLOCK_SIZE);
+    push_lits(anchor, BLOCK_SIZE);
     return n_seq;
 }

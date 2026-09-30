@@ -312,3 +312,48 @@ lvl9, `--batch max` (b2431), i3, median of 3. "seq" is the sequential K3 in the 
 | **coop K3 (default)** | 3497.3 / 3526.7 / 3551.6 | **3526.7** | 15.37 | 12.56 | 32.61 | 9.95 | 4.14 | 74.62 |
 
 `--verify`: 3481.5 MB/s, passed. Compressed bytes are equal in both modes (4,792,885,250).
+
+### S4 — literals gathered from (data, seqs) (7b61477), 2026-09-30, load avg 0.6–2.0, every run gated on an idle GPU
+
+What changed:
+- K3 (sequential, lazy and cooperative) no longer writes literals: `push_lits` only counts, `coop_push_lits` and the
+  `lits` binding are gone. `counts` stays (n_seq, n_lit).
+- K5 now runs whenever frames are emitted and writes every literals section, Raw included (`HUFFMAN` false: Raw only).
+  It gathers the literals from `data`. A workgroup prefix sum over groups of G = ceil(n_seq / 256) sequences per thread
+  leaves each group's first literal index and block byte in 2 × 257 u32 of workgroup memory (2 KiB, for any n_seq up
+  to MAX_SEQS). A thread seeks its first literal with a binary search plus a walk over at most G runs, then streams a
+  contiguous literal range with a run cursor, loading an unaligned word when 4 bytes lie in one run (histogram, bit
+  counts, the backward encode, the Raw copy).
+- K4 no longer reads literals (no `lits` binding, no Raw copy, no `RAW_SECTION`).
+- The `lits` buffer is removed: −128 KiB per block (−5 % of the ~2.53 MiB per block at i3), so `--batch max` grows
+  from b2431 to **b2559**. The parse path reads back only `seqs` and gathers the literals on the host from the block
+  (`decode_output` / `gather_literals`).
+- K5 workgroup memory: ~9.3 → ~11.3 KiB (under 16 KiB).
+
+lvl9 `--batch max`, i3, baseline (b2ee6c7) and S4 runs interleaved:
+
+| Config | Batch | E2E MB/s (3 runs) | Median | K1 | K2 | K3 | K4 | K5 | Kernel sum ms/b (µs/block) |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2431 | 3516.5 / 3496.2 / 3512.3 | 3512.3 | 15.37 | 12.51 | 32.62 | 10.37 | 4.01 | 74.88 (30.8) |
+| **S4** | **2559** | 3684.6 / 3543.9 / 3676.6 | **3676.6 (+4.7 %)** | 16.08 | 13.04 | 30.86 | 9.75 | 4.75 | 74.48 (29.1) |
+| S4, same batch | 2431 | 3627.7 / 3606.9 / 3639.8 | 3627.7 (+3.3 %) | 15.40 | 12.59 | 30.48 | 9.33 | 4.50 | 72.11 (29.7) |
+
+(Per-kernel columns are from each row's median run.) Kernel time over the whole corpus: 1647 ms → 1564 ms (−5.1 %):
+K3 −70 ms (−9.7 %), K4 −23 ms, K5 +11 ms. The middle S4 run (3543.9) had a noisy K4/K5 (11.2 / 5.8 ms/b).
+
+rung1 `--batch max`, i3, interleaved: baseline 5084.6 / 5056.7 / 5083.0 (median **5083.0**, b2431) → S4 5176.8 / 5218.1 /
+5247.5 (median **5218.1**, +2.7 %, b2559).
+
+`--verify` lvl9: 3622.8 MB/s, every block round-trips. Compressed bytes equal the baseline (lvl9 4,792,885,250;
+rung1 4,834,508,359).
+
+Kept (+4.7 % lvl9, +2.7 % rung1, 5 % more blocks per batch).
+
+Intermediate K5 versions (lvl9 b2559): byte-at-a-time gather 3558.9 (K5 6.9 ms/b); word loads in the histogram, bit
+counts and Raw copy 3631.5 (K5 5.5); plus word loads in the backward encode (final) 3656–3677 (K5 4.5–4.75).
+
+4060-class carry-over. The K3 gain (a store stream and the literal copy off the parse's critical path) should carry
+over roughly in proportion, since K3 is the kernel least hurt by fewer SMs. K5's extra work (index scan, seeks) is
+parallel across 256 threads per block and scales with bandwidth like the rest of K5; its share stays small. The
+VRAM saving is worth more on an 8 GB card: 128 KiB per block is 5 % more blocks per batch, or headroom for
+per-slot scratch.

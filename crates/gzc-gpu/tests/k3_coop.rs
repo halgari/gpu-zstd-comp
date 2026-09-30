@@ -219,9 +219,8 @@ fn scan_restarts_mid_regime() {
 }
 
 /// A best[] entry that claims a match past the block end (K2 never writes one) puts the anchor
-/// past BLOCK_SIZE. K3 must still terminate (no GPU hang; the device stays usable). The
-/// cooperative K3 pushes no trailing literals then; the sequential one reports garbage counts,
-/// which `read_outputs` rejects, so only the cooperative result is checked in detail.
+/// past BLOCK_SIZE. K3 must still terminate (no GPU hang; the device stays usable). Both K3s
+/// count no trailing literals then (since S4 the sequential one no longer wraps its count).
 #[test]
 fn anchor_past_block_end_terminates() {
     let mut cases = Vec::new();
@@ -235,17 +234,13 @@ fn anchor_past_block_end_terminates() {
         let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
         let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
         let got = parses_from_best_unchecked(&ctx, &kernels, &blocks, &bests);
-        if matches!(kernels.k3_mode(), K3Mode::Coop { .. }) {
-            let got = got.expect("cooperative K3 on a match past the block end");
-            for (c, got) in cases.iter().zip(&got) {
-                let last = got.sequences.last().unwrap_or_else(|| panic!("{}: no sequence", c.name));
-                let covered: usize = got.sequences.iter().map(|q| (q.lit_len + q.match_len) as usize).sum();
-                assert!(covered > BLOCK_SIZE, "{}: the last match should run past the block end", c.name);
-                assert_eq!(got.literals.len(), got.sequences.iter().map(|q| q.lit_len as usize).sum::<usize>(), "{}", c.name);
-                assert!(last.match_len >= 4, "{}", c.name);
-            }
-        } else {
-            eprintln!("sequential K3: {:?}", got.as_ref().map(|v| v.len()));
+        let got = got.unwrap_or_else(|e| panic!("{:?} K3 on a match past the block end: {e}", kernels.k3_mode()));
+        for (c, got) in cases.iter().zip(&got) {
+            let last = got.sequences.last().unwrap_or_else(|| panic!("{}: no sequence", c.name));
+            let covered: usize = got.sequences.iter().map(|q| (q.lit_len + q.match_len) as usize).sum();
+            assert!(covered > BLOCK_SIZE, "{}: the last match should run past the block end", c.name);
+            assert_eq!(got.literals.len(), got.sequences.iter().map(|q| q.lit_len as usize).sum::<usize>(), "{}", c.name);
+            assert!(last.match_len >= 4, "{}", c.name);
         }
         // The device survived: a normal scripted case still parses exactly.
         let normal = [Case::random("after", 1).explicit(1000, 33, 8, 8).done()];
