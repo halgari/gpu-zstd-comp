@@ -47,7 +47,8 @@ pub const MAX_SEQS: u32 = (BLOCK_SIZE / MAX_SEQS_MIN_SEQ_LEN) as u32 + 1;
 /// Largest batch `compress_batch`/`compress_frames` allocate buffers for, even when the device
 /// limits would allow more. At 128K blocks, worst case (dfast's two hash chains, `emit_frames`:
 /// `data_bytes` + `chains::head_bytes`/`pred_bytes` + `best_bytes` + `seqs_bytes` + `counts_bytes`
-/// + `frames_bytes` + `frame_len_bytes`) is ~2.6 MiB per block, ~672 MiB at this cap.
+/// + `frames_bytes` + `frame_len_bytes`, with `head_bytes` capped at `chains::HEAD_TABLES` tables)
+/// is ~2.4 MiB per block, ~608 MiB at this cap.
 const COMPRESS_BATCH_CAP: u32 = 256;
 
 /// Kernel names, in timestamp-query order, as reported in timing breakdowns (`k4_entropy` and
