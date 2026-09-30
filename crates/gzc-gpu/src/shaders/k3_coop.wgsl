@@ -136,7 +136,7 @@ fn coop_store_seq(base: u32, sbase: u32, n_seq: u32, anchor: u32, ll: u32, offse
     return n_seq + 1u;
 }
 
-// == lazy_parse (k3_lazy.wgsl) with every match_len cooperative.
+// == lazy_parse (k3_lazy.wgsl): cooperative literal scan, match_len and catch-up.
 fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     var n_seq = 0u;
     var anchor = 0u;
@@ -145,22 +145,50 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     var offset_2 = select(0u, r1, r1 <= 1u);
 
     while (ip < PARSE_END) {
+        // Literal scan: the sequential loop body `continue`s (skips ip) exactly when neither the
+        // rep probe at ip + 1 (rep_len > 0 <=> the first 4 bytes match, as BLOCK_SIZE - (ip + 1)
+        // >= 8) nor best[ip] (len >= MIN_MATCH) has a match.
+        // Lane k tests the k-th element of the skip sequence from ip, ip + k * step, while it is
+        // below PARSE_END and still in the same step regime; both limits are monotone in k, so the
+        // valid lanes are a prefix. ip moves to the first hit, else to the first element past the
+        // valid lanes, which is the next element of the sequence either way.
+        let step = ((ip - anchor) >> 8u) + 1u;
+        let cand = ip + k * step;
+        let valid = (((cand - anchor) >> 8u) + 1u == step) && (cand < PARSE_END);
+        let c = select(ip, cand, valid);
+        let bw = best[bbase + c];
+        let rp = c + 1u;
+        let usable = offset_1 != 0u && offset_1 <= rp;
+        let src = select(rp, rp - offset_1, usable);
+        let rep4 = usable && (load_u32_nb(base, rp) == load_u32_nb(base, src));
+        let hit = valid && (best_len_of(bw) >= MIN_MATCH || rep4);
+        let h = first_lane(subgroupBallot(hit));
+        if (h == W) {
+            ip += first_lane(subgroupBallot(!valid)) * step;
+            continue;
+        }
+        ip += h * step;
+        let ip_bw = subgroupShuffle(bw, h);
+        let ip_rep4 = subgroupShuffle(select(0u, 1u, rep4), h) != 0u;
+
+        // The sequential body at ip.
         var match_length = 0u;
         var off_base = 1u;
         var start = ip + 1u;
 
-        let l = coop_rep_len(base, ip + 1u, offset_1, k);
-        if (l > 0u) {
-            match_length = l;
+        if (ip_rep4) {
+            match_length = coop_rep_len(base, ip + 1u, offset_1, k);
         }
-        let m0 = coop_search_max_w(base, best[bbase + ip], ip, k);
+        let m0 = coop_search_max_w(base, ip_bw, ip, k);
         if (m0.x > 0u && m0.x > match_length) {
             match_length = m0.x;
             start = ip;
             off_base = m0.y;
         }
         if (match_length < 4u) {
-            ip += ((ip - anchor) >> 8u) + 1u;
+            // Only when a capped best[ip] extends to fewer than 4 bytes, which K2 never produces
+            // (a scripted best[] in a test can).
+            ip += step;
             continue;
         }
 
