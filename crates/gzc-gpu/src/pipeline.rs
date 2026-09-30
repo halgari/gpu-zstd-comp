@@ -1,7 +1,9 @@
 //! In-flight streaming submission and GPU timestamp queries.
 //!
-//! `inflight` slots each own a `BatchBuffers` and a mappable staging buffer. A batch is
-//! uploaded into a free slot; the kernels plus copies of their outputs (and resolved timestamps)
+//! `inflight` slots each own an input (`data`) buffer, the kernels' output buffers they read
+//! back and a mappable staging buffer; the kernels' scratch buffers (hash chains, matches, parse)
+//! are shared by all slots, since the queue runs one batch's kernels after another anyway (see
+//! `vram_bytes`). A batch is uploaded into a free slot; the kernels plus copies of their outputs (and resolved timestamps)
 //! into the slot's staging buffer are recorded in one submission, and the staging buffer is
 //! mapped once. Completed slots are handed to the sink in submission order while later batches
 //! keep the GPU busy.
@@ -21,7 +23,7 @@ use gzc_core::seq::BlockOutput;
 
 use crate::compressor::{
     BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, MAX_SEQS, counts_bytes, decode_output,
-    frame_bytes, frame_len_bytes, frames_bytes, lits_bytes, max_batch_blocks, seqs_bytes,
+    frame_bytes, frame_len_bytes, frames_bytes, lits_bytes, max_batch_blocks, scratch_bytes, seqs_bytes, slot_bytes,
 };
 use crate::context::GpuContext;
 
@@ -128,9 +130,14 @@ impl<'a> Pipeline<'a> {
         let frames = cfg.params.emit_frames;
         let kernels = Kernels::new(ctx, cfg.params);
         let layout = StagingLayout::new(cfg.batch, frames);
-        let slots = (0..cfg.inflight)
-            .map(|_| Slot {
-                bufs: BatchBuffers::new(ctx, cfg.batch, frames),
+        let mut bufs = vec![BatchBuffers::new(ctx, cfg.batch, frames)];
+        for _ in 1..cfg.inflight {
+            bufs.push(BatchBuffers::new_sharing(ctx, &bufs[0], frames));
+        }
+        let slots = bufs
+            .into_iter()
+            .map(|bufs| Slot {
+                bufs,
                 staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("pipeline.staging"),
                     size: layout.size,
@@ -377,6 +384,15 @@ impl ErrorScopes {
     }
 }
 
+/// Device memory a `Pipeline` for `cfg` allocates: the shared scratch buffers once, and per slot
+/// its data/output buffers plus its staging buffer (mappable; counted although drivers may place
+/// it in host memory), plus K4's constant tables. Timestamp query sets are not counted.
+pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
+    let frames = cfg.params.emit_frames;
+    let per_slot = slot_bytes(cfg.batch, frames) + StagingLayout::new(cfg.batch, frames).size;
+    scratch_bytes(cfg.batch) + cfg.inflight as u64 * per_slot + if frames { 4096 } else { 0 }
+}
+
 /// Builds a parse-path `Pipeline` for `cfg` (whose `emit_frames` must be false) and streams
 /// `blocks` through it (see `Pipeline::run`).
 pub fn compress_stream(
@@ -495,6 +511,25 @@ mod tests {
 
     fn cpu_frame(block: &[u8]) -> Vec<u8> {
         write_frame(block, &compress_block(block, LVL3), K4_FRAME_OPTIONS)
+    }
+
+    #[test]
+    fn vram_counts_scratch_once_and_slots_per_inflight() {
+        let frames = |batch, inflight| PipelineConfig { params: GpuParams { depth: 1, emit_frames: true }, ..cfg(batch, inflight) };
+        let one = vram_bytes(&frames(100, 1));
+        let per_slot = vram_bytes(&frames(100, 2)) - one;
+        assert_eq!(vram_bytes(&frames(100, 4)), one + 3 * per_slot);
+        assert_eq!(per_slot, slot_bytes(100, true) + StagingLayout::new(100, true).size);
+        assert!(one > scratch_bytes(100) + per_slot, "scratch counted once, plus the K4 tables");
+        // The parse path reads back the fixed-stride seqs and lits instead of the frames.
+        assert!(vram_bytes(&cfg(100, 2)) > vram_bytes(&frames(100, 2)));
+        #[cfg(feature = "block-128k")]
+        {
+            // ~3.0 MiB of scratch per block, ~0.38 MiB per block per slot on the frame path.
+            let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
+            assert!((2.9..3.1).contains(&mib(scratch_bytes(100))), "{}", mib(scratch_bytes(100)));
+            assert!((0.37..0.39).contains(&mib(per_slot)), "{}", mib(per_slot));
+        }
     }
 
     #[test]

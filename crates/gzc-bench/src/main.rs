@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use gzc_gpu::compressor::GpuParams;
-use gzc_gpu::pipeline::PipelineConfig;
+use gzc_gpu::pipeline::{PipelineConfig, vram_bytes};
 
 use corpus::{Corpus, LoadOpts};
 
@@ -94,6 +94,10 @@ struct GpuSweepArgs {
     /// thread does that itself, N > 0 = N threads fed through a bounded channel.
     #[arg(long, value_delimiter = ',', default_value = "0")]
     writer_threads: Vec<usize>,
+    /// GPU memory budget in MiB (default: an 8 GB card minus headroom). Every (batch, inflight)
+    /// config's pipeline footprint (`gzc_gpu::pipeline::vram_bytes`) must fit, else the run errors.
+    #[arg(long, default_value_t = 6144)]
+    vram_budget_mb: u64,
 }
 
 #[derive(Args)]
@@ -201,13 +205,36 @@ fn run_ref_cmd(args: RefArgs) -> anyhow::Result<()> {
     write_reports(&results, &args.out)
 }
 
-/// Runs every (batch, inflight, writer_threads) combination, appending to `results`.
+/// GPU memory of the frame-path pipeline for `cfg`, checked against `budget_mb`.
+fn check_vram(cfg: &PipelineConfig, budget_mb: u64) -> anyhow::Result<u64> {
+    let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
+    let mib = vram_bytes(&cfg).div_ceil(1 << 20);
+    anyhow::ensure!(
+        mib <= budget_mb,
+        "gpu b{} i{} needs {mib} MiB of GPU memory, over the {budget_mb} MiB budget (--vram-budget-mb)",
+        cfg.batch,
+        cfg.inflight
+    );
+    Ok(mib)
+}
+
+/// Runs every (batch, inflight, writer_threads) combination, appending to `results`. Every
+/// config is checked against the VRAM budget before anything runs.
 fn run_gpu_sweep(corpus: &Corpus, sweep: &GpuSweepArgs, verify: bool, results: &mut Vec<result::RunResult>) -> anyhow::Result<()> {
+    let cfg = |batch, inflight| PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: true } };
+    for &batch in &sweep.batch {
+        for &inflight in &sweep.inflight {
+            check_vram(&cfg(batch, inflight), sweep.vram_budget_mb)?;
+        }
+    }
     for &batch in &sweep.batch {
         for &inflight in &sweep.inflight {
             for &writers in &sweep.writer_threads {
-                let cfg = PipelineConfig { batch, inflight, params: GpuParams { depth: 1, emit_frames: false } };
-                eprintln!("running gpu lvl3-greedy b{batch} i{inflight} @ {writers} writer threads (verify={verify})...");
+                let cfg = cfg(batch, inflight);
+                let mib = check_vram(&cfg, sweep.vram_budget_mb)?;
+                eprintln!(
+                    "running gpu lvl3-greedy b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})..."
+                );
                 results.push(gpurun::run_gpu(corpus, &cfg, writers, verify)?);
             }
         }
@@ -248,4 +275,19 @@ fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
     run_gpu_sweep(&corpus, &args.gpu, args.verify, &mut results)?;
 
     write_reports(&results, &args.out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vram_budget_rejects_configs_that_do_not_fit() {
+        let cfg = PipelineConfig { batch: 64, inflight: 2, params: GpuParams { depth: 1, emit_frames: false } };
+        let mib = check_vram(&cfg, 1 << 20).unwrap();
+        assert!(mib > 0);
+        assert_eq!(check_vram(&cfg, mib).unwrap(), mib, "a config exactly at the budget fits");
+        let err = check_vram(&cfg, mib - 1).unwrap_err().to_string();
+        assert!(err.contains("--vram-budget-mb") && err.contains("b64 i2"), "{err}");
+    }
 }
