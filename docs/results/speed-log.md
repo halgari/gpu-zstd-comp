@@ -189,3 +189,102 @@ Ada-class cards, where 24 resident workgroups per SM means about 3.3 K3 waves pe
 
 4060 view: the gain is a shorter dependent chain per block, not width or bandwidth (W8 ≈ W32; K3 reads < 5 GB/s). So it
 should carry over roughly 1:1 per block: K3 about 190 → about 105 ms/batch for lvl9 at ~3.3 waves, and 2.5–3.5× for greedy.
+
+## S6 — Transfer path (branch of `speed` @ 966a24f), 2026-09-30 02:00–03:30, load avg 0.9–2.9, runs gated on no other gzc process on the GPU
+
+### Where the time outside the kernels goes (before S6: lvl9, b2026 i3, 26 batches)
+
+New instrumentation (`PipelineStats::transfer_ms`, printed by `gzc-bench gpu`). Each submission is bracketed by two
+empty marker passes whose timestamps are written at BOTTOM_OF_PIPE (i.e. after all earlier commands finish), and
+the host thread is timed with `Instant`. `GZC_NO_TIMESTAMPS=1` turns all queries off. It gives the same MB/s
+(2398.5 / 2410.6 / 2400.1 against 2397.8 / 2398.4 with timestamps), so the markers do not perturb the run.
+
+| Item (median run) | ms/batch | Notes |
+|---|---:|---|
+| kernels K1–K5 | 96.2 | |
+| GPU upload copy (upload → `data`) | 1.97 | 265 MB at ~135 GB/s: the MAP_WRITE upload buffer is device-local (ReBAR), so this is a VRAM → VRAM copy |
+| GPU readback copy (`frames` → staging) | 5.27 | 266 MB at ~50 GB/s: PCIe 5 ×16 into host-cached memory |
+| GPU idle between submissions | 0.03 | the queue never runs dry |
+| host: upload memcpy + unmap | 12.8 | overlapped with GPU work |
+| host: frame delivery (`to_vec` per frame) | 8.2 | overlapped |
+| host: submit, upload-map wait, unmap | 0.3 | |
+| host: fill (first upload) / drain | 13.3 / 2.7 ms once | 0.6 % of the run |
+
+After S6 (lvl9 b2431 i3, 22 batches, median run 2579.9 MB/s):
+
+| Item | ms/batch | Notes |
+|---|---:|---|
+| kernels K1–K5 | 105.33 | 43.3 µs/block against 47.4 before |
+| GPU upload copy | 2.32 | |
+| GPU readback copy | 5.98 | |
+| GPU idle between submissions | 0.02 | includes the previous batch's timestamp resolve + copy |
+| host: upload memcpy + unmap | 14.95 | overlapped |
+| host: frame delivery | 9.57 | overlapped |
+| host: submit, upload-map wait, unmap | 0.26 | |
+| host: fill / drain | 15.6 / 0.6 ms once | |
+
+Wall time is 114.4 ms/batch, which equals kernels + copies (113.6) plus fill/drain. The copies are still 7.3 % of
+the time, all of it serial with the kernels.
+
+Before S6, wall time per batch was 104.1 ms, which equals kernels + copies (103.5) plus fill/drain. **The run is GPU-bound and the
+host is idle ~80 % of the time.** The whole "host overhead" is the two copies, which the single wgpu queue runs
+serially with the kernels (7.2 ms/batch, 7 %).
+
+### Sub-changes
+
+| Step | Batch | E2E MB/s (3 runs) | Median | Kernel sum ms/b (µs/block) | Readback ms/b | Kept? |
+|---|---:|---|---:|---:|---:|---|
+| baseline 966a24f | 2026 | 2395.1 / 2405.4 / 2394.3 | **2395.1** | 95.98 (47.4) | 5.27 | |
+| deferred readback: batch i's copies recorded between K2 and K3 of submission i+1 | 2026 | 2371.8 / 2405.0; no-ts 2386.8 / 2388.3 | ~2388 | 95.8 | 0 (K2→K3 gap 5.1–5.5) | no: the copy still serializes with K3 |
+| pack kernel inside K3's pass (deferred, into the MAPPABLE_PRIMARY staging buffer) | 2026 | 2226.7 / 2320.4; no-ts 2325.7 / 2341.9 | ~2320 | K3 +8.4 | — | no: serialized with K3 |
+| pack kernel inside K1's pass | 2026 | 2273.7 / 2253.5 | ~2264 | K1 +10.0 | — | no: serialized with K1 |
+| **shared `data`/`frames`/`frame_len` across slots** (a slot keeps only its upload + staging) | **2431** | 2579.9 / 2586.0 / 2573.9 | **2579.9** | 105.33 (43.3) | 6.09 | **yes (+7.7 %)** |
+| + `GZC_PACK=1` (pack after K4 into the staging buffer, 16-byte stores) | 2431 | 2557.1 / 2480.2 / 2488.1 | 2488.1 | 104.9–107.9 | 6.8–7.1 (+0.7 idle) | opt-in only (−1 to −3.6 %) |
+
+rung1: baseline b2026 2869.9 / 2855.3 / 2853.7 (median **2855.3**) → S6 b2431 3077.0 / 3106.0 / 3099.9 (median **3099.9**, +8.6 %).
+`--verify` lvl9 at S6: all blocks round-trip, 2569.1 MB/s. Compressed bytes equal the baseline (lvl9 4792885250, rung1 4834508359).
+
+Informational, `--inflight 2`: with only upload + staging per slot, a slot costs ~0.25 MiB/block, so i2 fits b2701 and
+reaches 2769.8 / 2767.0 / 2794.9 (median **2769.8**, +7.4 % over S6 i3) with the GPU still never idle (host work per
+batch ~28 ms against ~120 ms of GPU). The baseline at i2 fits b2431 and gives 2575.8, the same as S6 at i3 with the
+same batch: the S6 gain is the batch-size gain from freed VRAM.
+
+Findings:
+- **No copy/compute overlap on one wgpu queue here.** A readback copy recorded between K2 and K3 (whose barrier only waits
+  on compute) still ran serially with K3. A pack dispatch placed in K3's or K1's pass right after the kernel's dispatch
+  (so no barrier separates them: frames/frame_len are moved to read-only at the start of the submission, and staging's
+  first use is a host → compute transition in the pre-pass) also ran serially: the pass grew by the pack's full time.
+  This holds with and without timestamps. For K3 the likely cause is that its 1-lane workgroups fill every SM's
+  registers (2026 WGs in ~1.5 waves), so a second grid only starts in K3's tail. Overlap would need a second queue,
+  which wgpu does not expose, or S5/S7-style merging inside kernels.
+- **Packing is slower than copying on this card.** The shader's 16-byte stores into host memory reach ~33 GB/s (196 MB of
+  real frame bytes in ~5.9 ms), against the copy engine's ~50 GB/s for the full 266 MB fixed-stride region (5.3 ms).
+  The first version, with 4-byte stores, took ~9 ms. Packing is kept behind `GZC_PACK=1` (tested; staging size is
+  unchanged, since the worst case is still one raw frame per block) for measurement on a PCIe ×8 card, where both
+  paths should be link-bound and packing sends 26 % fewer bytes.
+- **Per-slot device buffers were redundant.** Each submission copies its own outputs to staging before the next
+  submission's kernels start, and wgpu orders the upload copy after the previous K4's reads with a barrier. So `data`,
+  `frames` and `frame_len` can be shared the way the scratch buffers already are. This frees 2 × 530 MB at i3, and
+  `--batch max` grows from 2026 to 2431.
+- The upload copy (2.3 ms/batch now) could go away if the kernels read `data` straight from the (ReBAR, device-local)
+  upload buffer. It was not tried: without ReBAR, that buffer lives in host memory and every kernel would read over PCIe.
+
+**`--inflight 2` observation (for the controller's protocol decision).** With slots now cheap, lvl9 `--batch max
+--inflight 2` gets b2701 and **2769.8 MB/s** (2769.8 / 2767.0 / 2794.9), +7.4 % over S6 at i3. The protocol is still i3.
+
+**`GZC_PACK` is an explicit exception to the keep/revert rule (controller ruling).** It is slower on the 5090 but kept
+opt-in, to be re-measured on the PCIe 4.0 ×8 target card. `MAPPABLE_PRIMARY_BUFFERS`, a native-only feature, is
+requested only when packing is asked for: `GZC_PACK`, or `GpuContext::with_options(_, true)` in its test. The
+default path does not enable it.
+
+**Kept:** the profiler, `GZC_NO_TIMESTAMPS`, the shared device buffers, and `GZC_PACK` as opt-in. **Reverted:** the
+deferred-readback and in-pass-pack scheduling (commits 301fd30, and the hooks in compressor.rs/chains.rs, which are
+not in the final diff).
+
+4060-class carry-over. The shared buffers cut the footprint from ~3.03 to ~2.53 MiB per block at i3, so an 8 GB card's
+batch grows by the same +20 %. That is worth less there, because K3 fills a 24–34 SM card's warp slots well before
+~1150 blocks; the headroom is better spent on S5's per-slot scratch or on more batches in flight. The transfer share,
+however, grows on such cards. A 4060 is PCIe 4.0 ×8 (~13 GB/s), so 128 KiB up and 128 KiB down per block cost ~20 µs
+per block, against a projected 60–80 µs of kernel time: 20–25 % of the wall time, all of it serial with the kernels on
+one queue. That is where `GZC_PACK` (26 % fewer readback bytes) should be re-measured, together with a non-ReBAR check of
+the upload path.

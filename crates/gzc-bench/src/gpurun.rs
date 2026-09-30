@@ -154,6 +154,10 @@ pub fn run_gpu(
     if gpu_ms > 0.0 {
         eprintln!("    {:<10} {gpu_ms:>10.1} ms total {:>8.2} ms/batch {:>9.1} MB/s", "sum", gpu_ms / batches, mb / (gpu_ms / 1e3));
     }
+    // Where the rest of the time goes (see gzc_gpu::pipeline::TRANSFER_NAMES).
+    for (name, ms) in &stats.transfer_ms {
+        eprintln!("    {name:<18} {ms:>10.1} ms total {:>8.2} ms/batch", ms / batches);
+    }
 
     Ok(RunResult {
         engine: "gpu".to_string(),
