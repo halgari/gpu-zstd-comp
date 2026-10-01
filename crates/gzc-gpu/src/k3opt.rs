@@ -43,9 +43,11 @@
 //! logs in `docs/results/m5-log.md`). Residency (M6 A1): at 64 KiB a wg16 pass kernel needs at
 //! most 4064 B of workgroup memory (`workgroup_bytes`; the final pass 3044 B) and 74..76
 //! registers (`vkstats`, M6 A3), so an RTX 5090 holds its cap of 24 workgroups per SM: one wave is 4080
-//! blocks (measured). A change that raises registers or workgroup memory past that cap splits a
-//! batch above about 3600 blocks into two waves (+40 % K3 time); check `vkstats` on every pass
-//! kernel (`GZC_DUMP_WGSL` writes the composed modules).
+//! blocks (measured). The persistent passes (M6 A4, `K3OptConfig::persist`, the default at wg16)
+//! need 4 B more and 80 (final) / 85..86 (cheap) registers: 23 cheap-pass workgroups per SM
+//! (3910 blocks resident), but a batch beyond that has no second-wave cliff (the loop takes the
+//! remaining blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
+//! `vkstats` on every pass kernel after a change (`GZC_DUMP_WGSL` writes the composed modules).
 use crate::compressor::{
     BatchBuffers, K3_FIXUP_WGSL, best_bytes_for, counts_bytes, data_bytes, decode_output, seqs_bytes_for, trace_bytes,
 };
@@ -58,6 +60,26 @@ use gzc_core::reference::CandWords;
 use gzc_core::seq::BlockOutput;
 
 const K3_OPT_WGSL: &str = include_str!("shaders/k3_opt.wgsl");
+const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
+
+/// Header words of the `sched` buffer (`k3_sched.wgsl`): the persistent passes' block counter at
+/// word 0, then 3 unused words.
+pub const SCHED_HDR: u32 = 4;
+
+/// `k3_sched.wgsl`'s weight samples runs of `WEIGHT_RUN` positions every `WEIGHT_STRIDE` positions
+/// (M6 A4): one 64-byte burst of candidate words in 33, 1986 positions per block. Over 2900 corpus
+/// blocks the sampled count's Spearman correlation with the full count is 0.996. A full scan cost
+/// about 1.4 % of opt16's K3 time, and every 33rd position alone (0.998) still 0.3 %: each
+/// position is its own memory burst. (Single positions at a power-of-two stride alias with
+/// periodic data: 0.79..0.84; the runs cover every phase mod 8, and 264 = 8 * 33 every other.)
+pub const WEIGHT_RUN: u32 = 8;
+pub const WEIGHT_STRIDE: u32 = 264;
+
+/// Bytes of the `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight, the
+/// heavy-first block order and each block's rank in it (4 B per block each).
+pub fn sched_bytes(n: u32) -> u64 {
+    (SCHED_HDR as u64 + 3 * n as u64) * 4
+}
 
 /// Sequences per block of the optimal parse (min match 3): `BLOCK_SIZE / 3 + 1`.
 pub use crate::compressor::MAX_SEQS_OPT;
@@ -117,6 +139,13 @@ pub struct K3OptConfig {
     /// each block to `OptBuffers::prices` (the workgroup epilogue), and skip the fix-up (needs
     /// `wg % segments == 0`).
     pub hist_out: bool,
+    /// Persistent workgroups (M6 A4, a07; `main_opt_persist`): each workgroup takes blocks in the
+    /// batch's heavy-first order (`k3_sched.wgsl`) until none is left. Only when `wg` equals the
+    /// segments per block; other sizes run one workgroup per block's lanes as before.
+    pub persist: bool,
+    /// Test aid: at most this many workgroups in a persistent dispatch (default: one per block),
+    /// so that each workgroup runs several blocks even in a small batch.
+    pub grid: Option<u32>,
 }
 
 impl Default for K3OptConfig {
@@ -128,8 +157,15 @@ impl Default for K3OptConfig {
             prices: PriceSrc::BlockInit,
             unbounded: true,
             hist_out: false,
+            persist: true,
+            grid: None,
         }
     }
+}
+
+/// Whether `cfg` builds the persistent pass under opt params `m` (`K3OptConfig::persist`).
+pub fn persistent(m: &MatchParams, cfg: &K3OptConfig) -> bool {
+    cfg.persist && cfg.wg == n_seg(m)
 }
 
 /// Segments per block.
@@ -166,7 +202,8 @@ pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
 /// - `p_ml`: the i32 ML prices, `target_length + 1` words per block;
 /// - `hist`: 256 words per block when the pass counts literals (`BlockInit`, `Prior`) or writes
 ///   its histogram (`hist_out`), else one word;
-/// - `hsum`: 5 words per block, one word for `PriceSrc::Buffer`.
+/// - `hsum`: 5 words per block, one word for `PriceSrc::Buffer`;
+/// - `next_item`: one word in a persistent pass (`persistent`).
 ///
 /// The fix-up's per-segment arrays belong to its own entry point (`main_fixup`, 12 B per
 /// segment), which wgpu compiles alone; they are not part of this pipeline.
@@ -175,7 +212,8 @@ fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     let hist_used = cfg.hist_out || matches!(cfg.prices, PriceSrc::BlockInit | PriceSrc::Prior);
     let hist = if hist_used { 256 * bpw } else { 1 };
     let hsum = if cfg.prices == PriceSrc::Buffer { 1 } else { 5 * bpw };
-    (bpw * (128 + 66 + suff_of(m) + 1) + hist + hsum) * 4
+    let item = if persistent(m, cfg) { 1 } else { 0 };
+    (bpw * (128 + 66 + suff_of(m) + 1) + hist + hsum + item) * 4
 }
 
 /// The ring memory `K3Opt::new` uses for `cfg` under a workgroup storage limit of `limit` bytes:
@@ -203,11 +241,23 @@ pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Resul
     Ok(ring)
 }
 
+/// The block schedule's kernels (`k3_sched.wgsl`, M6 A4): each block's weight, then the
+/// heavy-first order.
+struct Sched {
+    weight: wgpu::ComputePipeline,
+    rank: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
 /// The compiled K3opt pass.
 pub struct K3Opt {
     main: wgpu::ComputePipeline,
     fixup: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    /// The persistent pass's schedule kernels (`None`: not persistent).
+    sched: Option<Sched>,
+    grid: Option<u32>,
     pub wg: u32,
     pub ring: RingMem,
     pub prices: PriceSrc,
@@ -238,6 +288,8 @@ pub struct OptBuffers {
     /// passes).
     pub scratch: wgpu::Buffer,
     scratch_per_block: u64,
+    /// The block schedule (`sched_bytes`, M6 A4).
+    pub sched: wgpu::Buffer,
 }
 
 /// The buffers one K3opt dispatch binds (`OptBuffers::binds`, or the pipeline's `BatchBuffers`
@@ -254,6 +306,8 @@ pub struct OptBinds<'a> {
     pub scratch: &'a wgpu::Buffer,
     /// Bytes of `scratch` per block.
     pub scratch_per_block: u64,
+    /// The block schedule (`sched_bytes`).
+    pub sched: &'a wgpu::Buffer,
 }
 
 impl<'a> OptBinds<'a> {
@@ -271,6 +325,7 @@ impl<'a> OptBinds<'a> {
             prices: &o.prices,
             scratch: &o.scratch,
             scratch_per_block: o.scratch_per_block,
+            sched: &o.sched,
         })
     }
 
@@ -293,6 +348,7 @@ impl<'a> OptBinds<'a> {
             ("counts", self.counts, counts_bytes(n)),
             ("prices", self.prices, prices_bytes(n)),
             ("scratch", self.scratch, n as u64 * scratch_bytes_per_block(m)),
+            ("sched", self.sched, sched_bytes(n)),
         ];
         for (name, buf, bytes) in need {
             ensure!(buf.size() >= bytes, "k3opt: {name} buffer {} B < {bytes} B for {n} blocks", buf.size());
@@ -319,8 +375,9 @@ impl OptBuffers {
             prices: ctx.storage_buffer("k3opt.prices", prices_bytes(capacity), true),
             scratch: ctx.storage_buffer("k3opt.scratch", capacity as u64 * scratch_per_block, false),
             scratch_per_block,
+            sched: ctx.storage_buffer("k3opt.sched", sched_bytes(capacity), true),
         };
-        let bytes = [&bufs.data, &bufs.cands, &bufs.trace, &bufs.seqs, &bufs.counts, &bufs.prices, &bufs.scratch]
+        let bytes = [&bufs.data, &bufs.cands, &bufs.trace, &bufs.seqs, &bufs.counts, &bufs.prices, &bufs.scratch, &bufs.sched]
             .iter()
             .map(|b| b.size())
             .sum();
@@ -340,6 +397,7 @@ impl OptBuffers {
             prices: &self.prices,
             scratch: &self.scratch,
             scratch_per_block: self.scratch_per_block,
+            sched: &self.sched,
         }
     }
 
@@ -367,6 +425,14 @@ impl OptBuffers {
             // The kernel trusts the words (no bounds checks on offsets): each record must lie in
             // the block, before its position.
             for (p, w) in c.iter().enumerate() {
+                // w1's high half holds DEAD_BIT and nothing else (the kernel reads offB as
+                // `w1 & 0xFFFF` and the flag as `w1 & DEAD_BIT`; another bit there would be a
+                // format change neither checks for).
+                ensure!(
+                    w[1] >> 16 & !(gzc_core::reference::DEAD_BIT >> 16) == 0,
+                    "block {b}: candidate word 1 at {p} has bits besides DEAD_BIT in its high half: {:#x}",
+                    w[1]
+                );
                 let (a, bb) = gzc_core::reference::unpack_cands(*w);
                 for r in [a, bb] {
                     ensure!(
@@ -535,9 +601,12 @@ impl K3Opt {
                  fn rix(s: u32) -> u32 { return s; }\n"
             }
         };
+        let persist = persistent(m, &cfg);
         let body = format!(
             "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst WG: u32 = {}u;\nconst SUFF: u32 = {suff}u;\n\
-             const LEVEL: u32 = {}u;\nconst PRICE_MODE: u32 = {}u;\nconst HIST_OUT: bool = {};\n{}{ring_decl}{K3_OPT_WGSL}\n{K3_FIXUP_WGSL}",
+             const LEVEL: u32 = {}u;\nconst PRICE_MODE: u32 = {}u;\nconst HIST_OUT: bool = {};\n\
+             const DEAD_BIT: u32 = {}u;\nconst SCHED_HDR: u32 = {SCHED_HDR}u;\nconst PERSIST: bool = {persist};\n\
+             {}{ring_decl}{K3_OPT_WGSL}\n{K3_FIXUP_WGSL}",
             params_wgsl(m),
             m.segment_log2,
             cfg.wg,
@@ -549,20 +618,30 @@ impl K3Opt {
                 PriceSrc::Hist => 3,
             },
             cfg.hist_out,
+            gzc_core::reference::DEAD_BIT,
             tables_wgsl(),
         );
         let layout = crate::compressor::storage_layout(
             ctx,
             "k3opt",
-            &[true, false, false, false, false, false, false],
+            &[true, false, false, false, false, false, false, false],
         );
         let module = if cfg.unbounded {
             ctx.shader_unbounded_loops("k3_opt", &body)
         } else {
             ctx.shader("k3_opt", &body)
         };
-        let main =
-            crate::compressor::pipeline_from_module(ctx, "k3_opt", &layout, &module, "main_opt");
+        let entry = if persist { "main_opt_persist" } else { "main_opt" };
+        let main = crate::compressor::pipeline_from_module(ctx, "k3_opt", &layout, &module, entry);
+        let sched = persist.then(|| {
+            let body = format!(
+                "const SCHED_HDR: u32 = {SCHED_HDR}u;\nconst WEIGHT_RUN: u32 = {WEIGHT_RUN}u;\nconst WEIGHT_STRIDE: u32 = {WEIGHT_STRIDE}u;\n{K3_SCHED_WGSL}"
+            );
+            let layout = crate::compressor::storage_layout(ctx, "k3opt_sched", &[true, true, false]);
+            let module = ctx.shader("k3_sched", &body);
+            let pipe = |entry: &str| crate::compressor::pipeline_from_module(ctx, "k3_sched", &layout, &module, entry);
+            Sched { weight: pipe("main_weight"), rank: pipe("main_rank"), scatter: pipe("main_scatter"), layout }
+        });
         let fixup = crate::compressor::pipeline_from_module(
             ctx,
             "k3_opt_fixup",
@@ -574,6 +653,8 @@ impl K3Opt {
             main,
             fixup,
             layout,
+            sched,
+            grid: cfg.grid,
             wg: cfg.wg,
             ring,
             prices: cfg.prices,
@@ -614,7 +695,56 @@ impl K3Opt {
                 end_of_pass_write_index: Some(at + 2 * k + 1),
             })
         };
+        self.record_order(ctx, enc, bufs, n, None)?;
         self.record_with(ctx, enc, bufs, n, ts(0), ts(1))
+    }
+
+    /// Whether the pass is persistent (`K3OptConfig::persist`): it then needs the batch's block
+    /// order (`record_order`) in `sched`.
+    pub fn persistent(&self) -> bool {
+        self.sched.is_some()
+    }
+
+    /// Records the batch's heavy-first block order (`k3_sched.wgsl`) for the first `n` blocks
+    /// of `bufs` into `bufs.sched`, from the candidate words in `bufs.cands` (so before a final
+    /// pass overwrites them). One compute pass, with `ts` (also recorded, empty, when the pass is
+    /// not persistent and needs no order). Every persistent pass on these blocks can then use it.
+    pub fn record_order(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &OptBinds,
+        n: u32,
+        ts: Option<wgpu::ComputePassTimestampWrites>,
+    ) -> anyhow::Result<()> {
+        bufs.check(n, &self.params)?;
+        let max_groups = ctx.device.limits().max_compute_workgroups_per_dimension;
+        ensure!(n <= max_groups, "k3opt: {n} blocks > {max_groups} workgroups");
+        let Some(s) = &self.sched else {
+            if ts.is_some() {
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3opt_order"), timestamp_writes: ts });
+            }
+            return Ok(());
+        };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k3opt_sched"),
+            layout: &s.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.cands.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sched_binding(bufs, n) },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3opt_order"), timestamp_writes: ts });
+        pass.set_bind_group(0, &bind, &[]);
+        let tiles = n.div_ceil(256);
+        pass.set_pipeline(&s.weight);
+        pass.dispatch_workgroups(n, 1, 1);
+        pass.set_pipeline(&s.rank);
+        pass.dispatch_workgroups(tiles, tiles, 1);
+        pass.set_pipeline(&s.scatter);
+        pass.dispatch_workgroups(tiles, 1, 1);
+        Ok(())
     }
 
     /// `record` on `bufs` with the given timestamp writes for the DP's and the fix-up's compute
@@ -666,11 +796,22 @@ impl K3Opt {
                     binding: 6,
                     resource: bufs.scratch.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sched_binding(bufs, n),
+                },
             ],
         });
-        let groups = (n * self.n_seg).div_ceil(self.wg);
+        let mut groups = (n * self.n_seg).div_ceil(self.wg);
         let max_groups = ctx.device.limits().max_compute_workgroups_per_dimension;
         ensure!(groups <= max_groups && n <= max_groups, "k3opt: {groups} workgroups > {max_groups}");
+        if self.persistent() {
+            // The pass's block counter starts at 0 (the order is `record_order`'s). The grid
+            // stays one workgroup per block (a07: the same as one per resident slot, which wgpu
+            // cannot query); the workgroups that start after the order is used up exit at once.
+            enc.clear_buffer(bufs.sched, 0, Some(4 * SCHED_HDR as u64));
+            groups = groups.min(self.grid.unwrap_or(u32::MAX).max(1));
+        }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("k3opt"),
@@ -692,6 +833,15 @@ impl K3Opt {
         pass.dispatch_workgroups(n, 1, 1);
         Ok(())
     }
+}
+
+/// `bufs.sched` bound to exactly `sched_bytes(n)` (the kernels derive `n` from its length).
+fn sched_binding<'a>(bufs: &OptBinds<'a>, n: u32) -> wgpu::BindingResource<'a> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: bufs.sched,
+        offset: 0,
+        size: wgpu::BufferSize::new(sched_bytes(n)),
+    })
 }
 
 /// Reads the first `n` blocks' parses out of `bufs` (literals gathered from `blocks`).
@@ -757,7 +907,7 @@ pub fn parses_from_cands(
                 ctx.poison_workgroup_memory(&mut enc);
                 ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
                 ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, &k.params));
-                for b in [&bufs.trace, &bufs.seqs, &bufs.counts, &bufs.scratch] {
+                for b in [&bufs.trace, &bufs.seqs, &bufs.counts, &bufs.scratch, &bufs.sched] {
                     ctx.poison_from(&mut enc, b, 0);
                 }
                 let from = if k.prices == PriceSrc::Buffer { prices_bytes(n) } else { 0 };
@@ -879,9 +1029,11 @@ impl OptPasses {
         self.kernels.len()
     }
 
-    /// Records every pass on the first `n` blocks of `bufs` (uploaded blocks and candidate
-    /// words). Timestamps: pass i's DP at `2i`/`2i + 1`, the final fix-up at `2 * n_passes()` and
-    /// `2 * n_passes() + 1`.
+    /// Records the block order (M6 A4, once for all passes: K2opt's candidate words are intact
+    /// until the final pass) and every pass on the first `n` blocks of `bufs` (uploaded blocks
+    /// and candidate words). Timestamps: pass i's DP at `2i`/`2i + 1`, the final fix-up at
+    /// `2 * n_passes()` and `2 * n_passes() + 1`, the block order at `2 * n_passes() + 2` and
+    /// `2 * n_passes() + 3`.
     pub fn record(
         &self,
         ctx: &GpuContext,
@@ -891,16 +1043,44 @@ impl OptPasses {
         queries: Option<&wgpu::QuerySet>,
     ) -> anyhow::Result<()> {
         let binds = bufs.binds();
+        let at = 2 * self.n_passes() as u32 + 2;
+        let ts = queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(at),
+            end_of_pass_write_index: Some(at + 1),
+        });
+        self.record_order(ctx, enc, &binds, n, ts)?;
         for (i, k) in self.kernels().enumerate() {
+            let ts = |j: u32| {
+                queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                    query_set,
+                    beginning_of_pass_write_index: Some(2 * i as u32 + 2 * j),
+                    end_of_pass_write_index: Some(2 * i as u32 + 2 * j + 1),
+                })
+            };
             // The final pass's fix-up lands at 2 * i + 2 = 2 * n_passes().
-            k.record_at(ctx, enc, &binds, n, queries.map(|q| (q, 2 * i as u32)))?;
+            k.record_with(ctx, enc, &binds, n, ts(0), ts(1))?;
         }
         Ok(())
     }
 
-    /// Records every pass on the first `n` blocks of `bufs`, with one timestamp pair spanning
-    /// them all (the pipeline's K3 entry): `span`'s beginning write on the first pass's DP and
-    /// its end write on the final fix-up.
+    /// The block order of the passes (`K3Opt::record_order`; every pass of a preset is persistent
+    /// or none is: they share `wg`).
+    fn record_order(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &OptBinds,
+        n: u32,
+        ts: Option<wgpu::ComputePassTimestampWrites>,
+    ) -> anyhow::Result<()> {
+        debug_assert!(self.kernels.iter().all(|k| k.persistent() == self.kernels[0].persistent()));
+        self.kernels[0].record_order(ctx, enc, bufs, n, ts)
+    }
+
+    /// Records the block order and every pass on the first `n` blocks of `bufs`, with one
+    /// timestamp pair spanning them all (the pipeline's K3 entry): `span`'s beginning write on the
+    /// block order's compute pass and its end write on the final fix-up.
     pub fn record_span(
         &self,
         ctx: &GpuContext,
@@ -910,19 +1090,21 @@ impl OptPasses {
         span: Option<wgpu::ComputePassTimestampWrites>,
     ) -> anyhow::Result<()> {
         let last = self.kernels.len() - 1;
+        let begin = span.as_ref().map(|s| wgpu::ComputePassTimestampWrites {
+            query_set: s.query_set,
+            beginning_of_pass_write_index: s.beginning_of_pass_write_index,
+            end_of_pass_write_index: None,
+        });
+        // (An empty compute pass carries the beginning write when the passes are not persistent.)
+        self.record_order(ctx, enc, bufs, n, begin)?;
         for (i, k) in self.kernels().enumerate() {
-            let begin = span.as_ref().filter(|_| i == 0).map(|s| wgpu::ComputePassTimestampWrites {
-                query_set: s.query_set,
-                beginning_of_pass_write_index: s.beginning_of_pass_write_index,
-                end_of_pass_write_index: None,
-            });
             let end = span.as_ref().filter(|_| i == last).map(|s| wgpu::ComputePassTimestampWrites {
                 query_set: s.query_set,
                 beginning_of_pass_write_index: None,
                 end_of_pass_write_index: s.end_of_pass_write_index,
             });
             // Only the final pass (last) has a fix-up.
-            k.record_with(ctx, enc, bufs, n, begin, end)?;
+            k.record_with(ctx, enc, bufs, n, None, end)?;
         }
         Ok(())
     }
@@ -991,9 +1173,10 @@ pub fn parses_from_passes(
     })
 }
 
-/// GPU time (ms, median of `reps` runs after one warm-up) of each DP pass of `p` and of the final
-/// fix-up, on the first `n` blocks of `bufs`: `n_passes() + 1` values, then the span from the
-/// first pass's start to the fix-up's end (dispatch gaps included). The final pass overwrites part
+/// GPU time (ms, median of `reps` runs after one warm-up) of each DP pass of `p`, of the final
+/// fix-up and of the block order (M6 A4; 0 when the passes are not persistent), on the first `n`
+/// blocks of `bufs`: `n_passes() + 2` values, then the span from the block order's start to the
+/// fix-up's end (dispatch gaps included). The final pass overwrites part
 /// of the candidate words, so `reupload` runs before every run (outside the timed passes).
 pub fn time_passes(
     ctx: &GpuContext,
@@ -1004,7 +1187,7 @@ pub fn time_passes(
     mut reupload: impl FnMut(),
 ) -> anyhow::Result<Vec<f64>> {
     ensure!(ctx.timestamps, "timestamps unavailable");
-    let q = 2 * (p.n_passes() + 1);
+    let q = 2 * (p.n_passes() + 2);
     let qs = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("k3opt.passes.ts"),
         ty: wgpu::QueryType::Timestamp,
@@ -1017,7 +1200,7 @@ pub fn time_passes(
         mapped_at_creation: false,
     });
     let period = ctx.queue.get_timestamp_period() as f64;
-    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 2];
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 3];
     for r in 0..=reps {
         reupload();
         let mut enc = ctx
@@ -1030,10 +1213,12 @@ pub fn time_passes(
         ctx.queue.submit([enc.finish()]);
         let t: Vec<u64> = ctx.read_buffer(&resolve, 0, q);
         if r > 0 {
-            for (i, v) in times.iter_mut().take(p.n_passes() + 1).enumerate() {
+            for (i, v) in times.iter_mut().take(p.n_passes() + 2).enumerate() {
                 v.push(t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * period / 1e6);
             }
-            times[p.n_passes() + 1].push(t[q - 1].saturating_sub(t[0]) as f64 * period / 1e6);
+            // From the block order's start (q - 2) to the fix-up's end (2 * n_passes() + 1).
+            let fix_end = t[2 * p.n_passes() + 1];
+            times[p.n_passes() + 2].push(fix_end.saturating_sub(t[q - 2]) as f64 * period / 1e6);
         }
     }
     Ok(times

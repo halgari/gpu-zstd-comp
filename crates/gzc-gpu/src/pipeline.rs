@@ -818,7 +818,7 @@ impl<'a> Pipeline<'a> {
         let s = &self.bufs;
         // Direct upload: `data` is a slot's upload buffer, counted with the slots.
         let data = if self.direct { 0 } else { size(&s.data) };
-        let k3opt = s.opt.as_ref().map_or(0, |o| size(&o.prices) + size(&o.scratch));
+        let k3opt = s.opt.as_ref().map_or(0, |o| size(&o.prices) + size(&o.scratch) + size(&o.sched));
         let shared = data
             + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| size(b)).sum::<u64>()
             + opt(&s.frames)

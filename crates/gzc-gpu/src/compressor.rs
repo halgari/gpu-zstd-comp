@@ -185,13 +185,14 @@ pub fn trace_bytes(n_blocks: u32) -> u64 {
 }
 
 /// Bytes of K3opt's own buffers for `n_blocks` under match params `m` (0 without `opt`): the
-/// price tables / histograms (`k3opt::PRICE_WORDS` words per block) and the DP nodes' payload
-/// scratch (`k3opt::scratch_bytes_per_block`).
+/// price tables / histograms (`k3opt::PRICE_WORDS` words per block), the DP nodes' payload
+/// scratch (`k3opt::scratch_bytes_per_block`) and the block schedule (`k3opt::sched_bytes`).
 pub fn opt_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
     if m.opt.is_none() {
         return 0;
     }
     n_blocks as u64 * (crate::k3opt::prices_bytes(1) + crate::k3opt::scratch_bytes_per_block(m))
+        + crate::k3opt::sched_bytes(n_blocks)
 }
 
 /// Bytes of the `counts` buffer: `[block]` × (n_seq, n_lit) u32.
@@ -224,6 +225,7 @@ pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
     if m.opt.is_some() {
         per_block.push(crate::k3opt::prices_bytes(1));
         per_block.push(crate::k3opt::scratch_bytes_per_block(m));
+        per_block.push(crate::k3opt::sched_bytes(1));
     }
     let by_buffers = per_block.into_iter().map(|per_block| limit / per_block).min().unwrap();
     let by_index = (1u64 << 32) / (BLOCK_SIZE as u64 * best_words(m) as u64);
@@ -266,6 +268,8 @@ pub struct OptScratch {
     pub scratch: wgpu::Buffer,
     /// Bytes of `scratch` per block (for the params it was sized for).
     pub scratch_per_block: u64,
+    /// The persistent passes' block schedule (`k3opt::sched_bytes`, M6 A4).
+    pub sched: wgpu::Buffer,
 }
 
 impl BatchBuffers {
@@ -311,6 +315,7 @@ impl BatchBuffers {
                 prices: ctx.storage_buffer("batch.opt_prices", crate::k3opt::prices_bytes(capacity), true),
                 scratch: ctx.storage_buffer("batch.opt_scratch", capacity as u64 * scratch_per_block, false),
                 scratch_per_block,
+                sched: ctx.storage_buffer("batch.opt_sched", crate::k3opt::sched_bytes(capacity), false),
             }
         });
         // K3opt's `ld32` reads one word past a block's last word, so `data` keeps its trailing
@@ -1101,6 +1106,7 @@ fn poison_front(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBu
     if let Some(o) = &bufs.opt {
         ctx.poison_from(enc, &o.prices, 0);
         ctx.poison_from(enc, &o.scratch, 0);
+        ctx.poison_from(enc, &o.sched, 0);
     }
 }
 
@@ -1791,7 +1797,9 @@ mod tests {
         assert_eq!(best_bytes_for(3, &OPT16), 3 * 8 * BLOCK_SIZE as u64);
         // Against lvl3 (also two chains): the second candidate word, the larger seqs, and K3opt's
         // prices (377 words) and scratch per block. The trace reuses pred (8 B per position).
-        let k3opt = crate::k3opt::prices_bytes(10) + 10 * crate::k3opt::scratch_bytes_per_block(&OPT16);
+        let k3opt = crate::k3opt::prices_bytes(10)
+            + 10 * crate::k3opt::scratch_bytes_per_block(&OPT16)
+            + crate::k3opt::sched_bytes(10);
         assert_eq!(pred_bytes_for(10, &OPT16), trace_bytes(10));
         assert_eq!(pred_bytes_for(10, &OPT16), pred_bytes(10, 2));
         assert_eq!(opt_bytes(10, &OPT16), k3opt);
@@ -1841,7 +1849,11 @@ mod tests {
                     .iter()
                     .chain(&[seqs_bytes_for(n, &OPT16P1), opt_bytes(n, &OPT16P1), counts_bytes(n), frames_bytes(n)])
                     .all(|&b| b <= limit)
-                    && [crate::k3opt::prices_bytes(n), n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1)]
+                    && [
+                        crate::k3opt::prices_bytes(n),
+                        n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1),
+                        crate::k3opt::sched_bytes(n),
+                    ]
                         .iter()
                         .all(|&b| b <= limit)
             };
@@ -1864,7 +1876,7 @@ mod tests {
         let o = b.opt.as_ref().unwrap();
         let sizes = [&b.data, &b.head, &b.pred, &b.best, &b.seqs, &b.counts, b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap()]
             .iter()
-            .chain([&o.prices, &o.scratch].iter())
+            .chain([&o.prices, &o.scratch, &o.sched].iter())
             .map(|x| x.size())
             .sum::<u64>();
         assert_eq!(sizes, scratch_bytes(7, &m) + slot_bytes(7, true));
