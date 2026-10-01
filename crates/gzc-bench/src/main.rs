@@ -628,7 +628,9 @@ mod tests {
             assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
         }
         // M6 opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB at
-        // 64 KiB), so `max` resolves lower: 3125 blocks at 64 KiB.
+        // 64 KiB), so the budget allows fewer: 3125 blocks at 64 KiB. On a device whose storage
+        // bindings stop at 2 GiB (an RTX 5090 under wgpu) `device_max` is lower still: the pred
+        // buffer, 704 KiB per block, caps the batch at 2978 (`max_batch_blocks`).
         let p1 = resolve_max_batch(OPT16P1, inflight, budget_mb, device_max, false).unwrap();
         let fits = |b: u32| vram_bytes(&sweep_cfg(OPT16P1, b, inflight)).div_ceil(1 << 20) <= budget_mb;
         assert!(p1 < o16 && fits(p1) && !fits(p1 + 1), "opt16p1 {p1}, opt16 {o16}");

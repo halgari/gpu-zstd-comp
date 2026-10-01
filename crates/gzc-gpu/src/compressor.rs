@@ -1896,6 +1896,10 @@ mod tests {
             };
             assert!(n > 0 && fits(n) && !fits(n + 1), "limit {limit}: n {n}");
         }
+        // At 64 KiB with 2 GiB storage bindings (an RTX 5090 under wgpu), the 704 KiB of pred per
+        // block bound the batch below the 6 GiB budget's 3125 (M6 B4: `--batch max` is 2978).
+        #[cfg(feature = "block-64k")]
+        assert_eq!(max_batch_blocks(&limits(1 << 31, u64::MAX, 65535), &OPT16P1), 2978);
         let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16P1) as u64;
         assert!(n > 0 && n * 11 * BLOCK_SIZE as u64 / 4 <= 1 << 32, "pred word index");
     }
