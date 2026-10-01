@@ -64,11 +64,14 @@ const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
 /// word 0, then 3 unused words.
 pub const SCHED_HDR: u32 = 4;
 
-/// `k3_sched.wgsl`'s weight reads every `WEIGHT_STRIDE`-th position's candidate words (M6 A4):
-/// about 1/8 of the candidate words' memory sectors. Odd, so it does not alias with periodic data:
-/// over 2900 corpus blocks, the sampled count's Spearman correlation with the full count is 0.998
-/// at 33, 0.999 at 7..17 and 0.997 at 65, but 0.79..0.84 at strides 8..128.
-pub const WEIGHT_STRIDE: u32 = 33;
+/// `k3_sched.wgsl`'s weight samples runs of `WEIGHT_RUN` positions every `WEIGHT_STRIDE` positions
+/// (M6 A4): one 64-byte burst of candidate words in 33, 1986 positions per block. Over 2900 corpus
+/// blocks the sampled count's Spearman correlation with the full count is 0.996. A full scan cost
+/// about 1.4 % of opt16's K3 time, and every 33rd position alone (0.998) still 0.3 %: each
+/// position is its own memory burst. (Single positions at a power-of-two stride alias with
+/// periodic data: 0.79..0.84; the runs cover every phase mod 8, and 264 = 8 * 33 every other.)
+pub const WEIGHT_RUN: u32 = 8;
+pub const WEIGHT_STRIDE: u32 = 264;
 
 /// Bytes of the `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight, the
 /// heavy-first block order and each block's rank in it (4 B per block each).
@@ -630,7 +633,7 @@ impl K3Opt {
         let main = crate::compressor::pipeline_from_module(ctx, "k3_opt", &layout, &module, entry);
         let sched = persist.then(|| {
             let body = format!(
-                "const SCHED_HDR: u32 = {SCHED_HDR}u;\nconst WEIGHT_STRIDE: u32 = {WEIGHT_STRIDE}u;\n{K3_SCHED_WGSL}"
+                "const SCHED_HDR: u32 = {SCHED_HDR}u;\nconst WEIGHT_RUN: u32 = {WEIGHT_RUN}u;\nconst WEIGHT_STRIDE: u32 = {WEIGHT_STRIDE}u;\n{K3_SCHED_WGSL}"
             );
             let layout = crate::compressor::storage_layout(ctx, "k3opt_sched", &[true, true, false]);
             let module = ctx.shader("k3_sched", &body);

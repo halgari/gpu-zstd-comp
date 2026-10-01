@@ -16,7 +16,7 @@ use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{GpuParams, Kernels, frames_from_parses};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::k3opt::{
-    K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, SCHED_HDR, WEIGHT_STRIDE,
+    K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
     parses_from_cands, parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass,
     time_passes, workgroup_bytes,
 };
@@ -732,7 +732,7 @@ fn k3opt_passes_synthetic() {
 }
 
 /// The persistent passes' block order (M6 A4, `k3_sched.wgsl`): each block's weight (positions
-/// whose longest candidate is 3..32, every `WEIGHT_STRIDE`-th position) and the order, blocks by
+/// whose longest candidate is 3..32, in the sampled runs) and the order, blocks by
 /// descending weight with ties by ascending block id. 600 blocks (3 tiles of the rank sort), each
 /// synthetic block several times (ties).
 #[test]
@@ -755,10 +755,10 @@ fn k3opt_block_order() {
     let got: Vec<u32> = ctx.read_buffer(&bufs.sched, 0, SCHED_HDR as usize + 3 * n);
     let weight = |c: &[CandWords]| -> u32 {
         c.iter()
-            .step_by(WEIGHT_STRIDE as usize)
-            .filter(|w| {
+            .enumerate()
+            .filter(|(p, w)| {
                 let (a, b) = gzc_core::reference::unpack_cands(**w);
-                (3..=32).contains(&a.len.max(b.len))
+                (*p as u32 % WEIGHT_STRIDE) < WEIGHT_RUN && (3..=32).contains(&a.len.max(b.len))
             })
             .count() as u32
     };

@@ -12,15 +12,15 @@
 //
 // Weight (a07's cost proxy, Spearman 0.925 against the block's K3opt time): the block's positions
 // whose longest candidate (max(lenA, lenB)) is 3..32. Longer matches are encoded at once and are
-// cheap; dead and match-free positions have lenA = lenB = 0. Only every WEIGHT_STRIDE-th position
-// is read (k3opt::WEIGHT_STRIDE, odd: a full scan of the candidate words cost about 1.4 % of opt16's
-// K3 time). The order only steers timing: the passes' output is the same for any order (blocks are
+// cheap; dead and match-free positions have lenA = lenB = 0. Only runs of WEIGHT_RUN positions,
+// one every WEIGHT_STRIDE positions, are read (see k3opt::WEIGHT_STRIDE: a full scan of the
+// candidate words cost about 1.4 % of opt16's K3 time). The order only steers timing: the passes' output is the same for any order (blocks are
 // independent), and the order itself is deterministic.
 //
 // Dispatches, in order (one compute pass): main_weight (n, 1, 1), main_rank (ceil(n / 256),
 // ceil(n / 256), 1), main_scatter (ceil(n / 256), 1, 1).
 //
-// Consts injected by the host: SCHED_HDR, WEIGHT_STRIDE (plus the block constants).
+// Consts injected by the host: SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE (plus the block constants).
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> best: array<u32>;
@@ -36,11 +36,14 @@ fn main_weight(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let b = wid.x;
     let cb = 2u * b * BLOCK_SIZE;
     var c = 0u;
-    // Terminates: p rises by 256 * WEIGHT_STRIDE to BLOCK_SIZE.
-    for (var p = lid * WEIGHT_STRIDE; p < BLOCK_SIZE; p += 256u * WEIGHT_STRIDE) {
-        let w0 = best[cb + 2u * p];
-        let m = max((w0 >> 16u) & 0xFFu, w0 >> 24u);
-        c += select(0u, 1u, m >= 3u && m <= 32u);
+    // Terminates: r rises by 256 * WEIGHT_STRIDE to BLOCK_SIZE, j to WEIGHT_RUN.
+    for (var r = lid * WEIGHT_STRIDE; r < BLOCK_SIZE; r += 256u * WEIGHT_STRIDE) {
+        for (var j = 0u; j < WEIGHT_RUN; j += 1u) {
+            let p = r + j;
+            let w0 = best[cb + 2u * min(p, BLOCK_SIZE - 1u)];
+            let m = max((w0 >> 16u) & 0xFFu, w0 >> 24u);
+            c += select(0u, 1u, p < BLOCK_SIZE && m >= 3u && m <= 32u);
+        }
     }
     atomicAdd(&wsum, c);
     workgroupBarrier();
