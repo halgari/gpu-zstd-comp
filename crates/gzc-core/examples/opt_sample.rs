@@ -9,11 +9,14 @@
 //! ```text
 //! cargo run --release -p gzc-core --example opt_sample -- eval  <corpus> <every> <offset> [zstd]
 //! cargo run --release -p gzc-core --example opt_sample -- train <corpus> <every> <offset>
+//! cargo run --release -p gzc-core --example opt_sample -- train-s3 <corpus> <every> <offset>
 //! ```
 //! `eval` prints the ratio (real bytes / frame bytes) of opt14 and opt16 (and libzstd L14/L16
 //! with `zstd`), and checks every opt frame with libzstd. `train` sums the LL/ML/OF code
 //! histograms of opt16's output over the sample and prints them scaled to 65536 per table
-//! (round to nearest): the `OPT_PRIOR_*` constants. `THREADS` (default 16) sets the thread count.
+//! (round to nearest): the `OPT_PRIOR_*` constants. `train-s3` does the same for `s3_train_params`
+//! (the opt16 schedule over opt16p1's candidates and segment ends): the `OPT_PRIOR_S3_*`
+//! constants. `eval` also prints opt16p1. `THREADS` (default 16) sets the thread count.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,7 +24,7 @@ use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::{write_frame, FrameOptions};
 use gzc_core::opt::Hist;
-use gzc_core::params::{MatchParams, OPT14, OPT16};
+use gzc_core::params::{MatchParams, OptParams, PriorTables, Seed, OPT14, OPT16, OPT16P1};
 use gzc_core::reference::{chains, compress_block, find_cands};
 
 struct Blk {
@@ -93,7 +96,7 @@ fn ratio(blocks: &[Blk], sizes: &[usize]) -> f64 {
 }
 
 fn eval(blocks: &[Blk], zstd: bool) {
-    for (name, p) in [("opt14", OPT14), ("opt16", OPT16)] {
+    for (name, p) in [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)] {
         let t = std::time::Instant::now();
         let sizes = par_map(blocks, |b| {
             let out = compress_block(&b.data, p);
@@ -112,7 +115,15 @@ fn eval(blocks: &[Blk], zstd: bool) {
     }
 }
 
-fn train(blocks: &[Blk], p: MatchParams) {
+/// The parse the `OPT_PRIOR_S3_*` tables are trained on (M6 B0): `OPT16P1`'s candidates (h4 8
+/// deep, h3, the S3 sparse chains) and gap3 segment ends, with `OPT16`'s schedule (`BlockInit`
+/// seed, 3 cheap passes, the optLevel-2 final pass), no relaxation pruning and no drop pass.
+fn s3_train_params() -> MatchParams {
+    let o = OptParams { passes: 3, seed: Seed::BlockInit, prior: PriorTables::M5, relax_lengths: None, drop_max_len: 0, ..OPT16P1.opt.unwrap() };
+    MatchParams { opt: Some(o), ..OPT16P1 }
+}
+
+fn train(blocks: &[Blk], p: MatchParams, prefix: &str) {
     let hs = par_map(blocks, |b| {
         let cands = find_cands(&b.data, &chains(&b.data, &p), &p);
         Hist::of_output(&gzc_core::opt::parse(&b.data, &cands, &p))
@@ -127,21 +138,22 @@ fn train(blocks: &[Blk], p: MatchParams) {
         let s: u64 = v.iter().sum::<u64>().max(1);
         v.iter().map(|&x| ((x * 65536 + s / 2) / s) as u32).collect()
     };
-    println!("pub const OPT_PRIOR_LL: [u32; 36] = {:?};", scale(&t.0));
-    println!("pub const OPT_PRIOR_ML: [u32; 53] = {:?};", scale(&t.1));
-    println!("pub const OPT_PRIOR_OF: [u32; 32] = {:?};", scale(&t.2));
+    println!("pub const {prefix}_LL: [u32; 36] = {:?};", scale(&t.0));
+    println!("pub const {prefix}_ML: [u32; 53] = {:?};", scale(&t.1));
+    println!("pub const {prefix}_OF: [u32; 32] = {:?};", scale(&t.2));
 }
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let usage = "usage: opt_sample eval|train <corpus> <every> <offset> [zstd]";
+    let usage = "usage: opt_sample eval|train|train-s3 <corpus> <every> <offset> [zstd]";
     let (mode, dir) = (a.get(1).expect(usage), PathBuf::from(a.get(2).expect(usage)));
     let every: usize = a.get(3).expect(usage).parse().unwrap();
     let offset: usize = a.get(4).expect(usage).parse().unwrap();
     let blocks = load(&dir, every, offset);
     match mode.as_str() {
         "eval" => eval(&blocks, a.get(5).is_some_and(|s| s == "zstd")),
-        "train" => train(&blocks, OPT16),
+        "train" => train(&blocks, OPT16, "OPT_PRIOR"),
+        "train-s3" => train(&blocks, s3_train_params(), "OPT_PRIOR_S3"),
         _ => panic!("{usage}"),
     }
 }
