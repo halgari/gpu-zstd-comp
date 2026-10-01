@@ -130,6 +130,17 @@ const NIF_STRINGS: [&str; 6] = [
     "Scene Root",
 ];
 
+/// `sin(x)` for `x` in [0, 2π) using only `+`, `-` and `*` (IEEE-exact everywhere), so the
+/// synthetic corpus is bit-identical on every platform. `f32::sin` goes through the platform
+/// libm (glibc vs the MSVC CRT differ in the last bit), which changed the lvl3 anchor on Windows.
+fn portable_sin(x: f32) -> f32 {
+    const PI: f32 = std::f32::consts::PI;
+    let x = if x > PI { x - 2.0 * PI } else { x };
+    let x2 = x * x;
+    // Taylor series to x^11: plenty for a smooth synthetic surface.
+    x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0 * (1.0 - x2 / 72.0 * (1.0 - x2 / 110.0)))))
+}
+
 /// NIF-mesh-like data: a Gamebryo header, a cycling string table, then
 /// repeating vertex + triangle-index records on a smooth grid.
 pub fn nif_like(seed: u64, len: usize) -> Vec<u8> {
@@ -149,7 +160,7 @@ pub fn nif_like(seed: u64, len: usize) -> Vec<u8> {
     while out.len() < len {
         let px = (i % 32) as f32;
         let py = ((i / 32) % 32) as f32;
-        let pz = ((px + py) * 0.1).sin() * 5.0;
+        let pz = portable_sin((px + py) * 0.1) * 5.0;
         out.extend_from_slice(&px.to_le_bytes());
         out.extend_from_slice(&py.to_le_bytes());
         out.extend_from_slice(&pz.to_le_bytes());
