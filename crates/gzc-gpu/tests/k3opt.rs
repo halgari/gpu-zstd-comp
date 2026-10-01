@@ -208,7 +208,24 @@ fn k3opt_ring_choice() {
     let need = workgroup_bytes(&OPT16, &auto);
     let tables = need - ring_bytes(auto.wg, target);
     if BLOCK_SIZE == 65536 {
-        assert!(need <= 5200, "wg16 workgroup footprint {need} B (one wave needs about 5 KB)");
+        // M6 A1: at most 4266 B per wg16 workgroup on every pass kernel (24 resident blocks per
+        // SM on an RTX 5090 with 100 KB of shared memory, so a 4080-block batch is one wave).
+        // The final pass declares no histogram: 1 KiB less than the cheap passes.
+        for (level, prices, hist_out) in [
+            (0, PriceSrc::BlockInit, true),
+            (0, PriceSrc::Prior, true),
+            (0, PriceSrc::Hist, true),
+            (2, PriceSrc::Hist, false),
+            (2, PriceSrc::BlockInit, false),
+            (2, PriceSrc::Buffer, false),
+        ] {
+            let c = K3OptConfig { level, prices, hist_out, ..auto };
+            let b = workgroup_bytes(&OPT16, &c);
+            assert!(b <= 4266, "{c:?}: wg16 workgroup footprint {b} B > 4266");
+            if !hist_out && prices == PriceSrc::Hist {
+                assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
+            }
+        }
     }
     assert_eq!(ring_for(&OPT16, &auto, need).unwrap(), RingMem::Workgroup);
     assert_eq!(ring_for(&OPT16, &auto, need - 1).unwrap(), RingMem::Private);
@@ -710,6 +727,11 @@ fn k3opt_passes_corpus() {
     let cands = cands_of(&blocks);
     let live = check_passes(&ctx, &names, &blocks, &cands, &schedules(), K3OptConfig::default());
     eprintln!("final passes with ll[1] < ll[0]: {live}");
+    // The private-ring fallback through opt16 and opt14 (M6 A1: its tables are built without
+    // workgroup staging).
+    let presets = [("opt16".to_string(), OPT16), ("opt14".to_string(), OPT14)];
+    let private = K3OptConfig { ring: Some(RingMem::Private), ..K3OptConfig::default() };
+    check_passes(&ctx, &names, &blocks, &cands, &presets, private);
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
