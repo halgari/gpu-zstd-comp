@@ -725,6 +725,17 @@ pub fn drops_from_parses(
             ctx.queue.write_buffer(&bufs.prices, 0, bytemuck::cast_slice(&words));
         }
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3drop") });
+        if ctx.poisoning() {
+            // Everything but the uploaded words (the inputs' seqs words are left as they are).
+            ctx.poison_workgroup_memory(&mut enc);
+            ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+            ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, &d.params));
+            ctx.poison_from(&mut enc, &bufs.counts, counts_bytes(n));
+            for b in [&bufs.trace, &bufs.scratch, &bufs.sched] {
+                ctx.poison_from(&mut enc, b, 0);
+            }
+            ctx.poison_from(&mut enc, &bufs.prices, if d.prices_in { prices_bytes(n) } else { 0 });
+        }
         d.record(ctx, &mut enc, &bufs.binds(), n, None)?;
         ctx.queue.submit([enc.finish()]);
         read_parses(ctx, &bufs, blocks)
@@ -1344,6 +1355,17 @@ pub fn parses_from_passes(
             let at = i * BATCH_CAP;
             bufs.upload(ctx, chunk, &cands[at..at + chunk.len()], None)?;
             let n = chunk.len() as u32;
+            if ctx.poisoning() {
+                // Everything but the uploaded blocks (+ trailing word) and candidates.
+                let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3opt.poison") });
+                ctx.poison_workgroup_memory(&mut enc);
+                ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+                ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, p.params()));
+                for b in [&bufs.trace, &bufs.seqs, &bufs.counts, &bufs.scratch, &bufs.sched, &bufs.prices] {
+                    ctx.poison_from(&mut enc, b, 0);
+                }
+                ctx.queue.submit([enc.finish()]);
+            }
             if hists {
                 for (j, k) in p.kernels().enumerate() {
                     let mut enc = ctx
