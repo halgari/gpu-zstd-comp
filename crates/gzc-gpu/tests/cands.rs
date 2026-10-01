@@ -88,10 +88,6 @@ fn h4_hash_is_injective_in_byte_3() {
 #[test]
 fn gpu_cands_match_cpu_opt16() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    // opt16 only implements at blocks of at most 64 KiB.
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT16);
@@ -103,10 +99,6 @@ fn gpu_cands_match_cpu_opt16() {
 #[test]
 fn gpu_cands_match_cpu_other_depths() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    // opt14/opt16 only implement at blocks of at most 64 KiB.
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT14);
@@ -122,9 +114,6 @@ fn gpu_cands_match_cpu_other_depths() {
 #[test]
 fn gpu_cands_match_cpu_opt16p1() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     let lc = |width, stride, depth| Some(SparseChain { width, stride, depth });
     let with = |depth, sparse_chains| MatchParams {
         depth,

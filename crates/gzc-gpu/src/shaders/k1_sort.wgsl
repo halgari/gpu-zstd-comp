@@ -5,9 +5,8 @@
 // the slots below each position's own (k2_window.wgsl). Single hash only.
 //
 // One workgroup of 32 lanes per block runs a counting sort over 2^KEY_BITS counters in workgroup
-// memory, 16 bits each (two per word) when blocks have at most 2^16 positions (a count or cursor
-// is at most HASHED_POSITIONS < 2^16 then, so an add never carries into the other half), else 32
-// bits:
+// memory, 16 bits each (two per word: a count or cursor is at most HASHED_POSITIONS < 2^16, so
+// an add never carries into the other half):
 // 1. histogram: every lane adds its position's key (atomicAdd);
 // 2. exclusive scan of the counters in place;
 // 3. ranking, one 32-position tile at a time in position order: the lanes holding equal keys
@@ -26,17 +25,15 @@
 @group(0) @binding(2) var<storage, read_write> rankw: array<u32>;
 
 const NKEYS: u32 = 1u << KEY_BITS;
-const CNT16: bool = LOG2_BLOCK <= 16u;
-const NWORDS: u32 = select(NKEYS, NKEYS / 2u, CNT16);
+// 16-bit counters need HASHED_POSITIONS < 2^16.
+const_assert LOG2_BLOCK <= 16u;
+const NWORDS: u32 = NKEYS / 2u;
 var<workgroup> cnt: array<atomic<u32>, NWORDS>;
 
 // Adds n to key k's counter and returns its old value.
 fn cnt_add(k: u32, n: u32) -> u32 {
-    if (CNT16) {
-        let sh = (k & 1u) * 16u;
-        return (atomicAdd(&cnt[k >> 1u], n << sh) >> sh) & 0xFFFFu;
-    }
-    return atomicAdd(&cnt[k], n);
+    let sh = (k & 1u) * 16u;
+    return (atomicAdd(&cnt[k >> 1u], n << sh) >> sh) & 0xFFFFu;
 }
 
 // Key (x) and pred-style word p | pred_fp (y) of p < HASHED_POSITIONS, from its 8 bytes.
@@ -84,7 +81,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     var sum = 0u;
     for (var i = 0u; i < PER; i++) {
         let x = atomicLoad(&cnt[lane * PER + i]);
-        sum += select(x, (x & 0xFFFFu) + (x >> 16u), CNT16);
+        sum += (x & 0xFFFFu) + (x >> 16u);
     }
     tkey[lane] = sum;
     workgroupBarrier();
@@ -94,14 +91,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }
     for (var i = 0u; i < PER; i++) {
         let x = atomicLoad(&cnt[lane * PER + i]);
-        if (CNT16) {
-            let lo = x & 0xFFFFu;
-            atomicStore(&cnt[lane * PER + i], run | ((run + lo) << 16u));
-            run += lo + (x >> 16u);
-        } else {
-            atomicStore(&cnt[lane * PER + i], run);
-            run += x;
-        }
+        let lo = x & 0xFFFFu;
+        atomicStore(&cnt[lane * PER + i], run | ((run + lo) << 16u));
+        run += lo + (x >> 16u);
     }
     workgroupBarrier();
 

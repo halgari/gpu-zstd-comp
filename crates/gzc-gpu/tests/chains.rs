@@ -118,10 +118,6 @@ fn k1_single_hash_preds_match_cpu() {
 #[test]
 fn k1_opt3_preds_match_cpu() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    // opt16 only implements at blocks of at most 64 KiB.
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     use gzc_core::hash::hash3;
     let blocks = all_blocks();
     let block = &blocks[0].1;
@@ -158,9 +154,6 @@ fn long_chain_variants() -> Vec<MatchParams> {
 #[test]
 fn k1_long_chains_match_cpu() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     let blocks = all_blocks();
     // Layout: two full chains, then BLOCK_SIZE / 4 words per sparse chain.
     assert_eq!(pred_words_per_block(&OPT16P1), 2 * BLOCK_SIZE as u64 + 3 * BLOCK_SIZE as u64 / 4);
@@ -214,7 +207,6 @@ fn k1_head_reuse_across_dispatches() {
         let head = ctx.storage_buffer("test.head", head_bytes(cap, 5), false);
         let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(cap, &OPT16P1).max(pred_bytes(cap, 2)), true);
         let opts = |groups, wide_masks| ChainsOptions { groups, wide_masks, ..ChainsOptions::default() };
-        let opt = gzc_core::config::LOG2_BLOCK <= 16;
         let kernels: Vec<(MatchParams, ChainsKernel)> = [
             (LVL3, opts(None, false)),
             (RUNG1, opts(Some(1), false)),
@@ -222,8 +214,8 @@ fn k1_head_reuse_across_dispatches() {
             (LVL9, opts(Some(1), false)),
             (RUNG1, opts(None, true)),
             (LVL3, opts(Some(1), false)),
-            (if opt { OPT16P1 } else { LVL3 }, opts(Some(3), false)),
-            (if opt { OPT16P1 } else { LVL3 }, opts(Some(1), true)),
+            (OPT16P1, opts(Some(3), false)),
+            (OPT16P1, opts(Some(1), true)),
         ]
         .into_iter()
         .map(|(p, o)| (p, ChainsKernel::with_options(&ctx, &p, o).unwrap()))
@@ -275,10 +267,6 @@ fn k1_pred_words_carry_fingerprints() {
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         for params in [LVL3, LVL9, OPT16, OPT16P1] {
-            // opt16 only implements at blocks of at most 64 KiB.
-            if params.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
-                continue;
-            }
             let kernel = ChainsKernel::new(&ctx, &params).unwrap();
             let nh = kernel.n_hashes() as usize;
             let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);

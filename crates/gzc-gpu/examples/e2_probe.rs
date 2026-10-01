@@ -2,7 +2,7 @@
 //! candidate array, and the GPU sorted K1 + window K2, against K1 + K2 over hash chains.
 //!
 //! `cargo run --release -p gzc-gpu --example e2_probe -- <corpus dir> [stride] [blocks]`
-//! Takes every `stride`-th 128 KiB block of the corpus's .dds/.nif files (default 20, up to
+//! Takes every `stride`-th 64 KiB block of the corpus's .dds/.nif files (default 20, up to
 //! `blocks` = 2559), builds the sorted arrays on the CPU (`gzc_core::hash::bucket_sort`), checks the
 //! GPU window K2 against `gzc_core::reference::find_best`, and times each kernel (median of 5).
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, PARSE_END};

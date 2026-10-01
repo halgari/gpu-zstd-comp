@@ -14,26 +14,25 @@
 //! lanes) and a workgroup-memory version without subgroups (`k1_sort.wgsl`), picked like the chain
 //! K1's two kernels: the subgroup one when the device has suitable subgroups and it passes its
 //! self-test. Each needs its `workgroup_bytes` within the device's limit (the context keeps wgpu's
-//! default 16 KiB: a 12-bit key fits both versions at every block size; a 13-bit key fits only the
-//! subgroup version, only at blocks of at most 64 KiB); otherwise (or
+//! default 16 KiB: a 12-bit key fits both versions; a 13-bit key fits only the subgroup
+//! version); otherwise (or
 //! with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the same chains over the
 //! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
-use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK};
+use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS};
 use gzc_core::params::{Hashes, MatchParams};
 
 const K1_SORT_WGSL: &str = include_str!("shaders/k1_sort.wgsl");
 const K1_SORT_SG_WGSL: &str = include_str!("shaders/k1_sort_sg.wgsl");
 
-/// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory at 64 KiB blocks,
-/// wgpu's default limit; 32 KiB at 128 KiB, which needs a raised limit).
+/// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory, wgpu's default
+/// limit).
 pub const MAX_SORT_KEY_BITS: u32 = 13;
 
-/// Workgroup memory of the sorted K1's counters: 2^hash_bits of 16 bits (32 bits for blocks of
-/// more than 2^16 bytes).
+/// Workgroup memory of the sorted K1's counters: 2^hash_bits of 16 bits.
 pub fn table_bytes(p: &MatchParams) -> u32 {
-    (if LOG2_BLOCK <= 16 { 2 } else { 4 }) << p.hash_bits
+    2 << p.hash_bits
 }
 
 /// All the workgroup memory of the sorted K1's `main_sg` (`subgroups`: the counters only) or

@@ -2,9 +2,6 @@
 //! fed `reference::find_cands` words (or `opt::cases`' scripted ones) from the host.
 //! M5 T4: every pass of `OptPasses` (seeds, cheap passes with their histograms, final pass)
 //! against `opt::passes`.
-//! opt14/opt16 only implement at blocks of at most 64 KiB, so this whole file is skipped in a
-//! `block-128k` build.
-#![cfg(not(feature = "block-128k"))]
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
@@ -117,7 +114,7 @@ fn check_blocks(
 }
 
 /// Whether `c` can run here: a forced workgroup ring needs `workgroup_bytes` within the adapter's
-/// limit (wg32 at 16 KiB blocks needs about 38 KB); prints a skip message when it cannot.
+/// limit; prints a skip message when it cannot.
 fn runs_here(ctx: &GpuContext, c: &K3OptConfig) -> bool {
     let need = workgroup_bytes(&OPT16, c);
     let limit = ctx.device.limits().max_compute_workgroup_storage_size;
@@ -223,11 +220,10 @@ fn k3opt_ring_choice() {
     let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
     let tables = need - ring_bytes(auto.wg, target);
-    // M6 A1: the wg16 footprint of every pass kernel. 64 KiB: at most 4266 B (24 resident blocks
-    // per SM on an RTX 5090 with 100 KB of shared memory, so a 4080-block batch is one wave), the
-    // final pass (no histogram) 1020 B below its cheap-pass twin. 16 KiB (4 blocks per
-    // workgroup): 9920 B for a pass that declares the histogram, 5828 B for the final pass,
-    // 5752 B with Buffer prices. Every kernel within 16384 B (WebGPU's minimum limit).
+    // M6 A1: the wg16 footprint of every pass kernel: at most 4266 B (24 resident blocks per SM
+    // on an RTX 5090 with 100 KB of shared memory, so a 4080-block batch is one wave), the final
+    // pass (no histogram) 1020 B below its cheap-pass twin. Every kernel within 16384 B
+    // (WebGPU's minimum limit).
     for (level, prices, hist_out) in [
         (0, PriceSrc::BlockInit, true),
         (0, PriceSrc::Prior, true),
@@ -239,22 +235,9 @@ fn k3opt_ring_choice() {
         let c = K3OptConfig { level, prices, hist_out, ..auto };
         let b = workgroup_bytes(&OPT16, &c);
         assert!(b <= 16384, "{c:?}: wg16 workgroup footprint {b} B > 16384");
-        match BLOCK_SIZE {
-            65536 => {
-                assert!(b <= 4266, "{c:?}: wg16 workgroup footprint {b} B > 4266");
-                if !hist_out && prices == PriceSrc::Hist {
-                    assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
-                }
-            }
-            16384 => {
-                let want = match (prices, hist_out) {
-                    (PriceSrc::Hist, false) => 5828,
-                    (PriceSrc::Buffer, _) => 5752,
-                    _ => 9920,
-                };
-                assert_eq!(b, want, "{c:?}: wg16 workgroup footprint {b} B at 16 KiB");
-            }
-            _ => {}
+        assert!(b <= 4266, "{c:?}: wg16 workgroup footprint {b} B > 4266");
+        if !hist_out && prices == PriceSrc::Hist {
+            assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
         }
     }
     assert_eq!(ring_for(&OPT16, &auto, need).unwrap(), RingMem::Workgroup);

@@ -65,6 +65,9 @@ use gzc_core::reference::CandWords;
 use gzc_core::seq::BlockOutput;
 
 const K3_OPT_WGSL: &str = include_str!("shaders/k3_opt.wgsl");
+
+// K3opt and K3Drop keep offsets and literal counts in 16-bit fields (k3_opt.wgsl's const_asserts).
+const _: () = assert!(BLOCK_SIZE <= 1 << 16, "K3opt/K3Drop need blocks of at most 64 KiB");
 const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
 
 /// Header words of the `sched` buffer (`k3_sched.wgsl`): the persistent passes' block counter at
@@ -601,7 +604,6 @@ impl K3Drop {
         m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
         let o = m.opt.ok_or_else(|| anyhow!("K3Drop needs opt params"))?;
         ensure!(o.drop_max_len > 0, "K3Drop: drop_max_len is 0");
-        ensure!(BLOCK_SIZE <= 1 << 16, "K3Drop: blocks of at most 64 KiB");
         ensure!(n_seg(m) <= 64 && 64 % n_seg(m) == 0, "K3Drop: {} segments per block", n_seg(m));
         let body = format!(
             "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst DROP_MAX: u32 = {}u;\n\
@@ -749,7 +751,6 @@ impl K3Opt {
             .map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
         let o = m.opt.ok_or_else(|| anyhow!("K3opt needs opt params"))?;
         ensure!(cfg.level == 0 || cfg.level == 2, "optLevel {}", cfg.level);
-        ensure!(BLOCK_SIZE <= 1 << 16, "K3opt: blocks of at most 64 KiB");
         let n_seg = n_seg(m);
         ensure!(
             cfg.wg.is_power_of_two() && (8..=256).contains(&cfg.wg),
@@ -1470,10 +1471,6 @@ mod tests {
     #[test]
     fn check_rejects_bad_buffers() {
         let _gpu = crate::test_support::gpu_test_slot();
-        // opt16 only implements at blocks of at most 64 KiB.
-        if BLOCK_SIZE > 1 << 16 {
-            return;
-        }
         // Without poisoning: its padding would make the short buffers below long enough.
         let opts = crate::context::GpuOptions { poison: false, ..crate::context::GpuOptions::default() };
         if crate::context::env_on("GZC_POISON") {
@@ -1516,9 +1513,6 @@ mod tests {
     fn check_dead_marks_rejects_bad_marks() {
         use gzc_core::config::PARSE_END;
         use gzc_core::reference::{DEAD_BIT, chains, find_cands, is_dead};
-        if BLOCK_SIZE > 1 << 16 {
-            return;
-        }
         let mut block = gzc_core::synth::random(5, BLOCK_SIZE);
         block.copy_within(200..300, 1000);
         let c = find_cands(&block, &chains(&block, &OPT16), &OPT16);
