@@ -30,6 +30,12 @@
 //    the lane's off_bases are the true ones and its final r is the true history.
 //    counts = (n_seq, n_lit).
 //
+// After this pass `seqs` and `counts` are the block's parse; `best` is not consistent with them.
+// Step 3 overwrites each segment's raw sequences in `best` with its kept ones (in order, off_bases
+// under the lane's history), but leaves the SEG_META trailers (count, end, match bytes, reps) as
+// K3opt wrote them, so they describe the parse before the drops. Nothing may run main_fixup again
+// or read the `best` words or trailers after this pass: K5 and K4 read only data, seqs and counts.
+//
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, ... (params), MAX_SEQS, SEG_LOG2,
 // DROP_MAX (OptParams::drop_max_len), DROP_PRICES_IN, LL_BITS / ML_BITS / ML_CODE (codes.rs).
 // k3_fixup.wgsl is appended for its rep helpers (its main_fixup entry is not built here).
@@ -45,6 +51,8 @@ const DROP_WG: u32 = 64u;
 const LPS: u32 = DROP_WG / NSEG;
 const_assert DROP_WG % NSEG == 0u;
 const_assert NSEG <= DROP_WG;
+// Step 0's clamped counts keep every `seqs` index inside the block's MAX_SEQS words.
+const_assert NSEG * (SEG / 3u) <= MAX_SEQS;
 const MATCH_FEE: i32 = 51;
 const HIST_WORDS: u32 = 377u;
 // opt::Hist / opt::Prices layout: lit[256] ll[36] ml[53] of[32].
@@ -138,6 +146,11 @@ fn main_drop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         var reps = init;
         for (var k = 0u; k < NSEG; k += 1u) {
             let src = bbase + k * SEG_WORDS;
+            // main_fixup reads the same count unclamped. Here the clamp never binds for a trailer
+            // K3opt wrote: every match is at least 3 bytes and lies in its segment, so n <= SEG / 3.
+            // It only bounds the walks below and step 3's writes (3 * SEG / 3 < SEG_META words,
+            // inside the segment's own `best` words; 16 * (SEG / 3) <= MAX_SEQS for `seqs`) if
+            // the trailer were ever garbage, where main_fixup would already have gone wrong.
             let n = min(best[src + SEG_META], SEG / 3u);
             let carry = k * SEG - prev_end;
             d_n[k] = n;
@@ -245,6 +258,12 @@ fn main_drop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         var prev_end = k * SEG - d_carry[k];
         // The current sequence's words, loaded with the previous one's as its successor (one
         // memory round per sequence: the successor's words and the match bytes together).
+        // Reads that may not belong to this segment are harmless: with n == 0 the load below reads
+        // index f (a later segment's sequence, or f == n_all, still inside the block's MAX_SEQS
+        // words: n_all <= NSEG * (SEG / 3) by step 0's clamp) and the loop never runs; for the
+        // block's last sequence (no successor) q stays put, so
+        // nll / nml / nob reload the sequence itself, and only the candidate test reads them,
+        // which needs has_next.
         var q = sbase + 3u * f;
         var nll = seqs[q];
         var nml = seqs[q + 1u];

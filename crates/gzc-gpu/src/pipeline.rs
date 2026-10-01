@@ -1779,7 +1779,7 @@ mod tests {
     use crate::chains::{head_bytes, pred_bytes};
     use gzc_core::block::chunk_file;
     use gzc_core::frame::write_frame;
-    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, RUNG1};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
@@ -2048,8 +2048,8 @@ mod tests {
     fn vram_matches_params() {
         let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14] {
-            // opt14/opt16 only implement at blocks of at most 64 KiB.
+        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14, OPT16P1] {
+            // The optimal parse only implements at blocks of at most 64 KiB.
             if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
                 continue;
             }
@@ -2083,13 +2083,19 @@ mod tests {
                 + crate::compressor::opt_bytes(10, &OPT16);
             assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
             assert_eq!(scratch(OPT14), scratch(OPT16));
+            // opt16p1 (M6): three more head tables and sparse pred words; K3opt's buffers (and the
+            // drop pass, which has none) are the same.
+            let p1_extra = crate::compressor::pred_bytes_for(10, &OPT16P1) - crate::compressor::pred_bytes_for(10, &OPT16)
+                + head_bytes(10, 5)
+                - head_bytes(10, 2);
+            assert_eq!(scratch(OPT16P1) - scratch(OPT16), p1_extra);
         }
     }
 
-    /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4) through the streaming
-    /// pipeline in every upload/readback mode, over partial batches and reuse, equals the CPU
-    /// oracle's frames (which libzstd decodes); the parse path too. `allocated_bytes` equals
-    /// `vram_bytes` in every mode.
+    /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4; M6 B4: opt16p1 with
+    /// its sparse chains and drop pass) through the streaming pipeline in every upload/readback
+    /// mode, over partial batches and reuse, equals the CPU oracle's frames (which libzstd
+    /// decodes); the parse path too. `allocated_bytes` equals `vram_bytes` in every mode.
     #[test]
     fn opt_stream_every_mode_matches_cpu() {
         let _gpu = crate::test_support::gpu_test_slot();
@@ -2100,7 +2106,7 @@ mod tests {
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..50).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let modes = mode_contexts();
-        for matching in [OPT14, OPT16] {
+        for matching in [OPT14, OPT16, OPT16P1] {
             let params = GpuParams { matching, emit_frames: true, huffman: true };
             let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
             for (w, b) in want.iter().zip(&distinct) {
@@ -2369,8 +2375,8 @@ mod tests {
         let distinct = distinct_blocks();
         // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
         // trailing zero word after partial batches of stale blocks). opt14 only implements at
-        // blocks of at most 64 KiB.
-        for matching in [LVL9S12SEG, OPT14] {
+        // blocks of at most 64 KiB. M6 B4: opt16p1 (sparse chains, drop pass) as well.
+        for matching in [LVL9S12SEG, OPT14, OPT16P1] {
             if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
                 continue;
             }

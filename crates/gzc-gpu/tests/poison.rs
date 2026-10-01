@@ -6,7 +6,7 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
-use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, RUNG2};
+use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1, RUNG2};
 use gzc_core::reference::compress_block;
 use gzc_gpu::compressor::{GpuParams, Kernels, compress_frames};
 use gzc_gpu::context::{GpuContext, GpuOptions};
@@ -21,6 +21,8 @@ fn presets() -> Vec<(&'static str, MatchParams)> {
     // The optimal parse implements blocks of at most 64 KiB.
     if BLOCK_SIZE <= 1 << 16 {
         p.push(("opt14", OPT14));
+        // M6 B4: sparse chains, gap3, top-4 and the drop pass.
+        p.push(("opt16p1", OPT16P1));
     }
     p
 }

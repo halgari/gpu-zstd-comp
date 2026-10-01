@@ -10,28 +10,25 @@ no GPU decompression, and blocks never reference each other.
 
 ## Status (2026-10-01)
 
-- **Ten presets** run on the GPU, from libzstd-level-3 ratio up to libzstd-level-16 ratio. The
+- **Eleven presets** run on the GPU, from libzstd-level-3 ratio up to libzstd-level-16 ratio. The
   `gzc-core` crate holds a CPU reference encoder for each preset. GPU output is byte-identical
   to it, and tests check that on every supported backend.
 - **Fastest preset:** `lvl9s12seg` beats libzstd level 9's ratio at about 10.4 GB/s on an
   RTX 5090.
-- **Highest-ratio presets:** `opt14` and `opt16` beat libzstd levels 14 and 16 at
-  1.8–2.3 and 1.1–1.5 GB/s on the same card.
+- **Highest-ratio presets:** `opt16p1` beats libzstd level 16's ratio at about 3.4 GB/s on
+  the same card. `opt14` and `opt16` beat levels 14 and 16 at about 2.9 and 2.0 GB/s.
 - **Platforms:** Linux/Vulkan on NVIDIA is the main development platform. macOS/Metal works and
   was benchmarked on an M4 Pro. Windows/Vulkan works but has an open bug (see below).
   Windows/DX12 does not work.
-- **Next steps:** a research round on making `opt16` faster has finished. Its recommendations
-  have not been implemented yet:
-  - kernel changes that keep the output byte-identical (fewer registers, skipping positions
-    that can't start a match, a persistent heaviest-block-first parse kernel);
-  - a 2-pass `opt16` that gets its ratio margin from splitting each frame into several zstd
-    blocks and from a longer-match hash chain.
-
-  See `docs/superpowers/m6/synthesis.md` and the twelve research reports next to it.
+- **M6 (done):** kernel work made `opt14`/`opt16` 60–80 % faster with the same output
+  (`docs/results/2026-10-01-m6-trackA.md`), and the new `opt16p1` preset does the level-16 job
+  in one parse pass (`docs/results/2026-10-01-m6-opt16p1.md`).
+- **Next steps:** splitting each frame into several zstd blocks (+0.14 % ratio in research) and
+  a windowed parse with more parallel lanes (`docs/superpowers/m7/`).
 
 ## Performance: RTX 5090 vs Ryzen 9 9950X3D
 
-Measured 2026-10-01 at commit `ba061ce` (`opt14`/`opt16` rows re-measured at `d75bebd` on branch `m6`, after the M6 Track A kernel work: `docs/results/2026-10-01-m6-trackA.md`) on one Linux machine: an RTX 5090 (Vulkan, driver 610)
+Measured 2026-10-01 at commit `ba061ce` (`opt14`/`opt16` rows re-measured at `d75bebd` on branch `m6`, after the M6 Track A kernel work: `docs/results/2026-10-01-m6-trackA.md`; `opt16p1` at `b362e10`: `docs/results/2026-10-01-m6-opt16p1.md`) on one Linux machine: an RTX 5090 (Vulkan, driver 610)
 and a Ryzen 9 9950X3D (16 cores, 32 threads).
 
 - **Corpus:** the full corpus, `--ext dds,nif`: 3172 files, 6.49 GB, 100,754 blocks of 64 KiB.
@@ -56,17 +53,22 @@ and a Ryzen 9 9950X3D (16 cores, 32 threads).
 | `lvl9s12d16seg` | 11,086 | 1.33860 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
 | `opt14` | 2,935 (2,862 at batch 2900) | 1.37064 | L14 | 224 / 415 / 590 | 1.36827 |
 | `opt16` | 2,003 (1,914 at batch 2900) | 1.37144 | L16 | 190 / 384 / 501 | 1.37100 |
+| `opt16p1` | **3,416** (3,398 at batch 2900) | 1.37229 | L16 | 190 / 384 / 501 | 1.37100 |
 
 How to read it:
 
 - **Against all 32 CPU threads:** at level-9 ratio the GPU is about 6× faster (`lvl9s12seg`,
-  10.4 GB/s against 1.75 GB/s). At level 14 it is about 5× faster and at level 16 about 4×.
-  At level 3 the CPU wins (9.4 GB/s against 7.4).
+  10.4 GB/s against 1.75 GB/s). At level 14 it is about 5× faster and at level 16 about 7×
+  (`opt16p1`). At level 3 the CPU wins (9.4 GB/s against 7.4).
 - **The 8-thread column** is the closest thing here to the target machine, an 8-core gaming
-  PC. Against it the GPU is 14× faster at level 9, 13× at level 14 and 10× at level 16.
+  PC. Against it the GPU is 14× faster at level 9, 13× at level 14 and 18× at level 16.
   The 9950X3D's cores are faster than a typical gaming CPU's.
 - **`opt14` and `opt16` at `--batch max`:** since the M6 kernel work (register diet, persistent
   heaviest-first parse) a 3586-block batch fits one wave and is the fastest setting.
+- **`opt16p1` at `--batch max`** resolves to 2978 blocks on this card, not the 3125 the budget
+  allows: its chain buffer (704 KiB per block) reaches wgpu's 2 GiB storage-binding limit first.
+- **`opt16p1` against `opt16`:** 70 % faster with a slightly higher ratio. It runs one parse
+  pass instead of four, over more candidates.
 - **Without subgroups:** `lvl9s12seg` runs at 8,569 MB/s with `GZC_NO_SUBGROUPS=1`, the
   portable kernels every GPU can run.
 - **Small cards:** an RTX 4060 has about 14 % of a 5090's compute. Projections, not
@@ -74,8 +76,8 @@ How to read it:
 
 Ratios with five decimals come from `gzc-bench ref` (the CPU reference, which the GPU matches
 byte for byte); the others are rounded from the run output. Full write-ups:
-`docs/results/2026-09-30-speed2.md` (the level-9 presets) and `docs/results/2026-09-30-m5.md`
-(`opt14`/`opt16`).
+`docs/results/2026-09-30-speed2.md` (the level-9 presets), `docs/results/2026-09-30-m5.md`
+(`opt14`/`opt16`) and `docs/results/2026-10-01-m6-opt16p1.md` (`opt16p1`).
 
 ## Other hardware
 
@@ -256,6 +258,7 @@ and the GPU, byte for byte the same frames:
 | `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 |
 | `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 |
 | `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 |
+| `opt16p1` | M6: one optimal-parse pass over more candidates (three extra hash chains on every 4th position), a retrained prior seed, then short matches turned back into literals where cheaper | L16 |
 
 Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for byte):
 
@@ -268,6 +271,7 @@ Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for by
 | `lvl9s12d16seg` | 1.33860 | L9 | 1.33786 |
 | `opt14` | 1.37064 | L14 | 1.36827 |
 | `opt16` | 1.37144 | L16 | 1.37100 |
+| `opt16p1` | 1.37229 | L16 | 1.37100 |
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
