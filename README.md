@@ -60,14 +60,13 @@ and a Ryzen 9 9950X3D (16 cores, 32 threads).
 How to read it:
 
 - **Against all 32 CPU threads:** at level-9 ratio the GPU is about 6× faster (`lvl9s12seg`,
-  10.4 GB/s against 1.75 GB/s). At level 14 it is 3.1–3.8× faster and at level 16 2.2–2.9×.
+  10.4 GB/s against 1.75 GB/s). At level 14 it is about 5× faster and at level 16 about 4×.
   At level 3 the CPU wins (9.4 GB/s against 7.4).
 - **The 8-thread column** is the closest thing here to the target machine, an 8-core gaming
-  PC. Against it the GPU is 14× faster at level 9, 8–10× at level 14 and 6–8× at level 16.
+  PC. Against it the GPU is 14× faster at level 9, 13× at level 14 and 10× at level 16.
   The 9950X3D's cores are faster than a typical gaming CPU's.
-- **`opt14` and `opt16` at `--batch max`:** the default budget allows 3586 blocks per batch.
-  On the 5090 only about 3400 fit on the GPU at once, so each batch runs a partial second
-  wave, which costs 20–24 %. A batch of 2900 avoids that.
+- **`opt14` and `opt16` at `--batch max`:** since the M6 kernel work (register diet, persistent
+  heaviest-first parse) a 3586-block batch fits one wave and is the fastest setting.
 - **Without subgroups:** `lvl9s12seg` runs at 8,569 MB/s with `GZC_NO_SUBGROUPS=1`, the
   portable kernels every GPU can run.
 - **Small cards:** an RTX 4060 has about 14 % of a 5090's compute. Projections, not
@@ -151,8 +150,6 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 - **Many devices per process on Metal.** Creating many GPU devices at once in one process can
   lose a device. Only the test suite does that, and it limits itself to 2 at a time
   (`GZC_GPU_TEST_SLOTS`).
-- **`opt14`/`opt16` at `--batch max`** pick a batch slightly too big for one wave on the 5090
-  (see above).
 - **Metal throughput:** subgroup kernels fall back to their slower versions on Metal, because
   wgpu reports Apple's subgroup width as 4–64. The fix is on the `metal-exp` branch.
 
