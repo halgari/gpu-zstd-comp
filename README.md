@@ -107,8 +107,7 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 - **Linux, RTX 5090, Vulkan:**
   - the full test suite, with and without subgroups;
   - full-corpus `--verify` for every preset;
-  - GPU vs CPU-reference differential tests at 16, 32 and 64 KiB blocks (and 128 KiB for the
-    level-3 to level-9 presets);
+  - GPU vs CPU-reference differential tests on synthetic and corpus blocks;
   - extra test modes that make shaders behave like Apple and AMD GPUs, fill every buffer with
     garbage before each batch (`GZC_POISON`), and stall threads at random (`GZC_EMULATE_SKEW`).
 - **macOS, M4 Pro, Metal:** the full test suite and a verified full-corpus benchmark of every
@@ -127,8 +126,6 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 - **The CPU baseline on the GTX 1660 Super machine** (Ryzen 5 7600X).
 - **Linux distributions other than the dev machine's (Arch-based),** and other driver versions.
 - **Other Apple chips** (M1–M3, base M4).
-- **Block sizes other than 64 KiB in the throughput tables.** Ratios at 16 and 32 KiB are
-  validated; speed is not.
 
 ## Known problems
 
@@ -166,8 +163,7 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 - `docs/results/`: dated results for each phase. `docs/superpowers/`: specs, plans and design
   notes.
 
-Block size is a compile-time feature on `gzc-core`/`gzc-gpu`/`gzc-bench`: exactly one of
-`block-16k`, `block-32k`, `block-64k` (default) or `block-128k`. All three crates must agree.
+Blocks are always 64 KiB and independent: each is one standard zstd frame.
 
 ## Build
 
@@ -179,13 +175,6 @@ cargo build --workspace
 
 ```sh
 cargo test --workspace
-```
-
-Non-default block size (all three feature-gated crates must agree):
-
-```sh
-cargo test --workspace --no-default-features \
-  --features gzc-core/block-16k,gzc-gpu/block-16k,gzc-bench/block-16k
 ```
 
 The portable (no-subgroup) kernels: `GZC_NO_SUBGROUPS=1 cargo test --workspace --release`.
@@ -255,36 +244,30 @@ and errors on any mismatch against the original block.
 parameters (`gzc_core::params::PRESETS`), one run per preset. Every preset runs on both `cpu-ref`
 and the GPU, byte for byte the same frames:
 
-| Preset | What it is | Compare against | ≥ libzstd L9 at |
-|---|---|---|---|
-| `lvl3` | dfast chains (8 B + 5 B), min match 5, depth 1, greedy | M3 output (byte-identical) / L3 | – |
-| `rung1` | single 4 B hash chain, depth 8, greedy | L5 | – |
-| `rung2` | `rung1` with a lazy parse | L6 | – |
-| `lvl9` | single 4 B hash chain, depth 32, lazy2 | L9 | 16, 32, 64, 128 KiB |
-| `lvl9seg` | `lvl9` with the parse split into independent 4 KiB segments (speed-2 E1) | L9 | 16, 32, 64, 128 KiB |
-| `lvl9s12` | `lvl9` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2) | L9 | 16, 32, 64, 128 KiB |
-| `lvl9s12seg` | `lvl9s12` + segmented parse: **the fastest preset validated at every block size** | L9 | 16, 32, 64, 128 KiB |
-| `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 | 16, 32, 64 KiB only (below L9 at 128 KiB) |
-| `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 | ≥ L14 at 16, 32, 64 KiB (the GPU runs it at ≤ 64 KiB) |
-| `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 | ≥ L16 at 16, 32, 64 KiB (the GPU runs it at ≤ 64 KiB) |
+| Preset | What it is | Compare against |
+|---|---|---|
+| `lvl3` | dfast chains (8 B + 5 B), min match 5, depth 1, greedy | M3 output (byte-identical) / L3 |
+| `rung1` | single 4 B hash chain, depth 8, greedy | L5 |
+| `rung2` | `rung1` with a lazy parse | L6 |
+| `lvl9` | single 4 B hash chain, depth 32, lazy2 | L9 |
+| `lvl9seg` | `lvl9` with the parse split into independent 4 KiB segments (speed-2 E1) | L9 |
+| `lvl9s12` | `lvl9` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2) | L9 |
+| `lvl9s12seg` | `lvl9s12` + segmented parse: the fastest preset at L9 ratio | L9 |
+| `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 |
+| `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 |
+| `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 |
 
-Full-corpus ratios (`gzc-bench ref`, which the GPU matches byte for byte) against libzstd L9 on
-the same block size:
+Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for byte):
 
-| Block | L9 | lvl9 | lvl9seg | lvl9s12 | lvl9s12seg | lvl9s12d16seg |
-|---|---:|---:|---:|---:|---:|---:|
-| 16 KiB | 1.30009 | 1.30024 | 1.30042 | 1.30023 | 1.30040 | 1.30017 |
-| 32 KiB | 1.31996 | 1.32131 | 1.32140 | 1.32128 | 1.32137 | 1.32107 |
-| 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
-| 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | 1.35159 |
-
-The same for `opt14`/`opt16` against libzstd L14/L16:
-
-| Block | L14 | opt14 | L16 | opt16 |
-|---|---:|---:|---:|---:|
-| 16 KiB | 1.32606 | 1.32765 | 1.32774 | 1.32794 |
-| 32 KiB | 1.34797 | 1.35105 | 1.35025 | 1.35158 |
-| 64 KiB | 1.36827 | 1.37064 | 1.37100 | 1.37144 |
+| Preset | Ratio | libzstd | libzstd ratio |
+|---|---:|---|---:|
+| `lvl9` | 1.33932 | L9 | 1.33786 |
+| `lvl9seg` | 1.33931 | L9 | 1.33786 |
+| `lvl9s12` | 1.33927 | L9 | 1.33786 |
+| `lvl9s12seg` | 1.33926 | L9 | 1.33786 |
+| `lvl9s12d16seg` | 1.33860 | L9 | 1.33786 |
+| `opt14` | 1.37064 | L14 | 1.36827 |
+| `opt16` | 1.37144 | L16 | 1.37100 |
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
