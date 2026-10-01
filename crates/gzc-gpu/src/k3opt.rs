@@ -19,6 +19,11 @@
 //! (`PriceSrc::Hist`). Only the final pass (at the preset's optLevel) writes its parse and runs
 //! the fix-up. `parses_from_passes` / `time_passes` are the host harnesses.
 //!
+//! M6 (`opt16p1`, B3): `inner_gap` (gap3), `relax_lengths` (top-N pruning) and `prior` (the S3
+//! prior tables) are compile-time options of the pass kernel (the M5 presets build the same
+//! kernels as before); with `drop_max_len > 0` `OptPasses` runs the drop pass (`K3Drop`,
+//! `shaders/k3_drop.wgsl`, `opt::drop_pass`) after the final pass's fix-up.
+//!
 //! Buffers per block: data (BLOCK_SIZE, plus the batch's trailing zero word: `ld32` reads one word
 //! past a block), candidate words (`compressor::best_bytes_for`, 8 B per position; after the DP
 //! each segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace

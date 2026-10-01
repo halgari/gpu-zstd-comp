@@ -979,10 +979,12 @@ fn k3opt_passes_timing() {
         eprintln!("blocks in heavy-first order");
     }
     let filter = std::env::var("GZC_TIMING_PRESETS").ok();
-    let presets: Vec<(&str, MatchParams)> = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)]
-        .into_iter()
-        .filter(|(n, _)| filter.as_ref().is_none_or(|f| f.split(',').any(|x| x == *n)))
-        .collect();
+    let all = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
+    // In GZC_TIMING_PRESETS' order (for A/B runs that alternate the order).
+    let presets: Vec<(&str, MatchParams)> = match &filter {
+        Some(f) => f.split(',').filter_map(|x| all.iter().find(|(n, _)| *n == x).copied()).collect(),
+        None => all.to_vec(),
+    };
     let s3 = presets.iter().any(|(_, m)| m.opt.unwrap().sparse_chains != OPT16.opt.unwrap().sparse_chains);
     let cands_s3 = if s3 { cands_of_m(&blocks, &OPT16P1) } else { Vec::new() };
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();

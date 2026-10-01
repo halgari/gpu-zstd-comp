@@ -9,7 +9,8 @@
 //   PRICE_MODE 1: the tables in `prices`, opt::Prices verbatim, 377 words per block: lit[256]
 //   ll[36] ml[53] of[32]). Then each lane runs opt::Dp::segment_ring over its segment: segment 0
 //   from ip 1 with INITIAL_REPS, segment k > 0 from ip = anchor = k*SEG with reps [0, 0, 0];
-//   iend = the segment end, ilimit = iend - 8.
+//   iend = the segment end, ilimit = iend - GAP for an inner segment, iend - 8 for the block's
+//   last one (opt::Seg::new; GAP = OptParams::inner_gap, 8 under the M5 presets, 3 for gap3).
 //   Phase 1, the DP:
 //   - The lane loop is flattened (one trip per series start probe or series position, no
 //     `continue`) so that the lanes' get_all_matches calls run together; each trip issues its
@@ -63,9 +64,15 @@
 //
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
 // (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
-// (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
-// LL_BITS / ML_BITS / ML_CODE (codes.rs), DEAD_BIT (reference::DEAD_BIT), SCHED_HDR
-// (k3_sched.wgsl), and the price ring's declaration (ring_p, rix).
+// (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices, from
+// the tables OptParams::prior names), LL_BITS / ML_BITS / ML_CODE (codes.rs), DEAD_BIT
+// (reference::DEAD_BIT), SCHED_HDR (k3_sched.wgsl), GAP (OptParams::inner_gap), RELAX_N
+// (OptParams::relax_lengths, 0 for None), and the price ring's declaration (ring_p, rix).
+//
+// M6 options (opt16p1; compile-time, so the M5 presets build the same kernels as before): GAP
+// (ilimit above), RELAX_N (relaxation pruning, opt::Dp::relax_floor: an explicit record relaxes
+// only its RELAX_N longest lengths, see the relaxation loop) and the PR_* tables. The drop pass
+// (OptParams::drop_max_len) is its own kernel after the fix-up, k3_drop.wgsl.
 //
 // Persistent passes (M6 A4, a07): with WG == NSEG the host runs the entry point main_opt_persist
 // instead of main_opt. The grid is the same (one workgroup per block), but each workgroup loops:

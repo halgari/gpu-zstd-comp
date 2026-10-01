@@ -241,15 +241,26 @@ fn main_drop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         var kstart = 0u;
         var kend = 0u;
         var kml = 0u;
-        // The match start of the current sequence, the end of the previous one's match.
+        // The end of the previous sequence's match.
         var prev_end = k * SEG - d_carry[k];
+        // The current sequence's words, loaded with the previous one's as its successor (one
+        // memory round per sequence: the successor's words and the match bytes together).
+        var q = sbase + 3u * f;
+        var nll = seqs[q];
+        var nml = seqs[q + 1u];
+        var nob = seqs[q + 2u];
         // Terminates: i rises to n.
         for (var i = 0u; i < n; i += 1u) {
             let j = f + i;
-            let q = sbase + 3u * j;
-            let ll_j = seqs[q];
-            let ml = seqs[q + 1u];
-            let ob_in = seqs[q + 2u];
+            let ll_j = nll;
+            let ml = nml;
+            let ob_in = nob;
+            // The successor j + 1 (possibly in a later segment; the last sequence has none).
+            let has_next = j + 1u < n_all;
+            q += select(0u, 3u, has_next);
+            nll = seqs[q];
+            nml = seqs[q + 1u];
+            nob = seqs[q + 2u];
             let s = prev_end + ll_j;
             prev_end = s + ml;
             let off = offset_of(rin, ob_in, ll_j);
@@ -257,16 +268,18 @@ fn main_drop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
             let ll = ll_j + carry;
             let ob = ob_for(r, off, ll);
             var dropped = false;
-            if (ml <= DROP_MAX && ob > 3u && j + 1u < n_all) {
-                let nll = seqs[q + 3u];
-                let nml = seqs[q + 4u];
+            if (ml <= DROP_MAX && ob > 3u && has_next) {
                 // rin: the true reps before j + 1.
-                let noff = offset_of(rin, seqs[q + 5u], nll);
+                let noff = offset_of(rin, nob, nll);
                 let after = applied(r, ob, ll);
                 let keep = seq_price(ll, ml, ob) + seq_price(nll, nml, ob_for(after, noff, nll));
                 var lits = 0;
-                // Terminates: e rises to s + ml.
-                for (var e = s; e < s + ml; e += 1u) { lits += d_price[load_byte(db, e)]; }
+                // A fixed trip count, so the byte loads issue together (the addresses stay in
+                // the match: s + ml <= BLOCK_SIZE).
+                for (var e = 0u; e < DROP_MAX; e += 1u) {
+                    let c = d_price[load_byte(db, s + min(e, ml - 1u))];
+                    lits += select(0, c, e < ml);
+                }
                 let mll = ll + ml + nll;
                 let drop = lits + seq_price(mll, nml, ob_for(r, noff, mll));
                 dropped = drop < keep;
