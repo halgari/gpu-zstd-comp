@@ -150,22 +150,29 @@ pub fn scratch_bytes_per_block(m: &MatchParams) -> u64 {
     n_seg(m) as u64 * (suff_of(m) as u64 + 1) * 12
 }
 
-/// Workgroup bytes of the price tables (and the prologue's histogram and sums, which also hold a
-/// `hist_out` pass's histogram) for `bpw` blocks.
-fn price_table_bytes(bpw: u32, target_length: u32) -> u32 {
-    bpw * (128 + 64 + 36 + (target_length + 1) + 32 + 256 + 5) * 4
-}
-
-/// Workgroup bytes `K3Opt` needs with its rings in workgroup memory.
+/// Workgroup bytes `K3Opt`'s DP entry point needs with its rings in workgroup memory.
 pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     ring_bytes(cfg.wg, suff_of(m)) + table_bytes(m, cfg)
 }
 
-/// Workgroup bytes `K3Opt` needs besides the rings: the price tables (and the fix-up's arrays).
+/// Workgroup bytes of the DP entry point besides the rings, per pass (M6 A1), exactly what
+/// `k3_opt.wgsl` declares for `bpw` blocks per workgroup:
+/// - `p_lit`: 128 words of u16 literal-price pairs per block;
+/// - `p_tab`: the LL-by-code (36), LL-by-litlen (64), ML (`target_length + 1`) and OF (32)
+///   prices as u16 pairs per block;
+/// - `hist`: 256 words per block when the pass counts literals (`BlockInit`, `Prior`) or writes
+///   its histogram (`hist_out`), else one word;
+/// - `hsum`: 5 words per block, one word for `PriceSrc::Buffer`.
+///
+/// The fix-up's per-segment arrays belong to its own entry point (`main_fixup`, 12 B per
+/// segment), which wgpu compiles alone; they are not part of this pipeline.
 fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
-    let n_seg = n_seg(m);
-    let bpw = (cfg.wg / n_seg).max(1);
-    price_table_bytes(bpw, suff_of(m)) + 3 * 4 * n_seg + 64
+    let bpw = (cfg.wg / n_seg(m)).max(1);
+    let tab_words = (36 + 64 + (suff_of(m) + 1) + 32).div_ceil(2);
+    let hist_used = cfg.hist_out || matches!(cfg.prices, PriceSrc::BlockInit | PriceSrc::Prior);
+    let hist = if hist_used { 256 * bpw } else { 1 };
+    let hsum = if cfg.prices == PriceSrc::Buffer { 1 } else { 5 * bpw };
+    (bpw * (128 + tab_words) + hist + hsum) * 4
 }
 
 /// The ring memory `K3Opt::new` uses for `cfg` under a workgroup storage limit of `limit` bytes:
@@ -458,7 +465,7 @@ impl K3Opt {
         let ring_decl = match ring {
             RingMem::Workgroup => {
                 "var<workgroup> ring_p: array<i32, RING_N * WG>;\n\
-                 fn rix(s: u32) -> u32 { return s * WG + lane; }\n"
+                 fn rix(s: u32) -> u32 { return s * WG + lane_id(); }\n"
             }
             RingMem::Private => {
                 "var<private> ring_p: array<i32, RING_N>;\n\
