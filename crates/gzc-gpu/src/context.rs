@@ -116,6 +116,12 @@ pub(crate) fn env_on(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v != "0")
 }
 
+/// Pipeline compilation options; `GZC_NO_WG_ZERO=1` turns off wgpu's workgroup-memory
+/// zero-initialisation (experiment a12-metal: every kernel must write before it reads).
+pub(crate) fn compile_opts() -> wgpu::PipelineCompilationOptions<'static> {
+    wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: !env_on("GZC_NO_WG_ZERO"), ..Default::default() }
+}
+
 /// A default-on knob set to `0` (see `env_on`).
 pub(crate) fn env_off(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == "0")
@@ -205,10 +211,18 @@ impl Prepared {
     }
 
     pub fn context(&self, device: wgpu::Device, queue: wgpu::Queue) -> GpuContext {
+        let mut adapter_info = self.info.clone();
+        // Experiment (a12-metal): Apple GPUs run every compute pipeline at SIMD width 32, but wgpu
+        // reports 4..=64, which sends K1, the sorted K1 and K3coop to their fallbacks. The kernels'
+        // self-tests / lane probe still guard the assumption.
+        if env_on("GZC_METAL_SG32") && adapter_info.backend == wgpu::Backend::Metal && self.subgroups {
+            adapter_info.subgroup_min_size = 32;
+            adapter_info.subgroup_max_size = 32;
+        }
         GpuContext {
             device,
             queue,
-            adapter_info: self.info.clone(),
+            adapter_info,
             timestamps: self.timestamps,
             timestamps_inside_encoders: self.timestamps_inside_encoders,
             subgroups: self.subgroups,
@@ -375,6 +389,14 @@ impl GpuContext {
         } else {
             src.into()
         };
+        if let Some(dir) = std::env::var_os("GZC_DUMP_WGSL") {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            src.hash(&mut h);
+            let tag = if !checks.bounds_checks { "trusted" } else if !checks.force_loop_bounding { "unbounded" } else { "checked" };
+            let path = std::path::Path::new(&dir).join(format!("{label}.{tag}.{:016x}.wgsl", h.finish()));
+            let _ = std::fs::write(path, src.as_bytes());
+        }
         // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
         // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
         // the K3 argument is at its call site in `Kernels::new`). Fully checked modules need no

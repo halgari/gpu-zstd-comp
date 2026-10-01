@@ -478,7 +478,11 @@ impl K3Opt {
             "k3opt",
             &[true, false, false, false, false, false, false],
         );
-        let module = if cfg.unbounded {
+        let module = if cfg.unbounded && crate::context::env_on("GZC_K3_TRUSTED") {
+            // Experiment (a12-metal): no buffer/index clamps (Metal has no robust buffer access, so
+            // the unbounded module clamps every storage access there). No safety argument yet.
+            ctx.shader_trusted("k3_opt", &body)
+        } else if cfg.unbounded {
             ctx.shader_unbounded_loops("k3_opt", &body)
         } else {
             ctx.shader("k3_opt", &body)

@@ -134,7 +134,7 @@ impl SortKernel {
                 layout: Some(&pipeline_layout),
                 module: &module,
                 entry_point: Some(entry_point),
-                compilation_options: Default::default(),
+                compilation_options: crate::context::compile_opts(),
                 cache: None,
             })
         };

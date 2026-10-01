@@ -837,9 +837,10 @@ fn dp(b: u32, k: u32) {
                             let v2 = mlen - 2u >= lo;
                             let v3 = mlen - 3u >= lo;
                             let s0 = slot(c0 + mlen);
-                            let s1 = slot(c0 + mlen - 1u);
-                            let s2 = slot(c0 + mlen - 2u);
-                            let s3 = slot(c0 + mlen - 3u);
+                            // One modulo per step (a12-metal): slot(x - 1) from slot(x).
+                            let s1 = select(s0 - 1u, RING_N - 1u, s0 == 0u);
+                            let s2 = select(s1 - 1u, RING_N - 1u, s1 == 0u);
+                            let s3 = select(s2 - 1u, RING_N - 1u, s2 == 0u);
                             let pr0 = mp + p_ml[pb * RING_N + mlen];
                             let pr1 = mp + p_ml[pb * RING_N + mlen - 1u];
                             let pr2 = mp + p_ml[pb * RING_N + mlen - 2u];

@@ -491,7 +491,7 @@ pub(crate) fn pipeline_from_module(
         layout: Some(&pipeline_layout),
         module,
         entry_point: Some(entry_point),
-        compilation_options: Default::default(),
+        compilation_options: crate::context::compile_opts(),
         cache: None,
     })
 }
