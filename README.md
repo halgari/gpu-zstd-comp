@@ -267,6 +267,12 @@ by `0` only.
   read back on the main queue).
 - `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
   time runs without per-kernel timestamp queries.
+- `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW` (anything but `0`) — **test only**: every
+  shader is rewritten (through naga) to behave as on other GPUs: shifts take their amount mod 32
+  (Apple, AMD; NVIDIA gives 0 for a shift by 32 or more), and a store to one component of a
+  workgroup vector is a read-modify-write of the whole vector (Apple's Metal, which corrupted
+  every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
+  differential suite with both on (`gzc_gpu::emulate`).
 - `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that

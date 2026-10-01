@@ -585,10 +585,7 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
          }}\n"
     );
     with_error_scopes(ctx, || {
-        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("k3_probe"),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
+        let module = ctx.wgsl_module("k3_probe", &src, wgpu::ShaderRuntimeChecks::checked());
         let layout = storage_layout(ctx, "k3_probe", &[false]);
         let pipeline = pipeline_from_module(ctx, "k3_probe", &layout, &module, "main");
         let buf = ctx.storage_buffer("k3_probe", 5 * 4 * n as u64, true);

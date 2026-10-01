@@ -699,6 +699,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "gzc-core",
+ "naga",
  "pollster",
  "wgpu",
  "zstd",

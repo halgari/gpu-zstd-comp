@@ -20,6 +20,9 @@ anyhow = { workspace = true }
 # The Vulkan types behind wgpu-hal's escape hatches (same version wgpu-hal 30 uses): the ReBAR
 # probe (`context::rebar`) and the extra queues of the multi-queue path.
 ash = "0.38"
+# wgpu's own naga (same version): `GZC_EMULATE_SHIFT_MOD32` rewrites shaders through it
+# (`context::shift_mod32_wgsl`).
+naga = { version = "30", features = ["wgsl-in", "wgsl-out"] }
 
 # wgpu-hal only exports its Vulkan API types (`hal::api::Vulkan`, used by the transfer-queue and
 # ReBAR paths) when its `vulkan` backend is compiled, which on Apple targets needs

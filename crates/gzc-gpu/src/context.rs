@@ -3,6 +3,8 @@ use anyhow::{Context as _, anyhow};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, NO_POS, PARSE_END};
 use gzc_core::params::MatchParams;
 
+pub use crate::emulate::Emulation;
+
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
 pub struct GpuContext {
@@ -48,6 +50,8 @@ pub struct GpuContext {
     /// whenever `MAPPABLE_PRIMARY_BUFFERS` exists (for measurements: without ReBAR the kernels
     /// would read the batch over PCIe).
     pub direct_upload: bool,
+    /// Other GPUs' semantics emulated in every shader module (`GpuOptions::emulate`).
+    pub emulate: Emulation,
 }
 
 /// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
@@ -64,12 +68,21 @@ pub struct GpuOptions {
     /// The transfer-queue readback (E3) where the adapter supports it (`GZC_TRANSFER_QUEUE=0`
     /// turns it off).
     pub transfer_queue: bool,
+    /// Test aid: rewrite every shader to behave as it would on other GPUs (`Emulation`). The
+    /// `GZC_EMULATE_*` variables turn their part on for every context, whatever the options.
+    pub emulate: Emulation,
 }
 
 impl Default for GpuOptions {
     /// Everything on where supported, ignoring the environment.
     fn default() -> Self {
-        Self { subgroups: true, pack_frames: false, direct_upload: None, transfer_queue: true }
+        Self {
+            subgroups: true,
+            pack_frames: false,
+            direct_upload: None,
+            transfer_queue: true,
+            emulate: Emulation::NONE,
+        }
     }
 }
 
@@ -85,6 +98,7 @@ impl GpuOptions {
                 _ => None,
             },
             transfer_queue: !env_off("GZC_TRANSFER_QUEUE"),
+            emulate: Emulation::from_env(),
         }
     }
 }
@@ -169,6 +183,7 @@ pub(crate) struct Prepared {
     pub mappable_storage: bool,
     pub pack_frames: bool,
     pub direct_upload: bool,
+    pub emulate: Emulation,
     pub required_features: wgpu::Features,
     pub required_limits: wgpu::Limits,
 }
@@ -193,6 +208,7 @@ impl Prepared {
             mappable_storage: self.mappable_storage,
             pack_frames: self.pack_frames,
             direct_upload: self.direct_upload,
+            emulate: self.emulate,
             transfer: None,
         }
     }
@@ -259,6 +275,7 @@ impl Prepared {
             mappable_storage,
             pack_frames,
             direct_upload,
+            emulate: opts.emulate.or(Emulation::from_env()),
             required_features,
             required_limits,
         })
@@ -266,6 +283,36 @@ impl Prepared {
 }
 
 impl GpuContext {
+    /// One line naming the adapter and what the context runs with, e.g.
+    /// `adapter: NVIDIA GeForce RTX 5090 (Vulkan, driver NVIDIA 610.57.04); subgroups: on (32..=32);
+    /// timestamps: on; direct upload: on; transfer queue: on; pack: off; workgroup storage: 49152 B`.
+    pub fn describe(&self) -> String {
+        let i = &self.adapter_info;
+        let on = |b: bool| if b { "on" } else { "off" };
+        let subgroups = if self.subgroups {
+            format!("on ({}..={})", i.subgroup_min_size, i.subgroup_max_size)
+        } else {
+            "off".to_string()
+        };
+        let mut line = format!(
+            "adapter: {} ({:?}, driver {} {}); subgroups: {subgroups}; timestamps: {}; direct upload: {}; \
+             transfer queue: {}; pack: {}; workgroup storage: {} B",
+            i.name,
+            i.backend,
+            i.driver,
+            i.driver_info,
+            on(self.timestamps),
+            on(self.direct_upload),
+            on(self.transfer.is_some()),
+            on(self.pack_frames),
+            self.device.limits().max_compute_workgroup_storage_size,
+        );
+        if self.emulate.any() {
+            line += &format!("; emulating {:?}", self.emulate);
+        }
+        line
+    }
+
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
     pub fn shader(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         self.shader_with(label, body, wgpu::ShaderRuntimeChecks::checked())
@@ -308,12 +355,24 @@ impl GpuContext {
 
     fn shader_with(&self, label: &str, body: &str, checks: wgpu::ShaderRuntimeChecks) -> wgpu::ShaderModule {
         let src = format!("{}\n{}\n{}", constants_wgsl(), COMMON_WGSL, body);
+        self.wgsl_module(label, &src, checks)
+    }
+
+    /// Creates a module from complete WGSL `src` (no templating) with `checks`, rewritten for
+    /// `emulate` (a test aid). Every module of the crate goes through here.
+    pub(crate) fn wgsl_module(&self, label: &str, src: &str, checks: wgpu::ShaderRuntimeChecks) -> wgpu::ShaderModule {
+        let src: std::borrow::Cow<str> = if self.emulate.any() {
+            self.emulate.rewrite(src).unwrap_or_else(|e| panic!("shader emulation: rewriting {label}: {e}")).into()
+        } else {
+            src.into()
+        };
         // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
         // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
-        // the K3 argument is at its call site in `Kernels::new`).
+        // the K3 argument is at its call site in `Kernels::new`). Fully checked modules need no
+        // guarantee.
         unsafe {
             self.device.create_shader_module_trusted(
-                wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) },
+                wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src) },
                 checks,
             )
         }
