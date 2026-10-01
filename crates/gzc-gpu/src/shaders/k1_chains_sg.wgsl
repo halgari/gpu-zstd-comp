@@ -33,6 +33,12 @@
 //
 // Assumes a workgroup's subgroups are full and equally sized (256 is a multiple of the subgroup
 // size), so li covers 0..256 exactly once.
+//
+// Every subgroup operation runs in subgroup-uniform control flow, and no operand comes straight
+// out of a lane-dependent branch: the hash is computed before a barrier (see `h` below) and
+// chunk_first uses `&` (naga lowers `&&` to an `if`), so nothing relies on the lanes reconverging
+// after divergence (VK_KHR_shader_maximal_reconvergence is not enabled;
+// .superpowers/m6-research/subgroup-audit.md).
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read_write> head: array<atomic<u32>>;
@@ -171,6 +177,13 @@ fn main(
         let tag = (j + 1u) << LOG2_BLOCK;
         // This lane's data words for the current tile; the next tile's are loaded a tile ahead.
         var words = load_words(base, li);
+        // This lane's hash for the current tile, computed a tile ahead (before the previous tile's
+        // closing storageBarrier; the first tile's here, before a barrier of its own). The
+        // ballots that consume h then follow a barrier, not the per-lane branches that built it
+        // (load_words' bound, chain_hash_words' byte shift). It also hides the hash's latency:
+        // K1 11 % faster than computing it at the top of the tile (RTX 5090, lvl9seg).
+        var h = chain_hash_words(words, li, chain);
+        workgroupBarrier();
 
         for (var t0 = 0u; t0 < HASHED_POSITIONS; t0 += T) {
             let mb = parity * CHUNKS * 5u;
@@ -180,11 +193,11 @@ fn main(
             let live = p < HASHED_POSITIONS;
             let cur = words;
             words = load_words(base, p + T);
-            var h = 0u;
-            if (live) { h = chain_hash_words(cur, p, chain); }
+            // A dead lane's h (from zero words) is masked out by the live ballot. chunk_first is
+            // built without a lane-dependent branch (`&`, not `&&`, which naga lowers to an `if`).
             let eq = publish(h, live, word, cl, mb + chunk * 5u);
             let lower = eq & below;
-            let chunk_first = live && lower == 0u;
+            let chunk_first = live & (lower == 0u);
             // A chunk-first lane may be its hash's first in the tile: load head[h] now so the load
             // overlaps the barrier and the matching; it is only used (and head[h] only written)
             // by the tile-first lane, after the barrier.
@@ -238,6 +251,7 @@ fn main(
                 }
                 pred_out[pb + p] = pred_word(pr, fp_words(cur, p, chain));
             }
+            h = chain_hash_words(words, p + T, chain);
             storageBarrier();
         }
 
