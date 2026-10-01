@@ -32,6 +32,11 @@ pub struct GpuContext {
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
     pub timestamps: bool,
+    /// The adapter can also write timestamps inside encoders
+    /// (`Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`, not requested). Without it (Metal on Apple
+    /// GPUs: counters sampled at stage boundaries only) the pipeline's timers are pass-boundary
+    /// samples that the device may leave unwritten, see `PipelineStats::kernel_ms`.
+    pub timestamps_inside_encoders: bool,
     /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
     /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
     /// otherwise the workgroup-sort fallback. K3 runs its cooperative kernel
@@ -179,6 +184,7 @@ pub(crate) struct Prepared {
     pub adapter: wgpu::Adapter,
     pub info: wgpu::AdapterInfo,
     pub timestamps: bool,
+    pub timestamps_inside_encoders: bool,
     pub subgroups: bool,
     pub mappable_storage: bool,
     pub pack_frames: bool,
@@ -204,6 +210,7 @@ impl Prepared {
             queue,
             adapter_info: self.info.clone(),
             timestamps: self.timestamps,
+            timestamps_inside_encoders: self.timestamps_inside_encoders,
             subgroups: self.subgroups,
             mappable_storage: self.mappable_storage,
             pack_frames: self.pack_frames,
@@ -255,6 +262,7 @@ impl Prepared {
         if timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        let timestamps_inside_encoders = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         if subgroups {
             required_features |= wgpu::Features::SUBGROUP;
         }
@@ -271,6 +279,7 @@ impl Prepared {
             adapter,
             info,
             timestamps,
+            timestamps_inside_encoders,
             subgroups,
             mappable_storage,
             pack_frames,

@@ -71,7 +71,12 @@ pub struct PipelineStats {
     /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
     /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals), in milliseconds;
     /// empty when the device has no timestamp queries; a kernel whose timestamps the device left
-    /// unwritten is left out.
+    /// unwritten (in any batch) is left out. That happens on Metal (an M4 Pro): with counters
+    /// sampled at stage boundaries only (no `TIMESTAMP_QUERY_INSIDE_ENCODERS`) it left K4's pair,
+    /// the last kernel's, unwritten in some batch of the optimal parse's frame-path test (batches
+    /// of 16 and 2 blocks; the bench's larger batches time it), though that pass samples like
+    /// every other kernel's: its own compute encoder, begin and end on the pass, every slot
+    /// written before the resolve in the same submission.
     pub kernel_ms: Vec<(String, f64)>,
     /// Wall time from the first upload to the last block handed to the sink.
     pub wall_s: f64,
@@ -524,6 +529,10 @@ pub struct Pipeline<'a> {
     /// (then the hook clears).
     #[cfg(test)]
     fail_submits_after: Option<u32>,
+    /// Test hook: the completion thread waits as on Metal (`Completion::poll_only`) whatever the
+    /// backend.
+    #[cfg(test)]
+    poll_only: bool,
 }
 
 impl Drop for Pipeline<'_> {
@@ -760,6 +769,8 @@ impl<'a> Pipeline<'a> {
             fail_deliveries_after: None,
             #[cfg(test)]
             fail_submits_after: None,
+            #[cfg(test)]
+            poll_only: false,
         })
     }
 
@@ -907,6 +918,11 @@ impl<'a> Pipeline<'a> {
         let fail_after = self.fail_deliveries_after.take();
         #[cfg(not(test))]
         let fail_after = None;
+        let metal = self.ctx.adapter_info.backend == wgpu::Backend::Metal;
+        #[cfg(test)]
+        let poll_only = metal || self.poll_only;
+        #[cfg(not(test))]
+        let poll_only = metal;
         let completion = Completion {
             ctx: self.ctx,
             xfer: self.xfer.as_ref().map(|x| (x.tq.clone(), x.t_done.clone())),
@@ -915,6 +931,7 @@ impl<'a> Pipeline<'a> {
             n_kernels: names.len(),
             last_kernel_end: 2 * names.iter().position(|&k| k == last).expect("last kernel is timed") + 1,
             timed: self.ctx.timestamps,
+            poll_only,
             fail_after,
         };
         let shared = self.shared.clone();
@@ -966,8 +983,15 @@ impl<'a> Pipeline<'a> {
         }
         let end = Instant::now();
         let wall_s = (end - start).as_secs_f64();
-        scopes.pop()?;
-        let (batches, pprof) = result?;
+        // A failed stream reports its own error first: the scope may hold one raised by
+        // `abandon`'s cleanup, e.g. after a lost device (wgpu-core destroys every buffer, so the
+        // unmap of an in-flight staging buffer fails), which must not mask the cause.
+        let (batches, pprof) = match (result, scopes.pop()) {
+            (Err(e), Err(scope)) => return Err(e.context(format!("stream failed (wgpu errors meanwhile: {scope:#})"))),
+            (Err(e), Ok(())) => return Err(e),
+            (Ok(_), Err(scope)) => return Err(scope),
+            (Ok(r), Ok(())) => r,
+        };
 
         // Timers whose timestamps the device did not write are left out, as without timestamps.
         let (kernel_ms, gpu_ms) = if self.ctx.timestamps {
@@ -1185,6 +1209,17 @@ struct Completion<'c> {
     /// Index of the last kernel's end query.
     last_kernel_end: usize,
     timed: bool,
+    /// Wait for a batch by polling (`PollType::Poll`) until its staging map completes, never with
+    /// `PollType::Wait`; on Metal. wgpu-hal 30's Metal `Device::wait` errors with
+    /// `DeviceError::Lost` ("No active command buffers for fence value") when it runs while a
+    /// `queue.submit` on another thread (the producer's next batch) is between `Fence::maintain`,
+    /// which drops command buffers whose status is already `Completed` although their completion
+    /// handler has not yet raised the fence value, and pushing its own command buffer: it then
+    /// finds the fence below the value and no pending command buffer that will reach it.
+    /// wgpu-core turns that into a lost device and destroys every buffer (which surfaced as
+    /// "Buffer with 'pipeline.staging' label has been destroyed" from `abandon`'s unmap). A
+    /// non-blocking poll never calls `Device::wait`.
+    poll_only: bool,
     /// Test hook: the delivery after this many more fails (then the hook clears).
     fail_after: Option<u32>,
 }
@@ -1249,13 +1284,28 @@ impl Completion<'_> {
                 break;
             }
             let t = Instant::now();
-            match &self.xfer {
-                Some((tq, t_done)) => {
+            // The staging map's result, when the wait already took it.
+            let mut mapped = None;
+            match (&self.xfer, &job.mapped) {
+                (Some((tq, t_done)), _) => {
                     tq.wait(t_done, job.seq)?;
                     // Deliver the upload buffers' map callbacks of completed submissions.
                     self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
                 }
-                None => {
+                (None, Some(rx)) if self.poll_only => {
+                    // The map completes with the submission (the staging buffer's last use).
+                    mapped = Some(loop {
+                        self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
+                        match rx.recv_timeout(std::time::Duration::from_micros(200)) {
+                            Ok(r) => break r,
+                            // The producer failed: deliver nothing more, as above.
+                            Err(mpsc::RecvTimeoutError::Timeout) if self.shared.aborted() => return Ok(()),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("staging map callback dropped"),
+                        }
+                    });
+                }
+                (None, _) => {
                     let wait = wgpu::PollType::Wait { submission_index: Some(job.submission.clone()), timeout: None };
                     self.ctx.device.poll(wait).context("device poll")?;
                 }
@@ -1263,7 +1313,7 @@ impl Completion<'_> {
             let done = Instant::now();
             prof.wait += (done - t).as_secs_f64();
             prof.last_wait = Some(done);
-            let lease = self.lease(&job)?;
+            let lease = self.lease(&job, mapped)?;
             if self.timed {
                 self.add_timestamps(lease.bytes(), prof);
             }
@@ -1281,14 +1331,21 @@ impl Completion<'_> {
         Ok(())
     }
 
-    /// Lends out `job`'s staging bytes (its batch completed).
-    fn lease(&self, job: &Job) -> anyhow::Result<Lease> {
+    /// Lends out `job`'s staging bytes (its batch completed); `mapped`: the staging map's result
+    /// if the wait already received it.
+    fn lease(&self, job: &Job, mapped: Option<Result<(), wgpu::BufferAsyncError>>) -> anyhow::Result<Lease> {
         let (view, ptr, len) = match &*job.staging {
             Staging::Wgpu(staging) => {
-                let rx = job.mapped.as_ref().context("wgpu staging without a map request")?;
-                // The submission completed, so its map callback has run or is running (on
-                // whichever thread polled: the producer polls too).
-                rx.recv().context("staging map callback dropped")?.context("map staging buffer")?;
+                let r = match mapped {
+                    Some(r) => r,
+                    None => {
+                        let rx = job.mapped.as_ref().context("wgpu staging without a map request")?;
+                        // The submission completed, so its map callback has run or is running
+                        // (on whichever thread polled: the producer polls too).
+                        rx.recv().context("staging map callback dropped")?
+                    }
+                };
+                r.context("map staging buffer")?;
                 let view = staging.get_mapped_range(..).map_err(|e| anyhow!("mapped range: {e}"))?;
                 let (ptr, len) = (view.as_ptr(), view.len());
                 (Some(view), ptr, len)
@@ -1744,6 +1801,24 @@ mod tests {
         }
     }
 
+    /// The frame path's kernel timers (Huffman literals): all five, each positive. The one
+    /// exception: on an adapter that samples timestamps at pass boundaries only (no
+    /// `TIMESTAMP_QUERY_INSIDE_ENCODERS`: Metal on Apple GPUs), the device may leave the last
+    /// kernel's (K4's) pair unwritten, so `kernel_ms` leaves K4 out (`PipelineStats::kernel_ms`);
+    /// every other timer must still be there.
+    fn assert_frame_timers(ctx: &GpuContext, stats: &PipelineStats, what: &str) {
+        if !ctx.timestamps {
+            assert!(stats.kernel_ms.is_empty(), "{what}: {:?}", stats.kernel_ms);
+            return;
+        }
+        let all = ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"];
+        let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
+        if ctx.timestamps_inside_encoders || names != ["k1_chains", "k2_best", "k3_parse", "k5_huffman"] {
+            assert_eq!(names, all, "{what}");
+        }
+        assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{what}: {:?}", stats.kernel_ms);
+    }
+
     fn cfg(batch: u32, inflight: u32) -> PipelineConfig {
         PipelineConfig { batch, inflight, params: GpuParams { matching: LVL3, emit_frames: false, huffman: true } }
     }
@@ -1950,11 +2025,7 @@ mod tests {
                     for (i, got) in sink.0.into_iter().enumerate() {
                         assert!(got.unwrap() == want[i % distinct.len()], "{name} {matching:?}: index {i}");
                     }
-                    if ctx.timestamps {
-                        let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
-                        assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"]);
-                        assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{name}: {:?}", stats.kernel_ms);
-                    }
+                    assert_frame_timers(ctx, &stats, name);
                 }
             }
             // The parse path: the `seqs` readback at MAX_SEQS_OPT per block.
@@ -1988,11 +2059,7 @@ mod tests {
             assert!(*got == want[i % distinct.len()], "index {i}: GPU frame != CPU frame");
         }
         assert_eq!(stats.batches, 16);
-        if ctx.timestamps {
-            let names: Vec<&str> = stats.kernel_ms.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, ["k1_chains", "k2_best", "k3_parse", "k4_entropy", "k5_huffman"]);
-            assert!(stats.kernel_ms.iter().all(|&(_, ms)| ms > 0.0), "{:?}", stats.kernel_ms);
-        }
+        assert_frame_timers(&ctx, &stats, "lvl3");
     }
 
     /// The packing readback (`GZC_PACK`) delivers the same frames: Huffman and raw literals,
@@ -2260,6 +2327,143 @@ mod tests {
                 collected.check(total, |i| want[i % distinct.len()].clone(), &format!("{name} round {round}"));
             }
         }
+    }
+
+    /// Lease lifetimes under stress, in every mode and with both completion waits (`poll_only`,
+    /// Metal's): the sink hands every `FrameBatch` to a holder thread that keeps up to
+    /// `inflight - 1` of them and drops them out of order after random delays (a batch whenever
+    /// none arrives for up to a millisecond: the producer may be waiting for it), and still holds
+    /// the last ones when the producer finishes and the completion thread closes the channel
+    /// (the stream's end waits for them, `wait_released`); some streams fail mid-way
+    /// (`fail_deliveries_after`), so `abandon` runs while batches are held. Every frame read
+    /// right before its batch drops equals the CPU's, every stream's errors are its own, and the
+    /// pipeline is reused and dropped right after a stream whose last batches another thread
+    /// released.
+    #[test]
+    fn stream_frames_leases_held_across_stream_end() {
+        let distinct = distinct_blocks();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        let blocks: Vec<&[u8]> = (0..120).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 | 1;
+        eprintln!("seed {seed}");
+        for (name, ctx) in &mode_contexts() {
+            let poll_modes: &[bool] = if ctx.transfer.is_some() { &[false] } else { &[false, true] };
+            for &poll_only in poll_modes {
+                let inflight = 3;
+                let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 4, inflight, params }).unwrap();
+                pipe.poll_only = poll_only;
+                for round in 0..6 {
+                    let fail_at = (round % 3 == 2).then_some(round as u32 * 2);
+                    pipe.fail_deliveries_after = fail_at;
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let mut rng = seed;
+                    let (tx, rx) = mpsc::channel::<FrameBatch>();
+                    let what = format!("{name} poll_only={poll_only} round {round}");
+                    let (r, seen) = std::thread::scope(|s| {
+                        let want = &want;
+                        let what = &what;
+                        let holder = s.spawn(move || {
+                            let mut next = || {
+                                rng ^= rng << 13;
+                                rng ^= rng >> 7;
+                                rng ^= rng << 17;
+                                rng
+                            };
+                            let mut held: Vec<FrameBatch> = Vec::new();
+                            let mut seen = 0;
+                            let release = |b: FrameBatch, seen: &mut usize| {
+                                for (i, f) in b.frames() {
+                                    assert!(f == want[i % want.len()], "{what}: index {i}");
+                                }
+                                *seen += b.len();
+                                drop(b);
+                            };
+                            // The producer reuses the slots in turn, so holding the oldest
+                            // batch stalls it: release a random held batch whenever none
+                            // arrives for a while, and whenever `inflight - 1` are held.
+                            loop {
+                                match rx.recv_timeout(std::time::Duration::from_micros(300 + next() % 700)) {
+                                    Ok(b) => held.push(b),
+                                    Err(mpsc::RecvTimeoutError::Timeout) if !held.is_empty() => {
+                                        let k = next() as usize % held.len();
+                                        release(held.swap_remove(k), &mut seen);
+                                    }
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                }
+                                while held.len() >= inflight as usize {
+                                    let k = next() as usize % held.len();
+                                    std::thread::sleep(std::time::Duration::from_micros(next() % 500));
+                                    release(held.swap_remove(k), &mut seen);
+                                }
+                            }
+                            // The channel closed: the producer is done and the stream waits for
+                            // these.
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            while !held.is_empty() {
+                                let k = next() as usize % held.len();
+                                std::thread::sleep(std::time::Duration::from_micros(next() % 500));
+                                release(held.swap_remove(k), &mut seen);
+                            }
+                            seen
+                        });
+                        let r = pipe.stream_frames(
+                            move |b| tx.send(b).map_err(|_| anyhow!("holder gone")),
+                            |stream| stream.upload_blocks(&blocks),
+                        );
+                        (r, holder.join().unwrap())
+                    });
+                    match fail_at {
+                        Some(_) => {
+                            let e = format!("{:#}", r.expect_err("injected delivery failure"));
+                            assert!(e.contains("injected delivery failure"), "{what}: {e}");
+                        }
+                        None => {
+                            let stats = r.unwrap_or_else(|e| panic!("{what}: {e:#}"));
+                            assert_eq!(stats.batches as usize, blocks.len().div_ceil(4), "{what}");
+                            assert_eq!(seen, blocks.len(), "{what}");
+                        }
+                    }
+                }
+                // Dropped right after a stream whose last batches the holder thread released.
+                drop(pipe);
+            }
+        }
+    }
+
+    /// A device lost mid-stream (here `Device::destroy`; on Metal, wgpu-hal's fence race in
+    /// `Device::wait` loses the device from a `poll`): wgpu-core then destroys every buffer, so
+    /// `abandon`'s unmap of the in-flight staging buffers raises "Buffer with 'pipeline.staging'
+    /// label has been destroyed" in the stream's error scope. The stream must report the failure
+    /// itself (the lost device), with that validation error only as context.
+    #[test]
+    fn stream_frames_reports_device_loss_not_the_cleanup_error() {
+        use crate::context::GpuOptions;
+        let opts = GpuOptions { direct_upload: Some(false), transfer_queue: false, ..GpuOptions::default() };
+        let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = (0..400).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 8, inflight: 3, params }).unwrap();
+        let mut delivered = 0;
+        let e = pipe
+            .stream_frames(
+                |_batch| {
+                    delivered += 1;
+                    if delivered == 2 {
+                        ctx.device.destroy();
+                    }
+                    Ok(())
+                },
+                |stream| stream.upload_blocks(&blocks),
+            )
+            .expect_err("a stream on a lost device fails");
+        let msg = format!("{e:#}");
+        eprintln!("stream error: {msg}");
+        assert!(!msg.starts_with("wgpu validation error"), "the cleanup's validation error masks the cause: {msg}");
     }
 
     /// Payloads of arbitrary size spanning several blocks (and one of 0 bytes), written from
