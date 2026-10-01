@@ -41,7 +41,7 @@
 //! Workgroups: `K3OptConfig::wg` lanes (a power of two, 8..=256; a block's 16 segment lanes may
 //! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 and T3b
 //! logs in `docs/results/m5-log.md`). Residency (M6 A1): at 64 KiB a wg16 pass kernel needs at
-//! most 4064 B of workgroup memory (`workgroup_bytes`; the final pass 3044 B) and 75..77
+//! most 4064 B of workgroup memory (`workgroup_bytes`; the final pass 3044 B) and 74..76
 //! registers (`vkstats`, M6 A3), so an RTX 5090 holds its cap of 24 workgroups per SM: one wave is 4080
 //! blocks (measured). A change that raises registers or workgroup memory past that cap splits a
 //! batch above about 3600 blocks into two waves (+40 % K3 time); check `vkstats` on every pass
