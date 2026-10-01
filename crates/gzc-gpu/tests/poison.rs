@@ -60,6 +60,26 @@ fn poisoned_frames_match_cpu() {
     }
 }
 
+/// Poisoned and with every invocation's timing skewed (`Emulation::skew`: pseudo-random stalls at
+/// entry, after barriers and before subgroup operations), for races a slow, preempted GPU would
+/// expose. A few blocks only: the stalls make the kernels much slower.
+#[test]
+fn poisoned_skewed_frames_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let blocks: Vec<Vec<u8>> = blocks().into_iter().step_by(4).collect();
+    let emulate = gzc_gpu::context::Emulation { skew: true, ..gzc_gpu::context::Emulation::NONE };
+    let ctx = poisoned(GpuOptions { emulate, ..GpuOptions::from_env() });
+    for (name, matching) in [("lvl3", LVL3), ("lvl9", LVL9), ("lvl9s12seg", LVL9S12SEG)] {
+        let params = GpuParams { matching, emit_frames: true, huffman: true };
+        let kernels = Kernels::new(&ctx, params).expect("Kernels::new");
+        let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let got = compress_frames(&ctx, &kernels, &refs).expect("compress_frames");
+        for (k, (g, b)) in got.iter().zip(&blocks).enumerate() {
+            assert!(*g == cpu_frame(b, params), "{name} skewed: block {k} differs from the CPU frame");
+        }
+    }
+}
+
 struct CollectFrames(Vec<Option<Vec<u8>>>);
 
 impl FrameSink for CollectFrames {

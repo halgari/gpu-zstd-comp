@@ -276,7 +276,11 @@ by `0` only.
   (Apple, AMD; NVIDIA gives 0 for a shift by 32 or more), and a store to one component of a
   workgroup vector is a read-modify-write of the whole vector (Apple's Metal, which corrupted
   every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
-  differential suite with both on (`gzc_gpu::emulate`).
+  differential suite with both on (`gzc_gpu::emulate`). `GZC_EMULATE_SKEW` — **test only**:
+  timing skew, every invocation stalls pseudo-randomly at entry, after each barrier and before
+  each subgroup operation, for races a slow or preempted GPU would expose (much slower).
+  `cargo run --release -p gzc-gpu --example gpu_hog -- [GiB] [s]` is a second GPU tenant for
+  contention runs.
 - `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
