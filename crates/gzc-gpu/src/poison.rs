@@ -53,10 +53,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
-/// Workgroup words `poison_workgroup_memory` fills per workgroup: the device's limit, at most
-/// 48 KiB (the most any kernel uses).
+/// Workgroup words `poison_workgroup_memory` fills per workgroup: the device's limit minus 1 KiB of
+/// headroom, at most 32 KiB (more than any of our kernels declares). Never the full limit: with
+/// `GZC_EMULATE_SKEW` the skew rewrite adds a workgroup counter to this kernel too, and a kernel 4 B
+/// over the limit crashed a GTX 1660 Super's channel (Xid 13 `SKEDCHECK18_L1_CONFIG_TOO_SMALL`)
+/// instead of failing validation.
 fn dirty_words(ctx: &GpuContext) -> u32 {
-    (ctx.device.limits().max_compute_workgroup_storage_size / 4).min(12288)
+    (ctx.device.limits().max_compute_workgroup_storage_size.saturating_sub(1024) / 4).min(8192)
 }
 
 #[allow(non_snake_case)]

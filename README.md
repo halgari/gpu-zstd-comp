@@ -432,7 +432,8 @@ by `0` only.
   every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
   differential suite with both on (`gzc_gpu::emulate`). `GZC_EMULATE_SKEW`, **test only**:
   timing skew, every invocation stalls pseudo-randomly at entry, after each barrier and before
-  each subgroup operation, for races a slow or preempted GPU would expose (much slower).
+  each subgroup operation, for races a slow or preempted GPU would expose (much slower). Meant
+  for fast GPUs: on a GTX 1660 Super the stalled kernels run long enough to lose the device.
   `cargo run --release -p gzc-gpu --example gpu_hog -- [GiB] [s]` is a second GPU tenant for
   contention runs.
 - `GZC_K3_FORCE_FALLBACK=1`, **test only**, not a tuning knob: makes every workgroup of
