@@ -27,7 +27,7 @@
 //   - The end of a series (commit_ring) only updates the parse state (end_series: ip, anchor and
 //     reps follow from the last stretch alone) and logs the series in `seqs` (free until
 //     main_fixup); no lane waits for another's backward trace inside the DP loop.
-//   Phase 2: the logged series' backward traces, last series first (emit_series), write the
+//   Phase 2: the logged series' backward traces, last series first (emit), write the
 //   segment's sequences in reverse order (RAW_REVERSED) into its own words of `best` (the
 //   candidate words, 2 per position, no longer read): sequence i from the segment's end at
 //   best[wbase() + 3*i ..], trailer (n_seq, final anchor, sum of match_len, final reps) at
@@ -490,9 +490,14 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
     n_series += 1u;
 }
 
-// Phase 2 (opt::Dp::commit_ring's output): the backward trace of one logged series, appending
-// its sequences last first to the segment's words of `best`. Series are emitted last first too,
-// so the segment's raw sequences end up in reverse order (RAW_REVERSED).
+// Phase 2 (opt::Dp::commit_ring's output): the backward traces of the logged series, last series
+// first, each appending its sequences last first to the segment's words of `best`, so the
+// segment's raw sequences end up in reverse order (RAW_REVERSED).
+//
+// One flat loop, one sequence per iteration (M6 A2, a01 P5): a series' header is read when the
+// previous series is done, so the warp runs the maximum over its lanes of n_seq iterations, not
+// the sum over series of the longest series' trace. Reads and writes keep the order of the
+// series-by-series form (which the HIST_OUT in-place log relies on, see LOG_SEQS).
 //
 // The DP's offBases are stored as they are: each is seq::off_base_for(offset, lit_len) under the
 // DP's own history, as main_fixup needs. A rep record (index i, zstd's ll0 numbering) is only
@@ -504,11 +509,29 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
 //
 // HIST_OUT: the sequences go to the segment's series-log words instead (see LOG_SEQS), and each
 // is counted in the pass's histograms with its literal bytes (hist_seq).
-fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_ob: u32) {
-    var sp = last_pos - last_mlen - last_litlen;
-    var mlen = last_mlen;
-    var ob = last_ob;
+fn emit() {
+    var i = n_series;
+    var have = false;
+    var sip = 0u;
+    var sp = 0u;
+    var mlen = 0u;
+    var ob = 0u;
+    // Terminates: every iteration emits one sequence or takes the next series (i falls to 0);
+    // inside a series sp falls by nl + nm >= 3 per sequence (a node ending a match has mlen >= 3),
+    // and the series start (sp = 0) has nm = 0.
     loop {
+        if (!have) {
+            if (i == 0u) { break; }
+            i -= 1u;
+            let l = lbase() + 3u * i;
+            let a = seqs[l];
+            let c = seqs[l + 1u];
+            sip = a & 0xFFFFu;
+            mlen = a >> 16u;
+            sp = (c & 0xFFFFu) - mlen - (c >> 16u);
+            ob = seqs[l + 2u];
+            have = true;
+        }
         let t = cbase() + 2u * (sip + sp);
         let t0 = trace[t];
         let nm = t0 & 0xFFu;
@@ -527,12 +550,13 @@ fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_o
         }
         n_seq += 1u;
         ml_sum += mlen;
-        // Terminates: sp falls by nl + nm >= 3 per step (a node ending a match has mlen >= 3);
-        // the series start (sp = 0) has nm = 0.
-        if (nm == 0u || sp < nl + nm) { break; }
-        mlen = nm;
-        ob = trace[t + 1u];
-        sp -= nl + nm;
+        if (nm == 0u || sp < nl + nm) {
+            have = false;
+        } else {
+            mlen = nm;
+            ob = trace[t + 1u];
+            sp -= nl + nm;
+        }
     }
 }
 
@@ -973,14 +997,7 @@ fn dp() {
             in_series = false;
         }
     }
-    // Phase 2: the logged series' sequences, last first.
-    // Terminates: i falls to 0.
-    for (var i = n_series; i > 0u; i -= 1u) {
-        let l = lbase() + 3u * (i - 1u);
-        let a = seqs[l];
-        let c = seqs[l + 1u];
-        emit_series(a & 0xFFFFu, c & 0xFFFFu, a >> 16u, c >> 16u, seqs[l + 2u]);
-    }
+    emit();
     if (HIST_OUT) {
         // The literals after the segment's last match; the summary for hist_epilogue. The
         // candidate words stay (no trailer in `best`).
