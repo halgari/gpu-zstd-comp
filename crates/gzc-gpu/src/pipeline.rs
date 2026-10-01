@@ -1973,6 +1973,37 @@ mod tests {
         }
     }
 
+    /// M6 `opt16p1`'s sparse chains cost 3 * BLOCK_SIZE / 4 pred words (192 KiB at 64 KiB) per
+    /// block over opt16 once the head tables are capped, which `vram_bytes` counts, so a VRAM
+    /// budget's largest batch (gzc-bench `--batch max`) is smaller.
+    #[test]
+    fn vram_counts_opt16p1_sparse_chains() {
+        use gzc_core::params::{OPT16, OPT16P1};
+        let frames = |m, batch, inflight| PipelineConfig {
+            params: GpuParams { matching: m, emit_frames: true, huffman: true },
+            ..cfg(batch, inflight)
+        };
+        // At batches whose head tables are capped (5 * n and 2 * n >= HEAD_TABLES).
+        for n in [200u32, 2900] {
+            let extra = vram_bytes(&frames(OPT16P1, n, 2)) - vram_bytes(&frames(OPT16, n, 2));
+            assert_eq!(extra, n as u64 * 3 * BLOCK_SIZE as u64);
+        }
+        let max_at = |m, inflight, budget_mib: u64| {
+            (1..=20_000u32).take_while(|&n| vram_bytes(&frames(m, n, inflight)).div_ceil(1 << 20) <= budget_mib).last().unwrap()
+        };
+        for inflight in [1, 2, 3] {
+            let (a, b) = (max_at(OPT16, inflight, 6144), max_at(OPT16P1, inflight, 6144));
+            assert!(b < a, "inflight {inflight}: opt16 {a} opt16p1 {b}");
+            assert!(vram_bytes(&frames(OPT16P1, b, inflight)) <= 6144 << 20);
+            assert!(vram_bytes(&frames(OPT16P1, b + 1, inflight)).div_ceil(1 << 20) > 6144);
+            eprintln!(
+                "6144 MiB, inflight {inflight}: opt16 batch max {a} ({} B/block), opt16p1 {b} ({} B/block)",
+                vram_bytes(&frames(OPT16, a, inflight)) / a as u64,
+                vram_bytes(&frames(OPT16P1, b, inflight)) / b as u64
+            );
+        }
+    }
+
     #[test]
     fn vram_counts_scratch_once_and_slots_per_inflight() {
         let frames = |batch, inflight| PipelineConfig {

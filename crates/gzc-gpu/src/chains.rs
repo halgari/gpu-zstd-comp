@@ -15,7 +15,7 @@
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, HASH_BITS, LOG2_BLOCK, NO_POS};
-use gzc_core::params::{Hashes, MatchParams};
+use gzc_core::params::{Hashes, SparseChain, MatchParams};
 
 const K1_WGSL: &str = include_str!("shaders/k1_chains.wgsl");
 const K1_SG_WGSL: &str = include_str!("shaders/k1_chains_sg.wgsl");
@@ -69,11 +69,161 @@ pub fn chain_fp(params: &MatchParams, chain: usize, block: &[u8], p: usize) -> u
 /// chain 0 `hash_width(.., 4)`, chain 1 `hash3` with `pred_fp3` fingerprints).
 pub fn finder_wgsl(p: &MatchParams) -> String {
     format!(
-        "{}const KEY_SHIFT: u32 = {}u;\nconst OPT3: bool = {};\n",
+        "{}const KEY_SHIFT: u32 = {}u;\nconst OPT3: bool = {};\n{}",
         params_wgsl(p),
         HASH_BITS - p.hash_bits,
-        p.hashes == Hashes::Opt3
+        p.hashes == Hashes::Opt3,
+        layout_wgsl(p)
     )
+}
+
+/// The pred layout and sparse long chains of `p` as WGSL constants (`chain_span`): `N_FULL` full
+/// chains, `PRED_PER_BLOCK` words per block, and for k < `N_SPARSE` (at most 3) sparse chain k's
+/// key width `SP_W{k}`, stride `SP_S{k}`, walk depth `SP_D{k}`, hashed slots `SP_N{k}` and word
+/// offset in the block `SP_OFF{k}` (width, depth, slots and offset 0, stride 1 for absent chains).
+pub fn layout_wgsl(p: &MatchParams) -> String {
+    let longs = long_chains(p);
+    let full = full_chains(p);
+    let mut s = format!(
+        "const N_FULL: u32 = {full}u;\nconst N_SPARSE: u32 = {}u;\nconst PRED_PER_BLOCK: u32 = {}u;\n",
+        longs.len(),
+        pred_words_per_block(p)
+    );
+    for k in 0..3 {
+        let (w, st, d, n, off) = match longs.get(k) {
+            Some(c) => (c.width, c.stride, c.depth, long_chain_slots(c), chain_span(p, full + k as u32).0),
+            None => (0, 1, 0, 0, 0),
+        };
+        s += &format!(
+            "const SP_W{k}: u32 = {w}u;\nconst SP_S{k}: u32 = {st}u;\nconst SP_D{k}: u32 = {d}u;\n\
+             const SP_N{k}: u32 = {n}u;\nconst SP_OFF{k}: u32 = {off}u;\n"
+        );
+    }
+    s + LAYOUT_FNS_WGSL
+}
+
+/// Accessors of `layout_wgsl`'s per-chain constants by sparse chain index k < N_SPARSE, and the
+/// long chains' hash.
+const LAYOUT_FNS_WGSL: &str = "
+fn sp_pick(k: u32, a: u32, b: u32, c: u32) -> u32 { return select(select(c, b, k == 1u), a, k == 0u); }
+fn sp_width(k: u32) -> u32 { return sp_pick(k, SP_W0, SP_W1, SP_W2); }
+fn sp_stride(k: u32) -> u32 { return sp_pick(k, SP_S0, SP_S1, SP_S2); }
+fn sp_slots(k: u32) -> u32 { return sp_pick(k, SP_N0, SP_N1, SP_N2); }
+fn sp_off(k: u32) -> u32 { return sp_pick(k, SP_OFF0, SP_OFF1, SP_OFF2); }
+// The 16-bit long-chain hash of the w (5..=12) bytes at a word-aligned position whose words are
+// lo, hi, h2 (== gzc_core::hash::hash_sparse): each word masked to the bytes below p + w.
+fn long_hash(lo: u32, hi: u32, h2: u32, w: u32) -> u32 {
+    // `& 31u`: no-ops for the widths that use them, but the shifts stay below 32 for any w.
+    let mhi = select(0xFFFFFFFFu, (1u << ((8u * (w - 4u)) & 31u)) - 1u, w < 8u);
+    var mh2 = 0u;
+    if (w > 8u) { mh2 = select(0xFFFFFFFFu, (1u << ((8u * (w - 8u)) & 31u)) - 1u, w < 12u); }
+    return (((lo * 0x9E3779B1u) ^ ((hi & mhi) * 0x85EBCA77u) ^ ((h2 & mh2) * 0x27D4EB2Fu)) * 0xC2B2AE3Du) >> 16u;
+}
+";
+
+/// The sparse long chains of `p` (M6 `OptParams::sparse_chains`, in walk order after h4 and h3),
+/// empty for every other preset.
+pub fn long_chains(p: &MatchParams) -> Vec<SparseChain> {
+    p.opt.iter().flat_map(|o| o.sparse_chains.into_iter().flatten()).collect()
+}
+
+/// Chains of `p` stored at full length (one pred word per position): `n_hashes` minus the sparse
+/// long chains.
+pub fn full_chains(p: &MatchParams) -> u32 {
+    p.n_hashes() - long_chains(p).len() as u32
+}
+
+/// Positions a sparse long chain hashes: `p % stride == 0` and `p < BLOCK_SIZE - 12`
+/// (`gzc_core::reference::sparse_chain_preds`), as slots `p / stride`.
+pub fn long_chain_slots(c: &SparseChain) -> u32 {
+    (BLOCK_SIZE as u32 - 12).div_ceil(c.stride)
+}
+
+/// Where chain `chain` of `p` starts inside a block's pred words, and how many words it has.
+/// Layout per block: the full chains (`BLOCK_SIZE` words each, walk order), then each sparse long
+/// chain compactly, one word per slot (`BLOCK_SIZE / stride` words; slot s is position
+/// `s * stride`; slots from `long_chain_slots` on hold `PRED_NONE`).
+pub fn chain_span(p: &MatchParams, chain: u32) -> (u64, u64) {
+    let full = full_chains(p);
+    if chain < full {
+        return (chain as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u64);
+    }
+    let mut off = full as u64 * BLOCK_SIZE as u64;
+    for (k, c) in long_chains(p).iter().enumerate() {
+        let len = (BLOCK_SIZE as u32 / c.stride) as u64;
+        if k as u32 + full == chain {
+            return (off, len);
+        }
+        off += len;
+    }
+    panic!("chain {chain} out of range for {p:?}");
+}
+
+/// u32 pred words per block K1 writes for `p`'s chains (`chain_span`).
+pub fn pred_words_per_block(p: &MatchParams) -> u64 {
+    let (off, len) = chain_span(p, p.n_hashes() - 1);
+    off + len
+}
+
+/// Bytes of the `pred` buffer K1 writes for `n_blocks` under `p` (`pred_words_per_block`): equal
+/// to `pred_bytes(n_blocks, p.n_hashes())` without sparse long chains.
+pub fn chain_pred_bytes(n_blocks: u32, p: &MatchParams) -> u64 {
+    n_blocks as u64 * pred_words_per_block(p) * 4
+}
+
+/// Whether K1 can build `p`'s sparse long chains: their slots must be word aligned (stride 4 or
+/// 8), so a lane's key bytes are three whole data words.
+pub fn long_chains_supported(p: &MatchParams) -> bool {
+    long_chains(p).iter().all(|c| c.stride % 4 == 0 && c.width <= 12)
+}
+
+/// Expands one block's K1 pred words (`chain_span` layout) into `gzc_core::reference::chains`
+/// form: one BLOCK_SIZE-long array per chain, `pred_of_word` decoded, `NO_POS` off a sparse
+/// chain's slots.
+pub fn expand_preds(p: &MatchParams, words: &[u32]) -> Vec<Vec<u32>> {
+    (0..p.n_hashes())
+        .map(|c| {
+            let (off, len) = chain_span(p, c);
+            let w = &words[off as usize..(off + len) as usize];
+            if len == BLOCK_SIZE as u64 {
+                return w.iter().copied().map(pred_of_word).collect();
+            }
+            let stride = BLOCK_SIZE / len as usize;
+            let mut out = vec![NO_POS; BLOCK_SIZE];
+            for (s, &x) in w.iter().enumerate() {
+                out[s * stride] = pred_of_word(x);
+            }
+            out
+        })
+        .collect()
+}
+
+/// The raw K1 words (`chain_span` layout) of one block: per chain, `common.wgsl`'s `pred_word(pr,
+/// fp)` of `gzc_core::reference::chains` and the chain's fingerprint (`chain_fp`) at every hashed
+/// position (slot), plain `PRED_POS` past them.
+pub fn expected_words(p: &MatchParams, block: &[u8]) -> Vec<u32> {
+    let want = gzc_core::reference::chains(block, p);
+    let longs = long_chains(p);
+    let full = full_chains(p) as usize;
+    let mut out = Vec::with_capacity(pred_words_per_block(p) as usize);
+    for (c, chain) in want.iter().enumerate() {
+        let (stride, hashed) = if c < full {
+            (1, HASHED_POSITIONS)
+        } else {
+            let lc = &longs[c - full];
+            (lc.stride as usize, long_chain_slots(lc) as usize)
+        };
+        for s in 0..BLOCK_SIZE / stride {
+            let q = s * stride;
+            out.push(if s < hashed {
+                let pr = chain[q];
+                (if pr == NO_POS { PRED_POS } else { pr }) | chain_fp(p, c, block, q)
+            } else {
+                PRED_POS
+            });
+        }
+    }
+    out
 }
 
 /// Bytes of one head table (2^HASH_BITS u32 entries).
@@ -97,13 +247,25 @@ pub fn pred_bytes(n_blocks: u32, n_hashes: u32) -> u64 {
 /// also kept within `max_compute_workgroups_per_dimension`, which K2 dispatches over. 0 if one
 /// block doesn't fit.
 pub fn max_blocks_per_batch(limits: &wgpu::Limits, n_hashes: u32) -> u32 {
+    max_blocks_inner(limits, n_hashes, n_hashes as u64 * BLOCK_SIZE as u64)
+}
+
+/// `max_blocks_per_batch` for the chains of `p`: `n_hashes` head tables per block and
+/// `pred_words_per_block` pred words (fewer than `n_hashes` full chains with sparse long chains).
+pub fn max_blocks_per_batch_for(limits: &wgpu::Limits, p: &MatchParams) -> u32 {
+    max_blocks_inner(limits, p.n_hashes(), pred_words_per_block(p))
+}
+
+fn max_blocks_inner(limits: &wgpu::Limits, n_hashes: u32, pred_words: u64) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let nh = n_hashes as u64;
     let by_data = limit.saturating_sub(4) / BLOCK_SIZE as u64;
     // head_bytes(n) <= limit: always once HEAD_TABLES tables fit, else n * nh tables must.
     let by_head = if HEAD_TABLES as u64 * TABLE_BYTES <= limit { u64::MAX } else { limit / TABLE_BYTES / nh };
-    let by_buffers = by_data.min(by_head).min(limit / pred_bytes(1, n_hashes));
-    let by_index = (1u64 << (32 - LOG2_BLOCK)) / nh;
+    let by_buffers = by_data.min(by_head).min(limit / (pred_words * 4));
+    // The kernels' u32 pred word indices (b * PRED_PER_BLOCK + ..) cannot wrap; without sparse
+    // chains this is (b * n_hashes + chain) * BLOCK_SIZE.
+    let by_index = (1u64 << 32) / pred_words;
     by_buffers.min(by_index).min(limits.max_compute_workgroups_per_dimension as u64) as u32
 }
 
@@ -118,7 +280,7 @@ pub fn gpu_preds(ctx: &GpuContext, blocks: &[&[u8]], params: &MatchParams) -> an
 /// `gpu_preds` with a given kernel.
 pub fn gpu_preds_with(ctx: &GpuContext, kernel: &ChainsKernel, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<Vec<u32>>>> {
     let nh = kernel.n_hashes();
-    let max_blocks = max_blocks_per_batch(&ctx.device.limits(), nh) as usize;
+    let max_blocks = max_blocks_per_batch_for(&ctx.device.limits(), &kernel.params) as usize;
     anyhow::ensure!(max_blocks > 0, "device limits too small for one K1 block");
 
     let mut out = Vec::with_capacity(blocks.len());
@@ -128,7 +290,7 @@ pub fn gpu_preds_with(ctx: &GpuContext, kernel: &ChainsKernel, blocks: &[&[u8]])
         let data = ctx.storage_buffer("k1.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         let head = ctx.storage_buffer("k1.head", head_bytes(n, nh), false);
-        let pred = ctx.storage_buffer("k1.pred", pred_bytes(n, nh), true);
+        let pred = ctx.storage_buffer("k1.pred", chain_pred_bytes(n, &kernel.params), true);
         out.extend(kernel.run(ctx, &data, &head, &pred, n));
     }
     Ok(out)
@@ -155,6 +317,8 @@ pub struct ChainsKernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     n_hashes: u32,
+    /// The match params whose chains this kernel builds (their pred layout: `chain_span`).
+    params: MatchParams,
     subgroups: bool,
     opts: ChainsOptions,
     /// `GZC_K1_GROUPS`, parsed and validated once at construction (`build`), not per `record`
@@ -183,6 +347,7 @@ impl ChainsKernel {
     /// `new` with explicit options.
     pub fn with_options(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions) -> anyhow::Result<Self> {
         params.validate().map_err(|e| anyhow::anyhow!("invalid match params {params:?}: {e}"))?;
+        anyhow::ensure!(long_chains_supported(params), "K1 builds sparse long chains of stride 4 or 8 only: {params:?}");
         if Self::subgroup_kernel_possible(ctx) {
             // Build + self-test inside their own error scope (like `probe_lanes`), so a wgpu
             // validation error from the subgroup shader/pipeline (not just a wrong self-test
@@ -250,7 +415,7 @@ impl ChainsKernel {
             compilation_options: ctx.compilation_options(),
             cache: None,
         });
-        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), subgroups, opts, env_groups })
+        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), params: *params, subgroups, opts, env_groups })
     }
 
     /// Guards the subgroup kernel's assumptions (full, equally sized subgroups of >= 32 lanes
@@ -274,47 +439,20 @@ impl ChainsKernel {
         let blocks = [alphabet, gzc_core::synth::text(11, BLOCK_SIZE), gzc_core::synth::dds_like(12, BLOCK_SIZE)];
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         let want: Vec<Vec<Vec<u32>>> = blocks.iter().map(|b| gzc_core::reference::chains(b, params)).collect();
-        // The raw K1 word `want` predicts for each block/chain/position: `pred_word(pr, fp)` from
-        // common.wgsl, i.e. PRED_POS with the fingerprint OR'd in when there's no predecessor
-        // (p < HASHED_POSITIONS), else plain PRED_POS.
-        let want_words: Vec<Vec<Vec<u32>>> = blocks
-            .iter()
-            .zip(&want)
-            .map(|(block, chains)| {
-                chains
-                    .iter()
-                    .enumerate()
-                    .map(|(c, chain)| {
-                        (0..BLOCK_SIZE)
-                            .map(|p| {
-                                if p < HASHED_POSITIONS {
-                                    let pr = chain[p];
-                                    (if pr == NO_POS { PRED_POS } else { pr }) | chain_fp(params, c, block, p)
-                                } else {
-                                    PRED_POS
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        // The raw K1 words `want` predicts for each block (`expected_words`, K1's layout).
+        let want_words: Vec<Vec<u32>> = blocks.iter().map(|block| expected_words(params, block)).collect();
         let n = blocks.len() as u32;
         let packed = pack_blocks(&refs);
         let data = ctx.storage_buffer("k1.selftest.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         let head = ctx.storage_buffer("k1.selftest.head", head_bytes(n, self.n_hashes), false);
-        let pred = ctx.storage_buffer("k1.selftest.pred", pred_bytes(n, self.n_hashes), true);
+        let pred = ctx.storage_buffer("k1.selftest.pred", chain_pred_bytes(n, params), true);
         let one_group = Self { opts: ChainsOptions { groups: Some(1), ..self.opts }, ..self.shallow_clone() };
-        let per_block = self.n_hashes as usize * BLOCK_SIZE;
+        let per_block = pred_words_per_block(params) as usize;
         for (round, k) in [self, self, &one_group].into_iter().enumerate() {
             let raw = k.run_words(ctx, &data, &head, &pred, n);
-            let got_words: Vec<Vec<Vec<u32>>> =
-                raw.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect();
-            let got: Vec<Vec<Vec<u32>>> = got_words
-                .iter()
-                .map(|block| block.iter().map(|chain| chain.iter().copied().map(pred_of_word).collect()).collect())
-                .collect();
+            let got_words: Vec<Vec<u32>> = raw.chunks_exact(per_block).map(|block| block.to_vec()).collect();
+            let got: Vec<Vec<Vec<u32>>> = got_words.iter().map(|block| expand_preds(params, block)).collect();
             if let Some(b) = (0..blocks.len()).find(|&b| got[b] != want[b]) {
                 anyhow::bail!("pred of self-test block {b} differs from the CPU in round {round}");
             }
@@ -330,6 +468,7 @@ impl ChainsKernel {
             pipeline: self.pipeline.clone(),
             layout: self.layout.clone(),
             n_hashes: self.n_hashes,
+            params: self.params,
             subgroups: self.subgroups,
             opts: self.opts,
             env_groups: self.env_groups,
@@ -357,13 +496,13 @@ impl ChainsKernel {
         pred: &wgpu::Buffer,
         n_blocks: u32,
     ) -> Vec<Vec<Vec<u32>>> {
-        let per_block = self.n_hashes as usize * BLOCK_SIZE;
-        let all: Vec<u32> = self.run_words(ctx, data, head, pred, n_blocks).into_iter().map(pred_of_word).collect();
-        all.chunks_exact(per_block).map(|block| block.chunks_exact(BLOCK_SIZE).map(|c| c.to_vec()).collect()).collect()
+        let per_block = pred_words_per_block(&self.params) as usize;
+        let all = self.run_words(ctx, data, head, pred, n_blocks);
+        all.chunks_exact(per_block).map(|block| expand_preds(&self.params, block)).collect()
     }
 
     /// `run`, returning K1's raw pred words (predecessor and fingerprint, see `pred_fp`),
-    /// layout `[block][chain][pos]`.
+    /// layout `[block][chain][pos]`, sparse long chains compact (`chain_span`).
     pub fn run_words(
         &self,
         ctx: &GpuContext,
@@ -375,17 +514,18 @@ impl ChainsKernel {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1") });
         self.record(ctx, &mut enc, data, head, pred, n_blocks);
         ctx.queue.submit([enc.finish()]);
-        ctx.read_buffer(pred, 0, self.n_hashes as usize * BLOCK_SIZE * n_blocks as usize)
+        ctx.read_buffer(pred, 0, pred_words_per_block(&self.params) as usize * n_blocks as usize)
     }
 
     /// data: packed blocks; head: at least `head_bytes(n_blocks, n_hashes)`, per-dispatch scratch
     /// (each workgroup clears its table in-kernel; nothing is carried between dispatches); pred:
-    /// at least `pred_bytes(n_blocks, n_hashes)`, layout [block][chain][pos] (Dfast: chain 0 long,
-    /// 1 short; Single: chain 0 over `hash_width(min_match)`; Opt3: chain 0 h4, 1 h3).
+    /// at least `chain_pred_bytes(n_blocks, params)`, layout [block][chain][pos] (Dfast: chain 0
+    /// long, 1 short; Single: chain 0 over `hash_width(min_match)`; Opt3: chain 0 h4, 1 h3, then
+    /// the sparse long chains, compact: `chain_span`).
     ///
-    /// Precondition: `n_blocks <= max_blocks_per_batch(&ctx.device.limits(), n_hashes)`. That
-    /// keeps every buffer within the binding/buffer limits and `n_blocks * n_hashes <= 2^(32 -
-    /// LOG2_BLOCK)` so the shaders' u32 pred indices do not wrap.
+    /// Precondition: `n_blocks <= max_blocks_per_batch_for(&ctx.device.limits(), params)`. That
+    /// keeps every buffer within the binding/buffer limits and `n_blocks * pred_words_per_block
+    /// <= 2^32` so the shaders' u32 pred indices do not wrap.
     pub fn record(
         &self,
         ctx: &GpuContext,
@@ -434,7 +574,7 @@ impl ChainsKernel {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: pred,
                         offset: 0,
-                        size: std::num::NonZeroU64::new(pred_bytes(n_blocks, self.n_hashes)),
+                        size: std::num::NonZeroU64::new(chain_pred_bytes(n_blocks, &self.params)),
                     }),
                 },
             ],

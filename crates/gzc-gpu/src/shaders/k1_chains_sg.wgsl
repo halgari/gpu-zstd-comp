@@ -3,7 +3,14 @@
 // fallback: pred[p] = most recent q < p with hash(q) == hash(p), else none (== gzc_core
 // compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..], stored as pred words with p's
 // fingerprint (common.wgsl `pred_word`; the tail p >= HASHED_POSITIONS holds PRED_NONE). pred is
-// bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / BLOCK_SIZE.
+// bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / PRED_PER_BLOCK *
+// N_HASHES.
+// M6 sparse long chains (Opt3 chains N_FULL.., `chains::layout_wgsl`): chain N_FULL + k hashes
+// only the slots i < SP_N{k}, position p = i * SP_S{k} (stride 4 or 8, so the key's words are
+// word aligned), on `long_hash` (== gzc_core::reference::sparse_chain_preds), stored compactly at
+// pred[b*PRED_PER_BLOCK + SP_OFF{k} + i] (the slots from SP_N{k} on hold PRED_NONE), with
+// predecessor *positions* and pred_fp fingerprints. The build is the same, over slots instead of
+// positions: tiles, head entries and links are slot indices, scaled by the stride on output.
 //
 // Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
 // builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].
@@ -59,6 +66,10 @@ const_assert HASH_BITS == 16u;
 // load_u32_at(base, p) and load_u32_at(base, p + 4)): == hash_width(base, p, MIN_MATCH) for Single,
 // hash_long / hash_short for Dfast chain 0 / 1, hash_width(.., 4) / hash3 for Opt3 chain 0 / 1, reduced to the chain key (>> KEY_SHIFT).
 fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
+    if (N_SPARSE > 0u && chain >= N_FULL) {
+        // A sparse long chain: p is word aligned, w its key's three words.
+        return long_hash(w.x, w.y, w.z, sp_width(chain - N_FULL));
+    }
     let sh = (p & 3u) * 8u;
     var lo = w.x;
     var hi = w.y;
@@ -72,7 +83,10 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
         if (k == 0u) {
             mask = 0u;
         } else if (k < 4u) {
-            mask = (1u << (8u * k)) - 1u;
+            // `& 31u`: a no-op for k < 4, but this dead branch is still const-evaluated where
+            // MIN_MATCH < 4 (Opt3, k wraps) once naga folds k, as the GZC_EMULATE_* rewrite of
+            // naga's output does, and a shift by >= 32 there failed the module.
+            mask = (1u << ((8u * k) & 31u)) - 1u;
         }
         return mix(lo, hi & mask) >> KEY_SHIFT;
     } else if (OPT3) {
@@ -97,12 +111,13 @@ fn fp_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
     return pred_fp(lo, hi);
 }
 
-// The words chain_hash_words needs at p (zeros, without loading, if p is not hashed).
-fn load_words(base: u32, p: u32) -> vec3<u32> {
+// The words chain_hash_words needs at tile index i, position i * stride (zeros, without loading,
+// if i >= n_idx: not hashed).
+fn load_words(base: u32, i: u32, stride: u32, n_idx: u32) -> vec3<u32> {
     var w = vec3<u32>(0u);
-    if (p < HASHED_POSITIONS) {
-        let i = base + (p >> 2u);
-        w = vec3<u32>(data[i], data[i + 1u], data[i + 2u]);
+    if (i < n_idx) {
+        let x = base + ((i * stride) >> 2u);
+        w = vec3<u32>(data[x], data[x + 1u], data[x + 2u]);
     }
     return w;
 }
@@ -158,7 +173,7 @@ fn main(
     let word = sg_lane >> 5u;
     let below = (1u << cl) - 1u;
     let hb = wid.x << HASH_BITS;
-    let n_tasks = arrayLength(&pred_out) / BLOCK_SIZE;
+    let n_tasks = arrayLength(&pred_out) / PRED_PER_BLOCK * N_HASHES;
     var parity = 0u;
 
     // Stale entries of earlier dispatches may carry any tag: clear this workgroup's table.
@@ -173,26 +188,45 @@ fn main(
         let b = t / N_HASHES;
         let chain = t % N_HASHES;
         let base = block_base(b);
-        let pb = t * BLOCK_SIZE;
+        // The task's tile indices i < n_idx are positions i * stride; its pred words start at pb
+        // (n_len of them, the ones from n_idx on PRED_NONE).
+        var stride = 1u;
+        var n_idx = HASHED_POSITIONS;
+        var n_len = BLOCK_SIZE;
+        // Without sparse chains PRED_PER_BLOCK == N_HASHES * BLOCK_SIZE, so pb == t * BLOCK_SIZE,
+        // written so: `b * PRED_PER_BLOCK + chain * BLOCK_SIZE` there made the driver's code for
+        // the full chains ~5 % slower, this form ~10 % faster than before M6 (RTX 5090, opt16
+        // and lvl3, B2 report).
+        var pb = t * BLOCK_SIZE;
+        if (N_SPARSE > 0u) { pb = b * PRED_PER_BLOCK + chain * BLOCK_SIZE; }
+        if (N_SPARSE > 0u && chain >= N_FULL) {
+            let k = chain - N_FULL;
+            stride = sp_stride(k);
+            n_idx = sp_slots(k);
+            n_len = BLOCK_SIZE / stride;
+            pb = b * PRED_PER_BLOCK + sp_off(k);
+        }
         let tag = (j + 1u) << LOG2_BLOCK;
         // This lane's data words for the current tile; the next tile's are loaded a tile ahead.
-        var words = load_words(base, li);
+        var words = load_words(base, li, stride, n_idx);
         // This lane's hash for the current tile, computed a tile ahead (before the previous tile's
         // closing storageBarrier; the first tile's here, before a barrier of its own). The
         // ballots that consume h then follow a barrier, not the per-lane branches that built it
         // (load_words' bound, chain_hash_words' byte shift). It also hides the hash's latency:
         // K1 11 % faster than computing it at the top of the tile (RTX 5090, lvl9seg).
-        var h = chain_hash_words(words, li, chain);
+        var h = chain_hash_words(words, li * stride, chain);
         workgroupBarrier();
 
-        for (var t0 = 0u; t0 < HASHED_POSITIONS; t0 += T) {
+        for (var t0 = 0u; t0 < n_idx; t0 += T) {
             let mb = parity * CHUNKS * 5u;
             parity ^= 1u;
 
-            let p = t0 + li;
-            let live = p < HASHED_POSITIONS;
+            // Tile index i (a position, or a sparse chain's slot), position p.
+            let i = t0 + li;
+            let p = i * stride;
+            let live = i < n_idx;
             let cur = words;
-            words = load_words(base, p + T);
+            words = load_words(base, i + T, stride, n_idx);
             // A dead lane's h (from zero words) is masked out by the live ballot. chunk_first is
             // built without a lane-dependent branch (`&`, not `&&`, which naga lowers to an `if`).
             let eq = publish(h, live, word, cl, mb + chunk * 5u);
@@ -249,14 +283,16 @@ fn main(
                         pr = select(NO_POS, (old & POS_MASK) - 1u, (old & ~POS_MASK) == tag);
                     }
                 }
-                pred_out[pb + p] = pred_word(pr, fp_words(cur, p, chain));
+                // pr is a tile index: the predecessor's position is pr * stride.
+                if (pr != NO_POS) { pr *= stride; }
+                pred_out[pb + i] = pred_word(pr, fp_words(cur, p, chain));
             }
-            h = chain_hash_words(words, p + T, chain);
+            h = chain_hash_words(words, (i + T) * stride, chain);
             storageBarrier();
         }
 
-        if (li < BLOCK_SIZE - HASHED_POSITIONS) {
-            pred_out[pb + HASHED_POSITIONS + li] = PRED_NONE;
+        if (li < n_len - n_idx) {
+            pred_out[pb + n_idx + li] = PRED_NONE;
         }
     }
 }
