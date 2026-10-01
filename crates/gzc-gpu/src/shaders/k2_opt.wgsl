@@ -41,8 +41,8 @@
 // h3 head reached PRED_NONE (the whole h3 chain visited). Every visited q then had c <= 2 (a
 // fingerprint skip only drops a q with c <= 2 <= best), and every earlier position with p's
 // first 3 bytes has p's hash3 key, so it is on p's h3 chain: there is none. Its second word gets
-// DEAD_BIT (offB < 2^16 leaves the high half free).
-const DEAD_BIT: u32 = 0x10000u;
+// DEAD_BIT (offB < 2^16 leaves the high half free). DEAD_BIT is injected by the host
+// (reference::DEAD_BIT, as for k3_opt.wgsl), so K2opt, K3opt and the oracle cannot drift apart.
 
 // Candidate output index of (b, p).
 fn cand_index(b: u32, p: u32) -> u32 { return 2u * (b * BLOCK_SIZE + p); }

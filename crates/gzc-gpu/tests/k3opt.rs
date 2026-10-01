@@ -9,15 +9,15 @@ use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
 use gzc_core::opt::cases::{opt_test_cases, run_case};
-use gzc_core::opt::{Engine, Hist, Prices, dp_pass_with, passes};
-use gzc_core::params::{LVL9, MatchParams, OPT14, OPT16, OptParams, Seed};
+use gzc_core::opt::{Engine, Hist, Prices, dp_pass_with, drop_pass, passes};
+use gzc_core::params::{LVL9, MatchParams, OPT14, OPT16, OPT16P1, OptParams, PriorTables, Seed};
 use gzc_core::reference::{CandWords, chains, find_cands};
 use gzc_core::seq::BlockOutput;
-use gzc_gpu::compressor::{GpuParams, Kernels, frames_from_parses};
+use gzc_gpu::compressor::{GpuParams, Kernels, OptCandKernel, cands_from_blocks, frames_from_parses};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::k3opt::{
-    K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
-    parses_from_cands, parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass,
+    K3Drop, K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
+    drops_from_parses, parses_from_cands, parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass,
     time_passes, workgroup_bytes,
 };
 
@@ -54,16 +54,12 @@ fn first_diff(got: &BlockOutput, want: &BlockOutput) -> String {
 
 /// The oracle's single pass at `level` with `prices`.
 fn oracle(block: &[u8], cands: &[CandWords], prices: &Prices, level: u8) -> BlockOutput {
-    let o = OPT16.opt.unwrap();
-    dp_pass_with(
-        block,
-        cands,
-        &OPT16,
-        prices,
-        level,
-        o.target_length,
-        Engine::Ring,
-    )
+    oracle_m(&OPT16, block, cands, prices, level)
+}
+
+/// `oracle` under opt params `m` (its M6 DP options: gap, relaxation pruning).
+fn oracle_m(m: &MatchParams, block: &[u8], cands: &[CandWords], prices: &Prices, level: u8) -> BlockOutput {
+    dp_pass_with(block, cands, m, prices, level, m.opt.unwrap().target_length, Engine::Ring)
 }
 
 fn synthetic_blocks() -> Vec<(String, Vec<u8>)> {
@@ -79,6 +75,11 @@ fn synthetic_blocks() -> Vec<(String, Vec<u8>)> {
 }
 
 fn cands_of(blocks: &[Vec<u8>]) -> Vec<Vec<CandWords>> {
+    cands_of_m(blocks, &OPT16)
+}
+
+/// `reference::find_cands` of every block under `m` (its depth and sparse chains).
+fn cands_of_m(blocks: &[Vec<u8>], m: &MatchParams) -> Vec<Vec<CandWords>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: Vec<std::sync::Mutex<Vec<CandWords>>> =
         blocks.iter().map(|_| Default::default()).collect();
@@ -92,7 +93,7 @@ fn cands_of(blocks: &[Vec<u8>]) -> Vec<Vec<CandWords>> {
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(b) = blocks.get(i) else { break };
-                    *out[i].lock().unwrap() = find_cands(b, &chains(b, &OPT16), &OPT16);
+                    *out[i].lock().unwrap() = find_cands(b, &chains(b, m), m);
                 }
             });
         }
@@ -139,6 +140,21 @@ fn check_blocks_with(
     cfgs: &[K3OptConfig],
     frames: Option<&Kernels>,
 ) {
+    check_blocks_m(ctx, &OPT16, names, blocks, cands, tables, cfgs, frames);
+}
+
+/// `check_blocks_with` under opt params `m` (the kernels and the oracle's pass).
+#[allow(clippy::too_many_arguments)]
+fn check_blocks_m(
+    ctx: &GpuContext,
+    m: &MatchParams,
+    names: &[String],
+    blocks: &[Vec<u8>],
+    cands: &[Vec<CandWords>],
+    tables: &[Prices],
+    cfgs: &[K3OptConfig],
+    frames: Option<&Kernels>,
+) {
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bi = tables;
@@ -146,7 +162,7 @@ fn check_blocks_with(
         if !runs_here(ctx, &c) {
             continue;
         }
-        let k = K3Opt::new(ctx, &OPT16, c).expect("K3Opt::new");
+        let k = K3Opt::new(ctx, m, c).expect("K3Opt::new");
         let want: Vec<BlockOutput> = {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let out: Vec<std::sync::Mutex<BlockOutput>> =
@@ -157,7 +173,7 @@ fn check_blocks_with(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(b) = blocks.get(i) else { break };
-                            *out[i].lock().unwrap() = oracle(b, &cands[i], &bi[i], c.level);
+                            *out[i].lock().unwrap() = oracle_m(m, b, &cands[i], &bi[i], c.level);
                         }
                     });
                 }
@@ -633,8 +649,13 @@ fn check_passes(
                 }
             }
             let last = w.last().unwrap();
-            if got[i] != last.out {
-                bad.push(format!("{}: final parse: {}", names[i], first_diff(&got[i], &last.out)));
+            // opt::parse: the drop pass follows the final DP pass.
+            let fin = match m.opt.unwrap().drop_max_len {
+                0 => last.out.clone(),
+                d => drop_pass(&blocks[i], &last.out, d as u32, m.segment_log2),
+            };
+            if got[i] != fin {
+                bad.push(format!("{}: final parse: {}", names[i], first_diff(&got[i], &fin)));
             }
             live += (last.prices.ll[1] < last.prices.ll[0]) as usize;
         }
@@ -924,8 +945,10 @@ fn k3opt_passes_corpus() {
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
-/// Informal: GPU time of every pass of opt14 and opt16 (`GZC_CORPUS_BLOCKS`, default 2900 corpus
-/// blocks, one batch; wg16, the default ring; `GZC_K3OPT_SORT`: heavy-first block order).
+/// Informal: GPU time of every pass of opt14, opt16 and opt16p1 (its single final pass and the
+/// drop pass, on its S3 candidates; `GZC_TIMING_PRESETS`, comma-separated names, picks presets),
+/// `GZC_CORPUS_BLOCKS`, default 2900 corpus blocks, one batch; wg16, the default ring;
+/// `GZC_K3OPT_SORT`: heavy-first block order (by opt16's candidates).
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_passes_timing -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -955,8 +978,18 @@ fn k3opt_passes_timing() {
         cands = idx.iter().map(|&i| cands[i].clone()).collect();
         eprintln!("blocks in heavy-first order");
     }
+    let filter = std::env::var("GZC_TIMING_PRESETS").ok();
+    let all = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
+    // In GZC_TIMING_PRESETS' order (for A/B runs that alternate the order).
+    let presets: Vec<(&str, MatchParams)> = match &filter {
+        Some(f) => f.split(',').filter_map(|x| all.iter().find(|(n, _)| *n == x).copied()).collect(),
+        None => all.to_vec(),
+    };
+    let s3 = presets.iter().any(|(_, m)| m.opt.unwrap().sparse_chains != OPT16.opt.unwrap().sparse_chains);
+    let cands_s3 = if s3 { cands_of_m(&blocks, &OPT16P1) } else { Vec::new() };
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
+    let crefs_s3: Vec<&[CandWords]> = cands_s3.iter().map(|c| c.as_slice()).collect();
     let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32).unwrap();
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     // GZC_TIMING_WARMUP: one untimed opt16 run first, so the first timed preset does not pay the
@@ -970,16 +1003,17 @@ fn k3opt_passes_timing() {
         })
         .expect("time_passes");
     }
-    for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
+    for (name, m) in presets {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");
+        let c = if m.opt.unwrap().sparse_chains == OPT16.opt.unwrap().sparse_chains { &crefs } else { &crefs_s3 };
         let mut t = time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
-            bufs.upload(&ctx, &refs, &crefs, None).unwrap();
+            bufs.upload(&ctx, &refs, c, None).unwrap();
         })
         .expect("time_passes");
         let span = t.pop().unwrap();
         let per: Vec<String> = t.iter().map(|&ms| format!("{:.2}", us(ms))).collect();
         eprintln!(
-            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup, order) [{}], total {:.2} us/block ({:.3} ms), span {:.2} us/block",
+            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup, order, drop) [{}], total {:.2} us/block ({:.3} ms), span {:.2} us/block",
             blocks.len(),
             BLOCK_SIZE / 1024,
             per.join(", "),
@@ -988,4 +1022,233 @@ fn k3opt_passes_timing() {
             us(span)
         );
     }
+}
+
+// ---- M6 B3: opt16p1's DP options (gap3, top-4 pruning, S3 prior, one pass) and the drop pass ----
+
+/// `MatchParams` with `OPT16P1`'s match finder and the opt params `o`.
+fn on_p1(o: OptParams) -> MatchParams {
+    MatchParams { opt: Some(o), ..OPT16P1 }
+}
+
+/// `MatchParams` with `OPT16`'s match finder and the opt params `o`.
+fn on_16(o: OptParams) -> MatchParams {
+    MatchParams { opt: Some(o), ..OPT16 }
+}
+
+/// The M6 DP options one at a time and together, for single passes (`check_blocks_m`; no drop
+/// pass there): gap3, top-4 pruning, both, and top-2 (more lengths pruned).
+fn m6_dp_params() -> Vec<(String, MatchParams)> {
+    let p1 = OPT16P1.opt.unwrap();
+    vec![
+        ("gap3".into(), on_p1(OptParams { relax_lengths: None, drop_max_len: 0, ..p1 })),
+        ("top4".into(), on_p1(OptParams { inner_gap: 8, drop_max_len: 0, ..p1 })),
+        ("gap3+top4".into(), on_p1(OptParams { drop_max_len: 0, ..p1 })),
+        ("gap3+top2".into(), on_p1(OptParams { relax_lengths: Some(2), drop_max_len: 0, ..p1 })),
+    ]
+}
+
+/// The M6 schedules over `OPT16P1`'s candidates (`OptPasses`, the drop pass included): opt16p1
+/// itself (Prior S3 seed, one optLevel-2 pass with gap3 and top-4, the drop pass), without the
+/// drop pass, with a cheap pass first (gap3 and pruning in a `hist_out` pass), with a block-init
+/// seed, and with an optLevel-0 final pass.
+fn m6_schedules() -> Vec<(String, MatchParams)> {
+    let p1 = OPT16P1.opt.unwrap();
+    vec![
+        ("opt16p1".into(), OPT16P1),
+        ("opt16p1 no drop".into(), on_p1(OptParams { drop_max_len: 0, ..p1 })),
+        ("opt16p1 x1".into(), on_p1(OptParams { passes: 1, ..p1 })),
+        ("opt16p1 BlockInit".into(), on_p1(OptParams { seed: Seed::BlockInit, prior: PriorTables::M5, ..p1 })),
+        ("opt16p1 L0 top2".into(), on_p1(OptParams { level: 0, relax_lengths: Some(2), ..p1 })),
+    ]
+}
+
+/// M6 options on `OPT16`'s candidates (no sparse chains): the drop pass alone, and the S3 prior
+/// with a cheap pass.
+fn m6_schedules_16() -> Vec<(String, MatchParams)> {
+    let o16 = OPT16.opt.unwrap();
+    vec![
+        ("opt16 + drop".into(), on_16(OptParams { drop_max_len: 6, ..o16 })),
+        ("opt16 + S3 prior x1".into(), on_16(OptParams { seed: Seed::Prior, prior: PriorTables::S3, passes: 1, ..o16 })),
+    ]
+}
+
+/// Single M6 passes (`m6_dp_params`) on `OPT16P1`'s candidates: block-init prices at optLevel 2
+/// and 0, the private ring, wg32 with uploaded tables, and the non-persistent wg16 kernel.
+fn check_m6_single(ctx: &GpuContext, names: &[String], blocks: &[Vec<u8>], cands: &[Vec<CandWords>]) {
+    let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
+    let cfgs = [
+        cfg(2, RingMem::Workgroup, PriceSrc::BlockInit),
+        cfg(0, RingMem::Workgroup, PriceSrc::BlockInit),
+        cfg(2, RingMem::Private, PriceSrc::BlockInit),
+        K3OptConfig { wg: 32, ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer) },
+        K3OptConfig { persist: false, ..cfg(0, RingMem::Workgroup, PriceSrc::BlockInit) },
+    ];
+    for (name, m) in m6_dp_params() {
+        eprintln!("-- {name}");
+        check_blocks_m(ctx, &m, names, blocks, cands, &bi, &cfgs, None);
+    }
+}
+
+/// The oracle frame of every block's `opt::parse` under `m` from `cands`, through `kf`'s frame
+/// options.
+fn oracle_frames(blocks: &[Vec<u8>], cands: &[Vec<CandWords>], m: &MatchParams, kf: &Kernels) -> Vec<Vec<u8>> {
+    let opts = kf.frame_options();
+    par_map(blocks, |i, b| write_frame(b, &gzc_core::opt::parse(b, &cands[i], m), opts))
+}
+
+/// `OPT16P1`'s passes and drop pass from the candidate words `cands` (the oracle's, or K1/K2opt's
+/// on the GPU), frames through K4/K5, against the oracle's frames.
+fn check_p1_frames(ctx: &GpuContext, kf: &Kernels, blocks: &[Vec<u8>], cands: &[Vec<CandWords>], want: &[Vec<u8>], what: &str) {
+    let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
+    let p = OptPasses::new(ctx, &OPT16P1, K3OptConfig::default()).expect("OptPasses::new");
+    assert!(p.drop_pass().is_some());
+    let (got, _) = parses_from_passes(ctx, &p, &refs, &crefs, false).expect("parses_from_passes");
+    let mut bad = 0;
+    for (chunk, (bl, g)) in refs.chunks(256).zip(got.chunks(256)).enumerate() {
+        let fr = frames_from_parses(ctx, kf, bl, g).expect("frames_from_parses");
+        for (j, f) in fr.iter().enumerate() {
+            bad += (*f != want[chunk * 256 + j]) as usize;
+        }
+    }
+    assert_eq!(bad, 0, "opt16p1 ({what}): {bad} of {} frames differ", blocks.len());
+    eprintln!("opt16p1 ({what}): {} frames equal", blocks.len());
+}
+
+/// The frames' kernels (K4/K5 only; the parse comes from the K3opt harness).
+fn frame_kernels(ctx: &GpuContext) -> Kernels {
+    Kernels::new(ctx, GpuParams { matching: LVL9, emit_frames: true, huffman: true }).unwrap()
+}
+
+/// `opt::cases::m6_test_cases` (gap3, top-4 pruning) with their tables, at their level, on both
+/// rings; and every `opt::cases` block (with its scripted candidates) through the M6 schedules.
+#[test]
+fn k3opt_m6_opt_cases() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().expect("GPU required");
+    for c in gzc_core::opt::cases::m6_test_cases() {
+        for (i, (params, prices, want)) in c.expect.iter().enumerate() {
+            let prices = prices.clone().expect("m6 cases carry their tables");
+            let out = run_case(&c.block, &c.cands, params, Some(&prices), Engine::Ring);
+            assert_eq!(out.sequences, *want, "{} [{i}]: oracle", c.name);
+            let level = params.opt.unwrap().level;
+            for ring in [RingMem::Workgroup, RingMem::Private] {
+                let k = K3Opt::new(&ctx, params, cfg(level, ring, PriceSrc::Buffer)).expect("K3Opt::new");
+                let got = parses_from_cands(&ctx, &k, &[&c.block], &[&c.cands], Some(std::slice::from_ref(&prices)))
+                    .expect("parses_from_cands");
+                assert!(got[0] == out, "{} [{i}] {ring:?}: {}", c.name, first_diff(&got[0], &out));
+            }
+        }
+        eprintln!("{}: equal", c.name);
+    }
+    let cases: Vec<_> = opt_test_cases().into_iter().chain(gzc_core::opt::cases::m6_test_cases()).collect();
+    let names: Vec<String> = cases.iter().map(|c| c.name.clone()).collect();
+    let blocks: Vec<Vec<u8>> = cases.iter().map(|c| c.block.clone()).collect();
+    let cands: Vec<Vec<CandWords>> = cases.iter().map(|c| c.cands.clone()).collect();
+    let sched = [m6_schedules(), m6_schedules_16()].concat();
+    check_passes(&ctx, &names, &blocks, &cands, &sched, K3OptConfig::default());
+}
+
+/// `opt::cases::drop_test_cases` on the drop kernel: each scripted input as a final pass and its
+/// fix-up would leave it, with the case's prices (the kernel's test hook) and the expected output,
+/// and with the prices of the input's own histogram against `opt::drop_pass`.
+#[test]
+fn k3drop_matches_drop_cases() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().expect("GPU required");
+    let cases = gzc_core::opt::cases::drop_test_cases();
+    let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
+    let inputs: Vec<BlockOutput> = cases.iter().map(|c| c.input.clone()).collect();
+    let prices: Vec<Prices> = cases.iter().map(|c| c.prices.clone()).collect();
+    let m = on_p1(OptParams { drop_max_len: 6, ..OPT16P1.opt.unwrap() });
+    let d = K3Drop::new(&ctx, &m, true).expect("K3Drop::new");
+    let got = drops_from_parses(&ctx, &d, &blocks, &inputs, Some(&prices)).expect("drops_from_parses");
+    for (c, g) in cases.iter().zip(&got) {
+        assert_eq!(c.max_len, 6);
+        assert!(g.sequences == c.expect, "{}: got {:?}\n    want {:?}", c.name, g.sequences, c.expect);
+    }
+    let d = K3Drop::new(&ctx, &m, false).expect("K3Drop::new");
+    let got = drops_from_parses(&ctx, &d, &blocks, &inputs, None).expect("drops_from_parses");
+    for (c, g) in cases.iter().zip(&got) {
+        let want = drop_pass(&c.block, &c.input, 6, m.segment_log2);
+        assert!(*g == want, "{} (own prices): {}", c.name, first_diff(g, &want));
+    }
+    eprintln!("{} drop cases equal", cases.len());
+}
+
+/// Every synthetic block: the single M6 passes, the M6 schedules (default, looped persistent,
+/// private ring, non-persistent), opt16p1's frames from the oracle's candidates and from K1/K2opt's
+/// (the same frames), and the memo-edge blocks through the M6 passes (gap3 searches at lim 3..7).
+#[test]
+fn k3opt_m6_synthetic() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().expect("GPU required");
+    let all = synthetic_blocks();
+    let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
+    let blocks: Vec<Vec<u8>> = all.into_iter().map(|(_, b)| b).collect();
+    let cands = cands_of_m(&blocks, &OPT16P1);
+    check_m6_single(&ctx, &names, &blocks, &cands);
+    let sched = m6_schedules();
+    check_passes(&ctx, &names, &blocks, &cands, &sched, K3OptConfig::default());
+    let p1 = [("opt16p1".to_string(), OPT16P1)];
+    check_passes(&ctx, &names, &blocks, &cands, &p1, K3OptConfig { grid: Some(3), ..K3OptConfig::default() });
+    check_passes(&ctx, &names, &blocks, &cands, &p1, K3OptConfig { ring: Some(RingMem::Private), ..K3OptConfig::default() });
+    check_passes(&ctx, &names, &blocks, &cands, &p1, K3OptConfig { persist: false, ..K3OptConfig::default() });
+    check_passes(&ctx, &names, &blocks, &cands_of(&blocks), &m6_schedules_16(), K3OptConfig::default());
+    let kf = frame_kernels(&ctx);
+    let want = oracle_frames(&blocks, &cands, &OPT16P1, &kf);
+    check_p1_frames(&ctx, &kf, &blocks, &cands, &want, "oracle candidates");
+    let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let gpu_cands = cands_from_blocks(&ctx, &OptCandKernel::new(&ctx, &OPT16P1).unwrap(), &refs).unwrap();
+    assert!(gpu_cands == cands, "K1/K2opt candidates differ from find_cands");
+    check_p1_frames(&ctx, &kf, &blocks, &gpu_cands, &want, "K1/K2opt candidates");
+    let offs: [&[usize]; 3] = [&[3, 4, 5], &[1, 2, 3, 4], &[3, 4, 5, 6, 8, 9, 12, 16]];
+    let (mut mnames, mut mblocks) = (Vec::new(), Vec::new());
+    for seed in 0..6u64 {
+        for (j, o) in offs.iter().enumerate() {
+            mnames.push(format!("memo_edge[{seed}, {j}]"));
+            mblocks.push(memo_edge_block(seed, o));
+        }
+    }
+    let mcands = cands_of_m(&mblocks, &OPT16P1);
+    check_m6_single(&ctx, &mnames, &mblocks, &mcands);
+    check_passes(&ctx, &mnames, &mblocks, &mcands, &sched, K3OptConfig::default());
+}
+
+/// Informal (reads the real corpus; skips when it is missing): `GZC_CORPUS_BLOCKS` (default 4000)
+/// corpus blocks: the single M6 passes, the M6 schedules, opt16p1 on the looped persistent passes
+/// and the private ring, and opt16p1's frames from the oracle's and from K1/K2opt's candidates.
+/// `GZC_CORPUS=… cargo test --release -p gzc-gpu --test k3opt k3opt_m6_corpus -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn k3opt_m6_corpus() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
+    let Some(blocks) = corpus_blocks(n) else { return };
+    let ctx = GpuContext::new().expect("GPU required");
+    eprintln!("subgroups: {}", ctx.subgroups);
+    let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();
+    let cands = cands_of_m(&blocks, &OPT16P1);
+    check_m6_single(&ctx, &names, &blocks, &cands);
+    check_passes(&ctx, &names, &blocks, &cands, &m6_schedules(), K3OptConfig::default());
+    let p1 = [("opt16p1".to_string(), OPT16P1)];
+    check_passes(&ctx, &names, &blocks, &cands, &p1, K3OptConfig { grid: Some(37), ..K3OptConfig::default() });
+    check_passes(&ctx, &names, &blocks, &cands, &p1, K3OptConfig { ring: Some(RingMem::Private), ..K3OptConfig::default() });
+    check_passes(&ctx, &names, &blocks, &cands_of(&blocks), &m6_schedules_16(), K3OptConfig::default());
+    let kf = frame_kernels(&ctx);
+    let want = oracle_frames(&blocks, &cands, &OPT16P1, &kf);
+    check_p1_frames(&ctx, &kf, &blocks, &cands, &want, "oracle candidates");
+    let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let gpu_cands = cands_from_blocks(&ctx, &OptCandKernel::new(&ctx, &OPT16P1).unwrap(), &refs).unwrap();
+    let diff = gpu_cands.iter().zip(&cands).filter(|(g, c)| g != c).count();
+    assert_eq!(diff, 0, "K1/K2opt candidates differ from find_cands on {diff} blocks");
+    check_p1_frames(&ctx, &kf, &blocks, &gpu_cands, &want, "K1/K2opt candidates");
+    let dropped: usize = par_map(&blocks, |i, b| {
+        let last = passes(b, &cands[i], &OPT16P1).pop().unwrap().out;
+        last.sequences.len() - gzc_core::opt::parse(b, &cands[i], &OPT16P1).sequences.len()
+    })
+    .iter()
+    .sum();
+    eprintln!("the drop pass removed {dropped} sequences over {} blocks", blocks.len());
 }

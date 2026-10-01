@@ -1,7 +1,8 @@
 // K1, subgroup kernel (needs Features::SUBGROUP and subgroups of 32..=128 lanes, and passes a
 // self-test at ChainsKernel::new; otherwise the fallback k1_chains.wgsl runs). Same output as the
 // fallback: pred[p] = most recent q < p with hash(q) == hash(p), else none (== gzc_core
-// compute_preds), layout pred[(b*N_HASHES + chain)*BLOCK_SIZE ..], stored as pred words with p's
+// compute_preds), layout pred[b*PRED_PER_BLOCK + chain*BLOCK_SIZE + p] for the full chains
+// (`chains::chain_span`; (b*N_HASHES + chain)*BLOCK_SIZE without sparse chains), stored as pred words with p's
 // fingerprint (common.wgsl `pred_word`; the tail p >= HASHED_POSITIONS holds PRED_NONE). pred is
 // bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / PRED_PER_BLOCK *
 // N_HASHES.

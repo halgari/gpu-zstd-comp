@@ -1658,10 +1658,39 @@ pub mod cases {
         vec![case("relax_top4_explicit_records_only", block, cands, runs)]
     }
 
+    /// gap3's shortest search window: at `ilimit = iend - 3` a rep probe whose first 4 bytes
+    /// match (the 4th is the next segment's first byte) has length `lim = 3`, not more (the GPU's
+    /// rep probe extends from the 4th byte only when `lim > 3`). Segment 1: a series at
+    /// `2 SEG - 10` with 6 bytes at offset 700 and an expensive 8-byte record (offset 2000) that
+    /// keeps the series open past `ilimit`; after the 700 match a mismatching literal, then at
+    /// `2 SEG - 3` rep0 (700) matches 4 bytes up to `2 SEG + 1`: a 3-byte rep reaching `iend`
+    /// (immediate encoding). With `inner_gap: 8` that position is never searched.
+    pub fn gap3_rep_capped_at_ilimit() -> Vec<OptCase> {
+        let (b, r) = (2 * SEG - 10, 2 * SEG - 3);
+        let mut block = synth::random(122, BLOCK_SIZE);
+        plant(&mut block, b, 2000, 8);
+        plant(&mut block, b, 700, 6);
+        plant(&mut block, r, 700, 4);
+        real(&block, b, 2000, 8);
+        real(&block, b, 700, 6);
+        real(&block, r, 700, 4);
+        let mut cands = empty();
+        cands[b] = two((700, 6), (2000, 8));
+        let mut pr = flat();
+        pr.of[oc(2000)] = 60000;
+        let g3 = vec![seq(b as u32, 6, 703), seq(1, 3, 1)];
+        let g8 = vec![seq(b as u32, 6, 703)];
+        let runs = vec![(m6_pass(3, None), Some(pr.clone()), g3), (m6_pass(8, None), Some(pr), g8)];
+        vec![case("gap3_rep_capped_at_ilimit", block, cands, runs)]
+    }
+
     /// The M6 DP cases (gap3, relaxation pruning), in order. Kept apart from `opt_test_cases`,
     /// which the M5 GPU kernel replays.
     pub fn m6_test_cases() -> Vec<OptCase> {
-        [gap3_inner_segments_only, relax_top4_explicit_records_only].into_iter().flat_map(|f| f()).collect()
+        [gap3_inner_segments_only, gap3_rep_capped_at_ilimit, relax_top4_explicit_records_only]
+            .into_iter()
+            .flat_map(|f| f())
+            .collect()
     }
 
     /// One scripted drop-pass input: `input` (a parse of `block`, true-rep offBases), the
@@ -1763,9 +1792,48 @@ pub mod cases {
         vec![DropCase { name: "drop_chain_carries_literals".into(), block, input, prices, max_len: 6, dropped, expect }]
     }
 
+    /// The successor's rep numbering changes with the merge: an explicit 4-byte match (offset 900,
+    /// OF code 9, expensive) is followed at once (`ll' = 0`) by a 6-byte match at offset 400, which
+    /// before the drop is repcode 2 under `ll0` numbering (`r'[2]` of `r' = [900, 700, 400]`), and
+    /// after it, with 96 literals, repcode 2 under the plain numbering (`r[1]` of `[700, 400, 1]`).
+    /// The 900 is dropped; the GPU drop kernel must price and re-encode the successor both ways.
+    pub fn drop_successor_ll0_renumbered() -> Vec<DropCase> {
+        let ms = [(1000, 400, 8), (1100, 700, 8), (1200, 900, 4), (1204, 400, 6), (2000, 1500, 10)];
+        let (block, input) = planted(134, &ms);
+        assert_eq!(input.sequences[3], seq(0, 6, 2), "the successor is repcode 2 with ll0");
+        let prices = flat_of(&[(9, 60000)]);
+        let dropped = vec![false, false, true, false, false];
+        let expect = vec![seq(1000, 8, 403), seq(92, 8, 703), seq(96, 6, 2), seq(790, 10, 1503)];
+        vec![DropCase { name: "drop_successor_ll0_renumbered".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
+    /// After a drop the lane's reps differ from the input's, and so does the successor's
+    /// numbering: reps `[600, 1500, 3000]`; an explicit 3-byte match at offset 250 (OF code 7,
+    /// expensive) is dropped, so `r` stays; the next 3-byte match (offset 90, OF code 6, free) has
+    /// a successor at `ll' = 0` and offset 1500, explicit (1503, expensive) in the input (whose
+    /// reps hold 250) but repcode 2 under the lane's reps after the 90 (`[90, 600, 1500]`), which
+    /// makes keeping the 90 cheaper. Priced with the input's off_base instead, the 90 would be
+    /// dropped too.
+    pub fn drop_successor_renumbered_after_drop() -> Vec<DropCase> {
+        let ms = [(4000, 3000, 10), (4100, 1500, 10), (4200, 600, 8), (4300, 250, 3), (4400, 90, 3), (4403, 1500, 8), (6000, 4900, 10)];
+        let (block, input) = planted(135, &ms);
+        assert_eq!(input.sequences[5], seq(0, 8, 1503), "the successor is explicit in the input");
+        let prices = flat_of(&[(7, 60000), (6, 0), (10, 60000)]);
+        let dropped = vec![false, false, false, true, false, false, false];
+        let expect = vec![seq(4000, 10, 3003), seq(90, 10, 1503), seq(90, 8, 603), seq(192, 3, 93), seq(0, 8, 2), seq(1589, 10, 4903)];
+        vec![DropCase { name: "drop_successor_renumbered_after_drop".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
     /// Every drop-pass case, in order.
     pub fn drop_test_cases() -> Vec<DropCase> {
-        [drop_threshold_and_length, drop_rep_vs_explicit, drop_segment_starts_from_input_state, drop_chain_carries_literals]
+        [
+            drop_threshold_and_length,
+            drop_rep_vs_explicit,
+            drop_segment_starts_from_input_state,
+            drop_chain_carries_literals,
+            drop_successor_ll0_renumbered,
+            drop_successor_renumbered_after_drop,
+        ]
             .into_iter()
             .flat_map(|f| f())
             .collect()
@@ -2031,9 +2099,10 @@ mod tests {
         }
     }
 
-    /// 4000 blocks spread uniformly over the corpus (every `total / 4000`-th .dds/.nif block in
-    /// path order, the `gzc-bench --ext dds,nif` order), or `None` (with a message) when the
-    /// corpus directory (`GZC_CORPUS`, default `data/corpus`) is absent.
+    /// `GZC_CORPUS_BLOCKS` (default 4000) blocks spread uniformly over the corpus (every
+    /// `total / n`-th .dds/.nif block in path order, the `gzc-bench --ext dds,nif` order), or
+    /// `None` (with a message) when the corpus directory (`GZC_CORPUS`, default `data/corpus`) is
+    /// absent.
     fn corpus_sample() -> Option<Vec<Vec<u8>>> {
         use std::path::{Path, PathBuf};
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -2060,14 +2129,16 @@ mod tests {
         for f in files {
             blocks.extend(chunk_file(&std::fs::read(&f).unwrap()).into_iter().map(|b| b.data));
         }
-        let stride = (blocks.len() / 4000).max(1);
-        Some(blocks.into_iter().step_by(stride).take(4000).collect())
+        let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000).max(1);
+        let stride = (blocks.len() / n).max(1);
+        Some(blocks.into_iter().step_by(stride).take(n).collect())
     }
 
-    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`)
-    /// round-trip through libzstd for every variant (`variants` and `m6_variants`), and every
-    /// other one of them (2000, i.e. every ~50th block at 64 KiB) gives the same output on the
-    /// ring engine. Skipped with a message when the corpus is absent.
+    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`;
+    /// `GZC_CORPUS_BLOCKS` sets the count) round-trip through libzstd for every variant
+    /// (`variants` and `m6_variants`), and every other one of them (2000, i.e. every ~50th block
+    /// at 64 KiB) gives the same output on the ring engine. Runs on `GZC_TEST_THREADS` threads
+    /// (default 16, at most the cores). Skipped with a message when the corpus is absent.
     /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
     #[test]
     #[ignore]
@@ -2075,7 +2146,9 @@ mod tests {
         let Some(sample) = corpus_sample() else { return };
         let vars = [variants(), m6_variants()].concat();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cap: usize = std::env::var("GZC_TEST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let threads = cap.clamp(1, cores);
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| loop {

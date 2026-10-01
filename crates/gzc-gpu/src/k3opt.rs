@@ -19,6 +19,11 @@
 //! (`PriceSrc::Hist`). Only the final pass (at the preset's optLevel) writes its parse and runs
 //! the fix-up. `parses_from_passes` / `time_passes` are the host harnesses.
 //!
+//! M6 (`opt16p1`, B3): `inner_gap` (gap3), `relax_lengths` (top-N pruning) and `prior` (the S3
+//! prior tables) are compile-time options of the pass kernel (the M5 presets build the same
+//! kernels as before); with `drop_max_len > 0` `OptPasses` runs the drop pass (`K3Drop`,
+//! `shaders/k3_drop.wgsl`, `opt::drop_pass`) after the final pass's fix-up.
+//!
 //! Buffers per block: data (BLOCK_SIZE, plus the batch's trailing zero word: `ld32` reads one word
 //! past a block), candidate words (`compressor::best_bytes_for`, 8 B per position; after the DP
 //! each segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace
@@ -55,7 +60,7 @@ use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use anyhow::{anyhow, ensure};
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::opt::{Hist, Prices};
-use gzc_core::params::MatchParams;
+use gzc_core::params::{MatchParams, PriorTables};
 use gzc_core::reference::CandWords;
 use gzc_core::seq::BlockOutput;
 
@@ -543,17 +548,19 @@ fn wgsl_array_u32(name: &str, v: &[u32]) -> String {
     )
 }
 
-/// The `codes` and seed constants the kernel needs: block-init and prior-seed LL/ML/OF prices,
-/// LL/ML extra bits, and the ML codes of match lengths 3..131.
-fn tables_wgsl() -> String {
-    use gzc_core::codes::{LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, ml_code};
+/// The `codes` and seed constants the kernel needs: block-init and prior-seed LL/ML/OF prices
+/// (the `prior` tables, `opt::seed_prices`), LL/ML extra bits, and the ML codes of match lengths
+/// 3..131.
+fn tables_wgsl(prior: PriorTables) -> String {
+    use gzc_core::codes::{
+        LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF, ml_code,
+    };
     let bi = Prices::block_init(&vec![0u8; BLOCK_SIZE]);
-    let pr = Prices::from_hist(&Hist {
-        lit: [0; 256],
-        ll: OPT_PRIOR_LL,
-        ml: OPT_PRIOR_ML,
-        of: OPT_PRIOR_OF,
-    });
+    let (ll, ml, of) = match prior {
+        PriorTables::M5 => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
+        PriorTables::S3 => (OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF),
+    };
+    let pr = Prices::from_hist(&Hist { lit: [0; 256], ll, ml, of });
     let u = |t: &[u8]| t.iter().map(|&x| x as u32).collect::<Vec<u32>>();
     let mlc: Vec<u32> = (0..128u32).map(|b| ml_code(b + 3) as u32).collect();
     [
@@ -568,6 +575,171 @@ fn tables_wgsl() -> String {
         wgsl_array_u32("ML_CODE", &mlc),
     ]
     .concat()
+}
+
+const K3_DROP_WGSL: &str = include_str!("shaders/k3_drop.wgsl");
+
+/// The drop pass (M6 B3, `shaders/k3_drop.wgsl`): `opt::drop_pass` on the fixed-up parses of a
+/// final K3opt pass (`seqs`, `counts`, and the per-segment trailers the pass left in `best`), in
+/// place. One workgroup of 64 lanes per block: the output's histogram and its prices, one lane per
+/// 4 KiB segment for the decisions (`opt::drop_decisions`), then the compaction and the
+/// off_bases re-encoded against the true reps (`opt::apply_drops`).
+pub struct K3Drop {
+    pipe: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    /// The opt params the pass was built for (`drop_max_len > 0`).
+    pub params: MatchParams,
+    /// Test hook: the drop prices are the `opt::Prices` tables in `prices` (`PRICE_WORDS` per
+    /// block), not those of the output's histogram.
+    pub prices_in: bool,
+}
+
+impl K3Drop {
+    /// Builds the drop pass of opt params `m` (`drop_max_len > 0`); `prices_in`: see
+    /// `K3Drop::prices_in`.
+    pub fn new(ctx: &GpuContext, m: &MatchParams, prices_in: bool) -> anyhow::Result<Self> {
+        m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
+        let o = m.opt.ok_or_else(|| anyhow!("K3Drop needs opt params"))?;
+        ensure!(o.drop_max_len > 0, "K3Drop: drop_max_len is 0");
+        ensure!(BLOCK_SIZE <= 1 << 16, "K3Drop: blocks of at most 64 KiB");
+        ensure!(n_seg(m) <= 64 && 64 % n_seg(m) == 0, "K3Drop: {} segments per block", n_seg(m));
+        let body = format!(
+            "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst DROP_MAX: u32 = {}u;\n\
+             const DROP_PRICES_IN: bool = {prices_in};\n{}{K3_DROP_WGSL}\n{K3_FIXUP_WGSL}",
+            params_wgsl(m),
+            m.segment_log2,
+            o.drop_max_len,
+            tables_wgsl(o.prior),
+        );
+        let layout = crate::compressor::storage_layout(ctx, "k3drop", &[true, false, false, false, true]);
+        let module = ctx.shader_unbounded_loops("k3_drop", &body);
+        let pipe = crate::compressor::pipeline_from_module(ctx, "k3_drop", &layout, &module, "main_drop");
+        Ok(Self { pipe, layout, params: *m, prices_in })
+    }
+
+    /// Records the drop pass on the first `n` blocks of `bufs` (after the final pass's fix-up), in
+    /// its own compute pass with `ts`.
+    pub fn record(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &OptBinds,
+        n: u32,
+        ts: Option<wgpu::ComputePassTimestampWrites>,
+    ) -> anyhow::Result<()> {
+        bufs.check(n, &self.params)?;
+        let max_groups = ctx.device.limits().max_compute_workgroups_per_dimension;
+        ensure!(n <= max_groups, "k3drop: {n} blocks > {max_groups} workgroups");
+        let counts = wgpu::BufferBinding { buffer: bufs.counts, offset: 0, size: wgpu::BufferSize::new(counts_bytes(n)) };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k3drop"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.cands.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.seqs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(counts) },
+                wgpu::BindGroupEntry { binding: 4, resource: bufs.prices.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3drop"), timestamp_writes: ts });
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_pipeline(&self.pipe);
+        pass.dispatch_workgroups(n, 1, 1);
+        Ok(())
+    }
+}
+
+/// The words a final K3opt pass and its fix-up leave for `K3Drop` when their parse is `out`
+/// (`BLOCK_SIZE`-byte segments of `1 << seg_log2`): `best` (`2 * BLOCK_SIZE` words: each
+/// segment's raw sequences, last first, with off_bases under the segment's own history from
+/// `INITIAL_REPS` (segment 0) or `[0, 0, 0]`, and its 6-word trailer at `SEG_META`), the parse's
+/// `seqs` words and its counts. For replaying a scripted drop input (`opt::cases::DropCase`).
+/// Every match must lie in one segment.
+pub fn final_pass_words(out: &BlockOutput, seg_log2: u32) -> (Vec<u32>, Vec<u32>, [u32; 2]) {
+    use gzc_core::seq::{INITIAL_REPS, apply_off_base, off_base_for};
+    let seg = 1usize << seg_log2;
+    let seg_words = 2 * seg;
+    let meta = seg_words - 6;
+    let mut segs: Vec<Vec<(usize, u32, u32)>> = vec![Vec::new(); BLOCK_SIZE / seg];
+    let (mut r, mut pos) = (INITIAL_REPS, 0usize);
+    let mut ml_sum = 0u32;
+    for s in &out.sequences {
+        let off = apply_off_base(&mut r, s.off_base, s.lit_len);
+        let start = pos + s.lit_len as usize;
+        pos = start + s.match_len as usize;
+        assert_eq!(start / seg, (pos - 1) / seg, "a match crosses a segment");
+        segs[start / seg].push((start, s.match_len, off));
+        ml_sum += s.match_len;
+    }
+    let mut best = vec![0u32; 2 * BLOCK_SIZE];
+    for (k, v) in segs.iter().enumerate() {
+        let mut local = if k == 0 { INITIAL_REPS } else { [0; 3] };
+        let mut anchor = k * seg;
+        let (mut n, mut ml) = (0u32, 0u32);
+        let at = k * seg_words;
+        for (i, &(start, m, off)) in v.iter().enumerate() {
+            let ll = (start - anchor) as u32;
+            let ob = off_base_for(off, ll, &local);
+            apply_off_base(&mut local, ob, ll);
+            let w = at + 3 * (v.len() - 1 - i);
+            best[w..w + 3].copy_from_slice(&[ll, m, ob]);
+            anchor = start + m as usize;
+            n += 1;
+            ml += m;
+        }
+        best[at + meta..at + meta + 6].copy_from_slice(&[n, anchor as u32, ml, local[0], local[1], local[2]]);
+    }
+    let seqs: Vec<u32> = out.sequences.iter().flat_map(|s| [s.lit_len, s.match_len, s.off_base]).collect();
+    (best, seqs, [out.sequences.len() as u32, BLOCK_SIZE as u32 - ml_sum])
+}
+
+/// Runs `d` on scripted inputs: each block's parse `inputs[i]` as a final pass would leave it
+/// (`final_pass_words`), with the drop prices `prices[i]` when `d.prices_in`. Returns the parses
+/// after the drop pass.
+pub fn drops_from_parses(
+    ctx: &GpuContext,
+    d: &K3Drop,
+    blocks: &[&[u8]],
+    inputs: &[BlockOutput],
+    prices: Option<&[Prices]>,
+) -> anyhow::Result<Vec<BlockOutput>> {
+    ensure!(blocks.len() == inputs.len() && !blocks.is_empty(), "one input per block");
+    ensure!(prices.is_some() == d.prices_in, "price tables iff prices_in");
+    let n = blocks.len() as u32;
+    crate::compressor::with_error_scopes(ctx, || {
+        let bufs = OptBuffers::new(ctx, &d.params, n)?;
+        ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
+        let per = best_bytes_for(1, &d.params);
+        let mut counts = Vec::with_capacity(2 * blocks.len());
+        for (b, out) in inputs.iter().enumerate() {
+            let (best, seqs, c) = final_pass_words(out, d.params.segment_log2);
+            ctx.queue.write_buffer(&bufs.cands, b as u64 * per, bytemuck::cast_slice(&best));
+            ctx.queue.write_buffer(&bufs.seqs, b as u64 * seqs_bytes_for(1, &d.params), bytemuck::cast_slice(&seqs));
+            counts.extend_from_slice(&c);
+        }
+        ctx.queue.write_buffer(&bufs.counts, 0, bytemuck::cast_slice(&counts));
+        if let Some(ps) = prices {
+            let words: Vec<u32> =
+                ps.iter().flat_map(|p| p.lit.iter().chain(&p.ll).chain(&p.ml).chain(&p.of).map(|&x| x as u32)).collect();
+            ctx.queue.write_buffer(&bufs.prices, 0, bytemuck::cast_slice(&words));
+        }
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3drop") });
+        if ctx.poisoning() {
+            // Everything but the uploaded words (the inputs' seqs words are left as they are).
+            ctx.poison_workgroup_memory(&mut enc);
+            ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+            ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, &d.params));
+            ctx.poison_from(&mut enc, &bufs.counts, counts_bytes(n));
+            for b in [&bufs.trace, &bufs.scratch, &bufs.sched] {
+                ctx.poison_from(&mut enc, b, 0);
+            }
+            ctx.poison_from(&mut enc, &bufs.prices, if d.prices_in { prices_bytes(n) } else { 0 });
+        }
+        d.record(ctx, &mut enc, &bufs.binds(), n, None)?;
+        ctx.queue.submit([enc.finish()]);
+        read_parses(ctx, &bufs, blocks)
+    })
 }
 
 impl K3Opt {
@@ -606,6 +778,7 @@ impl K3Opt {
             "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst WG: u32 = {}u;\nconst SUFF: u32 = {suff}u;\n\
              const LEVEL: u32 = {}u;\nconst PRICE_MODE: u32 = {}u;\nconst HIST_OUT: bool = {};\n\
              const DEAD_BIT: u32 = {}u;\nconst SCHED_HDR: u32 = {SCHED_HDR}u;\nconst PERSIST: bool = {persist};\n\
+             const GAP: u32 = {}u;\nconst RELAX_N: u32 = {}u;\n\
              {}{ring_decl}{K3_OPT_WGSL}\n{K3_FIXUP_WGSL}",
             params_wgsl(m),
             m.segment_log2,
@@ -619,7 +792,9 @@ impl K3Opt {
             },
             cfg.hist_out,
             gzc_core::reference::DEAD_BIT,
-            tables_wgsl(),
+            o.inner_gap,
+            o.relax_lengths.unwrap_or(0),
+            tables_wgsl(o.prior),
         );
         let layout = crate::compressor::storage_layout(
             ctx,
@@ -748,8 +923,11 @@ impl K3Opt {
     }
 
     /// `record` on `bufs` with the given timestamp writes for the DP's and the fix-up's compute
-    /// passes (the fix-up's are unused after a `hist_out` pass).
-    pub fn record_with(
+    /// passes (the fix-up's are unused after a `hist_out` pass). A persistent pass needs the
+    /// batch's block order in `bufs.sched` (`record_order`, recorded before it on these blocks), so
+    /// this is crate-private: `record_at`, `OptPasses::record` and `OptPasses::record_span` record
+    /// the order first.
+    pub(crate) fn record_with(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
@@ -975,10 +1153,14 @@ pub fn time_pass(
 /// words), then the final pass at `o.level` with the fix-up. Pass 0 is priced by the seed
 /// (`Seed::BlockInit` → `PriceSrc::BlockInit`, `Seed::Prior` → `PriceSrc::Prior`), every later
 /// pass by the previous pass's histogram (`PriceSrc::Hist`). One dispatch per pass (plus the
-/// fix-up): the candidates, the data and the histograms stay resident in `OptBuffers`.
+/// fix-up): the candidates, the data and the histograms stay resident in `OptBuffers`. With
+/// `drop_max_len > 0` (M6 `opt16p1`) the drop pass (`K3Drop`) follows the fix-up, as
+/// `opt::parse` applies `opt::drop_pass` to the final pass's output.
 pub struct OptPasses {
     /// The kernel of each pass, in order (a kernel shared by several passes appears once per pass).
     kernels: Vec<std::sync::Arc<K3Opt>>,
+    /// The drop pass after the final pass's fix-up (`OptParams::drop_max_len > 0`).
+    drop: Option<K3Drop>,
 }
 
 impl OptPasses {
@@ -1011,7 +1193,8 @@ impl OptPasses {
         }
         let fin_src = if o.passes > 0 { PriceSrc::Hist } else { seed };
         kernels.push(Arc::new(K3Opt::new(ctx, m, cfg(o.level, fin_src, false))?));
-        Ok(Self { kernels })
+        let drop = if o.drop_max_len > 0 { Some(K3Drop::new(ctx, m, false)?) } else { None };
+        Ok(Self { kernels, drop })
     }
 
     /// The passes' kernels, in order.
@@ -1029,11 +1212,17 @@ impl OptPasses {
         self.kernels.len()
     }
 
+    /// The drop pass after the final pass (`OptParams::drop_max_len > 0`).
+    pub fn drop_pass(&self) -> Option<&K3Drop> {
+        self.drop.as_ref()
+    }
+
     /// Records the block order (M6 A4, once for all passes: K2opt's candidate words are intact
-    /// until the final pass) and every pass on the first `n` blocks of `bufs` (uploaded blocks
-    /// and candidate words). Timestamps: pass i's DP at `2i`/`2i + 1`, the final fix-up at
-    /// `2 * n_passes()` and `2 * n_passes() + 1`, the block order at `2 * n_passes() + 2` and
-    /// `2 * n_passes() + 3`.
+    /// until the final pass), every pass and the drop pass on the first `n` blocks of `bufs`
+    /// (uploaded blocks and candidate words). Timestamps: pass i's DP at `2i`/`2i + 1`, the final
+    /// fix-up at `2 * n_passes()` and `2 * n_passes() + 1`, the block order at `2 * n_passes() + 2`
+    /// and `2 * n_passes() + 3`, the drop pass at `2 * n_passes() + 4` and `2 * n_passes() + 5`
+    /// (an empty compute pass carries them when there is none).
     pub fn record(
         &self,
         ctx: &GpuContext,
@@ -1061,6 +1250,19 @@ impl OptPasses {
             // The final pass's fix-up lands at 2 * i + 2 = 2 * n_passes().
             k.record_with(ctx, enc, &binds, n, ts(0), ts(1))?;
         }
+        let at = 2 * self.n_passes() as u32 + 4;
+        let ts = queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(at),
+            end_of_pass_write_index: Some(at + 1),
+        });
+        match &self.drop {
+            Some(d) => d.record(ctx, enc, &binds, n, ts)?,
+            None if ts.is_some() => {
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3drop"), timestamp_writes: ts });
+            }
+            None => {}
+        }
         Ok(())
     }
 
@@ -1078,9 +1280,10 @@ impl OptPasses {
         self.kernels[0].record_order(ctx, enc, bufs, n, ts)
     }
 
-    /// Records the block order and every pass on the first `n` blocks of `bufs`, with one
-    /// timestamp pair spanning them all (the pipeline's K3 entry): `span`'s beginning write on the
-    /// block order's compute pass and its end write on the final fix-up.
+    /// Records the block order, every pass and the drop pass on the first `n` blocks of `bufs`,
+    /// with one timestamp pair spanning them all (the pipeline's K3 entry): `span`'s beginning
+    /// write on the block order's compute pass and its end write on the drop pass, or without one
+    /// on the final fix-up.
     pub fn record_span(
         &self,
         ctx: &GpuContext,
@@ -1097,14 +1300,20 @@ impl OptPasses {
         });
         // (An empty compute pass carries the beginning write when the passes are not persistent.)
         self.record_order(ctx, enc, bufs, n, begin)?;
-        for (i, k) in self.kernels().enumerate() {
-            let end = span.as_ref().filter(|_| i == last).map(|s| wgpu::ComputePassTimestampWrites {
+        let end = || {
+            span.as_ref().map(|s| wgpu::ComputePassTimestampWrites {
                 query_set: s.query_set,
                 beginning_of_pass_write_index: None,
                 end_of_pass_write_index: s.end_of_pass_write_index,
-            });
+            })
+        };
+        for (i, k) in self.kernels().enumerate() {
             // Only the final pass (last) has a fix-up.
-            k.record_with(ctx, enc, bufs, n, None, end)?;
+            let fix_end = if i == last && self.drop.is_none() { end() } else { None };
+            k.record_with(ctx, enc, bufs, n, None, fix_end)?;
+        }
+        if let Some(d) = &self.drop {
+            d.record(ctx, enc, bufs, n, end())?;
         }
         Ok(())
     }
@@ -1124,8 +1333,9 @@ pub fn read_hists(ctx: &GpuContext, bufs: &OptBuffers, n: usize) -> Vec<Hist> {
 }
 
 /// Runs every pass of `p` on `blocks` with their candidate words, batch by batch, and returns the
-/// final parses and, with `hists`, each cheap pass's histograms (`[pass][block]`, the GPU's
-/// counterpart of `opt::Hist::of_output(&opt::passes(..)[pass].out)`; one submission per pass).
+/// final parses (after the drop pass, if any: `opt::parse`) and, with `hists`, each cheap pass's
+/// histograms (`[pass][block]`, the GPU's counterpart of
+/// `opt::Hist::of_output(&opt::passes(..)[pass].out)`; one submission per pass).
 pub fn parses_from_passes(
     ctx: &GpuContext,
     p: &OptPasses,
@@ -1145,6 +1355,17 @@ pub fn parses_from_passes(
             let at = i * BATCH_CAP;
             bufs.upload(ctx, chunk, &cands[at..at + chunk.len()], None)?;
             let n = chunk.len() as u32;
+            if ctx.poisoning() {
+                // Everything but the uploaded blocks (+ trailing word) and candidates.
+                let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3opt.poison") });
+                ctx.poison_workgroup_memory(&mut enc);
+                ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+                ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, p.params()));
+                for b in [&bufs.trace, &bufs.seqs, &bufs.counts, &bufs.scratch, &bufs.sched, &bufs.prices] {
+                    ctx.poison_from(&mut enc, b, 0);
+                }
+                ctx.queue.submit([enc.finish()]);
+            }
             if hists {
                 for (j, k) in p.kernels().enumerate() {
                     let mut enc = ctx
@@ -1157,6 +1378,11 @@ pub fn parses_from_passes(
                     if k.hist_out {
                         hs[j].extend(read_hists(ctx, &bufs, chunk.len()));
                     }
+                }
+                if let Some(d) = &p.drop {
+                    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k3drop") });
+                    d.record(ctx, &mut enc, &bufs.binds(), n, None)?;
+                    ctx.queue.submit([enc.finish()]);
                 }
             } else {
                 let mut enc = ctx
@@ -1174,10 +1400,11 @@ pub fn parses_from_passes(
 }
 
 /// GPU time (ms, median of `reps` runs after one warm-up) of each DP pass of `p`, of the final
-/// fix-up and of the block order (M6 A4; 0 when the passes are not persistent), on the first `n`
-/// blocks of `bufs`: `n_passes() + 2` values, then the span from the block order's start to the
-/// fix-up's end (dispatch gaps included). The final pass overwrites part
-/// of the candidate words, so `reupload` runs before every run (outside the timed passes).
+/// fix-up, of the block order (M6 A4; 0 when the passes are not persistent) and of the drop pass
+/// (M6 B3; 0 without one), on the first `n` blocks of `bufs`: `n_passes() + 3` values, then the
+/// span from the block order's start to the end of the drop pass, or without one of the fix-up
+/// (dispatch gaps included). The final pass overwrites part of the candidate words, so `reupload`
+/// runs before every run (outside the timed passes).
 pub fn time_passes(
     ctx: &GpuContext,
     p: &OptPasses,
@@ -1187,7 +1414,7 @@ pub fn time_passes(
     mut reupload: impl FnMut(),
 ) -> anyhow::Result<Vec<f64>> {
     ensure!(ctx.timestamps, "timestamps unavailable");
-    let q = 2 * (p.n_passes() + 2);
+    let q = 2 * (p.n_passes() + 3);
     let qs = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("k3opt.passes.ts"),
         ty: wgpu::QueryType::Timestamp,
@@ -1200,7 +1427,7 @@ pub fn time_passes(
         mapped_at_creation: false,
     });
     let period = ctx.queue.get_timestamp_period() as f64;
-    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 3];
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); p.n_passes() + 4];
     for r in 0..=reps {
         reupload();
         let mut enc = ctx
@@ -1213,12 +1440,14 @@ pub fn time_passes(
         ctx.queue.submit([enc.finish()]);
         let t: Vec<u64> = ctx.read_buffer(&resolve, 0, q);
         if r > 0 {
-            for (i, v) in times.iter_mut().take(p.n_passes() + 2).enumerate() {
-                v.push(t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * period / 1e6);
+            for (i, v) in times.iter_mut().take(p.n_passes() + 3).enumerate() {
+                let d = if i == p.n_passes() + 2 && p.drop.is_none() { 0 } else { t[2 * i + 1].saturating_sub(t[2 * i]) };
+                v.push(d as f64 * period / 1e6);
             }
-            // From the block order's start (q - 2) to the fix-up's end (2 * n_passes() + 1).
-            let fix_end = t[2 * p.n_passes() + 1];
-            times[p.n_passes() + 2].push(fix_end.saturating_sub(t[q - 2]) as f64 * period / 1e6);
+            // From the block order's start (2 * n_passes() + 2) to the drop pass's end (q - 1), or
+            // the fix-up's (2 * n_passes() + 1).
+            let end = if p.drop.is_some() { t[q - 1] } else { t[2 * p.n_passes() + 1] };
+            times[p.n_passes() + 3].push(end.saturating_sub(t[2 * p.n_passes() + 2]) as f64 * period / 1e6);
         }
     }
     Ok(times

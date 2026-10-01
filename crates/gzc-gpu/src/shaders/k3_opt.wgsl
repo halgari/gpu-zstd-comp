@@ -9,7 +9,8 @@
 //   PRICE_MODE 1: the tables in `prices`, opt::Prices verbatim, 377 words per block: lit[256]
 //   ll[36] ml[53] of[32]). Then each lane runs opt::Dp::segment_ring over its segment: segment 0
 //   from ip 1 with INITIAL_REPS, segment k > 0 from ip = anchor = k*SEG with reps [0, 0, 0];
-//   iend = the segment end, ilimit = iend - 8.
+//   iend = the segment end, ilimit = iend - GAP for an inner segment, iend - 8 for the block's
+//   last one (opt::Seg::new; GAP = OptParams::inner_gap, 8 under the M5 presets, 3 for gap3).
 //   Phase 1, the DP:
 //   - The lane loop is flattened (one trip per series start probe or series position, no
 //     `continue`) so that the lanes' get_all_matches calls run together; each trip issues its
@@ -63,9 +64,15 @@
 //
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
 // (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
-// (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
-// LL_BITS / ML_BITS / ML_CODE (codes.rs), DEAD_BIT (reference::DEAD_BIT), SCHED_HDR
-// (k3_sched.wgsl), and the price ring's declaration (ring_p, rix).
+// (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices, from
+// the tables OptParams::prior names), LL_BITS / ML_BITS / ML_CODE (codes.rs), DEAD_BIT
+// (reference::DEAD_BIT), SCHED_HDR (k3_sched.wgsl), GAP (OptParams::inner_gap), RELAX_N
+// (OptParams::relax_lengths, 0 for None), and the price ring's declaration (ring_p, rix).
+//
+// M6 options (opt16p1; compile-time, so the M5 presets build the same kernels as before): GAP
+// (ilimit above), RELAX_N (relaxation pruning, opt::Dp::relax_floor: an explicit record relaxes
+// only its RELAX_N longest lengths, see the relaxation loop) and the PR_* tables. The drop pass
+// (OptParams::drop_max_len) is its own kernel after the fix-up, k3_drop.wgsl.
 //
 // Persistent passes (M6 A4, a07): with WG == NSEG the host runs the entry point main_opt_persist
 // instead of main_opt. The grid is the same (one workgroup per block), but each workgroup loops:
@@ -214,6 +221,12 @@ fn sbase() -> u32 { return gsg * (3u * RING_N); }
 fn lbase() -> u32 { return block_id() * (3u * MAX_SEQS) + seg_id() * LOG_WORDS; }
 // The segment's end (iend: positions [k * SEG, iend)).
 fn seg_end() -> u32 { return (seg_id() + 1u) * SEG; }
+// ilimit (opt::Seg::new): iend - GAP for an inner segment, iend - 8 for the block's last one (GAP
+// == 8 under the M5 presets, where this is iend - 8 for every segment).
+fn ilimit() -> u32 {
+    if (GAP == 8u) { return seg_end() - 8u; }
+    return seg_end() - select(8u, GAP, seg_id() + 1u < NSEG);
+}
 
 // Records of the last get_all_matches: offBase | length << 17 (offBase <= 65538 < 2^17, length
 // <= SEG < 2^15), strictly increasing length.
@@ -404,11 +417,12 @@ fn memo_len(p: u32, ro: u32) -> u32 {
 fn rep_probe(j: u32, p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, h: u32, bestl: ptr<function, u32>) -> bool {
     let d = x ^ y;
     if (!valid || (d & 0xFFFFFFu) != 0u) { return false; }
-    // lim >= 8 at every searched position (p <= ilimit = iend - 8).
+    // lim >= GAP >= 3 at every searched position (p <= ilimit = iend - GAP; 8 in the block's last
+    // segment): with lim == 3 (gap3, p == ilimit) the length is 3 whatever the 4th byte.
     var rl = h;
     if (h == 0u) {
         rl = 3u;
-        if (d == 0u) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
+        if (d == 0u && (GAP >= 4u || lim > 3u)) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
     }
     mem[j] = ro | (rl << 16u);
     if (rl <= *bestl) { return false; }
@@ -778,9 +792,10 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
             }
             var spec = select(vec3<u32>(0u), vec3<u32>(1u, 4u, 8u), kk == 0u);
             var i = 0u;
-            // Terminates: i rises to n.
+            // Terminates: i rises to n, bounded by LOG_SEQS (a segment logs at most SEG / 3 <=
+            // LOG_SEQS sequences, so the bound only guards against a corrupt summary word).
             loop {
-                if (i >= n || all(reps == spec)) { break; }
+                if (i >= min(n, LOG_SEQS) || all(reps == spec)) { break; }
                 let r = src + 3u * i;
                 let ll = seqs[r] + select(0u, carry, i == 0u);
                 let spec_ob = seqs[r + 2u];
@@ -853,7 +868,7 @@ fn in_batch() -> bool {
 // The DP pass of the lane's segment (phases 1 and 2).
 fn dp() {
     let s = seg_id() * SEG;
-    // iend = seg_end(), ilimit = seg_end() - 8 (recomputed at use, M6 A1).
+    // iend = seg_end(), ilimit = ilimit() (recomputed at use, M6 A1).
     st_anchor = s;
     if (s == 0u) {
         st_ip = 1u;
@@ -880,12 +895,12 @@ fn dp() {
             // nothing and only moves st_ip on by 1, so a dead stretch is skipped here, without
             // a trip per position. Terminates: st_ip rises by 1 per step.
             loop {
-                if (st_ip >= seg_end() - 8u) { break; }
+                if (st_ip >= ilimit()) { break; }
                 if ((best[cbase() + 2u * st_ip + 1u] & DEAD_BIT) == 0u) { break; }
                 st_ip += 1u;
             }
         }
-        if (!in_series && st_ip >= seg_end() - 8u) { break; }
+        if (!in_series && st_ip >= ilimit()) { break; }
         // The trip's position and its loads, issued before anything depends on them: the 4 bytes
         // at p (x), the byte before it, and p's candidate words (p is clamped to the segment: a
         // series may reach iend, where nothing is searched and x is unused).
@@ -942,7 +957,7 @@ fn dp() {
                     }
                 }
                 if (inr < seg_end()) { trace_put(inr, n); }
-                if (inr > seg_end() - 8u) {
+                if (inr > ilimit()) {
                     advance = true;
                 } else if (cur == last_pos) {
                     finish = true;
@@ -1025,8 +1040,21 @@ fn dp() {
                         let mrep = new_rep(src.r, ob, gll0);
                         let ra = mrep.x | (mrep.y << 16u);
                         let obs = ob << 8u;
-                        let lo = select(MIN_MATCH, (m_rec[max(mi, 2u) - 2u] >> REC_SHIFT) + 1u, mi > 1u);
+                        var lo = select(MIN_MATCH, (m_rec[max(mi, 2u) - 2u] >> REC_SHIFT) + 1u, mi > 1u);
                         var mlen = rec >> REC_SHIFT;
+                        if (RELAX_N > 0u && ob > 3u) {
+                            // Relaxation pruning (opt::Dp::relax_floor): an explicit record relaxes
+                            // only max(lo, L + 1 - RELAX_N) ..= L. Its pruned lengths above lp0 get
+                            // the oracle's fill (its top length is always relaxed then, being above
+                            // every earlier record's), so at a series start they are the
+                            // unreachable PRUNED nodes (price MAXP, litlen 1: the visit's literal
+                            // extension always replaces them, and the match + 1 literal check
+                            // never takes one); at or below lp0 they are left as they are.
+                            let floor = max(lo, mlen + 1u - min(mlen + 1u, RELAX_N));
+                            // Terminates: q rises to c0 + floor.
+                            for (var q = max(c0 + lo, lp0 + 1u); q < c0 + floor; q += 1u) { fill(q); }
+                            lo = floor;
+                        }
                         loop {
                             let v1 = mlen - 1u >= lo;
                             let v2 = mlen - 2u >= lo;
