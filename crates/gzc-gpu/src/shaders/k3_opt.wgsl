@@ -91,10 +91,10 @@ const_assert 3u * (SEG / 3u) <= LOG_WORDS;
 const_assert SEG / 3u <= LOG_SEQS;
 const HIST_WORDS: u32 = 377u;
 // HIST_OUT counts in the workgroup's `hist` words, no extra workgroup memory (K3opt's residency
-// is bound by it: 870 more bytes per workgroup cost 33 % at wg16, M5 T4 log): word e of local block pbf()
-// holds literal byte e's count in its low 17 bits (at most BLOCK_SIZE <= 65536) and code e's count
-// in its high 15 bits (at most MAX_SEQS < 32768), codes numbered as in the Hist: LL 0..36,
-// ML 36..89, OF 89..121. Counts never go negative, so the packed atomics are exact.
+// is bound by it: 870 more bytes per workgroup cost 33 % at wg16, M5 T4 log): word e of local
+// block pbf() holds literal byte e's count in its low 17 bits (at most BLOCK_SIZE <= 65536) and
+// code e's count in its high 15 bits (at most MAX_SEQS < 32768), codes numbered as in the Hist:
+// LL 0..36, ML 36..89, OF 89..121. Counts never go negative, so the packed atomics are exact.
 const LIT_BITS: u32 = 17u;
 const LIT_MASK: u32 = (1u << LIT_BITS) - 1u;
 const CODE_ONE: u32 = 1u << LIT_BITS;
@@ -135,21 +135,23 @@ const LL_CODE: array<u32, 64> = array<u32, 64>(
     24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u, 24u);
 
 // Price tables of the workgroup's blocks (local block pbf() at pbf() * size). Every price is in
-// 0..65536 (opt::Prices; a PRICE_MODE 1 table is checked on upload), so they are stored as u16
-// pairs (entry 2w in the low half of word w) in u32 words (M6 A1: 328 B less workgroup memory
-// per block than i32 tables).
+// 0..65536 (opt::Prices; a PRICE_MODE 1 table is checked on upload), so the literal, LL and OF
+// prices are stored as u16 pairs (entry 2w in the low half of word w) in u32 words. The ML
+// prices, read four at a time in the relaxation loop, stay i32: unpacking them there measured
+// 0.8 % slower than the 66 B they save per block (M6 A1; 264 B saved per block overall).
 // Literal prices by byte value.
 var<workgroup> p_lit: array<u32, 128u * BPW>;
-// The LL / ML / OF tables, one packed array (tab): LL price by code (litlen >= 64: code
-// highbit(litlen) + 19) at T_LLC, ll_price(litlen) for litlen < 64 at T_LLS, ML price by match
-// length 0..=SUFF (3..=SUFF used) at T_ML, OF price by code at T_OF.
+// The LL and OF tables, one packed array (tab): LL price by code (litlen >= 64: code
+// highbit(litlen) + 19) at T_LLC, ll_price(litlen) for litlen < 64 at T_LLS, OF price by code
+// at T_OF.
 const T_LLC: u32 = 0u;
 const T_LLS: u32 = 36u;
-const T_ML: u32 = 100u;
-const T_OF: u32 = T_ML + RING_N;
-const TAB_N: u32 = T_OF + 32u;
-const TAB_W: u32 = (TAB_N + 1u) / 2u;
+const T_OF: u32 = 100u;
+const TAB_N: u32 = 132u;
+const TAB_W: u32 = TAB_N / 2u;
 var<workgroup> p_tab: array<u32, TAB_W * BPW>;
+// ML price by match length 0..=SUFF (3..=SUFF used).
+var<workgroup> p_ml: array<i32, RING_N * BPW>;
 // The prologue's literal frequencies (PRICE_MODE 0 / 2); with HIST_OUT, then the pass's packed
 // histogram (see LIT_BITS). A pass that uses neither declares one word (M6 A1: the final pass
 // carried 1 KiB it never touched; workgroup memory bounds K3opt's residency).
@@ -237,7 +239,7 @@ fn frac_weight(raw: u32) -> u32 {
     return hb * 256u + ((stat << 8u) >> hb);
 }
 
-// Entry i of the lane's block's LL / ML / OF table (see T_LLC).
+// Entry i of the lane's block's packed LL / OF table (see T_LLC).
 fn tab(i: u32) -> i32 {
     return i32((p_tab[pbf() * TAB_W + (i >> 1u)] >> ((i & 1u) * 16u)) & 0xFFFFu);
 }
@@ -264,7 +266,7 @@ fn of_price(ob: u32) -> i32 {
 }
 
 fn ml_price(mlen: u32) -> i32 {
-    return tab(T_ML + mlen);
+    return p_ml[pbf() * RING_N + mlen];
 }
 
 // seq::apply_off_base on a history value: the reps after offBase `ob` with `ll` literals.
@@ -546,27 +548,18 @@ fn cover_chunk(blk: u32, kl: u32, b: u32) {
     atomicAdd(&hsum[blk * 5u + 4u], n);
 }
 
-// Entry i < TAB_W * 2 of the packed LL / ML / OF table (see T_LLC) under PRICE_MODE (the pad
-// entry of an odd TAB_N is 0): `q` the block's words in `prices` (PRICE_MODE 1 / 3) and `bases`
-// the LL / ML / OF base weights (PRICE_MODE 3: frac_weight of the table sums). Each value is what
-// the i32 tables held before M6 A1, all in 0..65536.
+// The LL / ML / OF prices under PRICE_MODE, each the value the i32 tables held before M6 A1 (in
+// 0..65536): `q` the block's words in `prices` (PRICE_MODE 1 / 3) and `bases` the LL / ML / OF
+// base weights (PRICE_MODE 3: frac_weight of the table sums).
+// Entry i < TAB_N of the packed LL / OF table (see T_LLC).
 fn tab_entry(i: u32, q: u32, bases: vec3<u32>) -> u32 {
-    if (i >= TAB_N) { return 0u; }
-    if (i < T_ML) {
+    if (i < T_OF) {
         // LL: by code (i < T_LLS), or by litlen i - T_LLS < 64.
         let c = select(LL_CODE[min(i - min(i, T_LLS), 63u)], i, i < T_LLS);
         if (PRICE_MODE == 0u) { return u32(BI_LL[c]); }
         if (PRICE_MODE == 2u) { return u32(PR_LL[c]); }
         if (PRICE_MODE == 1u) { return prices[q + 256u + c]; }
         return LL_BITS[c] * 256u + bases.x - frac_weight(seen(prices[q + 256u + c]));
-    }
-    if (i < T_OF) {
-        // ML by match length i - T_ML (lengths below MIN_MATCH hold code 0's price, never read).
-        let c = max(i - T_ML, 3u) - 3u;
-        if (PRICE_MODE == 0u) { return u32(BI_ML[c]); }
-        if (PRICE_MODE == 2u) { return u32(PR_ML[c]); }
-        if (PRICE_MODE == 1u) { return prices[q + 292u + c]; }
-        return ML_BITS[c] * 256u + bases.y - frac_weight(seen(prices[q + 292u + c]));
     }
     let c = i - T_OF;
     if (PRICE_MODE == 0u) { return u32(BI_OF[c]); }
@@ -575,13 +568,25 @@ fn tab_entry(i: u32, q: u32, bases: vec3<u32>) -> u32 {
     return c * 256u + bases.z - frac_weight(seen(prices[q + 345u + c]));
 }
 
-// Local block blk's packed LL / ML / OF table, written in place by the block's lanes (kl
+// The ML price of match length m <= SUFF (lengths below MIN_MATCH take code 0's, never read).
+fn ml_entry(m: u32, q: u32, bases: vec3<u32>) -> u32 {
+    let c = max(m, 3u) - 3u;
+    if (PRICE_MODE == 0u) { return u32(BI_ML[c]); }
+    if (PRICE_MODE == 2u) { return u32(PR_ML[c]); }
+    if (PRICE_MODE == 1u) { return prices[q + 292u + c]; }
+    return ML_BITS[c] * 256u + bases.y - frac_weight(seen(prices[q + 292u + c]));
+}
+
+// Local block blk's LL / OF (packed) and ML tables, written in place by the block's lanes (kl
 // striding). Nothing is staged, so the private-ring fallback needs no workgroup scratch.
-fn pack_tables(blk: u32, kl: u32, q: u32, bases: vec3<u32>) {
+fn build_tables(blk: u32, kl: u32, q: u32, bases: vec3<u32>) {
     for (var w = kl; w < TAB_W; w += LPB) {
         let lo = tab_entry(2u * w, q, bases);
         let hi = tab_entry(2u * w + 1u, q, bases);
         p_tab[blk * TAB_W + w] = (lo & 0xFFFFu) | (hi << 16u);
+    }
+    for (var m = kl; m < RING_N; m += LPB) {
+        p_ml[blk * RING_N + m] = i32(ml_entry(m, q, bases));
     }
 }
 
@@ -617,12 +622,12 @@ fn prologue(valid: bool, b: u32) {
             let hi = lit_from(atomicLoad(&hist[blk * 256u + 2u * e + 1u]), lb);
             p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
         }
-        pack_tables(blk, kl, 0u, vec3<u32>(0u));
+        build_tables(blk, kl, 0u, vec3<u32>(0u));
     } else if (PRICE_MODE == 1u) {
         if (valid) {
             let q = b * PRICE_WORDS;
             for (var e = kl; e < 128u; e += LPB) { p_lit[blk * 128u + e] = prices[q + 2u * e] | (prices[q + 2u * e + 1u] << 16u); }
-            pack_tables(blk, kl, q, vec3<u32>(0u));
+            build_tables(blk, kl, q, vec3<u32>(0u));
         }
     } else {
         // PRICE_MODE 3: opt::Prices::from_hist of the block's Hist (lit, ll, ml, of).
@@ -654,7 +659,7 @@ fn prologue(valid: bool, b: u32) {
                 let hi = lit_from(seen(prices[q + 2u * e + 1u]), lb);
                 p_lit[blk * 128u + e] = u32(lo) | (u32(hi) << 16u);
             }
-            pack_tables(blk, kl, q, vec3<u32>(llb, mlb, ofb));
+            build_tables(blk, kl, q, vec3<u32>(llb, mlb, ofb));
         }
     }
     workgroupBarrier();

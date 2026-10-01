@@ -40,9 +40,12 @@
 //!
 //! Workgroups: `K3OptConfig::wg` lanes (a power of two, 8..=256; a block's 16 segment lanes may
 //! span several workgroups). 16 is the fastest on an RTX 5090 at 64 KiB blocks (M5 T3 and T3b
-//! logs in `docs/results/m5-log.md`). Residency: about 5 KB of workgroup memory and ≤ 100
-//! registers per wg16 workgroup (T3b), so one wave holds 20 warps/SM (3400 blocks on the 5090);
-//! a change that raises either past that splits a 2900-block batch into two waves.
+//! logs in `docs/results/m5-log.md`). Residency (M6 A1): at 64 KiB a wg16 pass kernel needs at
+//! most 4064 B of workgroup memory (`workgroup_bytes`; the final pass 3044 B) and about 73
+//! registers (`vkstats`), so an RTX 5090 holds its cap of 24 workgroups per SM: one wave is 4080
+//! blocks (measured). A change that raises registers or workgroup memory past that cap splits a
+//! batch above about 3600 blocks into two waves (+40 % K3 time); check `vkstats` on every pass
+//! kernel (`GZC_DUMP_WGSL` writes the composed modules).
 use crate::compressor::{
     BatchBuffers, K3_FIXUP_WGSL, best_bytes_for, counts_bytes, data_bytes, decode_output, seqs_bytes_for, trace_bytes,
 };
@@ -158,8 +161,9 @@ pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
 /// Workgroup bytes of the DP entry point besides the rings, per pass (M6 A1), exactly what
 /// `k3_opt.wgsl` declares for `bpw` blocks per workgroup:
 /// - `p_lit`: 128 words of u16 literal-price pairs per block;
-/// - `p_tab`: the LL-by-code (36), LL-by-litlen (64), ML (`target_length + 1`) and OF (32)
-///   prices as u16 pairs per block;
+/// - `p_tab`: the LL-by-code (36), LL-by-litlen (64) and OF (32) prices as u16 pairs, 66 words
+///   per block;
+/// - `p_ml`: the i32 ML prices, `target_length + 1` words per block;
 /// - `hist`: 256 words per block when the pass counts literals (`BlockInit`, `Prior`) or writes
 ///   its histogram (`hist_out`), else one word;
 /// - `hsum`: 5 words per block, one word for `PriceSrc::Buffer`.
@@ -168,11 +172,10 @@ pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
 /// segment), which wgpu compiles alone; they are not part of this pipeline.
 fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     let bpw = (cfg.wg / n_seg(m)).max(1);
-    let tab_words = (36 + 64 + (suff_of(m) + 1) + 32).div_ceil(2);
     let hist_used = cfg.hist_out || matches!(cfg.prices, PriceSrc::BlockInit | PriceSrc::Prior);
     let hist = if hist_used { 256 * bpw } else { 1 };
     let hsum = if cfg.prices == PriceSrc::Buffer { 1 } else { 5 * bpw };
-    (bpw * (128 + tab_words) + hist + hsum) * 4
+    (bpw * (128 + 66 + suff_of(m) + 1) + hist + hsum) * 4
 }
 
 /// The ring memory `K3Opt::new` uses for `cfg` under a workgroup storage limit of `limit` bytes:
