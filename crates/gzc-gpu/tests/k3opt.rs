@@ -723,6 +723,126 @@ fn k3opt_passes_synthetic() {
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
+/// A block for the rep-length memo's edges (M6 A2/A3): random bytes overwritten with short copies
+/// at offsets from `offs` (small, close offsets, so rep histories with two equal offsets are
+/// common, e.g. rep0 - 1 == rep2 under ll0), random stretches (dead positions between searches),
+/// and in every segment a rep tail ending exactly at the segment's end: a copy at offset o, one
+/// mismatching literal, then 9..=32 bytes at offset o up to iend (lim > 8, so the rep's length is
+/// lim, and later positions of its series reuse it through the memo capped at their lim). In
+/// every other segment the match also really ends at iend (the next byte differs).
+fn memo_edge_block(seed: u64, offs: &[usize]) -> Vec<u8> {
+    let seg = 1usize << OPT16.segment_log2;
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut rnd = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 11) as usize
+    };
+    let mut b: Vec<u8> = (0..BLOCK_SIZE).map(|_| rnd() as u8).collect();
+    let mut p = 32;
+    while p < BLOCK_SIZE {
+        if rnd() % 6 == 0 {
+            p += 1 + rnd() % 20;
+            continue;
+        }
+        let o = offs[rnd() % offs.len()];
+        let len = 3 + rnd() % 10;
+        for i in p..(p + len).min(BLOCK_SIZE) {
+            b[i] = b[i - o];
+        }
+        p += len + rnd() % 3;
+    }
+    for k in 0..BLOCK_SIZE / seg {
+        let iend = (k + 1) * seg;
+        let t = 9 + (rnd() % 24);
+        let o = offs[rnd() % offs.len()] + 16;
+        let brk = iend - t - 1;
+        for i in brk - 11..brk {
+            b[i] = b[i - o];
+        }
+        b[brk] = b[brk - o] ^ 0x5A;
+        for i in iend - t..iend {
+            b[i] = b[i - o];
+        }
+        if k % 2 == 0 && iend < BLOCK_SIZE {
+            b[iend] = b[iend - o] ^ 0xA5;
+        }
+    }
+    b
+}
+
+/// Counts, over the parse `out` replayed with each segment's own rep history (segment 0 from
+/// INITIAL_REPS, segment k > 0 from [0, 0, 0], as the DP sees them): matches whose search saw two
+/// valid rep probes with the same offset, and rep matches longer than 8 that end exactly at
+/// their segment's end.
+fn memo_edge_witnesses(out: &BlockOutput) -> (usize, usize) {
+    use gzc_core::seq::{INITIAL_REPS, apply_off_base, off_base_for};
+    let seg = 1usize << OPT16.segment_log2;
+    let (mut dup, mut tail) = (0, 0);
+    let mut reps = INITIAL_REPS;
+    let mut local = INITIAL_REPS;
+    let (mut pos, mut cur_seg) = (0usize, 0usize);
+    for s in &out.sequences {
+        let start = pos + s.lit_len as usize;
+        let off = apply_off_base(&mut reps, s.off_base, s.lit_len);
+        let k = start / seg;
+        if k != cur_seg {
+            local = [0, 0, 0];
+            cur_seg = k;
+        }
+        let ll = (start - pos.max(k * seg)) as u32;
+        let ros = if ll == 0 { [local[1], local[2], local[0].wrapping_sub(1)] } else { local };
+        let valid = |r: u32| r >= 1 && r as usize <= start;
+        if (0..3).any(|i| (i + 1..3).any(|j| valid(ros[i]) && ros[i] == ros[j])) {
+            dup += 1;
+        }
+        let ob = off_base_for(off, ll, &local);
+        apply_off_base(&mut local, ob, ll);
+        pos = start + s.match_len as usize;
+        if ob <= 3 && s.match_len > 8 && pos == (k + 1) * seg {
+            tail += 1;
+        }
+    }
+    (dup, tail)
+}
+
+/// The rep-length memo's edges (M6 A2 review, A3): a rep match ending exactly at seg_end() with
+/// lim > 8, and searches with two rep probes of the same offset, through single passes (both
+/// levels, both rings) and the opt16 / opt14 schedules, against the oracle.
+#[test]
+fn k3opt_memo_edges() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().expect("GPU required");
+    let offs: [&[usize]; 3] = [&[3, 4, 5], &[1, 2, 3, 4], &[3, 4, 5, 6, 8, 9, 12, 16]];
+    let mut names = Vec::new();
+    let mut blocks = Vec::new();
+    for seed in 0..6u64 {
+        for (j, o) in offs.iter().enumerate() {
+            names.push(format!("memo_edge[{seed}, {j}]"));
+            blocks.push(memo_edge_block(seed, o));
+        }
+    }
+    let cands = cands_of(&blocks);
+    let (mut dup, mut tail) = (0, 0);
+    for (b, c) in blocks.iter().zip(&cands) {
+        let (d, t) = memo_edge_witnesses(&oracle(b, c, &Prices::block_init(b), 2));
+        dup += d;
+        tail += t;
+    }
+    eprintln!("witnesses: {dup} matches after equal-offset rep probes, {tail} rep tails ending at seg_end");
+    assert!(dup > 0 && tail > 0, "the blocks miss an edge: {dup} equal-offset, {tail} tails");
+    let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
+    let cfgs = [
+        cfg(2, RingMem::Workgroup, PriceSrc::BlockInit),
+        cfg(0, RingMem::Workgroup, PriceSrc::BlockInit),
+        cfg(2, RingMem::Private, PriceSrc::BlockInit),
+    ];
+    check_blocks_with(&ctx, &names, &blocks, &cands, &bi, &cfgs, None);
+    let presets = [("opt16".to_string(), OPT16), ("opt14".to_string(), OPT14)];
+    check_passes(&ctx, &names, &blocks, &cands, &presets, K3OptConfig::default());
+}
+
 /// Informal (reads the real corpus; skips when it is missing): 4000 corpus blocks through every
 /// schedule, and the later-pass Buffer-price configs.
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_passes_corpus -- --ignored --nocapture`

@@ -36,7 +36,8 @@
 //   block's true reps (== lazy::encode_raw), one workgroup per block.
 //
 // Candidate words (reference::CandWords, K2opt): best[2*(b*BLOCK_SIZE + p)] = offA | lenA << 16 |
-// lenB << 24, best[.. + 1] = offB; lengths capped at SEARCH_CAP (a stored SEARCH_CAP is extended).
+// lenB << 24, best[.. + 1] = offB, plus DEAD_BIT at a dead position; lengths capped at SEARCH_CAP
+// (a stored SEARCH_CAP is extended).
 //
 // Precondition (K2opt's output satisfies it): every candidate record lies in the block before its
 // position, and its length is the true common length capped at SEARCH_CAP. The kernel trusts the
@@ -111,6 +112,18 @@ const SUM_WORDS: u32 = 5u;
 fn summ_base(b: u32, k: u32) -> u32 { return 2u * (b * BLOCK_SIZE + k * SEG); }
 const_assert BLOCK_SIZE <= 65536u;
 const_assert WG % NSEG == 0u || NSEG % WG == 0u;
+// Dead positions (M6 A3, a09; reference::find_cands): DEAD_BIT in a candidate word w1 marks p as
+// dead: no earlier position of the block shares p's first 3 bytes, so no candidate and no rep
+// reaches MIN_MATCH there and get_all_matches(p) is empty under every rep state. The DP skips
+// such positions' searches: outside a series in a tight loop before the trip (st_ip += 1 per
+// dead position), inside one the position only gets its literal extension. The rep-length memo
+// stays exact across a skipped search (its lengths hold at any later position of the segment,
+// see mem). (A run length per position, capped at K2opt's 256-position tiles, measured no faster
+// here and cost K2opt two workgroup barriers.)
+const DEAD_BIT: u32 = 0x10000u;
+// Literal-only positions of a series folded into one trip (dp): measured on the optLevel-0
+// passes only (a09: the final pass is faster without; it has fewer `+128` skips).
+const FOLD: bool = LEVEL == 0u;
 const_assert 3u * (SEG / 3u) <= SEG_META;
 const_assert NSEG * (SEG / 3u) <= MAX_SEQS;
 // ML code == mlen - 3 for every priced length (mlen <= SUFF <= 34).
@@ -821,17 +834,27 @@ fn dp() {
     // Terminates: every trip either advances st_ip (outside a series: by 1, or a commit moves it
     // past the series start) or cur (inside one, cur <= last_pos <= iend - sip, then a commit).
     loop {
+        if (!in_series) {
+            // Dead positions (M6 A3, a09; see DEAD_BIT): a series start probe there finds
+            // nothing and only moves st_ip on by 1, so a dead stretch is skipped here, without
+            // a trip per position. Terminates: st_ip rises by 1 per step.
+            loop {
+                if (st_ip >= seg_end() - 8u) { break; }
+                if ((best[cbase() + 2u * st_ip + 1u] & DEAD_BIT) == 0u) { break; }
+                st_ip += 1u;
+            }
+        }
         if (!in_series && st_ip >= seg_end() - 8u) { break; }
         // The trip's position and its loads, issued before anything depends on them: the 4 bytes
         // at p (x), the byte before it, and p's candidate words (p is clamped to the segment: a
         // series may reach iend, where nothing is searched and x is unused).
-        let p = select(st_ip, sip + cur, in_series);
-        let pc = min(p, seg_end() - 1u);
-        let x = ld32(dbase(), pc);
-        let xprev = load_byte(dbase(), p - 1u);
-        let ci = cbase() + 2u * pc;
-        let w0 = best[ci];
-        let w1 = best[ci + 1u];
+        // (vars: a FOLD trip moves on to the next series position.)
+        var p = select(st_ip, sip + cur, in_series);
+        var pc = min(p, seg_end() - 1u);
+        var x = ld32(dbase(), pc);
+        var xprev = load_byte(dbase(), p - 1u);
+        var w0 = best[cbase() + 2u * pc];
+        var w1 = best[cbase() + 2u * pc + 1u];
 
         // Part 1: what to search, if anything.
         var grep = vec3<u32>(0u);
@@ -845,43 +868,66 @@ fn dp() {
             gll0 = st_ip == st_anchor;
             search = true;
         } else {
-            let inr = p;
-            let prev = ld(cur - 1u);
-            let litlen = prev.litlen + 1u;
-            let price = prev.price + lit_cost(xprev) + (ll_price(litlen) - ll_price(litlen - 1u));
-            n = ld(cur);
-            if (price <= n.price) {
-                let pm = n;
-                n = prev;
-                n.litlen = litlen;
-                n.price = price;
-                st(cur, n);
-                if (LEVEL >= 1u && pm.litlen == 0u && ll_inc1() < 0 && inr < seg_end()) {
-                    let next_lit = lit_cost(x & 0xFFu);
-                    let with1 = pm.price + next_lit + ll_inc1();
-                    let with_more = price + next_lit + (ll_price(litlen + 1u) - ll_price(litlen));
-                    var next_price = MAXP;
-                    if (cur < last_pos) { next_price = ld_price(cur + 1u); }
-                    if (with1 < with_more && with1 < next_price) {
-                        var q = pm;
-                        q.litlen = 1u;
-                        q.price = with1;
-                        st(cur + 1u, q);
-                        last_pos = max(last_pos, cur + 1u);
+            // FOLD (M6 A3, a09): a position that only needs its literal extension (advance) is
+            // followed by the next one in the same trip, with the same statements, while cur <
+            // last_pos (so the next trip would have been that position, in the series).
+            // Terminates: cur rises by 1 per fold, to last_pos, which only a LEVEL >= 1 pass
+            // raises here (FOLD is LEVEL 0 only).
+            loop {
+                let inr = p;
+                let prev = ld(cur - 1u);
+                let litlen = prev.litlen + 1u;
+                let price = prev.price + lit_cost(xprev) + (ll_price(litlen) - ll_price(litlen - 1u));
+                n = ld(cur);
+                if (price <= n.price) {
+                    let pm = n;
+                    n = prev;
+                    n.litlen = litlen;
+                    n.price = price;
+                    st(cur, n);
+                    if (LEVEL >= 1u && pm.litlen == 0u && ll_inc1() < 0 && inr < seg_end()) {
+                        let next_lit = lit_cost(x & 0xFFu);
+                        let with1 = pm.price + next_lit + ll_inc1();
+                        let with_more = price + next_lit + (ll_price(litlen + 1u) - ll_price(litlen));
+                        var next_price = MAXP;
+                        if (cur < last_pos) { next_price = ld_price(cur + 1u); }
+                        if (with1 < with_more && with1 < next_price) {
+                            var q = pm;
+                            q.litlen = 1u;
+                            q.price = with1;
+                            st(cur + 1u, q);
+                            last_pos = max(last_pos, cur + 1u);
+                        }
                     }
                 }
-            }
-            if (inr < seg_end()) { trace_put(inr, n); }
-            if (inr > seg_end() - 8u) {
-                advance = true;
-            } else if (cur == last_pos) {
-                finish = true;
-            } else if (LEVEL == 0u && ld_price(cur + 1u) <= n.price + 128) {
-                advance = true;
-            } else {
-                grep = n.r;
-                gll0 = n.litlen == 0u;
-                search = true;
+                if (inr < seg_end()) { trace_put(inr, n); }
+                if (inr > seg_end() - 8u) {
+                    advance = true;
+                } else if (cur == last_pos) {
+                    finish = true;
+                } else if (LEVEL == 0u && ld_price(cur + 1u) <= n.price + 128) {
+                    advance = true;
+                } else if ((w1 & DEAD_BIT) != 0u) {
+                    // A dead position (inr <= ilimit, so w1 is inr's): get_all_matches would
+                    // find nothing, and the trip would only advance.
+                    advance = true;
+                } else {
+                    grep = n.r;
+                    gll0 = n.litlen == 0u;
+                    search = true;
+                }
+                if (FOLD && advance && cur < last_pos) {
+                    advance = false;
+                    cur += 1u;
+                    p = sip + cur;
+                    pc = min(p, seg_end() - 1u);
+                    x = ld32(dbase(), pc);
+                    xprev = load_byte(dbase(), p - 1u);
+                    w0 = best[cbase() + 2u * pc];
+                    w1 = best[cbase() + 2u * pc + 1u];
+                    continue;
+                }
+                break;
             }
         }
 

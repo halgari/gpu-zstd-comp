@@ -30,6 +30,12 @@
 // and its early stop are unchanged.
 // Indices: pred words hold positions < HASHED_POSITIONS or PRED_NONE (K1's output, run before
 // this in the same submission), so pred[pb + q] and the byte loads stay in the block.
+// Dead positions (M6 A3, reference::find_cands): p is dead when the walk found no record and its
+// h3 head reached PRED_NONE (the whole h3 chain visited). Every visited q then had c <= 2 (a
+// fingerprint skip only drops a q with c <= 2 <= best), and every earlier position with p's
+// first 3 bytes has p's hash3 key, so it is on p's h3 chain: there is none. Its second word gets
+// DEAD_BIT (offB < 2^16 leaves the high half free).
+const DEAD_BIT: u32 = 0x10000u;
 
 // Candidate output index of (b, p).
 fn cand_index(b: u32, p: u32) -> u32 { return 2u * (b * BLOCK_SIZE + p); }
@@ -110,5 +116,5 @@ fn main_opt(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     best[o] = select(0u, a | (best_len << 24u), a != 0u);
-    best[o + 1u] = off_b;
+    best[o + 1u] = off_b | select(0u, DEAD_BIT, a == 0u && q3 == PRED_NONE);
 }

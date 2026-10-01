@@ -77,8 +77,17 @@ pub struct Cand {
 }
 
 /// The two candidate words of a position (K2opt's output, 8 B per position):
-/// `w[0] = offA | lenA << 16 | lenB << 24`, `w[1] = offB`. All zero when there is no candidate.
+/// `w[0] = offA | lenA << 16 | lenB << 24`, `w[1] = offB`, plus `DEAD_BIT` at a dead position
+/// (`find_cands`). All zero when there is no candidate, apart from `DEAD_BIT`.
 pub type CandWords = [u32; 2];
+
+/// `w[1]`'s flag of a dead position (M6 A3, see `find_cands`); offsets are below 2^16.
+pub const DEAD_BIT: u32 = 1 << 16;
+
+/// Whether a position's candidate words mark it dead (`find_cands`).
+pub fn is_dead(w: CandWords) -> bool {
+    w[1] & DEAD_BIT != 0
+}
 
 /// Packs records `a` (nearest) and `b` (longest) into `CandWords`.
 pub fn pack_cands(a: Cand, b: Cand) -> CandWords {
@@ -107,6 +116,15 @@ pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
 /// `p`'s (a 16-bit hash collision) can still share 3 bytes and is then a valid 3-byte record, so
 /// a 4-byte fingerprint mismatch may skip the compare only once `best >= 3` (or when the first 3
 /// bytes differ too).
+///
+/// Dead positions (M6 A3, a09): `p` is *dead* when it has no record and its `h3` walk reached
+/// the chain's end (`NO_POS`, within `OPT_H3_DEPTH` steps). Then no earlier position shares `p`'s
+/// first 3 bytes: every such position has `p`'s `hash3` key, so it is on `p`'s `h3` chain (which
+/// links every earlier position below `HASHED_POSITIONS` with that key), and the walk visited the
+/// whole chain without a 3-byte match. So no candidate and no rep (whatever its offset) reaches 3
+/// bytes there, and the parse's `get_all_matches` is empty under every rep state. A dead
+/// position's words are `[0, DEAD_BIT]`. The parse oracle ignores the bit (`unpack_cands`);
+/// K3opt skips dead positions.
 pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<CandWords> {
     assert_eq!(params.hashes, Hashes::Opt3, "find_cands: Opt3 chains only");
     assert_eq!(chains.len(), 2);
@@ -151,6 +169,9 @@ pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Ve
             }
         }
         out[p] = pack_cands(a, b);
+        if a.len == 0 && q3 == NO_POS {
+            out[p][1] |= DEAD_BIT;
+        }
     }
     out
 }
@@ -481,6 +502,7 @@ mod tests {
     fn find_cands_by_definition(block: &[u8], params: &MatchParams) -> Vec<CandWords> {
         let ch = chains(block, params);
         let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+        let mut dead = vec![false; BLOCK_SIZE];
         for (p, w) in out.iter_mut().enumerate().take(PARSE_END) {
             let mut v = Vec::new();
             for (c, d) in [(&ch[0], params.depth), (&ch[1], OPT_H3_DEPTH)] {
@@ -493,6 +515,14 @@ mod tests {
                     q = c[q as usize];
                 }
             }
+            // Dead: the h3 chain ends within OPT_H3_DEPTH steps (and no record, below).
+            let mut q = ch[1][p];
+            let mut n = 0;
+            while q != NO_POS && n < OPT_H3_DEPTH {
+                q = ch[1][q as usize];
+                n += 1;
+            }
+            dead[p] = q == NO_POS;
             v.sort_unstable_by(|a, b| b.cmp(a));
             v.dedup();
             let mut recs = Vec::new();
@@ -506,6 +536,12 @@ mod tests {
             }
             if let (Some(&a), Some(&b)) = (recs.first(), recs.last()) {
                 *w = pack_cands(a, b);
+                dead[p] = false;
+            }
+        }
+        for (w, &d) in out.iter_mut().zip(&dead) {
+            if d {
+                w[1] |= DEAD_BIT;
             }
         }
         out
@@ -524,6 +560,21 @@ mod tests {
                     let got = find_cands(&blk.data, &chains(&blk.data, &params), &params);
                     let want = find_cands_by_definition(&blk.data, &params);
                     assert!(got == want, "{name} block {i} depth {}: find_cands differs from its definition", params.depth);
+                    // Dead positions really have no earlier position with the same 3 bytes.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut n_dead = 0;
+                    for (p, &w) in got.iter().enumerate().take(PARSE_END) {
+                        let k = &blk.data[p..p + 3];
+                        if is_dead(w) {
+                            assert!(!seen.contains(k), "p={p}: dead but an earlier position shares its 3 bytes");
+                            assert_eq!(w, [0, DEAD_BIT], "p={p}: dead with a record");
+                            n_dead += 1;
+                        }
+                        seen.insert(k);
+                    }
+                    if name == "random" {
+                        assert!(n_dead > 0, "{name}: no dead position");
+                    }
                     for (p, &w) in got.iter().enumerate() {
                         let (a, b) = unpack_cands(w);
                         assert_eq!(a.len == 0, b.len == 0, "p={p}");
