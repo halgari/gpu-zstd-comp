@@ -1525,7 +1525,10 @@ fn k2_opt_pipeline(ctx: &GpuContext, m: &MatchParams, layout: &wgpu::BindGroupLa
     );
     // Loops: the merged walk decrements a depth counter every iteration (DEPTH + H3_DEPTH at
     // most) and match_len_capped is bounded by SEARCH_CAP; indices as in K2 (pred words hold
-    // positions below HASHED_POSITIONS, from K1 in the same submission).
+    // positions below HASHED_POSITIONS, from K1 in the same submission). The dead-run scan (M6
+    // A3) runs at most DEAD_TILE / 32 = 8 steps over the 8-word `dead_mask`, indexed by
+    // lid >> 5 < 8 and its loop counter < 8; the dispatch's workgroups are exactly the tiles.
+    const _: () = assert!(BLOCK_SIZE % gzc_core::reference::DEAD_TILE == 0 && gzc_core::reference::DEAD_TILE == 256);
     let module = ctx.shader_trusted("k2_opt", &body);
     pipeline_from_module(ctx, "k2_opt", layout, &module, "main_opt")
 }

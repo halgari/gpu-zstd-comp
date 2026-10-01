@@ -77,8 +77,18 @@ pub struct Cand {
 }
 
 /// The two candidate words of a position (K2opt's output, 8 B per position):
-/// `w[0] = offA | lenA << 16 | lenB << 24`, `w[1] = offB`. All zero when there is no candidate.
+/// `w[0] = offA | lenA << 16 | lenB << 24`, `w[1] = offB | dead_run << 16`. All zero when there
+/// is no candidate, apart from the dead run (`find_cands`), which is nonzero only there.
 pub type CandWords = [u32; 2];
+
+/// Dead runs (M6 A3) stop at the end of the position's aligned tile of this many positions (K2opt's
+/// workgroup), so each GPU workgroup computes its own runs.
+pub const DEAD_TILE: usize = 256;
+
+/// The dead run of a position's candidate words (`find_cands`): 0 when the position is not dead.
+pub fn dead_run(w: CandWords) -> u32 {
+    w[1] >> 16
+}
 
 /// Packs records `a` (nearest) and `b` (longest) into `CandWords`.
 pub fn pack_cands(a: Cand, b: Cand) -> CandWords {
@@ -107,12 +117,23 @@ pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
 /// `p`'s (a 16-bit hash collision) can still share 3 bytes and is then a valid 3-byte record, so
 /// a 4-byte fingerprint mismatch may skip the compare only once `best >= 3` (or when the first 3
 /// bytes differ too).
+///
+/// Dead positions (M6 A3, a09): `p` is *dead* when it has no record and its `h3` walk reached
+/// the chain's end (`NO_POS`, within `OPT_H3_DEPTH` steps). Then no earlier position shares `p`'s
+/// first 3 bytes: every such position has `p`'s `hash3` key, so it is on `p`'s `h3` chain (which
+/// links every earlier position below `HASHED_POSITIONS` with that key), and the walk visited the
+/// whole chain without a 3-byte match. So no candidate and no rep (whatever its offset) reaches 3
+/// bytes there, and the parse's `get_all_matches` is empty under every rep state. `w[1]`'s high
+/// half holds the dead run: the number of consecutive dead positions from `p` up to the end of
+/// `p`'s `DEAD_TILE`-aligned tile (1..=`DEAD_TILE`), 0 when `p` is not dead. The parse oracle
+/// ignores it (`unpack_cands`); K3opt uses it to skip dead positions.
 pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<CandWords> {
     assert_eq!(params.hashes, Hashes::Opt3, "find_cands: Opt3 chains only");
     assert_eq!(chains.len(), 2);
     let (h4, h3) = (&chains[0], &chains[1]);
     let cap = params.search_cap as usize;
     let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+    let mut dead = vec![false; BLOCK_SIZE];
     for p in 0..PARSE_END {
         let max_c = cap.min(BLOCK_SIZE - p);
         let (mut q4, mut n4) = (h4[p], params.depth);
@@ -151,8 +172,22 @@ pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Ve
             }
         }
         out[p] = pack_cands(a, b);
+        dead[p] = a.len == 0 && q3 == NO_POS;
     }
+    set_dead_runs(&mut out, &dead);
     out
+}
+
+/// Writes the dead runs of the flags `dead` into `w[1]`'s high half (see `find_cands`).
+fn set_dead_runs(out: &mut [CandWords], dead: &[bool]) {
+    let mut run = 0u32;
+    for p in (0..BLOCK_SIZE).rev() {
+        if p % DEAD_TILE == DEAD_TILE - 1 {
+            run = 0;
+        }
+        run = if dead[p] { run + 1 } else { 0 };
+        out[p][1] |= run << 16;
+    }
 }
 
 /// `find_best` over the bucket-sorted candidate array (`hash::bucket_sort` of the Single chain's
@@ -481,6 +516,7 @@ mod tests {
     fn find_cands_by_definition(block: &[u8], params: &MatchParams) -> Vec<CandWords> {
         let ch = chains(block, params);
         let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+        let mut dead = vec![false; BLOCK_SIZE];
         for (p, w) in out.iter_mut().enumerate().take(PARSE_END) {
             let mut v = Vec::new();
             for (c, d) in [(&ch[0], params.depth), (&ch[1], OPT_H3_DEPTH)] {
@@ -493,6 +529,14 @@ mod tests {
                     q = c[q as usize];
                 }
             }
+            // Dead: the h3 chain ends within OPT_H3_DEPTH steps (and no record, below).
+            let mut q = ch[1][p];
+            let mut n = 0;
+            while q != NO_POS && n < OPT_H3_DEPTH {
+                q = ch[1][q as usize];
+                n += 1;
+            }
+            dead[p] = q == NO_POS;
             v.sort_unstable_by(|a, b| b.cmp(a));
             v.dedup();
             let mut recs = Vec::new();
@@ -506,7 +550,14 @@ mod tests {
             }
             if let (Some(&a), Some(&b)) = (recs.first(), recs.last()) {
                 *w = pack_cands(a, b);
+                dead[p] = false;
             }
+        }
+        // Runs by definition: consecutive dead positions from p within p's tile.
+        for p in 0..BLOCK_SIZE {
+            let end = (p / DEAD_TILE + 1) * DEAD_TILE;
+            let run = (p..end).take_while(|&q| dead[q]).count() as u32;
+            out[p][1] |= run << 16;
         }
         out
     }
@@ -524,6 +575,21 @@ mod tests {
                     let got = find_cands(&blk.data, &chains(&blk.data, &params), &params);
                     let want = find_cands_by_definition(&blk.data, &params);
                     assert!(got == want, "{name} block {i} depth {}: find_cands differs from its definition", params.depth);
+                    // Dead positions really have no earlier position with the same 3 bytes.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut n_dead = 0;
+                    for (p, &w) in got.iter().enumerate().take(PARSE_END) {
+                        let k = &blk.data[p..p + 3];
+                        if dead_run(w) > 0 {
+                            assert!(!seen.contains(k), "p={p}: dead but an earlier position shares its 3 bytes");
+                            assert_eq!(w, [0, dead_run(w) << 16], "p={p}: dead with a record");
+                            n_dead += 1;
+                        }
+                        seen.insert(k);
+                    }
+                    if name == "random" {
+                        assert!(n_dead > 0, "{name}: no dead position");
+                    }
                     for (p, &w) in got.iter().enumerate() {
                         let (a, b) = unpack_cands(w);
                         assert_eq!(a.len == 0, b.len == 0, "p={p}");

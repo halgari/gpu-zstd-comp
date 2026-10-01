@@ -374,6 +374,7 @@ impl OptBuffers {
                     );
                 }
             }
+            check_dead_runs(blocks[b], c).map_err(|e| anyhow!("block {b}: {e}"))?;
             ctx.queue.write_buffer(
                 &self.cands,
                 b as u64 * best_bytes_for(1, &self.params),
@@ -395,6 +396,35 @@ impl OptBuffers {
         }
         Ok(())
     }
+}
+
+/// The kernel also trusts the dead runs (`reference::find_cands`, M6 A3): it skips the search at
+/// every position a run covers. Checks that each marked position `p` is really dead (no record,
+/// below `PARSE_END`, and no earlier position with its first 3 bytes) and that its run stays in
+/// its tile and covers only marked positions, each with the run one shorter.
+fn check_dead_runs(block: &[u8], c: &[CandWords]) -> anyhow::Result<()> {
+    use gzc_core::config::PARSE_END;
+    use gzc_core::reference::{DEAD_TILE, dead_run};
+    if c.iter().all(|w| dead_run(*w) == 0) {
+        return Ok(());
+    }
+    ensure!(block.len() >= PARSE_END + 3, "dead runs on a short block");
+    // Seen 3-byte prefixes, a 2^24-bit set.
+    let mut seen = vec![0u64; 1 << 18];
+    for (p, w) in c.iter().enumerate() {
+        let run = dead_run(*w) as usize;
+        if run > 0 {
+            ensure!(p < PARSE_END && *w == [0, (run as u32) << 16], "bad dead word at {p}: {w:?}");
+            ensure!(run <= DEAD_TILE - p % DEAD_TILE, "dead run {run} at {p} leaves its tile");
+            ensure!(run == 1 || dead_run(c[p + 1]) as usize == run - 1, "dead run {run} at {p}: inconsistent");
+        }
+        if p < PARSE_END {
+            let k = block[p] as usize | (block[p + 1] as usize) << 8 | (block[p + 2] as usize) << 16;
+            ensure!(run == 0 || seen[k >> 6] & 1 << (k & 63) == 0, "dead position {p} has an earlier 3-byte match");
+            seen[k >> 6] |= 1 << (k & 63);
+        }
+    }
+    Ok(())
 }
 
 fn wgsl_array(name: &str, v: &[i32]) -> String {
