@@ -262,12 +262,19 @@ impl Prepared {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             desc.backends = wgpu::Backends::METAL;
         }
+        // One thread at a time: the Vulkan loader's first ICD scan is not thread-safe. Two test
+        // threads opening contexts at once crashed in it (SIGSEGV, a null call inside
+        // libvulkan.so.1's vkEnumerateInstanceExtensionProperties while the other thread was in
+        // the NVIDIA ICD's vk_icdNegotiateLoaderICDInterfaceVersion).
+        static INSTANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = INSTANCE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
         .map_err(|e| anyhow!("no GPU adapter found (wgpu): {e}"))?;
+        drop(guard);
 
         let al = adapter.limits();
         let info = adapter.get_info();
