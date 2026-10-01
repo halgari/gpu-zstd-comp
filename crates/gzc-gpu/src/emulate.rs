@@ -22,27 +22,40 @@ pub struct Emulation {
     /// different components of the same vector in one instruction then keep only one thread's
     /// component, as on an Apple GPU (the M4 Pro frame corruption: K4's prefix-sum scratch).
     pub vector_rmw: bool,
+    /// `GZC_EMULATE_SKEW`: timing skew, for races a slow or preempted GPU would expose. Every
+    /// invocation stalls for a pseudo-random time (a dependent ALU chain of up to 512 steps, one call
+    /// in eight) at entry, after every barrier and `workgroupUniformLoad`, and before every subgroup
+    /// operation, so that the phases between barriers start at very different times across the
+    /// workgroup and the lanes of a subgroup arrive at their collectives apart. Output must not
+    /// change. (Slower: a test aid.)
+    pub skew: bool,
 }
 
 impl Emulation {
-    pub const NONE: Self = Self { shift_mod32: false, vector_rmw: false };
-    pub const ALL: Self = Self { shift_mod32: true, vector_rmw: true };
+    pub const NONE: Self = Self { shift_mod32: false, vector_rmw: false, skew: false };
+    /// Every other GPU's semantics (not the timing skew, which only slows things down).
+    pub const ALL: Self = Self { shift_mod32: true, vector_rmw: true, skew: false };
 
     /// The parts the `GZC_EMULATE_*` variables turn on (any value but `0`).
     pub fn from_env() -> Self {
         Self {
             shift_mod32: crate::context::env_on("GZC_EMULATE_SHIFT_MOD32"),
             vector_rmw: crate::context::env_on("GZC_EMULATE_VEC_RMW"),
+            skew: crate::context::env_on("GZC_EMULATE_SKEW"),
         }
     }
 
     pub fn any(self) -> bool {
-        self.shift_mod32 || self.vector_rmw
+        self.shift_mod32 || self.vector_rmw || self.skew
     }
 
     /// Both parts that either of `self` and `other` has.
     pub fn or(self, other: Self) -> Self {
-        Self { shift_mod32: self.shift_mod32 || other.shift_mod32, vector_rmw: self.vector_rmw || other.vector_rmw }
+        Self {
+            shift_mod32: self.shift_mod32 || other.shift_mod32,
+            vector_rmw: self.vector_rmw || other.vector_rmw,
+            skew: self.skew || other.skew,
+        }
     }
 
     /// `src` (complete WGSL) rewritten as described on the fields.
@@ -57,6 +70,9 @@ impl Emulation {
         }
         if self.vector_rmw {
             out = vector_stores_rmw(&out);
+        }
+        if self.skew {
+            out = skew_timing(&out)?;
         }
         Ok(out)
     }
@@ -155,6 +171,86 @@ fn rmw_line(line: &str, vec_vars: &[(String, bool)]) -> Option<String> {
     Some(format!("{indent}{{ var rmw = {base}; rmw{component} = {value}; {base} = rmw; }}"))
 }
 
+/// The helpers `skew_timing` appends: a per-invocation LCG state and the stall.
+const SKEW_WGSL: &str = "
+var<private> gzc_seed: u32;
+var<workgroup> gzc_spin: atomic<u32>;
+fn gzc_hash(x: u32) -> u32 {
+    var h = x * 0x9E3779B1u;
+    h ^= h >> 15u;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13u;
+    return h;
+}
+fn gzc_skew() {
+    gzc_seed = gzc_seed * 1664525u + 1013904223u;
+    let r = gzc_seed >> 24u;
+    if (r < 32u) {
+        // A dependent ALU chain of up to 512 steps; the atomic on its (practically never 0)
+        // result keeps it from being optimized away.
+        var x = gzc_seed | 1u;
+        let n = (r + 1u) * 16u;
+        for (var i = 0u; i < n; i++) { x = (x ^ (x >> 13u)) * 0x5BD1E995u; }
+        if (x == 0u) { atomicAdd(&gzc_spin, 1u); }
+    }
+}
+";
+
+/// The parameter name of `@builtin(name)` in an entry point's parameter list, if any.
+fn builtin_param(params: &str, name: &str) -> Option<String> {
+    let at = params.find(&format!("@builtin({name})"))?;
+    let rest = params[at..].split_once(')')?.1.trim_start();
+    Some(rest.split(':').next()?.trim().to_string())
+}
+
+/// The timing skew (`Emulation::skew`) on naga's output: every compute entry point gets the
+/// `local_invocation_index` and `workgroup_id` built-ins (when it lacks them), seeds `gzc_seed`
+/// from them and stalls once; every `workgroupBarrier();` / `storageBarrier();` statement and
+/// every `workgroupUniformLoad` binding is followed by a stall, every statement calling a
+/// subgroup built-in preceded by one.
+fn skew_timing(s: &str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(s.len() * 2);
+    let mut entry = false;
+    for line in s.lines() {
+        let t = line.trim();
+        if t.starts_with("@compute") {
+            entry = true;
+        }
+        if entry && t.starts_with("fn ") {
+            entry = false;
+            let open = t.find('(').ok_or_else(|| anyhow!("entry point without parameters: {t}"))?;
+            let close = t.rfind(')').ok_or_else(|| anyhow!("entry point line not on one line: {t}"))?;
+            anyhow::ensure!(t.ends_with('{'), "entry point line not on one line: {t}");
+            let params = &t[open + 1..close];
+            let mut extra = Vec::new();
+            let lii = builtin_param(params, "local_invocation_index").unwrap_or_else(|| {
+                extra.push("@builtin(local_invocation_index) gzc_lii: u32");
+                "gzc_lii".into()
+            });
+            let wid = builtin_param(params, "workgroup_id").unwrap_or_else(|| {
+                extra.push("@builtin(workgroup_id) gzc_wid: vec3<u32>");
+                "gzc_wid".into()
+            });
+            let sep = if params.trim().is_empty() || extra.is_empty() { "" } else { ", " };
+            out.push_str(&format!("{}{sep}{}{}\n", &t[..close], extra.join(", "), &t[close..]));
+            out.push_str(&format!(
+                "    gzc_seed = gzc_hash({lii} ^ gzc_hash({wid}.x ^ ({wid}.y << 16u) ^ ({wid}.z << 24u)));\n    gzc_skew();\n"
+            ));
+            continue;
+        }
+        if t.contains("subgroup") && !t.starts_with("@") && !t.starts_with("fn ") {
+            out.push_str("gzc_skew();\n");
+        }
+        out.push_str(line);
+        out.push('\n');
+        if t == "workgroupBarrier();" || t == "storageBarrier();" || t.contains("workgroupUniformLoad(") {
+            out.push_str("gzc_skew();\n");
+        }
+    }
+    out.push_str(SKEW_WGSL);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,7 +258,7 @@ mod tests {
     #[test]
     fn shift_amounts_are_taken_mod_32() {
         let src = "fn f(x: u32, n: u32) -> u32 { var y = x << n; y >>= (n + 1u); return y + (x << 3u); }";
-        let out = Emulation { shift_mod32: true, vector_rmw: false }.rewrite(src).unwrap();
+        let out = Emulation { shift_mod32: true, ..Emulation::NONE }.rewrite(src).unwrap();
         assert!(out.contains("(x << ((n) % 32u))"), "{out}");
         assert!(out.contains(">> (((n + 1u)) % 32u))"), "{out}");
         assert!(out.contains("(x << ((3u) % 32u))"), "{out}");
@@ -176,12 +272,25 @@ mod tests {
                    @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) lid: u32) {\n\
                    s4[lid >> 2u][lid & 3u] = lid; s4[lid >> 2u].y = 1u; v[lid & 1u] = 2u; plain[lid & 3u] = 3u;\n\
                    s4[lid & 15u] = vec4(0u); v = vec2(0u); }";
-        let out = Emulation { shift_mod32: false, vector_rmw: true }.rewrite(src).unwrap();
+        let out = Emulation { vector_rmw: true, ..Emulation::NONE }.rewrite(src).unwrap();
         assert!(out.contains("{ var rmw = s4_[(lid >> 2u)]; rmw[(lid & 3u)] = lid; s4_[(lid >> 2u)] = rmw; }"), "{out}");
         assert!(out.contains("{ var rmw = s4_[(lid >> 2u)]; rmw.y = 1u; s4_[(lid >> 2u)] = rmw; }"), "{out}");
         assert!(out.contains("{ var rmw = v; rmw[(lid & 1u)] = 2u; v = rmw; }"), "{out}");
         assert!(out.contains("plain[(lid & 3u)] = 3u;"), "{out}");
         assert!(out.contains("s4_[(lid & 15u)] = vec4(0u);"), "{out}");
         assert!(out.contains("v = vec2(0u);"), "{out}");
+    }
+
+    #[test]
+    fn skew_seeds_entry_points_and_stalls_around_barriers() {
+        let src = "var<workgroup> a: array<u32, 64>;\n\
+                   @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) lid: u32) {\n\
+                   a[lid] = lid; workgroupBarrier(); let x = workgroupUniformLoad(&a[0]); a[lid] = x; }\n\
+                   @compute @workgroup_size(64) fn other() { storageBarrier(); }";
+        let out = Emulation { skew: true, ..Emulation::NONE }.rewrite(src).unwrap();
+        assert!(out.contains("gzc_seed = gzc_hash(lid ^ gzc_hash(gzc_wid.x"), "{out}");
+        assert!(out.contains("fn other(@builtin(local_invocation_index) gzc_lii: u32, @builtin(workgroup_id) gzc_wid: vec3<u32>)"), "{out}");
+        assert_eq!(out.matches("gzc_skew();").count(), 2 + 3, "{out}");
+        naga::front::wgsl::parse_str(&out).unwrap_or_else(|e| panic!("{}\n{out}", e.emit_to_string(&out)));
     }
 }

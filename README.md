@@ -276,11 +276,21 @@ by `0` only.
   (Apple, AMD; NVIDIA gives 0 for a shift by 32 or more), and a store to one component of a
   workgroup vector is a read-modify-write of the whole vector (Apple's Metal, which corrupted
   every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
-  differential suite with both on (`gzc_gpu::emulate`).
+  differential suite with both on (`gzc_gpu::emulate`). `GZC_EMULATE_SKEW` — **test only**:
+  timing skew, every invocation stalls pseudo-randomly at entry, after each barrier and before
+  each subgroup operation, for races a slow or preempted GPU would expose (much slower).
+  `cargo run --release -p gzc-gpu --example gpu_hog -- [GiB] [s]` is a second GPU tenant for
+  contention runs.
 - `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
   actually fails the guard.
+- `GZC_POISON` (anything but `0`) — **test only**: memory poisoning (`gzc_gpu::poison`). Every
+  buffer gets 4 KiB of padding, and before every batch garbage fills every scratch and output
+  buffer, the input past the batch's trailing zero word and the padding; workgroup memory loses
+  its zero-init and is dirtied by a garbage kernel. Output must stay byte-identical: no kernel may
+  read memory it did not write in that batch. `GZC_POISON_SEED=N` fixes the patterns.
+  `tests/poison.rs` runs a differential subset poisoned; `GZC_POISON=1 cargo test` the whole suite.
 
 **Backends:** the E3 paths (transfer-queue readback, and the direct upload's ReBAR detection) are
 Vulkan-only. On DX12 (wgpu's default on Windows) and Metal they are inactive: readback runs on the

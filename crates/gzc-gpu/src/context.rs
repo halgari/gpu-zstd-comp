@@ -59,6 +59,11 @@ pub struct GpuContext {
     pub emulate: Emulation,
     /// Set by the device-lost callback (`device_lost`).
     lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Memory poisoning (`GpuOptions::poison`, see `poison`).
+    pub(crate) poison: bool,
+    pub(crate) poisoner: std::sync::OnceLock<crate::poison::Poisoner>,
+    pub(crate) poison_seq: std::sync::atomic::AtomicU32,
+    pub(crate) poison_base: u64,
 }
 
 /// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
@@ -78,6 +83,9 @@ pub struct GpuOptions {
     /// Test aid: rewrite every shader to behave as it would on other GPUs (`Emulation`). The
     /// `GZC_EMULATE_*` variables turn their part on for every context, whatever the options.
     pub emulate: Emulation,
+    /// Test aid: poison every buffer and workgroup memory before every batch (`crate::poison`).
+    /// `GZC_POISON` turns it on for every context, whatever the options.
+    pub poison: bool,
 }
 
 impl Default for GpuOptions {
@@ -89,6 +97,7 @@ impl Default for GpuOptions {
             direct_upload: None,
             transfer_queue: true,
             emulate: Emulation::NONE,
+            poison: false,
         }
     }
 }
@@ -106,6 +115,7 @@ impl GpuOptions {
             },
             transfer_queue: !env_off("GZC_TRANSFER_QUEUE"),
             emulate: Emulation::from_env(),
+            poison: env_on("GZC_POISON"),
         }
     }
 }
@@ -192,6 +202,7 @@ pub(crate) struct Prepared {
     pub pack_frames: bool,
     pub direct_upload: bool,
     pub emulate: Emulation,
+    pub poison: bool,
     pub required_features: wgpu::Features,
     pub required_limits: wgpu::Limits,
 }
@@ -232,6 +243,12 @@ impl Prepared {
             direct_upload: self.direct_upload,
             emulate: self.emulate,
             transfer: None,
+            poison: self.poison,
+            poisoner: std::sync::OnceLock::new(),
+            poison_seq: std::sync::atomic::AtomicU32::new(0),
+            poison_base: std::env::var("GZC_POISON_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+            }),
         }
     }
 
@@ -245,12 +262,19 @@ impl Prepared {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             desc.backends = wgpu::Backends::METAL;
         }
+        // One thread at a time: the Vulkan loader's first ICD scan is not thread-safe. Two test
+        // threads opening contexts at once crashed in it (SIGSEGV, a null call inside
+        // libvulkan.so.1's vkEnumerateInstanceExtensionProperties while the other thread was in
+        // the NVIDIA ICD's vk_icdNegotiateLoaderICDInterfaceVersion).
+        static INSTANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = INSTANCE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
         .map_err(|e| anyhow!("no GPU adapter found (wgpu): {e}"))?;
+        drop(guard);
 
         let al = adapter.limits();
         let info = adapter.get_info();
@@ -300,6 +324,7 @@ impl Prepared {
             pack_frames,
             direct_upload,
             emulate: opts.emulate.or(Emulation::from_env()),
+            poison: opts.poison || env_on("GZC_POISON"),
             required_features,
             required_limits,
         })
@@ -400,6 +425,9 @@ impl GpuContext {
         if self.emulate.any() {
             line += &format!("; emulating {:?}", self.emulate);
         }
+        if self.poison {
+            line += "; poisoning memory";
+        }
         line
     }
 
@@ -468,8 +496,10 @@ impl GpuContext {
         }
     }
 
-    /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from.
+    /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from. When
+    /// poisoning, `poison::POISON_PAD` bytes larger.
     pub fn storage_buffer(&self, label: &str, size: u64, copy_src: bool) -> wgpu::Buffer {
+        let size = size + self.poison_pad();
         let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         if copy_src {
             usage |= wgpu::BufferUsages::COPY_SRC;

@@ -501,7 +501,7 @@ pub(crate) fn pipeline_from_module(
         layout: Some(&pipeline_layout),
         module,
         entry_point: Some(entry_point),
-        compilation_options: Default::default(),
+        compilation_options: ctx.compilation_options(),
         cache: None,
     })
 }
@@ -858,6 +858,7 @@ impl Kernels {
                 end_of_pass_write_index: Some(2 * k + 1),
             })
         };
+        poison_front(ctx, enc, bufs, n_blocks);
         self.record_best(ctx, enc, bufs, n_blocks, queries);
         self.record_parse(ctx, enc, bufs, n_blocks, ts(2))
     }
@@ -1035,6 +1036,14 @@ impl Kernels {
         let (Some(frames), Some(frame_len)) = (&bufs.frames, &bufs.frame_len) else {
             panic!("K4 needs BatchBuffers allocated with frames");
         };
+        if ctx.poisoning() {
+            // K5/K4's outputs, and their inputs past the batch's trailing zero word.
+            ctx.poison_workgroup_memory(enc);
+            ctx.poison_from(enc, frames, 0);
+            ctx.poison_from(enc, frame_len, 0);
+            ctx.poison_from(enc, &bufs.data, data_bytes(n_blocks));
+            ctx.poison_from(enc, lit_src, data_bytes(n_blocks));
+        }
         // K5 and K4 derive the batch size from the bound length of `frame_len`.
         let frame_len =
             wgpu::BufferBinding { buffer: frame_len, offset: 0, size: wgpu::BufferSize::new(frame_len_bytes(n_blocks)) };
@@ -1072,6 +1081,23 @@ impl Kernels {
         pass.set_pipeline(&k4.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);
+    }
+}
+
+/// When poisoning (`crate::poison`): garbage into workgroup memory and into every buffer K1–K3
+/// (and K3opt) write, and into `data` past the batch's `n_blocks` blocks and trailing zero word.
+fn poison_front(ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+    if !ctx.poisoning() {
+        return;
+    }
+    ctx.poison_workgroup_memory(enc);
+    ctx.poison_from(enc, &bufs.data, data_bytes(n_blocks));
+    for b in [&bufs.head, &bufs.pred, &bufs.best, &bufs.seqs, &bufs.counts] {
+        ctx.poison_from(enc, b, 0);
+    }
+    if let Some(o) = &bufs.opt {
+        ctx.poison_from(enc, &o.prices, 0);
+        ctx.poison_from(enc, &o.scratch, 0);
     }
 }
 
@@ -1308,6 +1334,14 @@ fn submit_from_best(
         ctx.queue.write_buffer(&bufs.best, b as u64 * best_bytes(1), bytemuck::cast_slice(&words));
     }
     let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("from_best") });
+    if ctx.poisoning() {
+        // Everything but the uploaded blocks (+ trailing word) and best[] tables.
+        ctx.poison_workgroup_memory(&mut enc);
+        ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+        ctx.poison_from(&mut enc, &bufs.best, best_bytes(n));
+        ctx.poison_from(&mut enc, &bufs.seqs, 0);
+        ctx.poison_from(&mut enc, &bufs.counts, 0);
+    }
     kernels.record_parse(ctx, &mut enc, &bufs, n, None)?;
     if frames {
         kernels.record_entropy(ctx, &mut enc, &bufs, n, None);
