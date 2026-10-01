@@ -1,17 +1,174 @@
 # gpu-zstd-comp
 
-A prototype GPU (wgpu/compute-shader) zstd compressor: match finding, parsing and
-entropy coding run on the GPU in fixed-size blocks, producing standard zstd frames
-that decode with libzstd. `gzc-core` holds the shared, CPU-checkable primitives
-(block chunking, the sequence/repeat-offset model, hashing, synthetic test corpora,
-the frame writer and the CPU reference encoder the GPU mirrors); `gzc-gpu` holds the wgpu
-kernels and host-side orchestration; `gzc-bench` compares CPU-baseline, CPU-reference
-and GPU throughput/ratio over a corpus; `tools/fetch-corpus` downloads/builds the
-benchmark corpus described by `corpus.toml`.
+A GPU zstd compressor written in Rust with wgpu compute shaders (WGSL). Input is cut into
+independent blocks (64 KiB by default). The GPU does the match finding, the parse and the entropy
+coding, and writes one standard zstd frame per block. Every frame decodes with stock libzstd.
 
-Block size is a compile-time feature on `gzc-core`/`gzc-gpu`/`gzc-bench`: exactly one
-of `block-16k`, `block-32k`, `block-64k`, `block-128k` (default `block-64k`, the largest block
-size the downloader uses; blocks are always independent).
+It was built for one job: recompressing Skyrim mod data (mostly DDS textures, plus NIF meshes)
+while it downloads, on a gaming PC, at up to 10 Gbit/s (1250 MB/s). It is a prototype. There is
+no GPU decompression, and blocks never reference each other.
+
+## Status (2026-10-01)
+
+- **Ten presets** run on the GPU, from libzstd-level-3 ratio up to libzstd-level-16 ratio. The
+  `gzc-core` crate holds a CPU reference encoder for each preset. GPU output is byte-identical
+  to it, and tests check that on every supported backend.
+- **Fastest preset:** `lvl9s12seg` beats libzstd level 9's ratio at about 10.4 GB/s on an
+  RTX 5090.
+- **Highest-ratio presets:** `opt14` and `opt16` beat libzstd levels 14 and 16 at
+  1.8–2.3 and 1.1–1.5 GB/s on the same card.
+- **Platforms:** Linux/Vulkan on NVIDIA is the main development platform. macOS/Metal works and
+  was benchmarked on an M4 Pro. Windows/Vulkan works but has an open bug (see below).
+  Windows/DX12 does not work.
+- **Next steps:** a research round on making `opt16` faster has finished. Its recommendations
+  have not been implemented yet:
+  - kernel changes that keep the output byte-identical (fewer registers, skipping positions
+    that can't start a match, a persistent heaviest-block-first parse kernel);
+  - a 2-pass `opt16` that gets its ratio margin from splitting each frame into several zstd
+    blocks and from a longer-match hash chain.
+
+  See `docs/superpowers/m6/synthesis.md` and the twelve research reports next to it.
+
+## Performance: RTX 5090 vs Ryzen 9 9950X3D
+
+Measured 2026-10-01 at commit `ba061ce` on one Linux machine: an RTX 5090 (Vulkan, driver 610)
+and a Ryzen 9 9950X3D (16 cores, 32 threads).
+
+- **Corpus:** the full corpus, `--ext dds,nif`: 3172 files, 6.49 GB, 100,754 blocks of 64 KiB.
+- **What MB/s means:** uncompressed bytes per second of wall time, including upload and
+  readback.
+- **Ratio:** uncompressed size divided by compressed size.
+- **GPU runs:** median of 3 runs at `--batch max --inflight 3` and the default 6 GiB
+  VRAM budget. A separate `--verify` run decoded every frame of every preset with libzstd, with
+  no mismatches.
+- **CPU runs:** libzstd (`gzc-bench cpu`), one run per cell.
+- **Background load:** a browser and two idle VMs were running.
+
+| GPU preset | GPU MB/s | Ratio | Same-ratio libzstd level | CPU MB/s, 8 / 16 / 32 threads | libzstd ratio |
+|---|---:|---:|---|---:|---:|
+| `lvl3` | 7,447 | 1.264 | L3 | 3,841 / 7,945 / 9,360 | 1.262 |
+| `rung1` | 9,750 | 1.330 | L6 (closest) | 964 / 1,911 / 2,265 | 1.335 |
+| `rung2` | 7,503 | 1.337 | L6 | 964 / 1,911 / 2,265 | 1.335 |
+| `lvl9` | 5,794 | 1.33932 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
+| `lvl9seg` | 9,134 | 1.33931 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
+| `lvl9s12` | 6,217 | 1.33927 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
+| `lvl9s12seg` | **10,396** | 1.33926 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
+| `lvl9s12d16seg` | 11,086 | 1.33860 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
+| `opt14` | 1,809 (2,260 at batch 2900) | 1.37064 | L14 | 224 / 415 / 590 | 1.36827 |
+| `opt16` | 1,116 (1,464 at batch 2900) | 1.37144 | L16 | 190 / 384 / 501 | 1.37100 |
+
+How to read it:
+
+- **Against all 32 CPU threads:** at level-9 ratio the GPU is about 6× faster (`lvl9s12seg`,
+  10.4 GB/s against 1.75 GB/s). At level 14 it is 3.1–3.8× faster and at level 16 2.2–2.9×.
+  At level 3 the CPU wins (9.4 GB/s against 7.4).
+- **The 8-thread column** is the closest thing here to the target machine, an 8-core gaming
+  PC. Against it the GPU is 14× faster at level 9, 8–10× at level 14 and 6–8× at level 16.
+  The 9950X3D's cores are faster than a typical gaming CPU's.
+- **`opt14` and `opt16` at `--batch max`:** the default budget allows 3586 blocks per batch.
+  On the 5090 only about 3400 fit on the GPU at once, so each batch runs a partial second
+  wave, which costs 20–24 %. A batch of 2900 avoids that.
+- **Without subgroups:** `lvl9s12seg` runs at 8,569 MB/s with `GZC_NO_SUBGROUPS=1`, the
+  portable kernels every GPU can run.
+- **Small cards:** an RTX 4060 has about 14 % of a 5090's compute. Projections, not
+  measurements, put `opt16` at about 150–215 MB/s and `opt14` at 250–365 MB/s on an RTX 4060.
+
+Ratios with five decimals come from `gzc-bench ref` (the CPU reference, which the GPU matches
+byte for byte); the others are rounded from the run output. Full write-ups:
+`docs/results/2026-09-30-speed2.md` (the level-9 presets) and `docs/results/2026-09-30-m5.md`
+(`opt14`/`opt16`).
+
+## Other hardware
+
+**Apple M4 Pro** (16-core GPU, 12 CPU cores, 24 GB, macOS 15.1, Metal), on the same corpus.
+Details are in `docs/results/2026-09-30-m4pro.md`.
+
+- **Correctness:** every preset verified.
+- **The GPU loses to the CPU at every level on this machine:**
+
+  | GPU preset | GPU MB/s | libzstd level | CPU MB/s, 12 threads |
+  |---|---:|---|---:|
+  | `lvl3` | 491 | L3 | 4,821 |
+  | `lvl9seg` | 576 | L9 | 692 (721 at 8 threads) |
+  | `opt14` | 221 | L14 | 295 |
+  | `opt16` | 161 | L16 | 259 |
+
+- **GPU and CPU together:** with the GPU and 8 CPU threads each compressing their own share of
+  the blocks, level-16 ratio reached 366 MB/s, 42 % more than the CPU alone.
+- **Metal tuning:** two settings on the `metal-exp` branch (subgroup width 32, 32 K1
+  workgroups) add 4–27 %. They are not on master yet.
+
+**GTX 1660 Super** (Windows 11, NVIDIA driver 595.97): builds and runs on Vulkan. It has not
+been benchmarked, because of the open bug below and because the machine is shared.
+
+## What has been tested
+
+- **Linux, RTX 5090, Vulkan:**
+  - the full test suite, with and without subgroups;
+  - full-corpus `--verify` for every preset;
+  - GPU vs CPU-reference differential tests at 16, 32 and 64 KiB blocks (and 128 KiB for the
+    level-3 to level-9 presets);
+  - extra test modes that make shaders behave like Apple and AMD GPUs, fill every buffer with
+    garbage before each batch (`GZC_POISON`), and stall threads at random (`GZC_EMULATE_SKEW`).
+- **macOS, M4 Pro, Metal:** the full test suite and a verified full-corpus benchmark of every
+  preset.
+- **Windows, GTX 1660 Super, Vulkan:** build, the test suite (with the failure below), and the
+  smoke test.
+- **Linux, AMD Ryzen iGPU, OpenGL backend:** one quick run, before the Metal-era fixes.
+
+## What has not been tested
+
+- **AMD discrete cards** (RDNA 2/3) on Vulkan, Windows or Linux. AMD's Vulkan driver has not
+  run this code at all.
+- **Intel Arc.**
+- **The common 8 GB NVIDIA cards** (RTX 3060, RTX 4060). Every number for them is a
+  projection.
+- **Throughput on the GTX 1660 Super.**
+- **Linux distributions other than the dev machine's (Arch-based),** and other driver versions.
+- **Other Apple chips** (M1–M3, base M4).
+- **Block sizes other than 64 KiB in the throughput tables.** Ratios at 16 and 32 KiB are
+  validated; speed is not.
+
+## Known problems
+
+- **Wrong output on the GTX 1660 Super under load.** On Windows/Vulkan with subgroups on, a few
+  frames came out the right length with their last 1–3 bytes wrong. It happened only when
+  other work was using the GPU at the same time, and no error was reported.
+  - It has not reproduced on the RTX 5090, including under the poison, skew and contention
+    test modes.
+  - Two rounds of hardening have gone in since: subgroup operations moved out of branches, and
+    allocation and device-loss errors are now reported. Neither has been re-tested on that card.
+  - Until it is, use `--verify` (or decode and check) on anything other than the dev machine.
+- **DX12 does not work.** On Windows with `WGPU_BACKEND=dx12`, the smoke test reports
+  "Data corruption detected", and startup takes several minutes. Vulkan is wgpu's default on
+  the machines tried, but nothing stops wgpu from picking DX12. Use `WGPU_BACKEND=vulkan` on
+  Windows.
+- **Driver-killed jobs hang the process.** If the driver kills a GPU job for running too long
+  (NVIDIA Xid 109), the process waits forever instead of returning an error. A watchdog is not
+  written yet.
+- **Many devices per process on Metal.** Creating many GPU devices at once in one process can
+  lose a device. Only the test suite does that, and it limits itself to 2 at a time
+  (`GZC_GPU_TEST_SLOTS`).
+- **`opt14`/`opt16` at `--batch max`** pick a batch slightly too big for one wave on the 5090
+  (see above).
+- **Metal throughput:** subgroup kernels fall back to their slower versions on Metal, because
+  wgpu reports Apple's subgroup width as 4–64. The fix is on the `metal-exp` branch.
+
+## Layout
+
+- `crates/gzc-core`: the CPU side, checkable without a GPU. Block chunking, the sequence and
+  repeat-offset model, hashing, synthetic test data, the frame writer, and the CPU reference
+  encoder that the GPU mirrors.
+- `crates/gzc-gpu`: the WGSL kernels (`src/shaders/`), the pipeline that streams batches
+  through the GPU, and the GPU tests.
+- `crates/gzc-bench`: the benchmark CLI. It compares libzstd, the CPU reference and the GPU on
+  a corpus, and writes a table, JSON and an HTML report.
+- `tools/fetch-corpus`: downloads the benchmark corpus pinned in `corpus.toml` from Nexus Mods.
+- `docs/results/`: dated results for each phase. `docs/superpowers/`: specs, plans and design
+  notes.
+
+Block size is a compile-time feature on `gzc-core`/`gzc-gpu`/`gzc-bench`: exactly one of
+`block-16k`, `block-32k`, `block-64k` (default) or `block-128k`. All three crates must agree.
 
 ## Build
 
@@ -41,7 +198,7 @@ run does not put a dozen devices on one GPU at once; light tests run beside them
 ## Corpus (`tools/fetch-corpus`, dev-only)
 
 `gzc-bench` needs a realistic byte corpus to measure ratio/throughput on. Nothing
-in the workspace depends on this tool — it just populates `data/corpus/` on disk.
+in the workspace depends on this tool; it just populates `data/corpus/` on disk.
 `data/` and `out/` are gitignored; nothing under them is ever committed.
 
 Requires `NEXUS_API_KEY` (a Nexus Mods Premium account, for `download_link`) and
@@ -122,18 +279,13 @@ the same block size:
 | 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
 | 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | 1.35159 |
 
-Headline (speed phase 2, `docs/results/2026-09-30-speed2.md`, RTX 5090, 64 KiB blocks, full
-corpus, `--batch max --inflight 3`): GPU **`lvl9s12seg` reaches 10588 MB/s** (median of 8 runs) at
-ratio **1.33926**, above libzstd L9's 1.3379 on the same blocks (libzstd L9: 1754 MB/s on 32
-threads). `lvl9` does 5767 MB/s and `lvl9seg` 8809 MB/s; with `GZC_NO_SUBGROUPS=1`, `lvl9s12seg`
-does 8722 MB/s. At that point the pipeline was **host-bound** (one thread wrote uploads and
-delivered frames; the GPU waited ~2 ms per batch); since the host track (`docs/results/host-log.md`)
-frames are delivered on a completion thread beside the uploading thread and the GPU is the
-bottleneck again, with the host's share of the wall time down from ~40–120 ms to ~25 ms per run. The earlier phases are in `docs/results/2026-09-29-m4.md` and
-`docs/results/2026-09-30-speed.md` (128 KiB blocks). All these numbers are measured on an RTX
-5090. The quality presets `opt14`/`opt16` (M5, `docs/results/2026-09-30-m5.md`) reach libzstd L14/L16's
-ratio at 64 KiB (1.37064 / 1.37144) at 2.17 / 1.43 GB/s (batch 2900; 1.75 / 1.09 GB/s at the default
-`--batch max` on a 6 GiB budget, which spills past one wave).
+The same for `opt14`/`opt16` against libzstd L14/L16:
+
+| Block | L14 | opt14 | L16 | opt16 |
+|---|---:|---:|---:|---:|
+| 16 KiB | 1.32606 | 1.32765 | 1.32774 | 1.32794 |
+| 32 KiB | 1.34797 | 1.35105 | 1.35025 | 1.35158 |
+| 64 KiB | 1.36827 | 1.37064 | 1.37100 | 1.37144 |
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify
@@ -152,7 +304,7 @@ list is swept:
 - `--preset P` match presets (default `lvl3`; see above).
 - `--batch N` blocks per GPU batch (default 512), or `max`: the largest batch that
   fits `--vram-budget-mb` at a given preset and `--inflight` (capped by the
-  device's own limit), resolved separately per preset — the max batch depends on
+  device's own limit), resolved separately per preset; the max batch depends on
   how much scratch memory the preset's hash chains need per block, so it is not
   the same number for every preset. Lists can mix the two, e.g. `--batch 512,max`.
   The resolved number is what shows up in the run's config label.
@@ -271,28 +423,28 @@ by `0` only.
   read back on the main queue).
 - `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
   time runs without per-kernel timestamp queries.
-- `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW` (anything but `0`) — **test only**: every
+- `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW` (anything but `0`), **test only**: every
   shader is rewritten (through naga) to behave as on other GPUs: shifts take their amount mod 32
   (Apple, AMD; NVIDIA gives 0 for a shift by 32 or more), and a store to one component of a
   workgroup vector is a read-modify-write of the whole vector (Apple's Metal, which corrupted
   every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
-  differential suite with both on (`gzc_gpu::emulate`). `GZC_EMULATE_SKEW` — **test only**:
+  differential suite with both on (`gzc_gpu::emulate`). `GZC_EMULATE_SKEW`, **test only**:
   timing skew, every invocation stalls pseudo-randomly at entry, after each barrier and before
   each subgroup operation, for races a slow or preempted GPU would expose (much slower).
   `cargo run --release -p gzc-gpu --example gpu_hog -- [GiB] [s]` is a second GPU tenant for
   contention runs.
-- `GZC_K3_FORCE_FALLBACK=1` — **test only**, not a tuning knob: makes every workgroup of
+- `GZC_K3_FORCE_FALLBACK=1`, **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
   actually fails the guard.
-- `GZC_POISON` (anything but `0`) — **test only**: memory poisoning (`gzc_gpu::poison`). Every
+- `GZC_POISON` (anything but `0`), **test only**: memory poisoning (`gzc_gpu::poison`). Every
   buffer gets 4 KiB of padding, and before every batch garbage fills every scratch and output
   buffer, the input past the batch's trailing zero word and the padding; workgroup memory loses
   its zero-init and is dirtied by a garbage kernel. Output must stay byte-identical: no kernel may
   read memory it did not write in that batch. `GZC_POISON_SEED=N` fixes the patterns.
   `tests/poison.rs` runs a differential subset poisoned; `GZC_POISON=1 cargo test` the whole suite.
 
-**Backends:** the E3 paths (transfer-queue readback, and the direct upload's ReBAR detection) are
-Vulkan-only. On DX12 (wgpu's default on Windows) and Metal they are inactive: readback runs on the
-main queue and the upload is copied (unless `GZC_DIRECT_UPLOAD=1`), which gives correct output at
-lower throughput. Pin the Vulkan backend (e.g. `WGPU_BACKEND=vulkan`) to get them on Windows.
+**Backends.** The transfer-queue readback and the direct-upload ReBAR detection only work on
+Vulkan. On Metal they are off: readback runs on the main queue and uploads are copied, unless
+`GZC_DIRECT_UPLOAD=1`. That gives correct output at lower speed. DX12 currently gives wrong
+output (see Known problems), so set `WGPU_BACKEND=vulkan` on Windows.
