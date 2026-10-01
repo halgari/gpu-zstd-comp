@@ -76,7 +76,11 @@ const STG: u32 = (C * 76u + 31u) / 32u + 2u;
 // sbuf: codes [0, C), emitted state bits [C, 4C).
 var<workgroup> sbuf: array<u32, 1024>;
 var<workgroup> stg: array<atomic<u32>, STG>;
-var<workgroup> scan4: array<vec4<u32>, WG / 4u>;
+// wg_scan's per-thread values. Scalars: a store to one component of a workgroup vector is a
+// read-modify-write of the whole vector on Apple GPUs (Metal), so threads storing neighbouring
+// components of one vec4 lost each other's values there (short, corrupt frames on an M4 Pro;
+// `GZC_EMULATE_VEC_RMW` reproduces it elsewhere).
+var<workgroup> scan: array<u32, WG>;
 var<workgroup> nseq_wg: u32;
 var<workgroup> pos_wg: u32;
 var<workgroup> carry_wg: u32;
@@ -276,16 +280,14 @@ fn ncount(h: u32, len: u32, tl: u32, emit: bool) -> u32 {
 // Exclusive prefix sum of v over the workgroup's threads (x) and the total (y); all threads call
 // it. A barrier must separate two calls.
 fn wg_scan(lid: u32, v: u32) -> vec2<u32> {
-    scan4[lid >> 2u][lid & 3u] = v;
+    scan[lid] = v;
     workgroupBarrier();
     var pre = 0u;
     var tot = 0u;
-    for (var i = 0u; i < WG / 4u; i++) {
-        let q = scan4[i];
-        let b = 4u * i;
-        pre += select(0u, q.x, b < lid) + select(0u, q.y, b + 1u < lid) + select(0u, q.z, b + 2u < lid)
-            + select(0u, q.w, b + 3u < lid);
-        tot += q.x + q.y + q.z + q.w;
+    for (var i = 0u; i < WG; i++) {
+        let q = scan[i];
+        pre += select(0u, q, i < lid);
+        tot += q;
     }
     return vec2<u32>(pre, tot);
 }

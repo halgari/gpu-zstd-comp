@@ -171,13 +171,19 @@ impl ChainsKernel {
         Self::with_options(ctx, params, ChainsOptions::default())
     }
 
+    /// Whether `ctx` may run the subgroup kernel (it then still has to pass its self-test): the
+    /// kernel splits its 256-lane tiles into 32-lane chunks, each inside one subgroup, and reads
+    /// ballots of up to 128 lanes, so every subgroup size the adapter reports must lie in 32..=128.
+    /// Metal reports 4..=64 (its SIMD width is per pipeline), so Apple GPUs take the fallback.
+    pub fn subgroup_kernel_possible(ctx: &GpuContext) -> bool {
+        let info = &ctx.adapter_info;
+        ctx.subgroups && info.subgroup_min_size >= 32 && info.subgroup_max_size <= 128
+    }
+
     /// `new` with explicit options.
     pub fn with_options(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions) -> anyhow::Result<Self> {
         params.validate().map_err(|e| anyhow::anyhow!("invalid match params {params:?}: {e}"))?;
-        // The subgroup kernel splits its 256-lane tiles into 32-lane chunks, each inside one
-        // subgroup, and reads ballots of up to 128 lanes.
-        let info = &ctx.adapter_info;
-        if ctx.subgroups && info.subgroup_min_size >= 32 && info.subgroup_max_size <= 128 {
+        if Self::subgroup_kernel_possible(ctx) {
             // Build + self-test inside their own error scope (like `probe_lanes`), so a wgpu
             // validation error from the subgroup shader/pipeline (not just a wrong self-test
             // result) also falls back here instead of surfacing uncaptured, which wgpu may

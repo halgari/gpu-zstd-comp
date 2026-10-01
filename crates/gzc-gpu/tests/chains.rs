@@ -132,13 +132,14 @@ fn k1_opt3_preds_match_cpu() {
     }
 }
 
-/// The context picks the kernel: the subgroup one exactly when the device has subgroups.
+/// The context picks the kernel: the subgroup one exactly when the device has subgroups of
+/// suitable sizes (`ChainsKernel::subgroup_kernel_possible`; not Metal, which reports 4..=64).
 #[test]
 fn k1_kernel_follows_context() {
     for ctx in contexts() {
         let i = &ctx.adapter_info;
         eprintln!("{}: subgroups {} (sizes {}..={})", i.name, ctx.subgroups, i.subgroup_min_size, i.subgroup_max_size);
-        assert_eq!(ChainsKernel::new(&ctx, &LVL9).unwrap().uses_subgroups(), ctx.subgroups);
+        assert_eq!(ChainsKernel::new(&ctx, &LVL9).unwrap().uses_subgroups(), ChainsKernel::subgroup_kernel_possible(&ctx));
     }
 }
 
@@ -254,7 +255,7 @@ fn k1_pred_words_carry_fingerprints() {
 #[test]
 fn k1_failed_self_test_falls_back() {
     let ctx = GpuContext::new().unwrap();
-    if !ctx.subgroups {
+    if !ChainsKernel::subgroup_kernel_possible(&ctx) {
         return;
     }
     let good = ChainsKernel::with_options(&ctx, &LVL9, ChainsOptions::default()).unwrap();

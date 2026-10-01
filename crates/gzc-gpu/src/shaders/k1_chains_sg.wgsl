@@ -103,7 +103,10 @@ fn load_words(base: u32, p: u32) -> vec3<u32> {
 
 // Ballot of bit i of h over this lane's chunk (ballot word `word`; K1_BALLOT_WORD is `.x` for
 // subgroups of at most 32 lanes, else `[word]`, host-generated), published by the chunk's lane i
-// at bal[at ..]; returns the lanes whose bit i equals this lane's.
+// at bal[at ..]; returns the lanes whose bit i equals this lane's. One lane stores one component
+// per call, the calls in order: safe where a component store is a read-modify-write of the whole
+// vec4 (Metal; `GZC_EMULATE_VEC_RMW`), unlike several lanes storing components at once (K4's old
+// wg_scan). Storing whole vec4s from one lane instead cost this kernel 7 % (RTX 5090, lvl9).
 fn publish_bit(h: u32, i: u32, word: u32, cl: u32, at: u32) -> u32 {
     let bit = (h >> i) & 1u;
     let m = subgroupBallot(bit != 0u)K1_BALLOT_WORD;

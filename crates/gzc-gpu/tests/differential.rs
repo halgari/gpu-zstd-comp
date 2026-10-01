@@ -19,8 +19,22 @@ use gzc_gpu::compressor::{
     GpuParams, K3Mode, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
     parses_from_best,
 };
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::context::{Emulation, GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
+
+/// The foreign GPU semantics every context of this suite emulates: none when this file is its own
+/// test crate. `differential_emulated.rs` includes it as a module and defines its own
+/// `EMULATION`, which `crate::EMULATION` then names (this one goes unused there).
+#[allow(dead_code)]
+const EMULATION: Emulation = Emulation::NONE;
+
+/// `GpuContext::new()`, or `with_subgroups(false)` for `subgroups: false`, emulating
+/// `crate::EMULATION`.
+fn context(subgroups: bool) -> GpuContext {
+    let env = GpuOptions::from_env();
+    let opts = GpuOptions { subgroups: subgroups && env.subgroups, emulate: crate::EMULATION, ..env };
+    GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests")
+}
 
 /// Every test case chunked into padded blocks, labelled "name[i]".
 fn all_blocks() -> Vec<(String, Vec<u8>)> {
@@ -40,7 +54,7 @@ fn case(name: &str) -> Vec<u8> {
 }
 
 fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = context(true);
     let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: false, huffman: false }).expect("Kernels::new");
     (ctx, kernels)
 }
@@ -198,7 +212,7 @@ fn batch_of_300_mixed() {
 /// params are errors, not panics.
 #[test]
 fn kernels_per_params_coexist_and_reject_unsupported() {
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = context(true);
     let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
     let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
     let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
@@ -236,7 +250,7 @@ fn setup_frames(huffman: bool) -> (GpuContext, Kernels) {
 
 /// `setup_frames` for any match params.
 fn setup_frames_for(matching: MatchParams, huffman: bool) -> (GpuContext, Kernels) {
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = context(true);
     let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: true, huffman }).expect("Kernels::new");
     assert_eq!(kernels.frame_options().huffman, huffman);
     (ctx, kernels)
@@ -473,7 +487,7 @@ fn gpu_frames_identical_without_subgroups() {
     assert!(blocks.len() >= 3, "expected a handful of synthetic blocks, got {}", blocks.len());
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
-        let ctx = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
+        let ctx = context(false);
         assert!(!ctx.subgroups, "with_subgroups(false) must disable subgroups");
         let kernels =
             Kernels::new(&ctx, GpuParams { matching: params, emit_frames: true, huffman: true }).expect("Kernels::new");
@@ -495,7 +509,7 @@ fn compress_frames_needs_emit_frames() {
 /// instead of handing them to the GPU.
 #[test]
 fn frames_from_parses_rejects_invalid_sequences() {
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = context(true);
     let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
     let kernels = Kernels::new(&ctx, params).unwrap();
     let block = zeros(BLOCK_SIZE);
@@ -1546,7 +1560,7 @@ impl FrameSink for CollectFrames {
 /// stale blocks, the pipeline reused for a second run) for every non-lvl3 preset.
 #[test]
 fn stream_frames_match_cpu_non_lvl3_presets() {
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = context(true);
     let distinct = frame_blocks();
     for (name, matching) in GPU_PRESETS.into_iter().filter(|(n, _)| *n != "lvl3") {
         eprintln!("preset {name}");

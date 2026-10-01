@@ -70,15 +70,18 @@ pub struct PipelineConfig {
 pub struct PipelineStats {
     /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
     /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals), in milliseconds;
-    /// empty when the device has no timestamp queries.
+    /// empty when the device has no timestamp queries; a kernel whose timestamps the device left
+    /// unwritten is left out.
     pub kernel_ms: Vec<(String, f64)>,
     /// Wall time from the first upload to the last block handed to the sink.
     pub wall_s: f64,
     /// Number of batches submitted.
     pub batches: u32,
     /// Where the time outside the kernels goes, summed over all batches, in milliseconds (see
-    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (left out without them); the
-    /// `host_*` ones are wall time on the producer or the completion thread.
+    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (left out without them, or
+    /// when the device left a marker timestamp unwritten, which Metal apparently does for the
+    /// empty marker passes); the `host_*` ones are wall time on the producer or the completion
+    /// thread.
     pub transfer_ms: Vec<(String, f64)>,
 }
 
@@ -576,10 +579,7 @@ impl PackKernel {
             FRAME_STRIDE / 4,
             staging.a / 4
         );
-        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pack_frames"),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
+        let module = ctx.wgsl_module("pack_frames", &src, wgpu::ShaderRuntimeChecks::checked());
         let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("pack_frames"),
             layout: Some(&pipeline_layout),
@@ -969,12 +969,23 @@ impl<'a> Pipeline<'a> {
         scopes.pop()?;
         let (batches, pprof) = result?;
 
+        // Timers whose timestamps the device did not write are left out, as without timestamps.
         let (kernel_ms, gpu_ms) = if self.ctx.timestamps {
             let period_ns = self.ctx.queue.get_timestamp_period() as f64;
             let ms = |t: u64| t as f64 * period_ns / 1e6;
             (
-                names.iter().zip(&cprof.ticks).map(|(name, &t)| (name.to_string(), ms(t))).collect(),
-                vec![ms(cprof.upload_copy), ms(cprof.readback), ms(cprof.idle)],
+                names
+                    .iter()
+                    .zip(&cprof.ticks)
+                    .zip(&cprof.ticks_bad)
+                    .filter(|(_, bad)| !**bad)
+                    .map(|((name, &t), _)| (name.to_string(), ms(t)))
+                    .collect(),
+                if cprof.markers_bad {
+                    Vec::new()
+                } else {
+                    vec![ms(cprof.upload_copy), ms(cprof.readback), ms(cprof.idle)]
+                },
             )
         } else {
             (Vec::new(), Vec::new())
@@ -1183,6 +1194,11 @@ struct Completion<'c> {
 struct CompletionProfile {
     /// Kernel ticks, per `Kernels::names`.
     ticks: Vec<u64>,
+    /// Per kernel: some batch had an unwritten begin or end timestamp (`unwritten_stamp`).
+    ticks_bad: Vec<bool>,
+    /// Some batch had an unwritten marker timestamp: `upload_copy`, `readback` and `idle` are
+    /// meaningless (Metal apparently writes none for the empty marker passes).
+    markers_bad: bool,
     upload_copy: u64,
     readback: u64,
     idle: u64,
@@ -1209,7 +1225,8 @@ impl Completion<'_> {
     fn run(mut self, jobs: mpsc::Receiver<Job>, mut handler: Box<Handler<'_>>) -> (anyhow::Result<()>, CompletionProfile) {
         let shared = self.shared.clone();
         let _abort = AbortOnPanic(&shared);
-        let mut prof = CompletionProfile { ticks: vec![0; self.n_kernels], ..Default::default() };
+        let mut prof =
+            CompletionProfile { ticks: vec![0; self.n_kernels], ticks_bad: vec![false; self.n_kernels], ..Default::default() };
         let r = self.drain(jobs, &mut *handler, &mut prof);
         drop(handler);
         if r.is_err() {
@@ -1295,8 +1312,10 @@ impl Completion<'_> {
             view[t..t + (nk + 1) * 16].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
         for (k, acc) in prof.ticks.iter_mut().enumerate() {
             *acc += stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
+            prof.ticks_bad[k] |= unwritten_stamp(stamps[2 * k]) || unwritten_stamp(stamps[2 * k + 1]);
         }
         let (m0, m1) = (stamps[2 * nk], stamps[2 * nk + 1]);
+        prof.markers_bad |= [m0, m1, stamps[0], stamps[self.last_kernel_end]].into_iter().any(unwritten_stamp);
         prof.upload_copy += stamps[0].saturating_sub(m0);
         prof.readback += m1.saturating_sub(stamps[self.last_kernel_end]);
         if let Some(end) = prof.last_end {
@@ -1304,6 +1323,13 @@ impl Completion<'_> {
         }
         prof.last_end = Some(m1);
     }
+}
+
+/// A timestamp the GPU did not write: resolved as 0 (an M4 Pro printed a `gpu_upload_copy` of
+/// about 1.9e6 ms, the absolute GPU clock minus a zero start marker: Metal apparently samples
+/// nothing for the empty marker passes) or as Metal's `MTLCounterErrorValue` (all ones).
+fn unwritten_stamp(t: u64) -> bool {
+    t == 0 || t == u64::MAX
 }
 
 /// The producer's side of a stream (`Pipeline::stream_frames`): hands out the slots' mapped upload
