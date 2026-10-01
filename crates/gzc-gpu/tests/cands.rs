@@ -4,7 +4,7 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::hash::hash_width;
-use gzc_core::params::{MatchParams, OPT14, OPT16};
+use gzc_core::params::{SparseChain, MatchParams, OPT14, OPT16, OPT16P1, OptParams};
 use gzc_core::reference::{CandWords, chains, find_cands, unpack_cands};
 use gzc_core::synth::test_cases;
 use gzc_gpu::compressor::{OptCandKernel, cands_from_blocks};
@@ -54,6 +54,8 @@ fn first_diff(got: &[CandWords], want: &[CandWords]) -> Option<String> {
 
 fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
     let kernel = OptCandKernel::new(ctx, params).expect("OptCandKernel::new");
+    // The subgroup K1 passes its self-test (built for these chains) wherever it may run.
+    assert_eq!(kernel.uses_subgroups(), gzc_gpu::chains::ChainsKernel::subgroup_kernel_possible(ctx), "{params:?}");
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let got = cands_from_blocks(ctx, &kernel, &refs).expect("cands_from_blocks");
     assert_eq!(got.len(), blocks.len());
@@ -114,6 +116,42 @@ fn gpu_cands_match_cpu_other_depths() {
     }
 }
 
+/// M6 `opt16p1` (S3 candidates): h4 depth 8, h3 depth 4 and the 6-, 10- and 12-byte sparse
+/// chains on every 4th position, 16 deep, in one merged walk; and other long chain shapes (
+/// one, two or three chains, stride 8, depths 1 and 64, widths 5 to 12) and h4 depths.
+#[test]
+fn gpu_cands_match_cpu_opt16p1() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    if gzc_core::config::LOG2_BLOCK > 16 {
+        return;
+    }
+    let lc = |width, stride, depth| Some(SparseChain { width, stride, depth });
+    let with = |depth, sparse_chains| MatchParams {
+        depth,
+        opt: Some(OptParams { sparse_chains, ..OPT16P1.opt.unwrap() }),
+        ..OPT16P1
+    };
+    let blocks = all_blocks();
+    for ctx in contexts() {
+        check(&ctx, &blocks, &OPT16P1);
+        check(&ctx, &blocks[..1], &OPT16P1);
+        check(&ctx, &blocks, &with(1, [lc(5, 8, 1), lc(12, 4, 64), None]));
+        check(&ctx, &blocks, &with(32, [lc(8, 4, 3), lc(7, 8, 16), None]));
+        check(&ctx, &blocks, &with(64, [lc(9, 4, 16), None, None]));
+    }
+}
+
+/// K1 builds sparse chains of word-aligned slots only (stride 4 or 8).
+#[test]
+fn opt_cand_kernel_rejects_unaligned_long_chains() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().unwrap();
+    let o = OPT16P1.opt.unwrap();
+    let m = MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 10, stride: 2, depth: 16 }), None, None], ..o }), ..OPT16P1 };
+    assert!(m.validate().is_ok());
+    assert!(OptCandKernel::new(&ctx, &m).is_err());
+}
+
 #[test]
 fn opt_cand_kernel_rejects_non_opt_params() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
@@ -123,6 +161,7 @@ fn opt_cand_kernel_rejects_non_opt_params() {
 
 /// Informal (reads the real corpus): K1 + K2opt against `find_cands` on real .dds/.nif blocks.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test cands corpus -- --ignored --nocapture`
+/// `GZC_CANDS_PRESET` names the opt preset (default `opt16`; e.g. `opt16p1`).
 /// Takes up to `GZC_CORPUS_BLOCKS` (default 4000) blocks sampled uniformly over the whole corpus:
 /// every k-th of all (file, block) pairs, files in sorted path order, k = total blocks / wanted.
 /// Skips (with a message) when the corpus directory does not exist.
@@ -176,10 +215,12 @@ fn corpus_cands_match_cpu() {
     }
     blocks.truncate(want_blocks);
     eprintln!("{} blocks (every {step}th of {total}) from {} files", blocks.len(), files.len());
+    let name = std::env::var("GZC_CANDS_PRESET").unwrap_or_else(|_| "opt16".to_string());
+    let params = gzc_core::params::preset(&name).unwrap();
     let ctx = GpuContext::new().expect("GPU required");
-    eprintln!("subgroups: {}", ctx.subgroups);
+    eprintln!("{name}, subgroups: {}", ctx.subgroups);
     for chunk in blocks.chunks(500) {
-        check(&ctx, chunk, &OPT16);
+        check(&ctx, chunk, &params);
     }
     eprintln!("{} blocks equal", blocks.len());
 }
