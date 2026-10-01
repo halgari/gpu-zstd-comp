@@ -7,6 +7,7 @@ pub mod sorted;
 pub mod compressor;
 pub mod k3opt;
 pub mod pipeline;
+pub mod poison;
 pub mod multiqueue;
 pub mod transfer;
 #[doc(hidden)]

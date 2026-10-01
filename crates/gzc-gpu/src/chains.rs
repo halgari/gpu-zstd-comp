@@ -247,7 +247,7 @@ impl ChainsKernel {
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: ctx.compilation_options(),
             cache: None,
         });
         Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), subgroups, opts, env_groups })

@@ -681,6 +681,18 @@ pub fn parses_from_cands(
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("k3opt"),
                 });
+            if ctx.poisoning() {
+                // Everything but the uploaded blocks (+ trailing word), candidates and prices.
+                let n = chunk.len() as u32;
+                ctx.poison_workgroup_memory(&mut enc);
+                ctx.poison_from(&mut enc, &bufs.data, data_bytes(n));
+                ctx.poison_from(&mut enc, &bufs.cands, best_bytes_for(n, &k.params));
+                for b in [&bufs.trace, &bufs.seqs, &bufs.counts, &bufs.scratch] {
+                    ctx.poison_from(&mut enc, b, 0);
+                }
+                let from = if k.prices == PriceSrc::Buffer { prices_bytes(n) } else { 0 };
+                ctx.poison_from(&mut enc, &bufs.prices, from);
+            }
             k.record(ctx, &mut enc, &bufs, chunk.len() as u32, None)?;
             ctx.queue.submit([enc.finish()]);
             out.extend(read_parses(ctx, &bufs, chunk)?);
@@ -978,7 +990,13 @@ mod tests {
         if BLOCK_SIZE > 1 << 16 {
             return;
         }
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        // Without poisoning: its padding would make the short buffers below long enough.
+        let opts = crate::context::GpuOptions { poison: false, ..crate::context::GpuOptions::default() };
+        if crate::context::env_on("GZC_POISON") {
+            eprintln!("skipped: poisoning pads every buffer");
+            return;
+        }
+        let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
         let n = 4u32;
         let bufs = OptBuffers::new(&ctx, &OPT16, n).unwrap();
         let binds = bufs.binds();

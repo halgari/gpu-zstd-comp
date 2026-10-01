@@ -594,7 +594,7 @@ impl PackKernel {
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: ctx.compilation_options(),
             cache: None,
         });
         Self { pipeline, layout }
@@ -678,8 +678,8 @@ impl<'a> Pipeline<'a> {
             Some(tq) => Some(Xfer {
                 // First, so a second transfer-readback pipeline errors before allocating anything.
                 _streaming: tq.begin_streaming()?,
-                frames: tq.buffer(frames_bytes(cfg.batch), shared, false)?,
-                frame_len: tq.buffer(frame_len_bytes(cfg.batch), shared, false)?,
+                frames: tq.buffer(frames_bytes(cfg.batch) + ctx.poison_pad(), shared, false)?,
+                frame_len: tq.buffer(frame_len_bytes(cfg.batch) + ctx.poison_pad(), shared, false)?,
                 cmds: tq.commands(cfg.inflight)?,
                 k_done: tq.timeline()?,
                 t_done: Arc::new(tq.timeline()?),
@@ -732,9 +732,9 @@ impl<'a> Pipeline<'a> {
             // after the last submitted block (K3opt reads one word past each block; with the
             // direct upload this buffer is `data`, with the copy upload it is copied along).
             #[cfg(test)]
-            let upload_size = data_bytes(cfg.batch) + tests::EXTRA_UPLOAD_BYTES.get();
+            let upload_size = data_bytes(cfg.batch) + ctx.poison_pad() + tests::EXTRA_UPLOAD_BYTES.get();
             #[cfg(not(test))]
-            let upload_size = data_bytes(cfg.batch);
+            let upload_size = data_bytes(cfg.batch) + ctx.poison_pad();
             let upload = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("pipeline.upload"),
                 size: upload_size,
@@ -811,19 +811,23 @@ impl<'a> Pipeline<'a> {
     /// buffers are left out, as in `vram_bytes`.
     #[cfg(test)]
     fn allocated_bytes(&self) -> u64 {
-        let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, |b| b.size());
+        // Every buffer but the staging ones is `poison_pad` larger than its logical size.
+        let pad = self.ctx.poison_pad();
+        let size = |b: &wgpu::Buffer| b.size() - pad;
+        let opt = |b: &Option<wgpu::Buffer>| b.as_ref().map_or(0, size);
         let s = &self.bufs;
         // Direct upload: `data` is a slot's upload buffer, counted with the slots.
-        let data = if self.direct { 0 } else { s.data.size() };
-        let k3opt = s.opt.as_ref().map_or(0, |o| o.prices.size() + o.scratch.size());
+        let data = if self.direct { 0 } else { size(&s.data) };
+        let k3opt = s.opt.as_ref().map_or(0, |o| size(&o.prices) + size(&o.scratch));
         let shared = data
-            + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| b.size()).sum::<u64>()
+            + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| size(b)).sum::<u64>()
             + opt(&s.frames)
             + opt(&s.frame_len)
             + k3opt;
-        let per_slot: u64 = self.slots.iter().map(|slot| slot.upload.size() + slot.staging.size()).sum();
+        let per_slot: u64 = self.slots.iter().map(|slot| size(&slot.upload) + slot.staging.size()).sum();
         // Transfer readback: frames / frame_len are imports of `Xfer`'s buffers (same sizes).
-        shared + per_slot + self.kernels.own_buffer_bytes()
+        let own = self.kernels.own_buffer_bytes();
+        shared + per_slot + if own > 0 { own - pad } else { 0 }
     }
 
     /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's parse
@@ -2616,6 +2620,10 @@ mod tests {
     #[test]
     fn upload_slot_bytes_are_initialized() {
         let _gpu = crate::test_support::gpu_test_slot();
+        if crate::context::env_on("GZC_POISON") {
+            eprintln!("skipped: poisoning fills the slots past the trailing zero word");
+            return;
+        }
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
         let bs = BLOCK_SIZE;
         for (name, ctx) in &mode_contexts() {
