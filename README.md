@@ -304,7 +304,7 @@ direct upload active) to b4095 for `lvl3` (the device's own limit) and b5403 for
 single-hash preset (`rung1` … `lvl9s12d16seg`) at `--inflight 3`; at `--inflight 2` it's b4095
 and b6078. Without the direct upload (`GZC_DIRECT_UPLOAD=0`, or no full ReBAR) the pipeline keeps a
 shared `data` buffer and the single-hash presets resolve to b5118 at `--inflight 3`. These depend
-on the pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes_with`), the block size and the
+on the pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes_with`) and the
 device, so re-derive them for your own card/build with e.g.:
 
 ```sh
