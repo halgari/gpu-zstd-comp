@@ -752,7 +752,7 @@ fn k3opt_block_order() {
     let mut enc = ctx.device.create_command_encoder(&Default::default());
     k.record_order(&ctx, &mut enc, &bufs.binds(), n as u32, None).unwrap();
     ctx.queue.submit([enc.finish()]);
-    let got: Vec<u32> = ctx.read_buffer(&bufs.sched, 0, SCHED_HDR as usize + 2 * n);
+    let got: Vec<u32> = ctx.read_buffer(&bufs.sched, 0, SCHED_HDR as usize + 3 * n);
     let weight = |c: &[CandWords]| -> u32 {
         c.iter()
             .step_by(WEIGHT_STRIDE as usize)
@@ -767,7 +767,10 @@ fn k3opt_block_order() {
     assert_eq!(&got[h..h + n], &want_w[..], "weights");
     let mut want_o: Vec<u32> = (0..n as u32).collect();
     want_o.sort_by_key(|&i| (std::cmp::Reverse(want_w[i as usize]), i));
-    assert_eq!(&got[h + n..], &want_o[..], "order");
+    assert_eq!(&got[h + n..h + 2 * n], &want_o[..], "order");
+    for (r, &b) in want_o.iter().enumerate() {
+        assert_eq!(got[h + 2 * n + b as usize], r as u32, "rank of block {b}");
+    }
     let distinct: std::collections::BTreeSet<u32> = want_w.iter().copied().collect();
     assert!(distinct.len() > 3 && distinct.len() < n, "ties and distinct weights both present");
 }

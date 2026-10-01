@@ -64,13 +64,16 @@ const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
 /// word 0, then 3 unused words.
 pub const SCHED_HDR: u32 = 4;
 
-/// `k3_sched.wgsl`'s weight reads every `WEIGHT_STRIDE`-th position's candidate words (M6 A4).
-pub const WEIGHT_STRIDE: u32 = 1;
+/// `k3_sched.wgsl`'s weight reads every `WEIGHT_STRIDE`-th position's candidate words (M6 A4):
+/// about 1/8 of the candidate words' memory sectors. Odd, so it does not alias with periodic data:
+/// over 2900 corpus blocks, the sampled count's Spearman correlation with the full count is 0.998
+/// at 33, 0.999 at 7..17 and 0.997 at 65, but 0.79..0.84 at strides 8..128.
+pub const WEIGHT_STRIDE: u32 = 33;
 
-/// Bytes of the `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight and
-/// the heavy-first block order (4 B per block each).
+/// Bytes of the `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight, the
+/// heavy-first block order and each block's rank in it (4 B per block each).
 pub fn sched_bytes(n: u32) -> u64 {
-    (SCHED_HDR as u64 + 2 * n as u64) * 4
+    (SCHED_HDR as u64 + 3 * n as u64) * 4
 }
 
 /// Sequences per block of the optimal parse (min match 3): `BLOCK_SIZE / 3 + 1`.
@@ -237,7 +240,8 @@ pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Resul
 /// heavy-first order.
 struct Sched {
     weight: wgpu::ComputePipeline,
-    order: wgpu::ComputePipeline,
+    rank: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
 }
 
@@ -631,7 +635,7 @@ impl K3Opt {
             let layout = crate::compressor::storage_layout(ctx, "k3opt_sched", &[true, true, false]);
             let module = ctx.shader("k3_sched", &body);
             let pipe = |entry: &str| crate::compressor::pipeline_from_module(ctx, "k3_sched", &layout, &module, entry);
-            Sched { weight: pipe("main_weight"), order: pipe("main_order"), layout }
+            Sched { weight: pipe("main_weight"), rank: pipe("main_rank"), scatter: pipe("main_scatter"), layout }
         });
         let fixup = crate::compressor::pipeline_from_module(
             ctx,
@@ -728,10 +732,13 @@ impl K3Opt {
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3opt_order"), timestamp_writes: ts });
         pass.set_bind_group(0, &bind, &[]);
+        let tiles = n.div_ceil(256);
         pass.set_pipeline(&s.weight);
         pass.dispatch_workgroups(n, 1, 1);
-        pass.set_pipeline(&s.order);
-        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+        pass.set_pipeline(&s.rank);
+        pass.dispatch_workgroups(tiles, tiles, 1);
+        pass.set_pipeline(&s.scatter);
+        pass.dispatch_workgroups(tiles, 1, 1);
         Ok(())
     }
 
