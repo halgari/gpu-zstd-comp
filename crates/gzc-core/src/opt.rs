@@ -35,12 +35,27 @@
 //! candidates (zstd's `ll0` numbering) in increasing length, then `A`, then `B`, each kept only
 //! when strictly longer than every earlier one; `ZSTD_newRep` updates a node's reps from its
 //! predecessor when the node ends a match.
-use crate::codes::{ll_code, ml_code, LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF};
+//!
+//! M6 options (`OptParams`; all off in `opt14`/`opt16`, on in `opt16p1`):
+//! - `inner_gap`: inner segments use `ilimit = iend - inner_gap` (3: "gap3"); the block's last
+//!   segment keeps `iend - 8` (`Seg::new`).
+//! - `relax_lengths: Some(n)`: an explicit record (offBase > 3) of length `L` and start length
+//!   `S` (3, or the previous record's length + 1) relaxes only the lengths
+//!   `max(S, L + 1 - n) ..= L`, still from `L` downward (the optLevel-0 abort applies among them).
+//!   At a series start the pruned lengths `S .. L + 1 - n` are written as unreachable nodes
+//!   (`price = MAX_PRICE, mlen = 0, litlen = 1`), which the literal extension always replaces.
+//!   Rep records relax every length. Applies in every DP pass; `sufficient_len` and the
+//!   immediate encodings are unchanged (they act before any relaxation).
+//! - `drop_max_len`: `drop_pass` after the final DP pass.
+//! - `prior`: which prior tables `Seed::Prior` uses (`seed_prices`).
+use crate::codes::{
+    ll_code, ml_code, LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF,
+};
 use crate::config::BLOCK_SIZE;
 use crate::lazy::{encode_raw, RawSeq};
-use crate::params::{MatchParams, OptParams, Seed};
+use crate::params::{MatchParams, OptParams, PriorTables, Seed};
 use crate::reference::{match_len_capped, unpack_cands, CandWords};
-use crate::seq::{apply_off_base, BlockOutput, Reps, INITIAL_REPS};
+use crate::seq::{apply_off_base, off_base_for, BlockOutput, Reps, INITIAL_REPS};
 
 /// zstd `BITCOST_MULTIPLIER`: prices are in 1/256 bit.
 pub const BITCOST_MULTIPLIER: u32 = 256;
@@ -202,16 +217,16 @@ pub fn cover_literals(block: &[u8], cands: &[CandWords]) -> [u32; 256] {
     lit
 }
 
-/// Pass-0 prices for `seed`.
-pub fn seed_prices(block: &[u8], cands: &[CandWords], seed: Seed) -> Prices {
+/// Pass-0 prices for `seed`; `Seed::Prior` uses the `prior` tables (`codes::OPT_PRIOR_*` or
+/// `codes::OPT_PRIOR_S3_*`) and the block's cover literals.
+pub fn seed_prices(block: &[u8], cands: &[CandWords], seed: Seed, prior: PriorTables) -> Prices {
+    let (ll, ml, of) = match prior {
+        PriorTables::M5 => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
+        PriorTables::S3 => (OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF),
+    };
     match seed {
         Seed::BlockInit => Prices::block_init(block),
-        Seed::Prior => Prices::from_hist(&Hist {
-            lit: cover_literals(block, cands),
-            ll: OPT_PRIOR_LL,
-            ml: OPT_PRIOR_ML,
-            of: OPT_PRIOR_OF,
-        }),
+        Seed::Prior => Prices::from_hist(&Hist { lit: cover_literals(block, cands), ll, ml, of }),
     }
 }
 
@@ -245,11 +260,14 @@ struct Seg {
 }
 
 impl Seg {
-    fn new(k: usize, log2: u32) -> Seg {
+    /// Segment `k` of `1 << log2` bytes. Its `ilimit` is `iend - inner_gap` for an inner segment
+    /// (`iend < BLOCK_SIZE`) and `iend - 8` for the block's last segment.
+    fn new(k: usize, log2: u32, inner_gap: u8) -> Seg {
         let s = k << log2;
         let iend = s + (1 << log2);
         let (ip0, reps0) = if k == 0 { (1, INITIAL_REPS) } else { (s, [0; 3]) };
-        Seg { ip0, anchor0: s, iend, ilimit: iend - 8, reps0 }
+        let gap = if iend < BLOCK_SIZE { inner_gap as usize } else { 8 };
+        Seg { ip0, anchor0: s, iend, ilimit: iend - gap, reps0 }
     }
 }
 
@@ -262,6 +280,8 @@ struct Dp<'a> {
     level: u8,
     /// `sufficient_len = min(targetLength, ZSTD_OPT_NUM - 1)`.
     sufficient: usize,
+    /// `OptParams::relax_lengths`: relax only this many of an explicit record's longest lengths.
+    relax_lengths: Option<u8>,
     opt: Vec<Node>,
     /// `(offBase, len)` records of the last `get_all_matches`, strictly increasing length.
     matches: Vec<(u32, u32)>,
@@ -282,7 +302,21 @@ struct Dp<'a> {
     ring_pos: Vec<usize>,
 }
 
+/// The unreachable node a pruned series-start length gets (`OptParams::relax_lengths`).
+const PRUNED: Node = Node { price: MAX_PRICE, off: 0, mlen: 0, litlen: 1, rep: [0; 3] };
+
 impl Dp<'_> {
+    /// The shortest length relaxed for record `(off_base, last_ml)` whose lengths start at
+    /// `start_ml`: `start_ml`, or with `relax_lengths: Some(n)` and an explicit record
+    /// (`off_base > 3`), `max(start_ml, last_ml + 1 - n)`.
+    #[inline]
+    fn relax_floor(&self, off_base: u32, start_ml: u32, last_ml: u32) -> u32 {
+        match self.relax_lengths {
+            Some(n) if off_base > 3 => start_ml.max((last_ml + 1).saturating_sub(n as u32)),
+            _ => start_ml,
+        }
+    }
+
     #[inline]
     fn touch(&mut self, _i: usize) {
         #[cfg(debug_assertions)]
@@ -384,9 +418,14 @@ impl Dp<'_> {
                 }
                 for mi in 0..self.matches.len() {
                     let (ob, end) = self.matches[mi];
+                    let floor = self.relax_floor(ob, pos as u32, end) as usize;
                     while pos <= end as usize {
-                        let price = self.opt[0].price + pr.match_price(ob, pos as u32) + pr.ll_price(0);
-                        self.opt[pos] = Node { mlen: pos as u32, off: ob, litlen: 0, price, rep: [0; 3] };
+                        self.opt[pos] = if pos < floor {
+                            PRUNED
+                        } else {
+                            let price = self.opt[0].price + pr.match_price(ob, pos as u32) + pr.ll_price(0);
+                            Node { mlen: pos as u32, off: ob, litlen: 0, price, rep: [0; 3] }
+                        };
                         self.touch(pos);
                         pos += 1;
                     }
@@ -472,6 +511,7 @@ impl Dp<'_> {
                 for mi in 0..self.matches.len() {
                     let (ob, last_ml) = self.matches[mi];
                     let start_ml = if mi > 0 { self.matches[mi - 1].1 + 1 } else { MIN_MATCH as u32 };
+                    let start_ml = self.relax_floor(ob, start_ml, last_ml);
                     let mut mlen = last_ml;
                     while mlen >= start_ml {
                         let pos = cur + mlen as usize;
@@ -624,10 +664,15 @@ impl Dp<'_> {
             for mi in 0..self.matches.len() {
                 let (ob, end) = self.matches[mi];
                 let mrep = new_rep(rep, ob, litlen == 0);
+                let floor = self.relax_floor(ob, pos as u32, end) as usize;
                 while pos <= end as usize {
-                    let price = n0.price + pr.match_price(ob, pos as u32) + pr.ll_price(0);
                     let s = self.slot(pos);
-                    self.ring[s] = Node { mlen: pos as u32, off: ob, litlen: 0, price, rep: mrep };
+                    self.ring[s] = if pos < floor {
+                        PRUNED
+                    } else {
+                        let price = n0.price + pr.match_price(ob, pos as u32) + pr.ll_price(0);
+                        Node { mlen: pos as u32, off: ob, litlen: 0, price, rep: mrep }
+                    };
                     self.own(pos);
                     pos += 1;
                 }
@@ -702,6 +747,7 @@ impl Dp<'_> {
                 for mi in 0..self.matches.len() {
                     let (ob, last_ml) = self.matches[mi];
                     let start_ml = if mi > 0 { self.matches[mi - 1].1 + 1 } else { MIN_MATCH as u32 };
+                    let start_ml = self.relax_floor(ob, start_ml, last_ml);
                     let mrep = new_rep(n.rep, ob, ll0);
                     let mut mlen = last_ml;
                     while mlen >= start_ml {
@@ -843,6 +889,7 @@ pub fn dp_pass_with(
         prices,
         level,
         sufficient: (target_length as usize).min(OPT_NUM - 1),
+        relax_lengths: params.opt.and_then(|o| o.relax_lengths),
         opt: vec![Node::default(); OPT_NUM + 3],
         matches: Vec::with_capacity(8),
         #[cfg(debug_assertions)]
@@ -858,7 +905,7 @@ pub fn dp_pass_with(
     let mut prev_end = 0usize;
     let mut part = Vec::new();
     for k in 0..BLOCK_SIZE >> log2 {
-        let seg = Seg::new(k, log2);
+        let seg = Seg::new(k, log2, params.opt.map_or(8, |o| o.inner_gap));
         part.clear();
         let end = match engine {
             Engine::Linear => dp.segment(&seg, &mut part),
@@ -885,9 +932,10 @@ pub struct Pass {
 /// final pass at `o.level`. Pass 0 is priced by `seed_prices`, pass `n + 1` by
 /// `Prices::from_hist(&Hist::of_output(&pass[n].out))`. The GPU passes are checked against these
 /// one at a time (`Hist::of_output(&pass.out).to_text()` is the per-pass histogram dump).
+/// DP passes only: with `o.drop_max_len > 0`, `parse` is `drop_pass` of the last pass's output.
 pub fn passes(block: &[u8], cands: &[CandWords], params: &MatchParams) -> Vec<Pass> {
     let o: OptParams = params.opt.expect("opt::passes: params.opt is None");
-    let mut prices = seed_prices(block, cands, o.seed);
+    let mut prices = seed_prices(block, cands, o.seed, o.prior);
     let mut v = Vec::with_capacity(o.passes as usize + 1);
     for i in 0..=o.passes {
         let level = if i == o.passes { o.level } else { 0 };
@@ -898,7 +946,8 @@ pub fn passes(block: &[u8], cands: &[CandWords], params: &MatchParams) -> Vec<Pa
     v
 }
 
-/// The optimal parse of `block` from its `find_cands` words: the final pass of `passes`.
+/// The optimal parse of `block` from its `find_cands` words: the final pass of `passes`, then
+/// `drop_pass` when `drop_max_len > 0`.
 pub fn parse(block: &[u8], cands: &[CandWords], params: &MatchParams) -> BlockOutput {
     parse_with(block, cands, params, Engine::Linear)
 }
@@ -906,12 +955,112 @@ pub fn parse(block: &[u8], cands: &[CandWords], params: &MatchParams) -> BlockOu
 /// `parse` with an explicit `Engine` (every pass runs on it).
 pub fn parse_with(block: &[u8], cands: &[CandWords], params: &MatchParams, engine: Engine) -> BlockOutput {
     let o: OptParams = params.opt.expect("opt::parse: params.opt is None");
-    let mut prices = seed_prices(block, cands, o.seed);
+    let mut prices = seed_prices(block, cands, o.seed, o.prior);
     for _ in 0..o.passes {
         let out = dp_pass_with(block, cands, params, &prices, 0, o.target_length, engine);
         prices = Prices::from_hist(&Hist::of_output(&out));
     }
-    dp_pass_with(block, cands, params, &prices, o.level, o.target_length, engine)
+    let out = dp_pass_with(block, cands, params, &prices, o.level, o.target_length, engine);
+    match o.drop_max_len {
+        0 => out,
+        m => drop_pass(block, &out, m as u32, params.segment_log2),
+    }
+}
+
+/// The drop pass (M6, r4; `OptParams::drop_max_len`): `drop_decisions` at the parse's own prices
+/// (`Prices::from_hist(&Hist::of_output(out))`, the histogram of the final DP pass's output),
+/// then `apply_drops`.
+pub fn drop_pass(block: &[u8], out: &BlockOutput, max_len: u32, seg_log2: u32) -> BlockOutput {
+    let prices = Prices::from_hist(&Hist::of_output(out));
+    apply_drops(block, out, &drop_decisions(block, out, &prices, max_len, seg_log2))
+}
+
+/// The drop pass's decisions: `dropped[j]` for each sequence `j` of `out` (a parse whose offBases
+/// follow the decoder's reps from `INITIAL_REPS`, as every `BlockOutput`). Segment-local, so one
+/// GPU lane per segment can decide its own sequences:
+///
+/// - Decode `out` with the decoder's reps: sequence `j` has literal length `ll_j`, match length
+///   `ml_j`, real offset `off_j`, match start `s_j`, and `R_j` = the decoder reps before it.
+///   Its segment is `s_j >> seg_log2` (by match start; a parse's matches never cross segments).
+/// - Each segment walks its sequences in order with its own state: reps `r = R_first` (the
+///   input's decoder reps before the segment's first sequence) and `carry = 0`. Nothing flows in
+///   from the previous segment.
+/// - For sequence `j`: `ll = ll_j + carry`, `ob = off_base_for(off_j, ll, r)`. It is a candidate
+///   when `ml_j <= max_len`, `ob > 3` (explicit under `r`) and `j + 1 < n` (it has a successor,
+///   possibly in the next segment). For a candidate, with `(ll', ml', off')` = sequence `j + 1`'s
+///   input values, `r'` = `r` after `ob` (`apply_off_base`) and
+///   `price(ll, ml, ob) = prices.ll[ll_code(ll)] + prices.ml[ml_code(ml)] + prices.of[highbit(ob)] + 51`:
+///   - keep = `price(ll, ml_j, ob) + price(ll', ml', off_base_for(off', ll', r'))`;
+///   - drop = `sum(prices.lit[b] for b in block[s_j .. s_j + ml_j]) +
+///     price(ll + ml_j + ll', ml', off_base_for(off', ll + ml_j + ll', r))`.
+///
+///   It is dropped when `drop < keep` (strictly): `carry = ll + ml_j`, `r` unchanged.
+///   Otherwise it is kept: `r` = `r'` (`apply_off_base(r, ob, ll)`), `carry = 0`.
+pub fn drop_decisions(block: &[u8], out: &BlockOutput, prices: &Prices, max_len: u32, seg_log2: u32) -> Vec<bool> {
+    let price = |ll: u32, ml: u32, ob: u32| prices.ll_price(ll) + prices.match_price(ob, ml);
+    let n = out.sequences.len();
+    // decode: (ll, ml, offset), the decoder reps before each sequence, its match start
+    let mut raw: Vec<RawSeq> = Vec::with_capacity(n);
+    let mut reps_before: Vec<Reps> = Vec::with_capacity(n);
+    let mut starts: Vec<usize> = Vec::with_capacity(n);
+    let (mut r, mut pos) = (INITIAL_REPS, 0usize);
+    for s in &out.sequences {
+        reps_before.push(r);
+        starts.push(pos + s.lit_len as usize);
+        let off = apply_off_base(&mut r, s.off_base, s.lit_len);
+        raw.push((s.lit_len, s.match_len, off));
+        pos += (s.lit_len + s.match_len) as usize;
+    }
+    let mut dropped = vec![false; n];
+    let (mut r, mut carry) = (INITIAL_REPS, 0u32);
+    for j in 0..n {
+        if j == 0 || starts[j] >> seg_log2 != starts[j - 1] >> seg_log2 {
+            // a segment's first sequence: the lane starts from the input's state
+            r = reps_before[j];
+            carry = 0;
+        }
+        let (ll_j, ml, off) = raw[j];
+        let ll = ll_j + carry;
+        let ob = off_base_for(off, ll, &r);
+        if ml <= max_len && ob > 3 && j + 1 < n {
+            let mut after = r;
+            apply_off_base(&mut after, ob, ll);
+            let (nll, nml, noff) = raw[j + 1];
+            let keep = price(ll, ml, ob) + price(nll, nml, off_base_for(noff, nll, &after));
+            let s = starts[j];
+            let lits: i32 = block[s..s + ml as usize].iter().map(|&b| prices.lit_price(b)).sum();
+            let mll = ll + ml + nll;
+            let drop = lits + price(mll, nml, off_base_for(noff, mll, &r));
+            if drop < keep {
+                dropped[j] = true;
+                carry = ll + ml;
+                continue;
+            }
+        }
+        apply_off_base(&mut r, ob, ll);
+        carry = 0;
+    }
+    dropped
+}
+
+/// Applies drop decisions: every dropped sequence's literals and match bytes join the next kept
+/// sequence's literal run (or the block's last literals), then `lazy::encode_raw` re-encodes
+/// every offset with the block's true decoder reps.
+pub fn apply_drops(block: &[u8], out: &BlockOutput, dropped: &[bool]) -> BlockOutput {
+    assert_eq!(dropped.len(), out.sequences.len());
+    let mut kept: Vec<RawSeq> = Vec::with_capacity(out.sequences.len());
+    let (mut r, mut pending) = (INITIAL_REPS, 0u32);
+    for (s, &d) in out.sequences.iter().zip(dropped) {
+        let off = apply_off_base(&mut r, s.off_base, s.lit_len);
+        let ll = s.lit_len + pending;
+        if d {
+            pending = ll + s.match_len;
+        } else {
+            kept.push((ll, s.match_len, off));
+            pending = 0;
+        }
+    }
+    encode_raw(block, &kept)
 }
 
 /// Hand-built blocks with scripted candidate words and the exact sequences the optimal parse
@@ -922,10 +1071,15 @@ pub fn parse_with(block: &[u8], cands: &[CandWords], params: &MatchParams, engin
 /// A case runs one of two ways (`run_case`): with `prices: Some(p)`, one `dp_pass` at
 /// `params.opt.level` with the price tables `p` verbatim (the GPU loads them in place of its
 /// pass-0 prologue); with `prices: None`, the full `parse` of `params` (seed and passes).
-/// Every case fits the first four 4 KiB segments, so it runs at 16, 32 and 64 KiB blocks.
+/// Every case fits the first four 4 KiB segments (`gap3_inner_segments_only` also uses the
+/// block's last segment), so it runs at 16, 32 and 64 KiB blocks.
+///
+/// `opt_test_cases` are the M5 cases; `m6_test_cases` the M6 DP options (gap3, relaxation
+/// pruning); `drop_test_cases` the drop pass (`DropCase`).
 pub mod cases {
     use super::{dp_pass_with, parse_with, Engine, Prices, BITCOST_MULTIPLIER};
     use crate::config::BLOCK_SIZE;
+    use crate::lazy::{encode_raw, RawSeq};
     use crate::params::{MatchParams, OptParams, OPT14, OPT16};
     use crate::reference::{match_len, pack_cands, Cand, CandWords};
     use crate::seq::{BlockOutput, Sequence};
@@ -1423,6 +1577,199 @@ pub mod cases {
         .flat_map(|f| f())
         .collect()
     }
+
+    /// A single optLevel-2 pass with M6 options `gap` (`inner_gap`) and `relax`
+    /// (`relax_lengths`).
+    fn m6_pass(gap: u8, relax: Option<u8>) -> MatchParams {
+        MatchParams { opt: Some(OptParams { inner_gap: gap, relax_lengths: relax, ..pass(2).opt.unwrap() }), ..OPT16 }
+    }
+
+    /// gap3 (`inner_gap: 3`): an inner segment starts a series up to `iend - 4` (`ip < ilimit =
+    /// iend - 3`) and searches inside a series up to `iend - 3`; the block's last segment keeps
+    /// `ilimit = iend - 8`. Segment 0: a 4-byte match at `SEG - 4` reaching the segment end, as a
+    /// series start. Segment 1: a series at `2 SEG - 6` (4 bytes, offset 700) whose position
+    /// `2 SEG - 3` (= ilimit) finds a 3-byte match reaching `iend` (immediate encoding, cutting
+    /// the first match to 3). The last segment: a 5-byte match at `BLOCK_SIZE - 5`, never searched.
+    /// With `inner_gap: 8` none of them is found.
+    pub fn gap3_inner_segments_only() -> Vec<OptCase> {
+        let (a, b, z) = (SEG - 4, 2 * SEG - 6, BLOCK_SIZE - 5);
+        let mut block = synth::random(120, BLOCK_SIZE);
+        plant(&mut block, a, 300, 4);
+        plant(&mut block, b, 700, 4);
+        plant(&mut block, b + 3, 900, 3);
+        plant(&mut block, z, 400, 5);
+        real(&block, a, 300, 4);
+        real(&block, b + 3, 900, 3);
+        real(&block, z, 400, 5);
+        assert!(match_len(&block, b, b - 700) >= 3);
+        let mut cands = empty();
+        cands[a] = one(300, 4);
+        cands[b] = one(700, 4);
+        cands[b + 3] = one(900, 3);
+        cands[z] = one(400, 5);
+        let g3 = vec![seq(a as u32, 4, 303), seq((b - SEG) as u32, 3, 703), seq(0, 3, 903)];
+        let runs = vec![(m6_pass(3, None), Some(flat()), g3), (m6_pass(8, None), Some(flat()), vec![])];
+        vec![case("gap3_inner_segments_only", block, cands, runs)]
+    }
+
+    /// `relax_lengths: Some(4)` relaxes only the 4 longest lengths of an explicit record, also at
+    /// the series start. Site 1: R0 (offset 1000, 10 bytes) at `p1`, R2 (offset 3000, 20 bytes,
+    /// cheap) at `p1 + 6`; the best path cuts R0 to 6 = L - 4, pruned, so the pruned parse takes
+    /// 6 literals + R2. Site 2: the same with a 9-byte R0, where 6 = L - 3 is kept: both parses
+    /// cut R0 to 6. Site 3: a rep0 record of 10 bytes (offset 1500, set by a match 200 bytes
+    /// earlier) is not pruned: both parses cut it to 6 for R2.
+    pub fn relax_top4_explicit_records_only() -> Vec<OptCase> {
+        let (p1, p2, p3) = (7000, 9000, 11000);
+        let mut block = synth::random(121, BLOCK_SIZE);
+        let sites = [(p1, 1000, 10, 3000), (p2, 1100, 9, 3100)];
+        let mut cands = empty();
+        for &(p, o0, l0, o2) in &sites {
+            plant(&mut block, p, o0, l0);
+            plant(&mut block, p + 6, o2, 20);
+            real(&block, p, o0, l0);
+            real(&block, p + 6, o2, 20);
+            cands[p] = one(o0, l0 as u32);
+            cands[p + 6] = one(o2, 20);
+        }
+        plant(&mut block, p3 - 200, 1500, 5);
+        plant(&mut block, p3, 1500, 10);
+        plant(&mut block, p3 + 6, 3200, 20);
+        real(&block, p3 - 200, 1500, 5);
+        real(&block, p3, 1500, 10);
+        real(&block, p3 + 6, 3200, 20);
+        cands[p3 - 200] = one(1500, 5);
+        cands[p3 + 6] = one(3200, 20);
+        let mut pr = flat();
+        pr.of[oc(1000)] = 2000; // OF code 9
+        pr.of[oc(1100)] = 2000; // OF code 10: offsets 1100 and 1500
+        pr.of[oc(3000)] = 100; // OF code 11: offsets 3000, 3100 and 3200
+        let tail = |site1_end: usize| {
+            vec![
+                seq((p2 - site1_end) as u32, 6, 1103),
+                seq(0, 20, 3103),
+                seq((p3 - 200 - (p2 + 26)) as u32, 5, 1503),
+                seq(195, 6, 1),
+                seq(0, 20, 3203),
+            ]
+        };
+        let all = [vec![seq(p1 as u32, 6, 1003), seq(0, 20, 3003)], tail(p1 + 26)].concat();
+        let top4 = [vec![seq(p1 as u32 + 6, 20, 3003)], tail(p1 + 26)].concat();
+        let runs = vec![(m6_pass(8, None), Some(pr.clone()), all), (m6_pass(8, Some(4)), Some(pr), top4)];
+        vec![case("relax_top4_explicit_records_only", block, cands, runs)]
+    }
+
+    /// The M6 DP cases (gap3, relaxation pruning), in order. Kept apart from `opt_test_cases`,
+    /// which the M5 GPU kernel replays.
+    pub fn m6_test_cases() -> Vec<OptCase> {
+        [gap3_inner_segments_only, relax_top4_explicit_records_only].into_iter().flat_map(|f| f()).collect()
+    }
+
+    /// One scripted drop-pass input: `input` (a parse of `block`, true-rep offBases), the
+    /// `prices` and `max_len` of `super::drop_decisions`, and the expected decisions and output
+    /// (`super::apply_drops`). Segments are `OPT16.segment_log2` (4 KiB).
+    pub struct DropCase {
+        pub name: String,
+        pub block: Vec<u8>,
+        pub input: BlockOutput,
+        pub prices: Prices,
+        pub max_len: u32,
+        pub dropped: Vec<bool>,
+        pub expect: Vec<Sequence>,
+    }
+
+    /// A block with the raw sequences `(position, offset, length)` planted as real matches, and
+    /// its parse (`encode_raw`).
+    fn planted(seed: u64, matches: &[(usize, usize, usize)]) -> (Vec<u8>, BlockOutput) {
+        let mut block = synth::random(seed, BLOCK_SIZE);
+        for &(p, o, l) in matches {
+            plant(&mut block, p, o, l);
+        }
+        let mut raw: Vec<RawSeq> = Vec::new();
+        let mut end = 0usize;
+        for &(p, o, l) in matches {
+            assert!(match_len(&block, p, p - o) >= l, "planted match at {p}");
+            raw.push(((p - end) as u32, l as u32, o as u32));
+            end = p + l;
+        }
+        let out = encode_raw(&block, &raw);
+        (block, out)
+    }
+
+    /// Flat prices (`flat`) with OF code prices `of` (code, price) set.
+    fn flat_of(of: &[(usize, i32)]) -> Prices {
+        let mut p = flat();
+        for &(c, v) in of {
+            p.of[c] = v;
+        }
+        p
+    }
+
+    /// The drop threshold, strict: a 3-byte explicit match (offset 100, OF code 6) followed by an
+    /// explicit match is dropped when `3 lit = 3072 < of[6] + 51`; at equality it is kept. A
+    /// 7-byte match above `max_len` (6) is never dropped, however expensive; a 6-byte one is. The
+    /// last sequence has no successor and is never dropped.
+    pub fn drop_threshold_and_length() -> Vec<DropCase> {
+        let ms = [(3000, 100, 3), (3100, 2000, 10), (4000, 300, 7), (4100, 2100, 10), (5000, 600, 6), (5100, 2250, 10), (5500, 700, 3)];
+        let (block, input) = planted(130, &ms);
+        let mut v = Vec::new();
+        for (d, of6) in [(false, 3072 - 51), (true, 3072 - 50)] {
+            let prices = flat_of(&[(6, of6), (8, 60000), (9, 60000)]);
+            let dropped = vec![d, false, false, false, true, false, false];
+            let s0 = if d { vec![] } else { vec![seq(3000, 3, 103)] };
+            let s1 = seq(if d { 3100 } else { 97 }, 10, 2003);
+            let expect = [s0, vec![s1, seq(890, 7, 303), seq(93, 10, 2103), seq(890 + 6 + 94, 10, 2253), seq(390, 3, 703)]].concat();
+            v.push(DropCase { name: format!("drop_threshold_and_length (of6 {of6})"), block: block.clone(), input: input.clone(), prices, max_len: 6, dropped, expect });
+        }
+        v
+    }
+
+    /// Reps: a repcode match (offset == rep[1], offBase 2) is never dropped, however expensive;
+    /// an explicit 3-byte match (offset 800) that alone is cheaper than its literals is dropped
+    /// because then its successor (offset 450) becomes repcode 1 (cheap) instead of repcode 2
+    /// (expensive).
+    pub fn drop_rep_vs_explicit() -> Vec<DropCase> {
+        let ms = [(900, 450, 7), (1000, 500, 7), (1100, 450, 3), (1200, 800, 3), (1300, 450, 5), (2500, 900, 4)];
+        let (block, input) = planted(131, &ms);
+        let prices = flat_of(&[(0, 0), (1, 50000), (8, 2000), (9, 2600)]);
+        let dropped = vec![false, false, false, true, false, false];
+        let expect = vec![seq(900, 7, 453), seq(93, 7, 503), seq(93, 3, 2), seq(197, 5, 1), seq(1195, 4, 903)];
+        vec![DropCase { name: "drop_rep_vs_explicit".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
+    /// Segment edges: decisions are per 4 KiB segment by match start, and each segment starts
+    /// from the input's state (reps before its first sequence, no carried literals). The last
+    /// sequence of segment 0 (3 bytes at `SEG - 3`, expensive offset 700) is dropped. Segment 1's
+    /// first sequence (3 bytes at `SEG`, offset 699, literal length 0) is repcode 3 (`rep[0] - 1`)
+    /// under the input's reps and literal length, so it is not a candidate and stays, although
+    /// after the drop it is an expensive explicit match (offset 699 + 3) with 3 literals.
+    pub fn drop_segment_starts_from_input_state() -> Vec<DropCase> {
+        let ms = [(SEG - 3, 700, 3), (SEG, 699, 3), (SEG + 100, 900, 8)];
+        let (block, input) = planted(132, &ms);
+        let prices = flat_of(&[(1, 50000), (9, 60000)]);
+        let dropped = vec![true, false, false];
+        let expect = vec![seq(SEG as u32, 3, 702), seq(97, 8, 903)];
+        vec![DropCase { name: "drop_segment_starts_from_input_state".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
+    /// Inside a segment the dropped bytes carry: two expensive 3-byte matches back to back are
+    /// both dropped (the second priced with the first's bytes as literals), and the next
+    /// sequence takes all of them as literals.
+    pub fn drop_chain_carries_literals() -> Vec<DropCase> {
+        let ms = [(500, 300, 3), (503, 310, 3), (2600, 2000, 10)];
+        let (block, input) = planted(133, &ms);
+        let prices = flat_of(&[(8, 60000)]);
+        let dropped = vec![true, true, false];
+        let expect = vec![seq(2600, 10, 2003)];
+        vec![DropCase { name: "drop_chain_carries_literals".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
+    /// Every drop-pass case, in order.
+    pub fn drop_test_cases() -> Vec<DropCase> {
+        [drop_threshold_and_length, drop_rep_vs_explicit, drop_segment_starts_from_input_state, drop_chain_carries_literals]
+            .into_iter()
+            .flat_map(|f| f())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1431,7 +1778,7 @@ mod tests {
     use super::*;
     use crate::block::chunk_file;
     use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{OPT14, OPT16};
+    use crate::params::{OPT14, OPT16, OPT16P1};
     use crate::reference::{chains, compress_block, find_cands};
     use crate::seq::reconstruct;
     use crate::synth;
@@ -1447,6 +1794,134 @@ mod tests {
         }
         v.push(MatchParams { opt: Some(OptParams { level: 0, ..OPT16.opt.unwrap() }), ..OPT16 });
         v
+    }
+
+    /// `opt16p1` and its M6 options one at a time: each on `opt16` (gap3, top-4 pruning also at
+    /// optLevel 0, drop pass, S3 prior), and `opt16p1` without pruning / drop / gap3, with a
+    /// cheap pass.
+    fn m6_variants() -> Vec<MatchParams> {
+        let (o16, p1) = (OPT16.opt.unwrap(), OPT16P1.opt.unwrap());
+        let on16 = |o: OptParams| MatchParams { opt: Some(o), ..OPT16 };
+        let on1 = |o: OptParams| MatchParams { opt: Some(o), ..OPT16P1 };
+        vec![
+            OPT16P1,
+            on16(OptParams { inner_gap: 3, ..o16 }),
+            on16(OptParams { relax_lengths: Some(4), ..o16 }),
+            on16(OptParams { relax_lengths: Some(2), level: 0, ..o16 }),
+            on16(OptParams { drop_max_len: 6, ..o16 }),
+            on16(OptParams { seed: Seed::Prior, prior: PriorTables::S3, passes: 1, ..o16 }),
+            on1(OptParams { relax_lengths: None, ..p1 }),
+            on1(OptParams { drop_max_len: 0, ..p1 }),
+            on1(OptParams { inner_gap: 8, ..p1 }),
+            on1(OptParams { passes: 1, ..p1 }),
+        ]
+    }
+
+    /// Every synthetic block round-trips through libzstd for every M6 variant (no match crosses a
+    /// segment), and the ring engine gives the same output.
+    #[test]
+    fn m6_synthetic_roundtrip_and_ring() {
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
+        for params in m6_variants() {
+            assert_eq!(params.validate(), Ok(()), "{params:?}");
+            for (name, bytes) in synth::test_cases() {
+                for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
+                    let cands = find_cands(&blk.data, &chains(&blk.data, &params), &params);
+                    let out = parse_with(&blk.data, &cands, &params, Engine::Linear);
+                    assert!(parse_with(&blk.data, &cands, &params, Engine::Ring) == out, "{params:?} {name}[{i}]: ring engine differs");
+                    assert_eq!(out, compress_block(&blk.data, params));
+                    let mut pos = 0usize;
+                    for q in &out.sequences {
+                        let start = pos + q.lit_len as usize;
+                        pos = start + q.match_len as usize;
+                        assert!(q.match_len >= 3);
+                        assert_eq!(start >> 12, (pos - 1) >> 12, "{name}[{i}]: match {start}..{pos} crosses a segment");
+                    }
+                    let frame = write_frame(&blk.data, &out, FrameOptions::default());
+                    let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                        .unwrap_or_else(|e| panic!("{params:?} {name}[{i}]: libzstd rejected frame: {e}"));
+                    assert_eq!(dec, blk.data, "{params:?} {name}[{i}]: frame mismatch");
+                }
+            }
+        }
+    }
+
+    /// `parse` with a drop pass is `drop_pass` of `passes`' last output, priced from that
+    /// output's histogram; the drop pass only merges sequences (each output sequence's match is
+    /// an input match), and drops only short matches with a successor.
+    #[test]
+    fn drop_pass_follows_the_last_pass() {
+        if crate::config::LOG2_BLOCK > 16 {
+            return;
+        }
+        let o = OPT16P1.opt.unwrap();
+        for (name, bytes) in synth::test_cases() {
+            let blk = &chunk_file(&bytes)[0];
+            let cands = find_cands(&blk.data, &chains(&blk.data, &OPT16P1), &OPT16P1);
+            let ps = passes(&blk.data, &cands, &OPT16P1);
+            assert_eq!(ps.len(), 1, "{name}");
+            assert_eq!(ps[0].prices, seed_prices(&blk.data, &cands, Seed::Prior, PriorTables::S3), "{name}");
+            let last = &ps[0].out;
+            let out = parse(&blk.data, &cands, &OPT16P1);
+            assert_eq!(out, drop_pass(&blk.data, last, o.drop_max_len as u32, OPT16P1.segment_log2), "{name}");
+            let prices = Prices::from_hist(&Hist::of_output(last));
+            let dropped = drop_decisions(&blk.data, last, &prices, o.drop_max_len as u32, OPT16P1.segment_log2);
+            assert_eq!(out, apply_drops(&blk.data, last, &dropped), "{name}");
+            assert_eq!(out.sequences.len(), last.sequences.len() - dropped.iter().filter(|&&d| d).count(), "{name}");
+            let ends = |o: &BlockOutput| {
+                let mut pos = 0u32;
+                o.sequences.iter().map(|s| {
+                    pos += s.lit_len + s.match_len;
+                    (pos, s.match_len)
+                }).collect::<Vec<_>>()
+            };
+            let input_ends = ends(last);
+            for e in ends(&out) {
+                assert!(input_ends.contains(&e), "{name}: output match {e:?} is not an input match");
+            }
+            for (j, &d) in dropped.iter().enumerate() {
+                if d {
+                    assert!(last.sequences[j].match_len <= 6 && j + 1 < dropped.len(), "{name}: seq {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn m6_opt_cases() {
+        let mut failed = Vec::new();
+        for c in cases::m6_test_cases() {
+            for (i, (params, prices, want)) in c.expect.iter().enumerate() {
+                assert_eq!(params.validate(), Ok(()));
+                let out = run_case(&c.block, &c.cands, params, prices.as_ref(), Engine::Linear);
+                let ring = run_case(&c.block, &c.cands, params, prices.as_ref(), Engine::Ring);
+                assert_eq!(ring, out, "{} [{i}]: ring engine differs", c.name);
+                assert_eq!(reconstruct(&out).expect("reconstruct"), c.block, "{} [{i}]: output does not reconstruct", c.name);
+                if out.sequences != *want {
+                    failed.push(format!("{} [{i}]: got {:?}\n    want {:?}", c.name, out.sequences, want));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "\n{}", failed.join("\n"));
+    }
+
+    #[test]
+    fn drop_cases() {
+        let mut failed = Vec::new();
+        for c in cases::drop_test_cases() {
+            assert_eq!(reconstruct(&c.input).expect("reconstruct input"), c.block, "{}: input", c.name);
+            let dropped = drop_decisions(&c.block, &c.input, &c.prices, c.max_len, OPT16.segment_log2);
+            let out = apply_drops(&c.block, &c.input, &dropped);
+            assert_eq!(reconstruct(&out).expect("reconstruct"), c.block, "{}: output does not reconstruct", c.name);
+            let frame = write_frame(&c.block, &out, FrameOptions::default());
+            assert_eq!(zstd::bulk::decompress(&frame, BLOCK_SIZE).expect("libzstd"), c.block, "{}: libzstd", c.name);
+            if dropped != c.dropped || out.sequences != c.expect {
+                failed.push(format!("{}: dropped {:?} want {:?}\n    got {:?}\n    want {:?}", c.name, dropped, c.dropped, out.sequences, c.expect));
+            }
+        }
+        assert!(failed.is_empty(), "\n{}", failed.join("\n"));
     }
 
     /// Every synthetic block round-trips through libzstd for every variant, and no match crosses
@@ -1505,7 +1980,7 @@ mod tests {
                 let cands = find_cands(&blk.data, &chains(&blk.data, &params), &params);
                 let ps = passes(&blk.data, &cands, &params);
                 assert_eq!(ps.len(), o.passes as usize + 1, "{name}");
-                assert_eq!(ps[0].prices, seed_prices(&blk.data, &cands, o.seed), "{name}");
+                assert_eq!(ps[0].prices, seed_prices(&blk.data, &cands, o.seed, o.prior), "{name}");
                 for w in ps.windows(2) {
                     assert_eq!(w[1].prices, Prices::from_hist(&Hist::of_output(&w[0].out)), "{name}");
                     assert_eq!(w[0].level, 0, "{name}");
@@ -1551,19 +2026,15 @@ mod tests {
             return;
         }
         let bytes = synth::dds_like(9, BLOCK_SIZE);
-        for params in [OPT14, OPT16] {
+        for params in [OPT14, OPT16, OPT16P1] {
             assert_eq!(compress_block(&bytes, params), compress_block(&bytes, params));
         }
     }
 
-    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (every
-    /// `total / 4000`-th .dds/.nif block in path order) round-trip through libzstd for every
-    /// variant, and every other one of them (2000, i.e. every ~50th block at 64 KiB) gives the
-    /// same output on the ring engine.
-    /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
-    #[test]
-    #[ignore]
-    fn opt_corpus_roundtrip() {
+    /// 4000 blocks spread uniformly over the corpus (every `total / 4000`-th .dds/.nif block in
+    /// path order, the `gzc-bench --ext dds,nif` order), or `None` (with a message) when the
+    /// corpus directory (`GZC_CORPUS`, default `data/corpus`) is absent.
+    fn corpus_sample() -> Option<Vec<Vec<u8>>> {
         use std::path::{Path, PathBuf};
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let mut ents: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
@@ -1579,6 +2050,10 @@ mod tests {
         }
         let root = std::env::var("GZC_CORPUS")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+        if !Path::new(&root).is_dir() {
+            println!("skipped: no corpus at {root} (set GZC_CORPUS)");
+            return None;
+        }
         let mut files = Vec::new();
         walk(Path::new(&root), &mut files);
         let mut blocks = Vec::new();
@@ -1586,8 +2061,19 @@ mod tests {
             blocks.extend(chunk_file(&std::fs::read(&f).unwrap()).into_iter().map(|b| b.data));
         }
         let stride = (blocks.len() / 4000).max(1);
-        let sample: Vec<Vec<u8>> = blocks.into_iter().step_by(stride).take(4000).collect();
-        let vars = variants();
+        Some(blocks.into_iter().step_by(stride).take(4000).collect())
+    }
+
+    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`)
+    /// round-trip through libzstd for every variant (`variants` and `m6_variants`), and every
+    /// other one of them (2000, i.e. every ~50th block at 64 KiB) gives the same output on the
+    /// ring engine. Skipped with a message when the corpus is absent.
+    /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
+    #[test]
+    #[ignore]
+    fn opt_corpus_roundtrip() {
+        let Some(sample) = corpus_sample() else { return };
+        let vars = [variants(), m6_variants()].concat();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
         std::thread::scope(|s| {
@@ -1595,11 +2081,21 @@ mod tests {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(b) = sample.get(i) else { break };
-                    let cands = find_cands(b, &chains(b, &OPT16), &OPT16);
+                    // candidates depend only on depth and the sparse chains
+                    let mut cache: Vec<(MatchParams, Vec<CandWords>)> = Vec::new();
                     for params in &vars {
-                        let out = parse(b, &cands, params);
+                        let key = |m: &MatchParams| (m.depth, m.opt.unwrap().sparse_chains);
+                        let k = match cache.iter().position(|(m, _)| key(m) == key(params)) {
+                            Some(k) => k,
+                            None => {
+                                cache.push((*params, find_cands(b, &chains(b, params), params)));
+                                cache.len() - 1
+                            }
+                        };
+                        let cands = &cache[k].1;
+                        let out = parse(b, cands, params);
                         if i.is_multiple_of(2) {
-                            assert!(parse_with(b, &cands, params, Engine::Ring) == out, "block {i} {params:?}: ring engine differs");
+                            assert!(parse_with(b, cands, params, Engine::Ring) == out, "block {i} {params:?}: ring engine differs");
                         }
                         let frame = write_frame(b, &out, FrameOptions::default());
                         let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE).expect("libzstd rejected an opt frame");

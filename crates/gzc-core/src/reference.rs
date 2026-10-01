@@ -3,11 +3,11 @@
 //! This is the bit-exact oracle the GPU kernels are tested against: a hash-chain match
 //! finder and parse driven by runtime `MatchParams`, using integer arithmetic only so the
 //! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
-use crate::config::{BLOCK_SIZE, NO_POS, PARSE_END};
+use crate::config::{BLOCK_SIZE, HASH_BITS, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
-use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_width, key};
+use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_sparse, hash_width, key};
 use crate::lazy::{lazy_parse, lazy_parse_segmented};
-use crate::params::{cpu_supports, Hashes, MatchParams, OPT_H3_DEPTH};
+use crate::params::{cpu_supports, Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
 
 pub use crate::params::LVL3;
@@ -47,8 +47,9 @@ pub fn match_len_capped(block: &[u8], p: usize, q: usize, cap: usize) -> usize {
 
 /// The predecessor chains `find_best` walks, in walk order: for `Dfast`, the long-hash
 /// (8-byte) chain then the short-hash (5-byte) chain; for `Single`, one chain over
-/// `hash_width(.., min_match)`; for `Opt3`, the 4-byte chain (`hash_width(.., 4)`) then the
-/// 3-byte chain (`hash3`).
+/// `hash_width(.., min_match)`; for `Opt3`, the 4-byte chain (`hash_width(.., 4)`), the
+/// 3-byte chain (`hash3`), then one chain per `OptParams::sparse_chains` entry, in order
+/// (`sparse_chain_preds`).
 /// Each chain links equal *keys*: the hash's top `hash_bits` bits (`hash::key`; all 16 bits for
 /// every chain preset).
 pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
@@ -62,11 +63,37 @@ pub fn chains(block: &[u8], p: &MatchParams) -> Vec<Vec<u32>> {
             let min_match = p.min_match;
             vec![compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, min_match), hb))]
         }
-        Hashes::Opt3 => vec![
-            compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, 4), hb)),
-            compute_preds(block, move |b: &[u8], pos: usize| key(hash3(b, pos), hb)),
-        ],
+        Hashes::Opt3 => {
+            let mut v = vec![
+                compute_preds(block, move |b: &[u8], pos: usize| key(hash_width(b, pos, 4), hb)),
+                compute_preds(block, move |b: &[u8], pos: usize| key(hash3(b, pos), hb)),
+            ];
+            for c in p.opt.iter().flat_map(|o| o.sparse_chains.into_iter().flatten()) {
+                v.push(sparse_chain_preds(block, &c));
+            }
+            v
+        }
     }
+}
+
+/// Sparse chains hash positions `p < SPARSE_END` only (`hash::hash_sparse` reads up to 12 bytes).
+pub const SPARSE_END: usize = BLOCK_SIZE - 12;
+
+/// The predecessor chain of a sparse chain `c` (`params::SparseChain`): for each *sparse
+/// position* `p` (`p % c.stride == 0 && p < SPARSE_END`) in increasing order,
+/// `pred[p]` = the previous sparse position with the same `hash_sparse(block, p, c.width)`
+/// (16 bits), else `NO_POS`. Every other position is `NO_POS`, so `pred` links sparse positions
+/// only and `find_cands` walks the chain only from sparse positions.
+pub fn sparse_chain_preds(block: &[u8], c: &SparseChain) -> Vec<u32> {
+    assert_eq!(block.len(), BLOCK_SIZE);
+    let mut head = vec![NO_POS; 1 << HASH_BITS];
+    let mut pred = vec![NO_POS; BLOCK_SIZE];
+    for p in (0..SPARSE_END).step_by(c.stride as usize) {
+        let h = hash_sparse(block, p, c.width) as usize;
+        pred[p] = head[h];
+        head[h] = p as u32;
+    }
+    pred
 }
 
 /// One `find_cands` record: offset back from the position and capped length (`len == 0`: none).
@@ -100,22 +127,43 @@ pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
     (Cand { offset: w[0] & 0xFFFF, len: (w[0] >> 16) & 0xFF }, Cand { offset: w[1] & 0xFFFF, len: w[0] >> 24 })
 }
 
-/// K2opt (m5-opt-design §2.1), the optimal parse's candidates: for every `p < PARSE_END`, walk
-/// chain 0 (`h4`) `params.depth` deep and chain 1 (`h3`) `OPT_H3_DEPTH` deep, merged by position
-/// nearest first (both chains are strictly decreasing; a position on both is visited once). Each
-/// visited `q` gets the capped length `c = match_len_capped(block, p, q, search_cap)`; a *record*
-/// is a `q` whose `c` strictly beats every earlier `c` and the floor 2 (so records start at
-/// length 3, and on equal lengths the nearer `q` wins). `A` = the first record (the nearest
+/// Walk depth of each `Opt3` chain, in `chains` order: `h4` `params.depth`, `h3`
+/// `OPT_H3_DEPTH`, then each sparse chain's `depth`.
+pub fn cand_depths(params: &MatchParams) -> Vec<u32> {
+    let mut d = vec![params.depth, OPT_H3_DEPTH];
+    d.extend(params.opt.iter().flat_map(|o| o.sparse_chains.into_iter().flatten()).map(|c| c.depth));
+    d
+}
+
+/// K2opt (m5-opt-design §2.1; M6 sparse chains), the optimal parse's candidates.
+///
+/// For every `p < PARSE_END`, the *visit list* of `p` is the union, sorted by position
+/// descending (nearest first) with duplicates removed, of the first `depth_i` entries of each
+/// `Opt3` chain `i` from `p` (`chain_i[p]`, `chain_i[chain_i[p]]`, ..., stopping at `NO_POS`):
+/// chain 0 `h4` (`params.depth` deep), chain 1 `h3` (`OPT_H3_DEPTH`), chains 2.. the sparse
+/// chains (`OptParams::sparse_chains`, each its own `depth`; `cand_depths`). A sparse chain
+/// contributes only when `p` is a sparse position (`p % stride == 0 && p < SPARSE_END`):
+/// elsewhere `chain_i[p] = NO_POS`. Each chain is strictly decreasing and a position on several
+/// chains is visited once, but counts against each chain's depth.
+///
+/// Each visited `q` gets the capped length `c = match_len_capped(block, p, q, search_cap)`; a
+/// *record* is a `q` whose `c` strictly beats every earlier `c` and the floor 2 (so records start
+/// at length 3, and on equal lengths the nearer `q` wins). `A` = the first record (the nearest
 /// match of at least 3 bytes), `B` = the last (longest); with one record `B == A`. The walk may
-/// stop once `c`
-/// reaches `min(search_cap, BLOCK_SIZE - p)` (no later `q` can beat it). Lengths are capped: a
-/// stored 64 (`search_cap`) means "at least 64", extended by the parse. Positions `>= PARSE_END`
-/// are zero. Requires `Opt3` chains (`chains(block, params)`).
+/// stop once `c` reaches `min(search_cap, BLOCK_SIZE - p)` (no later `q` can beat it). Only the
+/// visit order matters, so any merge that visits the union nearest first gives the same words.
+/// Lengths are capped: a stored 64 (`search_cap`) means "at least 64", extended by the parse.
+/// Positions `>= PARSE_END` are zero. Requires `Opt3` chains (`chains(block, params)`).
+///
+/// This implementation merges the chains in one walk: the next `q` is the largest live head (a
+/// chain is live while it has depth left and its head is not `NO_POS`); every live chain whose
+/// head equals `q` advances to `chain_i[q]` and spends one depth.
 ///
 /// Fingerprint caveat (for GPU filters): an `h4`-chain entry whose first 4 bytes differ from
 /// `p`'s (a 16-bit hash collision) can still share 3 bytes and is then a valid 3-byte record, so
 /// a 4-byte fingerprint mismatch may skip the compare only once `best >= 3` (or when the first 3
-/// bytes differ too).
+/// bytes differ too). The same holds for sparse-chain collisions: a sparse entry is a
+/// candidate like any other, whatever its hashed bytes.
 ///
 /// Dead positions (M6 A3, a09): `p` is *dead* when it has no record and its `h3` walk reached
 /// the chain's end (`NO_POS`, within `OPT_H3_DEPTH` steps). Then no earlier position shares `p`'s
@@ -124,36 +172,41 @@ pub fn unpack_cands(w: CandWords) -> (Cand, Cand) {
 /// whole chain without a 3-byte match. So no candidate and no rep (whatever its offset) reaches 3
 /// bytes there, and the parse's `get_all_matches` is empty under every rep state. A dead
 /// position's words are `[0, DEAD_BIT]`. The parse oracle ignores the bit (`unpack_cands`);
-/// K3opt skips dead positions.
+/// K3opt skips dead positions. The test reads the `h3` walk only, so the sparse chains (which
+/// cannot add a record at a dead position) do not change it.
 pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Vec<CandWords> {
     assert_eq!(params.hashes, Hashes::Opt3, "find_cands: Opt3 chains only");
-    assert_eq!(chains.len(), 2);
-    let (h4, h3) = (&chains[0], &chains[1]);
+    let depths = cand_depths(params);
+    assert_eq!(chains.len(), depths.len());
+    let k = chains.len();
     let cap = params.search_cap as usize;
     let mut out = vec![[0u32; 2]; BLOCK_SIZE];
+    let mut heads = vec![NO_POS; k];
+    let mut left = vec![0u32; k];
     for p in 0..PARSE_END {
         let max_c = cap.min(BLOCK_SIZE - p);
-        let (mut q4, mut n4) = (h4[p], params.depth);
-        let (mut q3, mut n3) = (h3[p], OPT_H3_DEPTH);
+        for i in 0..k {
+            heads[i] = chains[i][p];
+            left[i] = depths[i];
+        }
         let mut best = 2usize;
         let (mut a, mut b) = (Cand::default(), Cand::default());
         loop {
-            // Next position of the merged walk: the larger live head; equal heads advance both.
-            let live4 = n4 > 0 && q4 != NO_POS;
-            let live3 = n3 > 0 && q3 != NO_POS;
-            let q = match (live4, live3) {
-                (false, false) => break,
-                (true, false) => q4,
-                (false, true) => q3,
-                (true, true) => q4.max(q3),
-            };
-            if live4 && q4 == q {
-                q4 = h4[q as usize];
-                n4 -= 1;
+            // Next position of the merged walk: the largest live head; equal heads all advance.
+            let mut q = NO_POS;
+            for i in 0..k {
+                if left[i] > 0 && heads[i] != NO_POS && (q == NO_POS || heads[i] > q) {
+                    q = heads[i];
+                }
             }
-            if live3 && q3 == q {
-                q3 = h3[q as usize];
-                n3 -= 1;
+            if q == NO_POS {
+                break;
+            }
+            for i in 0..k {
+                if left[i] > 0 && heads[i] == q {
+                    heads[i] = chains[i][q as usize];
+                    left[i] -= 1;
+                }
             }
             let qu = q as usize;
             let c = match_len_capped(block, p, qu, cap);
@@ -169,7 +222,8 @@ pub fn find_cands(block: &[u8], chains: &[Vec<u32>], params: &MatchParams) -> Ve
             }
         }
         out[p] = pack_cands(a, b);
-        if a.len == 0 && q3 == NO_POS {
+        // chain 1 is h3: its head is NO_POS iff the walk reached its end
+        if a.len == 0 && heads[1] == NO_POS {
             out[p][1] |= DEAD_BIT;
         }
     }
@@ -497,7 +551,7 @@ mod tests {
         }
     }
 
-    /// `find_cands` by its definition: the union of the two chains' first `depth` / 4 entries,
+    /// `find_cands` by its definition: the union of every chain's first `depth_i` entries,
     /// sorted nearest first, filtered by "capped length strictly above the best so far, from 3".
     fn find_cands_by_definition(block: &[u8], params: &MatchParams) -> Vec<CandWords> {
         let ch = chains(block, params);
@@ -505,7 +559,7 @@ mod tests {
         let mut dead = vec![false; BLOCK_SIZE];
         for (p, w) in out.iter_mut().enumerate().take(PARSE_END) {
             let mut v = Vec::new();
-            for (c, d) in [(&ch[0], params.depth), (&ch[1], OPT_H3_DEPTH)] {
+            for (c, &d) in ch.iter().zip(&cand_depths(params)) {
                 let mut q = c[p];
                 for _ in 0..d {
                     if q == NO_POS {
@@ -554,7 +608,17 @@ mod tests {
             return;
         }
         use crate::params::OPT16;
-        for params in [OPT16, MatchParams { depth: 3, ..OPT16 }, MatchParams { depth: 64, ..OPT16 }] {
+        use crate::params::{OptParams, SparseChain, OPT16P1};
+        let one_sparse = OptParams { sparse_chains: [Some(SparseChain { width: 5, stride: 1, depth: 3 }), None, None], ..OPT16.opt.unwrap() };
+        let variants = [
+            OPT16,
+            MatchParams { depth: 3, ..OPT16 },
+            MatchParams { depth: 64, ..OPT16 },
+            OPT16P1,
+            MatchParams { depth: 1, ..OPT16P1 },
+            MatchParams { opt: Some(one_sparse), ..OPT16 },
+        ];
+        for params in variants {
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
                     let got = find_cands(&blk.data, &chains(&blk.data, &params), &params);
@@ -620,6 +684,108 @@ mod tests {
         let (a, b) = unpack_cands(c[p2]);
         assert_eq!(b, Cand { offset: 700, len: 64 });
         assert_eq!(unpack_cands(pack_cands(a, b)), (a, b));
+    }
+
+    /// `sparse_chain_preds`: only sparse positions (`p % stride == 0`, `p < SPARSE_END`) are
+    /// linked, each to the previous sparse position with the same `hash_sparse`; on all-zero
+    /// data that is `p - stride`, the last sparse position is `SPARSE_END - stride` (for strides
+    /// dividing 12), and `chains` appends one such chain per `S3_CHAINS` entry.
+    #[test]
+    fn sparse_chain_links_sparse_positions_only() {
+        use crate::params::{OPT16P1, S3_CHAINS};
+        let zeros = synth::zeros(BLOCK_SIZE);
+        for stride in [1u32, 2, 4, 8] {
+            let c = SparseChain { width: 10, stride, depth: 16 };
+            let pred = sparse_chain_preds(&zeros, &c);
+            for (p, &q) in pred.iter().enumerate() {
+                let sparse = p % stride as usize == 0 && p < SPARSE_END;
+                let want = if sparse && p > 0 { (p - stride as usize) as u32 } else { NO_POS };
+                assert_eq!(q, want, "stride {stride} p={p}");
+            }
+        }
+        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 16], (BLOCK_SIZE - 20) as u32);
+        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 12], NO_POS);
+        let text = synth::text(3, BLOCK_SIZE);
+        let ch = chains(&text, &OPT16P1);
+        assert_eq!(ch.len(), 5);
+        assert_eq!(cand_depths(&OPT16P1), [8, OPT_H3_DEPTH, 16, 16, 16]);
+        for (i, c) in S3_CHAINS.iter().flatten().enumerate() {
+            assert_eq!(ch[2 + i], sparse_chain_preds(&text, c));
+            for (p, &q) in ch[2 + i].iter().enumerate() {
+                if q != NO_POS {
+                    assert!(p % 4 == 0 && (q as usize) < p && q % 4 == 0, "chain {i} p={p} q={q}");
+                    assert_eq!(hash_sparse(&text, q as usize, c.width), hash_sparse(&text, p, c.width));
+                }
+            }
+        }
+    }
+
+    /// The sparse chains reach a match the 8-deep h4 chain cannot: ten nearer 4-byte decoys
+    /// fill the h4 (and h3) walk at `p`, a 16-byte match lies behind them. Found only when both
+    /// `p` and the source are sparse positions (multiples of 4); at a non-sparse `p`, or with a
+    /// non-sparse source, A = B = the nearest decoy. OPT16 (h4 32 deep) finds it either way.
+    #[test]
+    fn find_cands_sparse_chains_reach_past_h4_depth() {
+        use crate::params::{OPT16, OPT16P1};
+        let mut block = synth::random(79, BLOCK_SIZE);
+        // (p, source): sparse/sparse, non-sparse p, non-sparse source
+        let sites = [(20000usize, 15000usize), (30002, 25002), (40000, 35001)];
+        for &(p, src) in &sites {
+            for i in 0..16 {
+                block[src + i] = block[p + i];
+            }
+            block[src + 16] = block[p + 16] ^ 0xFF;
+            for d in 0..10 {
+                let q = p - 100 - 40 * d;
+                block.copy_within(p..p + 4, q);
+                block[q + 4] = block[p + 4] ^ 0xFF;
+            }
+        }
+        let decoy = Cand { offset: 100, len: 4 };
+        let c1 = find_cands(&block, &chains(&block, &OPT16P1), &OPT16P1);
+        let c16 = find_cands(&block, &chains(&block, &OPT16), &OPT16);
+        for (k, &(p, src)) in sites.iter().enumerate() {
+            let far = Cand { offset: (p - src) as u32, len: 16 };
+            assert_eq!(unpack_cands(c16[p]), (decoy, far), "opt16 site {k}");
+            let want = if k == 0 { (decoy, far) } else { (decoy, decoy) };
+            assert_eq!(unpack_cands(c1[p]), want, "opt16p1 site {k}");
+        }
+    }
+
+    /// A position on several chains is visited once but spends depth on each: with h4 and a
+    /// 5-byte sparse chain at stride 1 (whose entries here are exactly h4's), a sparse depth of
+    /// 1 adds nothing to h4 depth 1, and the 2nd-nearest decoy's 6-byte match needs depth 2 on
+    /// either chain. Four nearer 3-byte decoys use up the h3 walk (A is the nearest of them).
+    #[test]
+    fn find_cands_shared_position_spends_each_depth() {
+        use crate::params::{OptParams, OPT16};
+        let mut block = synth::random(80, BLOCK_SIZE);
+        let p = 12000;
+        let (q1, q2) = (p - 50, p - 90);
+        for i in 0..6 {
+            block[q1 + i] = block[p + i];
+            block[q2 + i] = block[p + i];
+        }
+        block[q1 + 5] = block[p + 5] ^ 0xFF; // q1: 5 bytes
+        block[q2 + 6] = block[p + 6] ^ 0xFF; // q2: 6 bytes
+        for d in [10, 15, 20, 25] {
+            for i in 0..3 {
+                block[p - d + i] = block[p + i];
+            }
+            block[p - d + 3] = block[p + 3] ^ 0xFF;
+        }
+        let a3 = Cand { offset: 10, len: 3 };
+        let with = |h4: u32, sparse: u32| {
+            let o = OptParams { sparse_chains: [Some(SparseChain { width: 5, stride: 1, depth: sparse }), None, None], ..OPT16.opt.unwrap() };
+            let m = MatchParams { depth: h4, opt: Some(o), ..OPT16 };
+            let c = find_cands(&block, &chains(&block, &m), &m);
+            unpack_cands(c[p])
+        };
+        let near = Cand { offset: 50, len: 5 };
+        let far = Cand { offset: 90, len: 6 };
+        assert_eq!(with(1, 1), (a3, near));
+        assert_eq!(with(1, 2), (a3, far));
+        assert_eq!(with(2, 1), (a3, far));
     }
 
     /// xxh64 of the concatenated lvl3 frames, first captured on the unmodified M3 code (ddeee75);

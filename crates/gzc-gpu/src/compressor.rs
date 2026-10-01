@@ -11,7 +11,7 @@
 //! K3 writes only the sequences and counts; the literals are the block bytes the sequences leave
 //! uncovered, so K5 gathers them from `data` and the parse path from the host's copy of the block
 //! (`decode_output`).
-use crate::chains::{self, ChainsKernel, finder_wgsl, head_bytes, pred_bytes};
+use crate::chains::{self, ChainsKernel, chain_pred_bytes, finder_wgsl, head_bytes, layout_wgsl};
 use crate::k3opt::{K3OptConfig, OptBinds, OptPasses};
 use crate::context::{ErrorScopes, GpuContext, pack_blocks, params_wgsl};
 use crate::sorted::SortKernel;
@@ -105,8 +105,10 @@ pub struct GpuParams {
 /// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes, greedy,
 /// lazy and lazy2 since M4 Task 5; the M5 optimal parse, presets `opt14`/`opt16`, with K2opt and
 /// the K3opt passes since M5 T5, at blocks of at most 64 KiB: K3opt's 16-bit offsets).
+/// The M6 opt options (sparse chains, gap3, top-4 pruning, the drop pass, the S3 prior: preset
+/// `opt16p1`) are not on the GPU yet, so only M5-shaped `OptParams` are accepted.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.validate().is_ok() && (p.opt.is_none() || BLOCK_SIZE <= 1 << 16)
+    p.validate().is_ok() && p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16)
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
@@ -167,11 +169,12 @@ pub fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
     n_blocks as u64 * max_seqs(m) as u64 * 12
 }
 
-/// Bytes of the `pred` buffer under match params `m`: K1's chains (`chains::pred_bytes`), and for
-/// the optimal parse at least K3opt's DP trace, which reuses the buffer once K2opt has read the
-/// chains (`trace_bytes`). Opt3 has two chains, so the two are equal.
+/// Bytes of the `pred` buffer under match params `m`: K1's chains (`chains::chain_pred_bytes`),
+/// and for the optimal parse at least K3opt's DP trace, which reuses the buffer once K2opt has
+/// read the chains (`trace_bytes`). Opt3 has two full chains, so the two are equal; M6's sparse
+/// long chains add `BLOCK_SIZE / stride` words per block each (S3: 11 B per position).
 pub fn pred_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
-    let chains = pred_bytes(n_blocks, m.n_hashes());
+    let chains = chain_pred_bytes(n_blocks, m);
     if m.opt.is_some() { chains.max(trace_bytes(n_blocks)) } else { chains }
 }
 
@@ -216,7 +219,7 @@ pub fn frame_len_bytes(n_blocks: u32) -> u64 {
 /// 0 if one block doesn't fit.
 pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
-    let by_k1 = chains::max_blocks_per_batch(limits, m.n_hashes()) as u64;
+    let by_k1 = chains::max_blocks_per_batch_for(limits, m) as u64;
     let mut per_block =
         vec![best_bytes_for(1, m), pred_bytes_for(1, m), seqs_bytes_for(1, m), counts_bytes(1), frames_bytes(1)];
     if m.opt.is_some() {
@@ -1487,7 +1490,7 @@ impl OptCandKernel {
     }
 
     /// Records K1 then K2opt for the first `n_blocks` blocks of `data`: K1 into `head`/`pred`
-    /// (`chains::head_bytes`/`pred_bytes` for 2 chains), the candidates into `cands` (at least
+    /// (`chains::head_bytes` for `m.n_hashes()` chains, `chain_pred_bytes`), the candidates into `cands` (at least
     /// `best_bytes_for(n_blocks, m)`). `ts(0)` / `ts(1)` are K1's / K2opt's timestamp writes.
     /// `n_blocks <= max_batch_blocks(.., m)`.
     #[allow(clippy::too_many_arguments)]
@@ -1526,8 +1529,9 @@ impl OptCandKernel {
 /// K2opt (`k2_opt.wgsl`'s `main_opt`) for opt params `m`, on a (data, pred, cands) layout.
 fn k2_opt_pipeline(ctx: &GpuContext, m: &MatchParams, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
     let body = format!(
-        "{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\nconst H3_DEPTH: u32 = {OPT_H3_DEPTH}u;\n{K2_WGSL}\n{K2_OPT_WGSL}",
-        params_wgsl(m)
+        "{}{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\nconst H3_DEPTH: u32 = {OPT_H3_DEPTH}u;\n{K2_WGSL}\n{K2_OPT_WGSL}",
+        params_wgsl(m),
+        layout_wgsl(m)
     );
     // Loops: the merged walk decrements a depth counter every iteration (DEPTH + H3_DEPTH at
     // most) and match_len_capped is bounded by SEARCH_CAP; indices as in K2 (pred words hold
@@ -1551,7 +1555,7 @@ pub fn cands_from_blocks(ctx: &GpuContext, kernel: &OptCandKernel, blocks: &[&[u
         let nh = m.n_hashes();
         let data = ctx.storage_buffer("cands.data", data_bytes(cap), false);
         let head = ctx.storage_buffer("cands.head", head_bytes(cap, nh), false);
-        let pred = ctx.storage_buffer("cands.pred", pred_bytes(cap, nh), false);
+        let pred = ctx.storage_buffer("cands.pred", chain_pred_bytes(cap, &m), false);
         let cands = ctx.storage_buffer("cands.cands", best_bytes_for(cap, &m), true);
         let mut out = Vec::with_capacity(blocks.len());
         for batch in blocks.chunks(max) {
@@ -1666,6 +1670,7 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chains::pred_bytes;
     use gzc_core::params::{LVL3, LVL9, RUNG1, RUNG2};
 
     const MIB: u64 = 1 << 20;
@@ -1715,8 +1720,10 @@ mod tests {
     #[test]
     fn gpu_supports_all_presets() {
         for (name, p) in gzc_core::params::PRESETS {
-            // M5 T5: the optimal-parse presets too (at blocks of at most 64 KiB).
-            assert_eq!(gpu_supports(&p), p.opt.is_none() || BLOCK_SIZE <= 1 << 16, "{name}");
+            // M5 T5: the optimal-parse presets too (at blocks of at most 64 KiB); M6's opt16p1
+            // not until its K3/drop kernels land.
+            let m5_opt = p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16);
+            assert_eq!(gpu_supports(&p), m5_opt, "{name}");
             if gpu_supports(&p) {
                 check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
@@ -1816,6 +1823,60 @@ mod tests {
         let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16) as u64;
         assert!(n > 0 && n * 2 * BLOCK_SIZE as u64 <= 1 << 32, "cands / trace word index");
         assert!(n * 3 * MAX_SEQS_OPT as u64 <= 1 << 32, "seqs word index");
+    }
+
+    /// M6 `opt16p1`: K1's pred buffer holds h4 and h3 at full length plus the three stride-4 sparse
+    /// chains compactly (11 B per position, against opt16's 8 B, which K3opt's trace also needs),
+    /// counted by `pred_bytes_for` and so by `scratch_bytes` (`vram_bytes`) and `max_batch_blocks`.
+    #[test]
+    fn opt16p1_pred_counts_sparse_chains() {
+        use gzc_core::params::{OPT16, OPT16P1};
+        assert_eq!(OPT16P1.n_hashes(), 5);
+        assert_eq!(pred_bytes_for(10, &OPT16P1), 10 * 11 * BLOCK_SIZE as u64);
+        assert_eq!(pred_bytes_for(10, &OPT16P1), chain_pred_bytes(10, &OPT16P1));
+        assert!(pred_bytes_for(10, &OPT16P1) > trace_bytes(10));
+        // Five chains share K1's head tables, still at most HEAD_TABLES.
+        assert_eq!(head_bytes(10, OPT16P1.n_hashes()), 50 * (1 << 18));
+        assert_eq!(head_bytes(1000, 5), head_bytes(1000, 2));
+        assert_eq!(
+            scratch_bytes(10, &OPT16P1) - scratch_bytes(10, &OPT16),
+            head_bytes(10, 5) - head_bytes(10, 2) + 10 * 3 * BLOCK_SIZE as u64
+        );
+        for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
+            let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &OPT16P1);
+            let fits = |n: u32| {
+                [data_bytes(n), head_bytes(n, 5), pred_bytes_for(n, &OPT16P1), best_bytes_for(n, &OPT16P1)]
+                    .iter()
+                    .chain(&[seqs_bytes_for(n, &OPT16P1), opt_bytes(n, &OPT16P1), counts_bytes(n), frames_bytes(n)])
+                    .all(|&b| b <= limit)
+                    && [crate::k3opt::prices_bytes(n), n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1)]
+                        .iter()
+                        .all(|&b| b <= limit)
+            };
+            assert!(n > 0 && fits(n) && !fits(n + 1), "limit {limit}: n {n}");
+        }
+        let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16P1) as u64;
+        assert!(n > 0 && n * 11 * BLOCK_SIZE as u64 / 4 <= 1 << 32, "pred word index");
+    }
+
+    /// The batch buffers for `opt16p1` allocate exactly `scratch_bytes` + `slot_bytes`.
+    #[test]
+    fn opt16p1_batch_buffers_allocate_scratch_bytes() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        if BLOCK_SIZE > 1 << 16 {
+            return;
+        }
+        let m = gzc_core::params::OPT16P1;
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let b = BatchBuffers::new(&ctx, 7, true, &m).unwrap();
+        let o = b.opt.as_ref().unwrap();
+        let sizes = [&b.data, &b.head, &b.pred, &b.best, &b.seqs, &b.counts, b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap()]
+            .iter()
+            .chain([&o.prices, &o.scratch].iter())
+            .map(|x| x.size())
+            .sum::<u64>();
+        assert_eq!(sizes, scratch_bytes(7, &m) + slot_bytes(7, true));
+        assert_eq!(b.pred.size(), 7 * 11 * BLOCK_SIZE as u64);
     }
 
     #[test]
