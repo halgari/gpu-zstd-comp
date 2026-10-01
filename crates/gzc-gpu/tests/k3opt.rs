@@ -784,6 +784,17 @@ fn k3opt_passes_timing() {
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32).unwrap();
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
+    // GZC_TIMING_WARMUP: one untimed opt16 run first, so the first timed preset does not pay the
+    // GPU's clock ramp. (M6 A2: opt14 still shows a bimodal per-process state on an RTX 5090,
+    // every pass about 10 % slower with the fix-up at 0.37 instead of 0.27 us/block; compare
+    // runs in the same state.)
+    if std::env::var("GZC_TIMING_WARMUP").is_ok() {
+        let p = OptPasses::new(&ctx, &OPT16, K3OptConfig::default()).expect("OptPasses::new");
+        time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
+            bufs.upload(&ctx, &refs, &crefs, None).unwrap();
+        })
+        .expect("time_passes");
+    }
     for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");
         let mut t = time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
