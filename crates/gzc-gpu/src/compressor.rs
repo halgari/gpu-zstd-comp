@@ -105,8 +105,10 @@ pub struct GpuParams {
 /// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes, greedy,
 /// lazy and lazy2 since M4 Task 5; the M5 optimal parse, presets `opt14`/`opt16`, with K2opt and
 /// the K3opt passes since M5 T5, at blocks of at most 64 KiB: K3opt's 16-bit offsets).
+/// The M6 opt options (sparse chains, gap3, top-4 pruning, the drop pass, the S3 prior: preset
+/// `opt16p1`) are not on the GPU yet, so only M5-shaped `OptParams` are accepted.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.validate().is_ok() && (p.opt.is_none() || BLOCK_SIZE <= 1 << 16)
+    p.validate().is_ok() && p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16)
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
@@ -1709,8 +1711,10 @@ mod tests {
     #[test]
     fn gpu_supports_all_presets() {
         for (name, p) in gzc_core::params::PRESETS {
-            // M5 T5: the optimal-parse presets too (at blocks of at most 64 KiB).
-            assert_eq!(gpu_supports(&p), p.opt.is_none() || BLOCK_SIZE <= 1 << 16, "{name}");
+            // M5 T5: the optimal-parse presets too (at blocks of at most 64 KiB); M6's opt16p1
+            // not until its K3/drop kernels land.
+            let m5_opt = p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16);
+            assert_eq!(gpu_supports(&p), m5_opt, "{name}");
             if gpu_supports(&p) {
                 check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
