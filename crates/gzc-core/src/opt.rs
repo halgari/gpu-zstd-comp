@@ -1763,9 +1763,30 @@ pub mod cases {
         vec![DropCase { name: "drop_chain_carries_literals".into(), block, input, prices, max_len: 6, dropped, expect }]
     }
 
+    /// The successor's rep numbering changes with the merge: an explicit 4-byte match (offset 900,
+    /// OF code 9, expensive) is followed at once (`ll' = 0`) by a 6-byte match at offset 400, which
+    /// before the drop is repcode 2 under `ll0` numbering (`r'[2]` of `r' = [900, 700, 400]`), and
+    /// after it, with 96 literals, repcode 2 under the plain numbering (`r[1]` of `[700, 400, 1]`).
+    /// The 900 is dropped; the GPU drop kernel must price and re-encode the successor both ways.
+    pub fn drop_successor_ll0_renumbered() -> Vec<DropCase> {
+        let ms = [(1000, 400, 8), (1100, 700, 8), (1200, 900, 4), (1204, 400, 6), (2000, 1500, 10)];
+        let (block, input) = planted(134, &ms);
+        assert_eq!(input.sequences[3], seq(0, 6, 2), "the successor is repcode 2 with ll0");
+        let prices = flat_of(&[(9, 60000)]);
+        let dropped = vec![false, false, true, false, false];
+        let expect = vec![seq(1000, 8, 403), seq(92, 8, 703), seq(96, 6, 2), seq(790, 10, 1503)];
+        vec![DropCase { name: "drop_successor_ll0_renumbered".into(), block, input, prices, max_len: 6, dropped, expect }]
+    }
+
     /// Every drop-pass case, in order.
     pub fn drop_test_cases() -> Vec<DropCase> {
-        [drop_threshold_and_length, drop_rep_vs_explicit, drop_segment_starts_from_input_state, drop_chain_carries_literals]
+        [
+            drop_threshold_and_length,
+            drop_rep_vs_explicit,
+            drop_segment_starts_from_input_state,
+            drop_chain_carries_literals,
+            drop_successor_ll0_renumbered,
+        ]
             .into_iter()
             .flat_map(|f| f())
             .collect()
@@ -2031,9 +2052,10 @@ mod tests {
         }
     }
 
-    /// 4000 blocks spread uniformly over the corpus (every `total / 4000`-th .dds/.nif block in
-    /// path order, the `gzc-bench --ext dds,nif` order), or `None` (with a message) when the
-    /// corpus directory (`GZC_CORPUS`, default `data/corpus`) is absent.
+    /// `GZC_CORPUS_BLOCKS` (default 4000) blocks spread uniformly over the corpus (every
+    /// `total / n`-th .dds/.nif block in path order, the `gzc-bench --ext dds,nif` order), or
+    /// `None` (with a message) when the corpus directory (`GZC_CORPUS`, default `data/corpus`) is
+    /// absent.
     fn corpus_sample() -> Option<Vec<Vec<u8>>> {
         use std::path::{Path, PathBuf};
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -2060,14 +2082,16 @@ mod tests {
         for f in files {
             blocks.extend(chunk_file(&std::fs::read(&f).unwrap()).into_iter().map(|b| b.data));
         }
-        let stride = (blocks.len() / 4000).max(1);
-        Some(blocks.into_iter().step_by(stride).take(4000).collect())
+        let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000).max(1);
+        let stride = (blocks.len() / n).max(1);
+        Some(blocks.into_iter().step_by(stride).take(n).collect())
     }
 
-    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`)
-    /// round-trip through libzstd for every variant (`variants` and `m6_variants`), and every
-    /// other one of them (2000, i.e. every ~50th block at 64 KiB) gives the same output on the
-    /// ring engine. Skipped with a message when the corpus is absent.
+    /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`;
+    /// `GZC_CORPUS_BLOCKS` sets the count) round-trip through libzstd for every variant
+    /// (`variants` and `m6_variants`), and every other one of them (2000, i.e. every ~50th block
+    /// at 64 KiB) gives the same output on the ring engine. Runs on `GZC_TEST_THREADS` threads
+    /// (default 16, at most the cores). Skipped with a message when the corpus is absent.
     /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
     #[test]
     #[ignore]
@@ -2075,7 +2099,9 @@ mod tests {
         let Some(sample) = corpus_sample() else { return };
         let vars = [variants(), m6_variants()].concat();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cap: usize = std::env::var("GZC_TEST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let threads = cap.clamp(1, cores);
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| loop {

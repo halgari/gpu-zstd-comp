@@ -748,8 +748,11 @@ impl K3Opt {
     }
 
     /// `record` on `bufs` with the given timestamp writes for the DP's and the fix-up's compute
-    /// passes (the fix-up's are unused after a `hist_out` pass).
-    pub fn record_with(
+    /// passes (the fix-up's are unused after a `hist_out` pass). A persistent pass needs the
+    /// batch's block order in `bufs.sched` (`record_order`, recorded before it on these blocks), so
+    /// this is crate-private: `record_at`, `OptPasses::record` and `OptPasses::record_span` record
+    /// the order first.
+    pub(crate) fn record_with(
         &self,
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,

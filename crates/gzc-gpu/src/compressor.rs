@@ -211,12 +211,13 @@ pub fn frame_len_bytes(n_blocks: u32) -> u64 {
 }
 
 /// Largest `n_blocks` one `Kernels::record` call (and one `BatchBuffers`) for match params `m`
-/// may take under `limits`: K1's bound (`chains::max_blocks_per_batch` for `m.n_hashes()`: data,
-/// head and pred buffers, the workgroups-per-dimension limit used by K1's x and K2's y dispatch,
-/// u32 head/pred indices) further limited so the best, seqs, counts and frames buffers each
-/// fit one storage binding and one buffer and their u32 word indices (at most BLOCK_SIZE words
-/// per block, in `best`, times `best_words(m)`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap.
-/// 0 if one block doesn't fit.
+/// may take under `limits`: K1's bound (`chains::max_blocks_per_batch_for(limits, m)`: data, head
+/// and pred buffers, the pred words counting `m`'s sparse chains, the workgroups-per-dimension
+/// limit used by K1's x and K2's y dispatch, u32 head/pred indices) further limited so the best,
+/// pred (`pred_bytes_for`, which K3opt reuses as its trace), seqs, counts and frames buffers, and
+/// for opt params K3opt's prices, scratch and sched buffers, each fit one storage binding and one
+/// buffer, and their u32 word indices (at most BLOCK_SIZE words per block, in `best`, times
+/// `best_words(m)`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap. 0 if one block doesn't fit.
 pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let by_k1 = chains::max_blocks_per_batch_for(limits, m) as u64;
@@ -1529,13 +1530,16 @@ impl OptCandKernel {
 /// K2opt (`k2_opt.wgsl`'s `main_opt`) for opt params `m`, on a (data, pred, cands) layout.
 fn k2_opt_pipeline(ctx: &GpuContext, m: &MatchParams, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
     let body = format!(
-        "{}{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\nconst H3_DEPTH: u32 = {OPT_H3_DEPTH}u;\n{K2_WGSL}\n{K2_OPT_WGSL}",
+        "{}{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\nconst H3_DEPTH: u32 = {OPT_H3_DEPTH}u;\nconst DEAD_BIT: u32 = {}u;\n{K2_WGSL}\n{K2_OPT_WGSL}",
         params_wgsl(m),
-        layout_wgsl(m)
+        layout_wgsl(m),
+        gzc_core::reference::DEAD_BIT,
     );
-    // Loops: the merged walk decrements a depth counter every iteration (DEPTH + H3_DEPTH at
-    // most) and match_len_capped is bounded by SEARCH_CAP; indices as in K2 (pred words hold
-    // positions below HASHED_POSITIONS, from K1 in the same submission).
+    // Loops: every iteration of the merged walk spends one step of at least one live chain (so
+    // at most the sum of the chains' depths, `reference::cand_depths`: h4, h3 and each sparse
+    // chain's, 32 for opt16 and 60 for opt16p1) and match_len_capped is
+    // bounded by SEARCH_CAP; indices as in K2 (pred words hold positions below HASHED_POSITIONS,
+    // sparse chains' slot positions below SPARSE_END, from K1 in the same submission).
     let module = ctx.shader_trusted("k2_opt", &body);
     pipeline_from_module(ctx, "k2_opt", layout, &module, "main_opt")
 }

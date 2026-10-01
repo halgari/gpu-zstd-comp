@@ -778,9 +778,10 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
             }
             var spec = select(vec3<u32>(0u), vec3<u32>(1u, 4u, 8u), kk == 0u);
             var i = 0u;
-            // Terminates: i rises to n.
+            // Terminates: i rises to n, bounded by LOG_SEQS (a segment logs at most SEG / 3 <=
+            // LOG_SEQS sequences, so the bound only guards against a corrupt summary word).
             loop {
-                if (i >= n || all(reps == spec)) { break; }
+                if (i >= min(n, LOG_SEQS) || all(reps == spec)) { break; }
                 let r = src + 3u * i;
                 let ll = seqs[r] + select(0u, carry, i == 0u);
                 let spec_ob = seqs[r + 2u];
