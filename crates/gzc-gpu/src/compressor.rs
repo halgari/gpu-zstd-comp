@@ -1849,7 +1849,11 @@ mod tests {
                     .iter()
                     .chain(&[seqs_bytes_for(n, &OPT16P1), opt_bytes(n, &OPT16P1), counts_bytes(n), frames_bytes(n)])
                     .all(|&b| b <= limit)
-                    && [crate::k3opt::prices_bytes(n), n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1)]
+                    && [
+                        crate::k3opt::prices_bytes(n),
+                        n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1),
+                        crate::k3opt::sched_bytes(n),
+                    ]
                         .iter()
                         .all(|&b| b <= limit)
             };
@@ -1872,7 +1876,7 @@ mod tests {
         let o = b.opt.as_ref().unwrap();
         let sizes = [&b.data, &b.head, &b.pred, &b.best, &b.seqs, &b.counts, b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap()]
             .iter()
-            .chain([&o.prices, &o.scratch].iter())
+            .chain([&o.prices, &o.scratch, &o.sched].iter())
             .map(|x| x.size())
             .sum::<u64>();
         assert_eq!(sizes, scratch_bytes(7, &m) + slot_bytes(7, true));
