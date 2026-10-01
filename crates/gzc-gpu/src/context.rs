@@ -135,6 +135,8 @@ fn dump_wgsl(label: &str, src: &str) {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let Some(dir) = std::env::var_os("GZC_DUMP_WGSL") else { return };
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The label becomes one file name inside `dir`: no path separators, no `..`.
+    let label = label.replace(['/', '\\'], "_").replace("..", "_");
     let path = std::path::Path::new(&dir).join(format!("{label}.{n}.wgsl"));
     if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, src)) {
         eprintln!("GZC_DUMP_WGSL: {}: {e}", path.display());

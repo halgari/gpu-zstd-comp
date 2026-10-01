@@ -27,7 +27,7 @@
 //   - The end of a series (commit_ring) only updates the parse state (end_series: ip, anchor and
 //     reps follow from the last stretch alone) and logs the series in `seqs` (free until
 //     main_fixup); no lane waits for another's backward trace inside the DP loop.
-//   Phase 2: the logged series' backward traces, last series first (emit_series), write the
+//   Phase 2: the logged series' backward traces, last series first (emit), write the
 //   segment's sequences in reverse order (RAW_REVERSED) into its own words of `best` (the
 //   candidate words, 2 per position, no longer read): sequence i from the segment's end at
 //   best[wbase() + 3*i ..], trailer (n_seq, final anchor, sum of match_len, final reps) at
@@ -106,6 +106,9 @@ const_assert MAX_SEQS < (1u << (32u - LIT_BITS));
 // HIST_OUT: the segment summary (sequences, final anchor, final reps) for hist_epilogue, in the
 // segment's first trace words (dead after its phase 2).
 const SUM_WORDS: u32 = 5u;
+// The summary's first trace word for segment k of block b (the segment's first position's trace
+// words: written by dp's HIST_OUT tail, read by hist_epilogue).
+fn summ_base(b: u32, k: u32) -> u32 { return 2u * (b * BLOCK_SIZE + k * SEG); }
 const_assert BLOCK_SIZE <= 65536u;
 const_assert WG % NSEG == 0u || NSEG % WG == 0u;
 const_assert 3u * (SEG / 3u) <= SEG_META;
@@ -155,6 +158,10 @@ var<workgroup> p_ml: array<i32, RING_N * BPW>;
 // The prologue's literal frequencies (PRICE_MODE 0 / 2); with HIST_OUT, then the pass's packed
 // histogram (see LIT_BITS). A pass that uses neither declares one word (M6 A1: the final pass
 // carried 1 KiB it never touched; workgroup memory bounds K3opt's residency).
+// The one-word placeholders (`hist` without HIST_USED, `hsum` under PRICE_MODE 1) must never be
+// indexed: every access to `hist` must stay under HIST_USED, every access to `hsum` under
+// PRICE_MODE != 1 (WGSL clamps or discards an out-of-range workgroup index, so a stray access
+// would not fault, it would silently alias word 0).
 const HIST_USED: bool = HIST_OUT || PRICE_MODE == 0u || PRICE_MODE == 2u;
 var<workgroup> hist: array<atomic<u32>, select(1u, 256u * BPW, HIST_USED)>;
 // Per block: the table sums (lit, ll, ml, of) and, for PRICE_MODE 2, the uncovered bytes
@@ -200,6 +207,13 @@ var<private> n_seq: u32;
 var<private> ml_sum: u32;
 // Phase 1 series log: seqs[lbase() + 3*i ..] (free until main_fixup).
 var<private> n_series: u32;
+// Rep-length memo (M6 A2, a01 P1): the lane's last search position mem_p and, for each of its
+// three rep probes, offset | length << 16 with the probe's exact length (its common prefix capped
+// at that position's lim), or 0 when unknown. For the same offset, the capped common prefix at
+// mem_p + d is exactly L - d whenever L >= d + 3 (lim falls by d too), so a later search reuses
+// it instead of extending. The lane's search positions strictly increase.
+var<private> mem_p: u32;
+var<private> mem: vec3<u32>;
 
 // load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
 // are loaded, the high one masked when aligned. data[w + 1] is in bounds because every `data`
@@ -346,15 +360,32 @@ fn push_match(ob: u32, len: u32) {
     m_n += 1u;
 }
 
-// One rep probe of get_all_matches: offBase `ob`, source offset `ro` (valid: 1 <= ro <= p), `x`
-// and `y` the 4 bytes at p and p - ro. Records it when its length (the common prefix within
-// `lim`) is at least MIN_MATCH and beats `bestl`; true when the search ends there.
-fn rep_probe(p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, bestl: ptr<function, u32>) -> bool {
+// The memo's exact length for offset ro at p (> mem_p), or 0 (see mem).
+fn memo_len(p: u32, ro: u32) -> u32 {
+    let d = p - mem_p;
+    var r = 0u;
+    for (var i = 0u; i < 3u; i += 1u) {
+        let e = mem[i];
+        let l = e >> 16u;
+        r = select(r, l - d, (e & 0xFFFFu) == ro && l >= d + 3u);
+    }
+    return r;
+}
+
+// One rep probe of get_all_matches (probe j): offBase `ob`, source offset `ro` (valid: 1 <= ro
+// <= p), `x` and `y` the 4 bytes at p and p - ro, `h` its memo length (0: unknown). Records it
+// when its length (the common prefix within `lim`) is at least MIN_MATCH and beats `bestl`; true
+// when the search ends there.
+fn rep_probe(j: u32, p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, h: u32, bestl: ptr<function, u32>) -> bool {
     let d = x ^ y;
     if (!valid || (d & 0xFFFFFFu) != 0u) { return false; }
     // lim >= 8 at every searched position (p <= ilimit = iend - 8).
-    var rl = 3u;
-    if (d == 0u) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
+    var rl = h;
+    if (h == 0u) {
+        rl = 3u;
+        if (d == 0u) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
+    }
+    mem[j] = ro | (rl << 16u);
     if (rl <= *bestl) { return false; }
     *bestl = rl;
     push_match(ob, rl);
@@ -378,9 +409,14 @@ fn get_all_matches(p: u32, r: vec3<u32>, ll0: bool, iend: u32, x: u32, w0: u32, 
     let y0 = ld32(dbase(), p - select(0u, ro0, v0));
     let y1 = ld32(dbase(), p - select(0u, ro1, v1));
     let y2 = ld32(dbase(), p - select(0u, ro2, v2));
-    if (rep_probe(p, lim, 1u, ro0, v0, x, y0, &bestl)) { return; }
-    if (rep_probe(p, lim, 2u, ro1, v1, x, y1, &bestl)) { return; }
-    if (rep_probe(p, lim, 3u, ro2, v2, x, y2, &bestl)) { return; }
+    let h0 = select(0u, memo_len(p, ro0), v0);
+    let h1 = select(0u, memo_len(p, ro1), v1);
+    let h2 = select(0u, memo_len(p, ro2), v2);
+    mem_p = p;
+    mem = vec3<u32>(0u);
+    if (rep_probe(0u, p, lim, 1u, ro0, v0, x, y0, h0, &bestl)) { return; }
+    if (rep_probe(1u, p, lim, 2u, ro1, v1, x, y1, h1, &bestl)) { return; }
+    if (rep_probe(2u, p, lim, 3u, ro2, v2, x, y2, h2, &bestl)) { return; }
     for (var j = 0u; j < 2u; j += 1u) {
         let off = select(w1 & 0xFFFFu, w0 & 0xFFFFu, j == 0u);
         let len = select(w0 >> 24u, (w0 >> 16u) & 0xFFu, j == 0u);
@@ -454,9 +490,14 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
     n_series += 1u;
 }
 
-// Phase 2 (opt::Dp::commit_ring's output): the backward trace of one logged series, appending
-// its sequences last first to the segment's words of `best`. Series are emitted last first too,
-// so the segment's raw sequences end up in reverse order (RAW_REVERSED).
+// Phase 2 (opt::Dp::commit_ring's output): the backward traces of the logged series, last series
+// first, each appending its sequences last first to the segment's words of `best`, so the
+// segment's raw sequences end up in reverse order (RAW_REVERSED).
+//
+// One flat loop, one sequence per iteration (M6 A2, a01 P5): a series' header is read when the
+// previous series is done, so the warp runs the maximum over its lanes of n_seq iterations, not
+// the sum over series of the longest series' trace. Reads and writes keep the order of the
+// series-by-series form (which the HIST_OUT in-place log relies on, see LOG_SEQS).
 //
 // The DP's offBases are stored as they are: each is seq::off_base_for(offset, lit_len) under the
 // DP's own history, as main_fixup needs. A rep record (index i, zstd's ll0 numbering) is only
@@ -468,11 +509,29 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
 //
 // HIST_OUT: the sequences go to the segment's series-log words instead (see LOG_SEQS), and each
 // is counted in the pass's histograms with its literal bytes (hist_seq).
-fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_ob: u32) {
-    var sp = last_pos - last_mlen - last_litlen;
-    var mlen = last_mlen;
-    var ob = last_ob;
+fn emit() {
+    var i = n_series;
+    var have = false;
+    var sip = 0u;
+    var sp = 0u;
+    var mlen = 0u;
+    var ob = 0u;
+    // Terminates: every iteration emits one sequence or takes the next series (i falls to 0);
+    // inside a series sp falls by nl + nm >= 3 per sequence (a node ending a match has mlen >= 3),
+    // and the series start (sp = 0) has nm = 0.
     loop {
+        if (!have) {
+            if (i == 0u) { break; }
+            i -= 1u;
+            let l = lbase() + 3u * i;
+            let a = seqs[l];
+            let c = seqs[l + 1u];
+            sip = a & 0xFFFFu;
+            mlen = a >> 16u;
+            sp = (c & 0xFFFFu) - mlen - (c >> 16u);
+            ob = seqs[l + 2u];
+            have = true;
+        }
         let t = cbase() + 2u * (sip + sp);
         let t0 = trace[t];
         let nm = t0 & 0xFFu;
@@ -491,12 +550,13 @@ fn emit_series(sip: u32, last_pos: u32, last_mlen: u32, last_litlen: u32, last_o
         }
         n_seq += 1u;
         ml_sum += mlen;
-        // Terminates: sp falls by nl + nm >= 3 per step (a node ending a match has mlen >= 3);
-        // the series start (sp = 0) has nm = 0.
-        if (nm == 0u || sp < nl + nm) { break; }
-        mlen = nm;
-        ob = trace[t + 1u];
-        sp -= nl + nm;
+        if (nm == 0u || sp < nl + nm) {
+            have = false;
+        } else {
+            mlen = nm;
+            ob = trace[t + 1u];
+            sp -= nl + nm;
+        }
     }
 }
 
@@ -682,7 +742,7 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
         var reps = vec3<u32>(1u, 4u, 8u);
         var prev_end = 0u;
         for (var kk = 0u; kk < NSEG; kk += 1u) {
-            let sm = 2u * (b * BLOCK_SIZE + kk * SEG);
+            let sm = summ_base(b, kk);
             let n = trace[sm];
             let carry = kk * SEG - prev_end;
             if (n > 0u) { prev_end = trace[sm + 1u]; }
@@ -751,6 +811,8 @@ fn dp() {
     n_seq = 0u;
     ml_sum = 0u;
     n_series = 0u;
+    mem_p = 0u;
+    mem = vec3<u32>(0u);
 
     var in_series = false;
     var sip = 0u;       // the series' ip
@@ -935,19 +997,12 @@ fn dp() {
             in_series = false;
         }
     }
-    // Phase 2: the logged series' sequences, last first.
-    // Terminates: i falls to 0.
-    for (var i = n_series; i > 0u; i -= 1u) {
-        let l = lbase() + 3u * (i - 1u);
-        let a = seqs[l];
-        let c = seqs[l + 1u];
-        emit_series(a & 0xFFFFu, c & 0xFFFFu, a >> 16u, c >> 16u, seqs[l + 2u]);
-    }
+    emit();
     if (HIST_OUT) {
         // The literals after the segment's last match; the summary for hist_epilogue. The
         // candidate words stay (no trailer in `best`).
         hist_lits(st_anchor, seg_end());
-        let sm = wbase();
+        let sm = summ_base(block_id(), seg_id());
         trace[sm] = n_seq;
         trace[sm + 1u] = st_anchor;
         trace[sm + 2u] = st_rep.x;
