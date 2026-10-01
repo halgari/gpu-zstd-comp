@@ -603,10 +603,6 @@ mod tests {
 
     #[test]
     fn find_cands_matches_its_definition() {
-        // OPT16 (and its depth variants) only validate at blocks of at most 64 KiB.
-        if crate::config::LOG2_BLOCK > 16 {
-            return;
-        }
         use crate::params::OPT16;
         use crate::params::{OptParams, SparseChain, OPT16P1};
         let one_sparse = OptParams { sparse_chains: [Some(SparseChain { width: 5, stride: 1, depth: 3 }), None, None], ..OPT16.opt.unwrap() };
@@ -791,14 +787,7 @@ mod tests {
     /// xxh64 of the concatenated lvl3 frames, first captured on the unmodified M3 code (ddeee75);
 /// re-captured when `synth::nif_like` switched to a platform-independent sine (the lvl3 code
 /// itself unchanged: the old anchors still passed on Linux immediately before the switch).
-    #[cfg(feature = "block-128k")]
-    const M3_LVL3_ANCHOR: u64 = 0xc73510d0195192d6;
-    #[cfg(feature = "block-64k")]
     const M3_LVL3_ANCHOR: u64 = 0xd3354ac3c8f4a5d2;
-    #[cfg(feature = "block-32k")]
-    const M3_LVL3_ANCHOR: u64 = 0x0a4f0a366675659b;
-    #[cfg(feature = "block-16k")]
-    const M3_LVL3_ANCHOR: u64 = 0x42fda1cbdb8957f5;
 
     /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
     /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.

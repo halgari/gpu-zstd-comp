@@ -71,7 +71,7 @@ var<workgroup> section_wg: u32;
 const C: u32 = 256u;
 const PER: u32 = C / WG;
 // Longest sequence: 27 state bits + 16 + 16 + 17 extra bits = 76 (offset codes stay below 18
-// for BLOCK_SIZE <= 128K); + one word for the carry offset + one of slack.
+// at 64 KiB blocks); + one word for the carry offset + one of slack.
 const STG: u32 = (C * 76u + 31u) / 32u + 2u;
 // sbuf: codes [0, C), emitted state bits [C, 4C).
 var<workgroup> sbuf: array<u32, 1024>;

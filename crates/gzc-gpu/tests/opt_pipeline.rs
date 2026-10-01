@@ -3,9 +3,7 @@
 //! passes, then opt16p1's drop pass → K5 → K4), byte-identical to the CPU oracle
 //! (`reference::compress_block` + `write_frame`) on synthetic blocks and on real corpus blocks, in
 //! every upload/readback mode the adapter has. Run once more with `GZC_NO_SUBGROUPS=1` for the
-//! subgroup-less kernels. The optimal parse only implements at blocks of at most 64 KiB, so this
-//! whole file is skipped in a `block-128k` build.
-#![cfg(not(feature = "block-128k"))]
+//! subgroup-less kernels.
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;

@@ -1,7 +1,7 @@
 # gpu-zstd-comp
 
 A GPU zstd compressor written in Rust with wgpu compute shaders (WGSL). Input is cut into
-independent blocks (64 KiB by default). The GPU does the match finding, the parse and the entropy
+independent blocks of 64 KiB. The GPU does the match finding, the parse and the entropy
 coding, and writes one standard zstd frame per block. Every frame decodes with stock libzstd.
 
 It was built for one job: recompressing Skyrim mod data (mostly DDS textures, plus NIF meshes)

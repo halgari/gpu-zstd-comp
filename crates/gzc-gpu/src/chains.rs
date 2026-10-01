@@ -609,16 +609,8 @@ mod tests {
     fn batch_fits_every_buffer_at_default_limits() {
         let n2 = max_blocks_per_batch(&limits(128 * MIB, 256 * MIB, 65535), 2);
         let n1 = max_blocks_per_batch(&limits(128 * MIB, 256 * MIB, 65535), 1);
-        // pred-bound: 1 MiB per block at 128K (512 KiB with one chain), 128 KiB at 16K; head is
-        // at most 64 MiB.
-        #[cfg(feature = "block-128k")]
-        assert_eq!((n2, n1), (128, 256));
-        #[cfg(feature = "block-64k")]
+        // pred-bound: 512 KiB per block (256 KiB with one chain); head is at most 64 MiB.
         assert_eq!((n2, n1), (256, 512));
-        #[cfg(feature = "block-32k")]
-        assert_eq!((n2, n1), (512, 1024));
-        #[cfg(feature = "block-16k")]
-        assert_eq!((n2, n1), (1024, 2048));
         assert!(fits(n2, 2, 128 * MIB) && !fits(n2 + 1, 2, 128 * MIB));
         assert!(fits(n1, 1, 128 * MIB) && !fits(n1 + 1, 1, 128 * MIB));
     }

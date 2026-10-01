@@ -39,14 +39,10 @@ pub fn write_literals_raw(lits: &[u8], out: &mut Vec<u8>) {
 /// Magic number + Frame_Header_Descriptor + Frame_Content_Size (single segment, no dictionary).
 pub fn frame_header(opts: FrameOptions) -> Vec<u8> {
     let mut h = MAGIC.to_le_bytes().to_vec();
-    // FCS_Field_Size flag 1 (2 bytes, value - 256) covers 256..=65791; flag 2 is 4 bytes.
-    let fcs_flag: u8 = if BLOCK_SIZE < 65536 + 256 { 1 } else { 2 };
-    h.push((fcs_flag << 6) | (1 << 5) | ((opts.checksum as u8) << 2));
-    if fcs_flag == 1 {
-        h.extend_from_slice(&((BLOCK_SIZE - 256) as u16).to_le_bytes());
-    } else {
-        h.extend_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
-    }
+    // FCS_Field_Size flag 1: 2 bytes holding value - 256, which covers 256..=65791.
+    const _: () = assert!(BLOCK_SIZE >= 256 && BLOCK_SIZE < 65536 + 256);
+    h.push((1 << 6) | (1 << 5) | ((opts.checksum as u8) << 2));
+    h.extend_from_slice(&((BLOCK_SIZE - 256) as u16).to_le_bytes());
     h
 }
 
@@ -331,7 +327,7 @@ mod tests {
     #[test]
     fn frame_roundtrip_large_codes() {
         let bs = BLOCK_SIZE as u32;
-        // 128K: ll = 73728 (LL code 35), ml = 40960 (ML code 51).
+        // ll = 36864 (LL code 34), ml = 20480 (ML code 50).
         let ll = bs / 2 + bs / 16;
         let ml = bs / 4 + bs / 16;
         let (out, frame) = roundtrip_script(&[(ll, 1000, ml), (100, 3, bs / 16)], 3);
@@ -418,7 +414,7 @@ mod tests {
 
     #[test]
     fn many_sequences_nbseq_header_forms() {
-        // 4 bytes per sequence: 128K reaches the 3-byte nbSeq form (>= 0x7F00), smaller blocks the 2-byte form.
+        // 4 bytes per sequence: 16383 sequences, the 2-byte nbSeq form (the 3-byte form needs >= 0x7F00).
         let n = (BLOCK_SIZE / 4 - 1).min(0x7F00 + 100);
         let (out, frame) = roundtrip_script(&vec![(1, 1, 3); n], 13);
         assert_eq!(out.sequences.len(), n);
@@ -462,9 +458,8 @@ mod tests {
         let fhd = h[4];
         assert_eq!(fhd & 0b0010_0000, 0b0010_0000, "single segment");
         assert_eq!(fhd & 0b0000_0111, 0, "no checksum, no dict id");
-        let (flag, len) = if BLOCK_SIZE < 65536 + 256 { (1, 7) } else { (2, 9) };
-        assert_eq!(fhd >> 6, flag);
-        assert_eq!(h.len(), len);
+        assert_eq!(fhd >> 6, 1, "2-byte frame content size");
+        assert_eq!(h.len(), 7);
         for block in [synth::zeros(BLOCK_SIZE), synth::text(1, BLOCK_SIZE)] {
             let out = BlockOutput { sequences: vec![], literals: block.clone() };
             let frame = roundtrip(&block, &out, opts);

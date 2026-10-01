@@ -4,7 +4,6 @@
 //! Frames must still equal the CPU oracle byte for byte: no kernel may depend on memory it did not
 //! write in the same batch. The full suite runs poisoned with `GZC_POISON=1`.
 use gzc_core::block::chunk_file;
-use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
 use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1, RUNG2};
 use gzc_core::reference::compress_block;
@@ -17,14 +16,16 @@ fn blocks() -> Vec<Vec<u8>> {
 }
 
 fn presets() -> Vec<(&'static str, MatchParams)> {
-    let mut p = vec![("lvl3", LVL3), ("rung2", RUNG2), ("lvl9", LVL9), ("lvl9seg", LVL9SEG), ("lvl9s12seg", LVL9S12SEG)];
-    // The optimal parse implements blocks of at most 64 KiB.
-    if BLOCK_SIZE <= 1 << 16 {
-        p.push(("opt14", OPT14));
+    vec![
+        ("lvl3", LVL3),
+        ("rung2", RUNG2),
+        ("lvl9", LVL9),
+        ("lvl9seg", LVL9SEG),
+        ("lvl9s12seg", LVL9S12SEG),
+        ("opt14", OPT14),
         // M6 B4: sparse chains, gap3, top-4 and the drop pass.
-        p.push(("opt16p1", OPT16P1));
-    }
-    p
+        ("opt16p1", OPT16P1),
+    ]
 }
 
 fn poisoned(opts: GpuOptions) -> GpuContext {

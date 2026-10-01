@@ -115,15 +115,10 @@ fn main_sg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_i
     var run = 0u;
     for (var i0 = 0u; i0 < NWORDS; i0 += 32u) {
         let x = atomicLoad(&cnt[i0 + lane]);
-        if (CNT16) {
-            let lo = x & 0xFFFFu;
-            let ex = run + subgroupExclusiveAdd(lo + (x >> 16u));
-            atomicStore(&cnt[i0 + lane], ex | ((ex + lo) << 16u));
-            run += subgroupAdd(lo + (x >> 16u));
-        } else {
-            atomicStore(&cnt[i0 + lane], run + subgroupExclusiveAdd(x));
-            run += subgroupAdd(x);
-        }
+        let lo = x & 0xFFFFu;
+        let ex = run + subgroupExclusiveAdd(lo + (x >> 16u));
+        atomicStore(&cnt[i0 + lane], ex | ((ex + lo) << 16u));
+        run += subgroupAdd(lo + (x >> 16u));
     }
     workgroupBarrier();
 

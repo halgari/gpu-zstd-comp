@@ -142,7 +142,7 @@ impl MatchParams {
     /// Ok when every field is in its supported range: min_match 4..=8, depth 1..=64,
     /// lazy 0..=2, search_cap 8..=256, hash_bits 11..=16, and Dfast only with min_match 5.
     /// With `opt` (and only then): hashes `Opt3`, min_match 3, lazy 0, search_cap 64, hash_bits
-    /// 16, segment_log2 12, blocks of 16..64 KiB (offsets fit 16 bits), level 0 or 2,
+    /// 16, segment_log2 12, level 0 or 2,
     /// target_length 8..=32, passes 0..=7, k 2; prior tables other than M5 only with seed Prior;
     /// sparse chains packed first, each width 5..=12, stride 1/2/4/8, depth 1..=64; inner_gap 8
     /// or 3; relax_lengths None or 1..=32; drop_max_len 0 or 3..=32.
@@ -202,6 +202,9 @@ impl MatchParams {
 }
 
 /// `validate` for `opt` params (see there).
+// The opt parse packs offsets in 16 bits.
+const _: () = assert!(LOG2_BLOCK <= 16, "opt needs offsets that fit 16 bits");
+
 fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
     let want = |ok: bool, what: String| if ok { Ok(()) } else { Err(what) };
     want(p.hashes == Hashes::Opt3, format!("opt needs Opt3 hashes, got {:?}", p.hashes))?;
@@ -211,7 +214,6 @@ fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
     want(p.search_cap == 64, format!("opt needs search_cap 64, got {}", p.search_cap))?;
     want(p.hash_bits == HASH_BITS, format!("opt needs hash_bits {HASH_BITS}, got {}", p.hash_bits))?;
     want(p.segment_log2 == 12, format!("opt needs segment_log2 12, got {}", p.segment_log2))?;
-    want((14..=16).contains(&LOG2_BLOCK), format!("opt needs 16..64 KiB blocks, built for 2^{LOG2_BLOCK}"))?;
     want(o.level == 0 || o.level == 2, format!("opt level {} not 0 or 2", o.level))?;
     want((8..=32).contains(&o.target_length), format!("opt target_length {} not in 8..=32", o.target_length))?;
     want(o.passes <= 7, format!("opt passes {} not in 0..=7", o.passes))?;
@@ -244,29 +246,22 @@ pub const RUNG2: MatchParams =
 ///
 /// | block | L9 | lvl9 | lvl9seg | lvl9s12 | lvl9s12seg | lvl9s12d16seg |
 /// |---|---|---|---|---|---|---|
-/// | 16 KiB | 1.30009 | 1.30024 | 1.30042 | 1.30023 | 1.30040 | 1.30017 |
-/// | 32 KiB | 1.31996 | 1.32131 | 1.32140 | 1.32128 | 1.32137 | 1.32107 |
 /// | 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
-/// | 128 KiB | 1.35317 | 1.35489 | 1.35478 | 1.35468 | 1.35456 | **1.35159** (below L9) |
 pub const LVL9: MatchParams =
     MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 
 /// lvl9 with the parse split into independent 4 KiB segments (speed-2 E1): same match finder,
-/// a parse that runs one GPU lane per segment. Validated >= libzstd L9 at 16, 32, 64 and 128 KiB
-/// blocks (table at `LVL9`).
+/// a parse that runs one GPU lane per segment. Validated >= libzstd L9 (table at `LVL9`).
 pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
 /// `lvl9` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
-/// instead of 16-bit hash chains. Validated >= libzstd L9 at 16, 32, 64 and 128 KiB blocks
-/// (table at `LVL9`).
+/// instead of 16-bit hash chains. Validated >= libzstd L9 (table at `LVL9`).
 pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
-/// `lvl9s12` with the segmented parse (E2 + E1). Validated >= libzstd L9 at 16, 32, 64 and
-/// 128 KiB blocks (table at `LVL9`).
+/// `lvl9s12` with the segmented parse (E2 + E1). Validated >= libzstd L9 (table at `LVL9`).
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4). Validated >= libzstd L9 at
-/// 16, 32 and 64 KiB blocks only (at 16 KiB by just +0.006 %); at 128 KiB it is below L9 (table
-/// at `LVL9`).
+/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4). Validated >= libzstd L9
+/// (table at `LVL9`).
 pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 
 /// Optimal parse aimed at libzstd L16 (btultra, M5): `Opt3` candidates (h4 chain 32 deep + h3
@@ -279,8 +274,6 @@ pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
 ///
 /// | block | L14 | L16 | opt14 | opt16 |
 /// |---|---|---|---|---|
-/// | 16 KiB | 1.32606 | 1.32774 | 1.32765 | 1.32794 |
-/// | 32 KiB | 1.34797 | 1.35025 | 1.35105 | 1.35158 |
 /// | 64 KiB | 1.36827 | 1.37100 | 1.37064 | 1.37144 |
 pub const OPT16: MatchParams = MatchParams {
     hashes: Hashes::Opt3,
@@ -385,11 +378,7 @@ mod tests {
         assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {
-            // opt14/opt16 only validate at blocks of at most 64 KiB (`validate_opt`'s
-            // `LOG2_BLOCK` check); skip that assertion above that size.
-            if p.opt.is_none() || LOG2_BLOCK <= 16 {
-                assert_eq!(p.validate(), Ok(()), "{name}");
-            }
+            assert_eq!(p.validate(), Ok(()), "{name}");
             assert_eq!(preset(name), Ok(p), "{name}");
         }
         let opt = OptParams {
@@ -469,11 +458,6 @@ mod tests {
 
     #[test]
     fn validate_opt() {
-        // opt only validates at blocks of at most 64 KiB; above that every case here (including
-        // the "good" ones) is rejected by the `LOG2_BLOCK` check before its own field is checked.
-        if LOG2_BLOCK > 16 {
-            return;
-        }
         let o = OPT16.opt.unwrap();
         let bad = [
             MatchParams { min_match: 4, ..OPT16 },
@@ -530,8 +514,7 @@ mod tests {
     #[test]
     fn cpu_supports_all_presets() {
         for (name, p) in PRESETS {
-            // opt14/opt16 only validate (and so `cpu_supports`) at blocks of at most 64 KiB.
-            assert_eq!(cpu_supports(&p), p.opt.is_none() || LOG2_BLOCK <= 16, "{name}");
+            assert!(cpu_supports(&p), "{name}");
         }
         assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(cpu_supports(&MatchParams { min_match: 6, lazy: 1, ..RUNG2 }));

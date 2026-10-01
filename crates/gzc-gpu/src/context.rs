@@ -469,8 +469,8 @@ impl GpuContext {
     ///
     /// K2, K4 and K5 are built with this; their arguments are in `.superpowers/speed2/e3-report.md`
     /// (E9). A loop or index added to them must come with the same argument. RTX 5090, lvl9,
-    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 % (128 KiB: −6 / −17 / −5 %). K1 stays checked: its
-    /// subgroup kernel got 7 % slower at 64 KiB (9 % faster at 128 KiB); K3 keeps
+    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 %. K1 stays checked: its subgroup kernel got 7 %
+    /// slower; K3 keeps
     /// `shader_unbounded_loops` (the index clamps cost it nothing).
     /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
     pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
