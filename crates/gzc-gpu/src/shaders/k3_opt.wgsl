@@ -36,8 +36,8 @@
 //   block's true reps (== lazy::encode_raw), one workgroup per block.
 //
 // Candidate words (reference::CandWords, K2opt): best[2*(b*BLOCK_SIZE + p)] = offA | lenA << 16 |
-// lenB << 24, best[.. + 1] = offB | dead run << 16 (DEAD_SHIFT); lengths capped at SEARCH_CAP (a
-// stored SEARCH_CAP is extended).
+// lenB << 24, best[.. + 1] = offB, plus DEAD_BIT at a dead position; lengths capped at SEARCH_CAP
+// (a stored SEARCH_CAP is extended).
 //
 // Precondition (K2opt's output satisfies it): every candidate record lies in the block before its
 // position, and its length is the true common length capped at SEARCH_CAP. The kernel trusts the
@@ -112,14 +112,15 @@ const SUM_WORDS: u32 = 5u;
 fn summ_base(b: u32, k: u32) -> u32 { return 2u * (b * BLOCK_SIZE + k * SEG); }
 const_assert BLOCK_SIZE <= 65536u;
 const_assert WG % NSEG == 0u || NSEG % WG == 0u;
-// Dead runs (M6 A3, a09; reference::find_cands): a candidate word w1's high half is p's dead run,
-// nonzero only when no earlier position of the block shares p's first 3 bytes, so no candidate
-// and no rep reaches MIN_MATCH there and get_all_matches(p) is empty under every rep state. The
-// DP skips such positions' searches: outside a series a whole run at once (st_ip += run; the
-// run stops at its 256-position tile's end, where the next run is read), inside one the
-// position only gets its literal extension. The rep-length memo stays exact across a skipped
-// search (its lengths hold at any later position of the segment, see mem).
-const DEAD_SHIFT: u32 = 16u;
+// Dead positions (M6 A3, a09; reference::find_cands): DEAD_BIT in a candidate word w1 marks p as
+// dead: no earlier position of the block shares p's first 3 bytes, so no candidate and no rep
+// reaches MIN_MATCH there and get_all_matches(p) is empty under every rep state. The DP skips
+// such positions' searches: outside a series in a tight loop before the trip (st_ip += 1 per
+// dead position), inside one the position only gets its literal extension. The rep-length memo
+// stays exact across a skipped search (its lengths hold at any later position of the segment,
+// see mem). (A run length per position, capped at K2opt's 256-position tiles, measured no faster
+// here and cost K2opt two workgroup barriers.)
+const DEAD_BIT: u32 = 0x10000u;
 // Literal-only positions of a series folded into one trip (dp): measured on the optLevel-0
 // passes only (a09: the final pass is faster without; it has fewer `+128` skips).
 const FOLD: bool = LEVEL == 0u;
@@ -834,14 +835,13 @@ fn dp() {
     // past the series start) or cur (inside one, cur <= last_pos <= iend - sip, then a commit).
     loop {
         if (!in_series) {
-            // Dead positions (M6 A3, a09; see DEAD_SHIFT): a series start probe there finds
-            // nothing and only moves st_ip on by 1, so the probes of a dead run are skipped in
-            // one step per run. Terminates: st_ip rises by the run (>= 1) per step.
+            // Dead positions (M6 A3, a09; see DEAD_BIT): a series start probe there finds
+            // nothing and only moves st_ip on by 1, so a dead stretch is skipped here, without
+            // a trip per position. Terminates: st_ip rises by 1 per step.
             loop {
                 if (st_ip >= seg_end() - 8u) { break; }
-                let run = best[cbase() + 2u * st_ip + 1u] >> DEAD_SHIFT;
-                if (run == 0u) { break; }
-                st_ip += run;
+                if ((best[cbase() + 2u * st_ip + 1u] & DEAD_BIT) == 0u) { break; }
+                st_ip += 1u;
             }
         }
         if (!in_series && st_ip >= seg_end() - 8u) { break; }
@@ -907,7 +907,7 @@ fn dp() {
                     finish = true;
                 } else if (LEVEL == 0u && ld_price(cur + 1u) <= n.price + 128) {
                     advance = true;
-                } else if ((w1 >> DEAD_SHIFT) != 0u) {
+                } else if ((w1 & DEAD_BIT) != 0u) {
                     // A dead position (inr <= ilimit, so w1 is inr's): get_all_matches would
                     // find nothing, and the trip would only advance.
                     advance = true;

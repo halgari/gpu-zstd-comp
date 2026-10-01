@@ -35,7 +35,7 @@
 //!
 //! Precondition: the candidate words come from K2opt (or `reference::find_cands`): every record
 //! lies in the block before its position (1 <= offset <= position) with its true common length
-//! capped at `SEARCH_CAP`, and every dead run (M6 A3) covers only dead positions. The kernel does
+//! capped at `SEARCH_CAP`, and every dead mark (M6 A3) is on a dead position. The kernel does
 //! not bounds-check them; only the host harness (`OptBuffers::upload`) validates scripted words.
 //!
 //! Workgroups: `K3OptConfig::wg` lanes (a power of two, 8..=256; a block's 16 segment lanes may
@@ -357,7 +357,7 @@ impl OptBuffers {
         );
         ctx.queue
             .write_buffer(&self.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
-        let mut seen = Vec::new();
+        check_dead_marks_par(blocks, cands)?;
         for (b, c) in cands.iter().enumerate() {
             ensure!(
                 c.len() == BLOCK_SIZE,
@@ -375,7 +375,6 @@ impl OptBuffers {
                     );
                 }
             }
-            check_dead_runs(blocks[b], c, &mut seen).map_err(|e| anyhow!("block {b}: {e}"))?;
             ctx.queue.write_buffer(
                 &self.cands,
                 b as u64 * best_bytes_for(1, &self.params),
@@ -399,40 +398,57 @@ impl OptBuffers {
     }
 }
 
-/// The kernel also trusts the dead runs (`reference::find_cands`, M6 A3): it skips the search at
-/// every position a run covers. Checks that each marked position `p` is really dead (no record,
-/// below `PARSE_END`, and no earlier position with its first 3 bytes) and that its run stays in
-/// its tile and covers only marked positions, each with the run one shorter. `seen` is the
-/// caller's scratch (empty, or all zero as this leaves it).
-fn check_dead_runs(block: &[u8], c: &[CandWords], seen: &mut Vec<u64>) -> anyhow::Result<()> {
+/// `check_dead_marks` on every block, on up to 16 threads (a timing harness re-uploads between
+/// runs, and a long upload lets the GPU clock down).
+fn check_dead_marks_par(blocks: &[&[u8]], cands: &[&[CandWords]]) -> anyhow::Result<()> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| -> anyhow::Result<()> {
+                    let mut seen = Vec::new();
+                    loop {
+                        let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (Some(bl), Some(c)) = (blocks.get(b), cands.get(b)) else { return Ok(()) };
+                        ensure!(c.len() == BLOCK_SIZE, "block {b}: {} candidate words", c.len());
+                        check_dead_marks(bl, c, &mut seen).map_err(|e| anyhow!("block {b}: {e}"))?;
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().try_for_each(|w| w.join().expect("dead-mark check panicked"))
+    })
+}
+
+/// The kernel also trusts the dead marks (`reference::find_cands`, M6 A3): it skips the search at
+/// every marked position. Checks that each marked position `p` is really dead: words `[0,
+/// DEAD_BIT]` (no record), `p < PARSE_END`, and no earlier position with its first 3 bytes.
+/// `seen` is the caller's scratch (empty, or all zero as this leaves it).
+fn check_dead_marks(block: &[u8], c: &[CandWords], seen: &mut Vec<u64>) -> anyhow::Result<()> {
     use gzc_core::config::PARSE_END;
-    use gzc_core::reference::{DEAD_TILE, dead_run};
-    if c.iter().all(|w| dead_run(*w) == 0) {
+    use gzc_core::reference::{DEAD_BIT, is_dead};
+    if !c.iter().any(|w| is_dead(*w)) {
         return Ok(());
     }
-    ensure!(block.len() >= PARSE_END + 3, "dead runs on a short block");
+    ensure!(block.len() >= PARSE_END + 3, "dead marks on a short block");
     // Seen 3-byte prefixes, a 2^24-bit set (cleared again below, one word per position).
     seen.resize(1 << 18, 0);
     let key = |p: usize| block[p] as usize | (block[p + 1] as usize) << 8 | (block[p + 2] as usize) << 16;
     let mut res = Ok(());
-    let mut check = |p: usize, w: CandWords| -> anyhow::Result<()> {
-        let run = dead_run(w) as usize;
-        if run > 0 {
-            ensure!(p < PARSE_END && w == [0, (run as u32) << 16], "bad dead word at {p}: {w:?}");
-            ensure!(run <= DEAD_TILE - p % DEAD_TILE, "dead run {run} at {p} leaves its tile");
-            ensure!(run == 1 || dead_run(c[p + 1]) as usize == run - 1, "dead run {run} at {p}: inconsistent");
+    for (p, &w) in c.iter().enumerate() {
+        let dead = is_dead(w);
+        if dead && (p >= PARSE_END || w != [0, DEAD_BIT]) {
+            res = Err(anyhow!("bad dead word at {p}: {w:?}"));
+            break;
         }
         if p < PARSE_END {
             let k = key(p);
-            ensure!(run == 0 || seen[k >> 6] & 1 << (k & 63) == 0, "dead position {p} has an earlier 3-byte match");
+            if dead && seen[k >> 6] & 1 << (k & 63) != 0 {
+                res = Err(anyhow!("dead position {p} has an earlier 3-byte match"));
+                break;
+            }
             seen[k >> 6] |= 1 << (k & 63);
-        }
-        Ok(())
-    };
-    for (p, w) in c.iter().enumerate() {
-        res = check(p, *w);
-        if res.is_err() {
-            break;
         }
     }
     for p in 0..PARSE_END {
@@ -1079,35 +1095,34 @@ mod tests {
         assert!(e.to_string().contains("data"), "{e}");
     }
 
-    /// `check_dead_runs` (M6 A3) accepts `find_cands`' runs, also on a second block with the same
-    /// scratch, and rejects a run that covers a live position, a mark on a position with an
-    /// earlier 3-byte match, and a run that leaves its tile.
+    /// `check_dead_marks` (M6 A3) accepts `find_cands`' marks, also twice with the same scratch,
+    /// and rejects a mark on a position with an earlier 3-byte match, on a position with a record,
+    /// and at `PARSE_END`.
     #[test]
-    fn check_dead_runs_rejects_bad_marks() {
-        use gzc_core::reference::{DEAD_TILE, chains, dead_run, find_cands};
+    fn check_dead_marks_rejects_bad_marks() {
+        use gzc_core::config::PARSE_END;
+        use gzc_core::reference::{DEAD_BIT, chains, find_cands, is_dead};
         if BLOCK_SIZE > 1 << 16 {
             return;
         }
         let mut block = gzc_core::synth::random(5, BLOCK_SIZE);
         block.copy_within(200..300, 1000);
         let c = find_cands(&block, &chains(&block, &OPT16), &OPT16);
+        assert!(c.iter().filter(|w| is_dead(**w)).count() > BLOCK_SIZE / 2);
         let mut seen = Vec::new();
-        check_dead_runs(&block, &c, &mut seen).unwrap();
-        check_dead_runs(&block, &c, &mut seen).unwrap();
-        let p = (1..BLOCK_SIZE).find(|&p| p % DEAD_TILE != 0 && dead_run(c[p]) == 0 && dead_run(c[p - 1]) == 1).unwrap();
+        check_dead_marks(&block, &c, &mut seen).unwrap();
+        check_dead_marks(&block, &c, &mut seen).unwrap();
+        // 1050 repeats 250's bytes: not dead.
+        assert!(!is_dead(c[1050]));
         let mut bad = c.clone();
-        bad[p - 1][1] = 2 << 16;
-        bad[p] = [0, 1 << 16];
-        assert!(check_dead_runs(&block, &bad, &mut seen).is_err(), "a live position marked dead");
-        // 1050 repeats 250's bytes: not dead (it has a record) unless forced.
+        bad[1050] = [0, DEAD_BIT];
+        assert!(check_dead_marks(&block, &bad, &mut seen).is_err(), "an earlier 3-byte match");
         let mut bad = c.clone();
-        assert_eq!(dead_run(bad[1050]), 0);
-        bad[1050] = [0, 1 << 16];
-        assert!(check_dead_runs(&block, &bad, &mut seen).is_err(), "an earlier 3-byte match");
-        let q = (0..BLOCK_SIZE).find(|&q| q % DEAD_TILE == DEAD_TILE - 1 && dead_run(c[q]) == 1).unwrap();
+        bad[1050][1] |= DEAD_BIT;
+        assert!(check_dead_marks(&block, &bad, &mut seen).is_err(), "a record");
         let mut bad = c.clone();
-        bad[q][1] = 2 << 16;
-        assert!(check_dead_runs(&block, &bad, &mut seen).is_err(), "a run past its tile");
-        check_dead_runs(&block, &c, &mut seen).unwrap();
+        bad[PARSE_END] = [0, DEAD_BIT];
+        assert!(check_dead_marks(&block, &bad, &mut seen).is_err(), "at PARSE_END");
+        check_dead_marks(&block, &c, &mut seen).unwrap();
     }
 }

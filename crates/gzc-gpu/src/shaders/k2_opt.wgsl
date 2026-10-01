@@ -30,55 +30,26 @@
 // and its early stop are unchanged.
 // Indices: pred words hold positions < HASHED_POSITIONS or PRED_NONE (K1's output, run before
 // this in the same submission), so pred[pb + q] and the byte loads stay in the block.
-// Dead runs (M6 A3, reference::find_cands): p is dead when the walk found no record and its h3
-// head reached PRED_NONE (the whole h3 chain visited). Every visited q then had c <= 2 (a
+// Dead positions (M6 A3, reference::find_cands): p is dead when the walk found no record and its
+// h3 head reached PRED_NONE (the whole h3 chain visited). Every visited q then had c <= 2 (a
 // fingerprint skip only drops a q with c <= 2 <= best), and every earlier position with p's
-// first 3 bytes has p's hash3 key, so it is on p's h3 chain: there is none. The workgroup is one
-// DEAD_TILE (256 positions of one block): its dead flags go to a 256-bit mask in workgroup
-// memory, and each dead position stores its run (the consecutive dead positions from it to the
-// tile's end, 1..=256) in the high half of its second word.
-
-const DEAD_TILE: u32 = 256u;
-var<workgroup> dead_mask: array<atomic<u32>, 8>;
+// first 3 bytes has p's hash3 key, so it is on p's h3 chain: there is none. Its second word gets
+// DEAD_BIT (offB < 2^16 leaves the high half free).
+const DEAD_BIT: u32 = 0x10000u;
 
 // Candidate output index of (b, p).
 fn cand_index(b: u32, p: u32) -> u32 { return 2u * (b * BLOCK_SIZE + p); }
 
 @compute @workgroup_size(256)
-fn main_opt(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+fn main_opt(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     let b = gid.y;
-    // Explicitly zeroed (the poison test runs without workgroup zero-init).
-    if (lid < DEAD_TILE / 32u) { atomicStore(&dead_mask[lid], 0u); }
-    workgroupBarrier();
-    var w = vec2<u32>(0u);
-    if (p < PARSE_END) { w = cands_at(b, p); }
-    let dead = (w.y & DEAD_FLAG) != 0u;
-    if (dead) { atomicOr(&dead_mask[lid >> 5u], 1u << (lid & 31u)); }
-    workgroupBarrier();
-    var run = 0u;
-    if (dead) {
-        // The ones of the mask from bit lid on. Terminates: i rises to DEAD_TILE / 32 (or a word
-        // that is not all ones from bit sh ends the run).
-        var sh = lid & 31u;
-        for (var i = lid >> 5u; i < DEAD_TILE / 32u; i += 1u) {
-            let ones = countTrailingZeros(~(atomicLoad(&dead_mask[i]) >> sh));
-            let rest = 32u - sh;
-            run += min(ones, rest);
-            if (ones < rest) { break; }
-            sh = 0u;
-        }
-    }
     let o = cand_index(b, p);
-    best[o] = w.x;
-    best[o + 1u] = (w.y & ~DEAD_FLAG) | (run << 16u);
-}
-
-// p's dead flag in cands_at's second word (offB < 2^16).
-const DEAD_FLAG: u32 = 0x80000000u;
-
-// The candidate words of (b, p < PARSE_END): (w0, offB), with DEAD_FLAG when p is dead.
-fn cands_at(b: u32, p: u32) -> vec2<u32> {
+    if (p >= PARSE_END) {
+        best[o] = 0u;
+        best[o + 1u] = 0u;
+        return;
+    }
     let base = block_base(b);
     let mx = min(BLOCK_SIZE - p, SEARCH_CAP);
     let pw = base + (p >> 2u);
@@ -144,6 +115,6 @@ fn cands_at(b: u32, p: u32) -> vec2<u32> {
             }
         }
     }
-    let dead = a == 0u && q3 == PRED_NONE;
-    return vec2<u32>(select(0u, a | (best_len << 24u), a != 0u), off_b | select(0u, DEAD_FLAG, dead));
+    best[o] = select(0u, a | (best_len << 24u), a != 0u);
+    best[o + 1u] = off_b | select(0u, DEAD_BIT, a == 0u && q3 == PRED_NONE);
 }
