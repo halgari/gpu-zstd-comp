@@ -98,8 +98,10 @@ Details are in `docs/results/2026-09-30-m4pro.md`.
 - **Metal tuning:** two settings on the `metal-exp` branch (subgroup width 32, 32 K1
   workgroups) add 4–27 %. They are not on master yet.
 
-**GTX 1660 Super** (Windows 11, NVIDIA driver 595.97): builds and runs on Vulkan. It has not
-been benchmarked, because of the open bug below and because the machine is shared.
+**GTX 1660 Super** (Windows 11, Vulkan, Ryzen 5 7600X), same corpus, two verified runs each
+(`docs/results/2026-10-01-gtx1660s.md`): `lvl9s12seg` 552 MB/s, `lvl9seg` 370, `opt14` 95,
+`opt16` 58. The parse is 80 % of `opt16`'s time on this card. The fastest preset clears 1 Gbit but
+not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 
 ## What has been tested
 
@@ -123,7 +125,7 @@ been benchmarked, because of the open bug below and because the machine is share
 - **Intel Arc.**
 - **The common 8 GB NVIDIA cards** (RTX 3060, RTX 4060). Every number for them is a
   projection.
-- **Throughput on the GTX 1660 Super.**
+- **The CPU baseline on the GTX 1660 Super machine** (Ryzen 5 7600X).
 - **Linux distributions other than the dev machine's (Arch-based),** and other driver versions.
 - **Other Apple chips** (M1–M3, base M4).
 - **Block sizes other than 64 KiB in the throughput tables.** Ratios at 16 and 32 KiB are
