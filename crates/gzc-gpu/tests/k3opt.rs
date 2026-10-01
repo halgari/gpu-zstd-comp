@@ -16,9 +16,9 @@ use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{GpuParams, Kernels, frames_from_parses};
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::k3opt::{
-    K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, parses_from_cands,
-    parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass, time_passes,
-    workgroup_bytes,
+    K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, RingMem, SCHED_HDR, WEIGHT_STRIDE,
+    parses_from_cands, parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block, time_pass,
+    time_passes, workgroup_bytes,
 };
 
 fn cfg(level: u8, ring: RingMem, prices: PriceSrc) -> K3OptConfig {
@@ -473,6 +473,8 @@ fn k3opt_corpus() {
             cfg(0, RingMem::Workgroup, PriceSrc::BlockInit),
             cfg(2, RingMem::Private, PriceSrc::BlockInit),
             K3OptConfig { wg: 32, ..cfg(2, RingMem::Workgroup, PriceSrc::Buffer) },
+            K3OptConfig { grid: Some(37), ..cfg(2, RingMem::Workgroup, PriceSrc::BlockInit) },
+            K3OptConfig { persist: false, ..cfg(2, RingMem::Workgroup, PriceSrc::BlockInit) },
         ],
         None,
     );
@@ -521,7 +523,7 @@ fn k3opt_timing() {
                 if prices == PriceSrc::Buffer { "buffer" } else { "blockinit" },
                 if unbounded { "" } else { " checked" }
             );
-            let c = K3OptConfig { wg, ring: Some(ring), level, prices, unbounded, hist_out: false };
+            let c = K3OptConfig { wg, ring: Some(ring), level, prices, unbounded, hist_out: false, ..K3OptConfig::default() };
             (name, c)
         })
         .collect();
@@ -720,7 +722,54 @@ fn k3opt_passes_synthetic() {
         ..K3OptConfig::default()
     };
     check_passes(&ctx, &names, &blocks, &cands, &presets, wg32);
+    // M6 A4: the persistent passes with 3 workgroups (each runs several blocks, so every
+    // per-block state must follow the block, not the workgroup), and wg16 without persistence.
+    let looped = K3OptConfig { grid: Some(3), ..K3OptConfig::default() };
+    check_passes(&ctx, &names, &blocks, &cands, &schedules(), looped);
+    let plain = K3OptConfig { persist: false, ..K3OptConfig::default() };
+    check_passes(&ctx, &names, &blocks, &cands, &presets, plain);
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
+}
+
+/// The persistent passes' block order (M6 A4, `k3_sched.wgsl`): each block's weight (positions
+/// whose longest candidate is 3..32, every `WEIGHT_STRIDE`-th position) and the order, blocks by
+/// descending weight with ties by ascending block id. 600 blocks (3 tiles of the rank sort), each
+/// synthetic block several times (ties).
+#[test]
+fn k3opt_block_order() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = GpuContext::new().expect("GPU required");
+    let blocks: Vec<Vec<u8>> = synthetic_blocks().into_iter().map(|(_, b)| b).collect();
+    let cands = cands_of(&blocks);
+    let n = 600;
+    let pick = |i: usize| (i * 7 + i / 5) % blocks.len();
+    let refs: Vec<&[u8]> = (0..n).map(|i| blocks[pick(i)].as_slice()).collect();
+    let crefs: Vec<&[CandWords]> = (0..n).map(|i| cands[pick(i)].as_slice()).collect();
+    let k = K3Opt::new(&ctx, &OPT16, K3OptConfig::default()).expect("K3Opt::new");
+    assert!(k.persistent());
+    let bufs = OptBuffers::new(&ctx, &OPT16, n as u32).unwrap();
+    bufs.upload(&ctx, &refs, &crefs, None).unwrap();
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    k.record_order(&ctx, &mut enc, &bufs.binds(), n as u32, None).unwrap();
+    ctx.queue.submit([enc.finish()]);
+    let got: Vec<u32> = ctx.read_buffer(&bufs.sched, 0, SCHED_HDR as usize + 2 * n);
+    let weight = |c: &[CandWords]| -> u32 {
+        c.iter()
+            .step_by(WEIGHT_STRIDE as usize)
+            .filter(|w| {
+                let (a, b) = gzc_core::reference::unpack_cands(**w);
+                (3..=32).contains(&a.len.max(b.len))
+            })
+            .count() as u32
+    };
+    let want_w: Vec<u32> = crefs.iter().map(|c| weight(c)).collect();
+    let h = SCHED_HDR as usize;
+    assert_eq!(&got[h..h + n], &want_w[..], "weights");
+    let mut want_o: Vec<u32> = (0..n as u32).collect();
+    want_o.sort_by_key(|&i| (std::cmp::Reverse(want_w[i as usize]), i));
+    assert_eq!(&got[h + n..], &want_o[..], "order");
+    let distinct: std::collections::BTreeSet<u32> = want_w.iter().copied().collect();
+    assert!(distinct.len() > 3 && distinct.len() < n, "ties and distinct weights both present");
 }
 
 /// A block for the rep-length memo's edges (M6 A2/A3): random bytes overwritten with short copies
@@ -866,6 +915,9 @@ fn k3opt_passes_corpus() {
     let presets = [("opt16".to_string(), OPT16), ("opt14".to_string(), OPT14)];
     let private = K3OptConfig { ring: Some(RingMem::Private), ..K3OptConfig::default() };
     check_passes(&ctx, &names, &blocks, &cands, &presets, private);
+    // M6 A4: the persistent passes on 37 workgroups (about 7 blocks each per 256-block batch).
+    let looped = K3OptConfig { grid: Some(37), ..K3OptConfig::default() };
+    check_passes(&ctx, &names, &blocks, &cands, &presets, looped);
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
@@ -924,7 +976,7 @@ fn k3opt_passes_timing() {
         let span = t.pop().unwrap();
         let per: Vec<String> = t.iter().map(|&ms| format!("{:.2}", us(ms))).collect();
         eprintln!(
-            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup) [{}], total {:.2} us/block ({:.3} ms), span {:.2} us/block",
+            "{name}: {} blocks of {} KiB: us/block per pass (DP..., fixup, order) [{}], total {:.2} us/block ({:.3} ms), span {:.2} us/block",
             blocks.len(),
             BLOCK_SIZE / 1024,
             per.join(", "),

@@ -64,7 +64,16 @@
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, MAX_SEQS, SEG_LOG2, WG, SUFF
 // (sufficient_len), LEVEL (optLevel 0 | 2), PRICE_MODE, HIST_OUT, BI_LL / BI_ML / BI_OF
 // (block-init LL / ML / OF prices), PR_LL / PR_ML / PR_OF (prior-seed LL / ML / OF prices),
-// LL_BITS / ML_BITS / ML_CODE (codes.rs), and the price ring's declaration (ring_p, rix).
+// LL_BITS / ML_BITS / ML_CODE (codes.rs), DEAD_BIT (reference::DEAD_BIT), SCHED_HDR
+// (k3_sched.wgsl), and the price ring's declaration (ring_p, rix).
+//
+// Persistent passes (M6 A4, a07): with WG == NSEG the host runs the entry point main_opt_persist
+// instead of main_opt. The grid is the same (one workgroup per block), but each workgroup loops:
+// it takes the next item of the batch's heavy-first block order (k3_sched.wgsl) from a global
+// counter and runs prologue, DP and epilogue for that block, until the order is used up. An
+// NVIDIA Vulkan dispatch of this kernel larger than one wave runs as synchronous waves (each
+// pays its slowest block); the loop lets a free slot take the next block at once, heaviest first.
+// All per-block state is keyed by the block (gsg), not by the workgroup.
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;
@@ -119,8 +128,8 @@ const_assert WG % NSEG == 0u || NSEG % WG == 0u;
 // dead position), inside one the position only gets its literal extension. The rep-length memo
 // stays exact across a skipped search (its lengths hold at any later position of the segment,
 // see mem). (A run length per position, capped at K2opt's 256-position tiles, measured no faster
-// here and cost K2opt two workgroup barriers.)
-const DEAD_BIT: u32 = 0x10000u;
+// here and cost K2opt two workgroup barriers.) DEAD_BIT is injected by the host
+// (reference::DEAD_BIT), so the kernel and the oracle cannot drift apart.
 // Literal-only positions of a series folded into one trip (dp): measured on the optLevel-0
 // passes only (a09: the final pass is faster without; it has fewer `+128` skips).
 const FOLD: bool = LEVEL == 0u;
@@ -142,6 +151,9 @@ const_assert MIN_MATCH == 3u;
 // per lane (see six; lanes interleaved per slot measured 4 % slower, 16-byte nodes 0.5 %). Only
 // the price stays in ring_p.
 @group(0) @binding(6) var<storage, read_write> scr: array<u32>;
+// The batch's block schedule (k3_sched.wgsl; main_opt_persist only): the counter at word 0, the
+// order at SCHED_HDR + n.
+@group(0) @binding(7) var<storage, read_write> sched: array<atomic<u32>>;
 
 // zstd LL_Code for lit_len < 64 (codes::ll_code).
 const LL_CODE: array<u32, 64> = array<u32, 64>(
@@ -798,11 +810,40 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
 @compute @workgroup_size(WG)
 fn main_opt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     gsg = wid.x * WG + lid;
+    run_block();
+}
+
+// The lane's block (gsg): prologue, DP and (HIST_OUT) epilogue. Every lane of the workgroup calls
+// it (barriers).
+fn run_block() {
     prologue(in_batch(), block_id());
     if (in_batch()) { dp(); }
     // The epilogue's arguments are recomputed from gsg, not kept live across the DP (M6 A1).
     if (HIST_OUT) { hist_epilogue(in_batch(), block_id(), seg_id()); }
 }
+
+// The persistent entry point (see the header; WG == NSEG, one block per workgroup and item).
+// The item is broadcast through workgroup memory: workgroupUniformLoad's barrier also keeps a
+// lane from starting the next block's prologue (which rewrites the workgroup's tables) while
+// another lane still runs this block's DP.
+var<workgroup> next_item: u32;
+@compute @workgroup_size(WG)
+fn main_opt_persist(@builtin(local_invocation_index) lid: u32) {
+    let n = arrayLength(&counts) / 2u;
+    // Terminates: every trip takes a new counter value, and the trip with one >= n ends the loop.
+    loop {
+        if (lid == 0u) { next_item = atomicAdd(&sched[0], 1u); }
+        let item = workgroupUniformLoad(&next_item);
+        if (item >= n) { break; }
+        let b = atomicLoad(&sched[SCHED_HDR + n + item]);
+        // b < n < 2^30, so b >> 30 is 0. It keeps the lane opaque to the compiler, so the lane
+        // constants are recomputed from gsg in each trip instead of being hoisted out of the
+        // loop and held in registers (a07: 92 -> 138 registers without it).
+        gsg = b * WG + lid + (b >> 30u);
+        run_block();
+    }
+}
+const_assert !PERSIST || WG == NSEG;
 
 // Whether the lane's block is in the batch.
 fn in_batch() -> bool {
