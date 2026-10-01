@@ -233,3 +233,61 @@ fn opt_corpus_matches_oracle() {
         check_modes(&blocks, m, name, &want, 256);
     }
 }
+
+/// `gpu_supports` accepts the whole valid M6 option space (kernels take the options as injected
+/// constants, not per-value code paths). This sweep backs that up: a fixed pseudo-random spread
+/// of option combinations, each one byte-identical to the oracle end to end on the synthetic
+/// blocks. `GZC_SWEEP_N` sets the number of combinations (default 16).
+#[test]
+fn m6_option_sweep_matches_oracle_synthetic() {
+    use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
+    use gzc_gpu::compressor::gpu_supports;
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let blocks = synthetic_blocks();
+    let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let n: usize = std::env::var("GZC_SWEEP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = |k: u64| {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (x >> 33) % k
+    };
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let base = OPT16P1.opt.unwrap();
+    let mut tested = 0;
+    while tested < n {
+        let n_sparse = rnd(4) as usize;
+        let mut sparse = [None; 3];
+        for c in sparse.iter_mut().take(n_sparse) {
+            *c = Some(SparseChain {
+                width: 5 + rnd(8) as u32,
+                stride: [4u32, 8][rnd(2) as usize],
+                depth: [1u32, 3, 16, 64][rnd(4) as usize],
+            });
+        }
+        let prior = [PriorTables::M5, PriorTables::S3][rnd(2) as usize];
+        let seed = if prior == PriorTables::S3 { Seed::Prior } else { [Seed::BlockInit, Seed::Prior][rnd(2) as usize] };
+        let o = OptParams {
+            level: [0u8, 2][rnd(2) as usize],
+            target_length: [8u32, 16, 32][rnd(3) as usize],
+            passes: rnd(4) as u8,
+            seed,
+            prior,
+            sparse_chains: sparse,
+            inner_gap: [8u8, 3][rnd(2) as usize],
+            relax_lengths: [None, Some(1), Some(4), Some(32)][rnd(4) as usize],
+            drop_max_len: [0u8, 3, 6, 32][rnd(4) as usize],
+            ..base
+        };
+        let m = MatchParams { depth: [1u32, 8, 32, 64][rnd(4) as usize], opt: Some(o), ..OPT16P1 };
+        if m.validate().is_err() || !gpu_supports(&m) {
+            continue;
+        }
+        let want = oracle(&blocks, m);
+        let kf = Kernels::new(&ctx, GpuParams { matching: m, emit_frames: true, huffman: true }).unwrap();
+        let frames = compress_frames(&ctx, &kf, &refs).unwrap();
+        for (i, (got, (_, w))) in frames.iter().zip(&want).enumerate() {
+            assert!(got == w, "sweep {tested} {m:?}: block {i}: GPU frame != oracle frame");
+        }
+        tested += 1;
+    }
+}
