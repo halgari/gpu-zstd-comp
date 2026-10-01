@@ -43,9 +43,11 @@
 //! logs in `docs/results/m5-log.md`). Residency (M6 A1): at 64 KiB a wg16 pass kernel needs at
 //! most 4064 B of workgroup memory (`workgroup_bytes`; the final pass 3044 B) and 74..76
 //! registers (`vkstats`, M6 A3), so an RTX 5090 holds its cap of 24 workgroups per SM: one wave is 4080
-//! blocks (measured). A change that raises registers or workgroup memory past that cap splits a
-//! batch above about 3600 blocks into two waves (+40 % K3 time); check `vkstats` on every pass
-//! kernel (`GZC_DUMP_WGSL` writes the composed modules).
+//! blocks (measured). The persistent passes (M6 A4, `K3OptConfig::persist`, the default at wg16)
+//! need 4 B more and 80 (final) / 85..86 (cheap) registers: 23 cheap-pass workgroups per SM
+//! (3910 blocks resident), but a batch beyond that has no second-wave cliff (the loop takes the
+//! remaining blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
+//! `vkstats` on every pass kernel after a change (`GZC_DUMP_WGSL` writes the composed modules).
 use crate::compressor::{
     BatchBuffers, K3_FIXUP_WGSL, best_bytes_for, counts_bytes, data_bytes, decode_output, seqs_bytes_for, trace_bytes,
 };
