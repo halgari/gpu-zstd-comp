@@ -31,7 +31,7 @@ no GPU decompression, and blocks never reference each other.
 
 ## Performance: RTX 5090 vs Ryzen 9 9950X3D
 
-Measured 2026-10-01 at commit `ba061ce` on one Linux machine: an RTX 5090 (Vulkan, driver 610)
+Measured 2026-10-01 at commit `ba061ce` (`opt14`/`opt16` rows re-measured at `d75bebd` on branch `m6`, after the M6 Track A kernel work: `docs/results/2026-10-01-m6-trackA.md`) on one Linux machine: an RTX 5090 (Vulkan, driver 610)
 and a Ryzen 9 9950X3D (16 cores, 32 threads).
 
 - **Corpus:** the full corpus, `--ext dds,nif`: 3172 files, 6.49 GB, 100,754 blocks of 64 KiB.
@@ -54,8 +54,8 @@ and a Ryzen 9 9950X3D (16 cores, 32 threads).
 | `lvl9s12` | 6,217 | 1.33927 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
 | `lvl9s12seg` | **10,396** | 1.33926 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
 | `lvl9s12d16seg` | 11,086 | 1.33860 | L9 | 731 / 1,420 / 1,747 | 1.33786 |
-| `opt14` | 1,809 (2,260 at batch 2900) | 1.37064 | L14 | 224 / 415 / 590 | 1.36827 |
-| `opt16` | 1,116 (1,464 at batch 2900) | 1.37144 | L16 | 190 / 384 / 501 | 1.37100 |
+| `opt14` | 2,935 (2,862 at batch 2900) | 1.37064 | L14 | 224 / 415 / 590 | 1.36827 |
+| `opt16` | 2,003 (1,914 at batch 2900) | 1.37144 | L16 | 190 / 384 / 501 | 1.37100 |
 
 How to read it:
 
