@@ -207,24 +207,38 @@ fn k3opt_ring_choice() {
     let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
     let tables = need - ring_bytes(auto.wg, target);
-    if BLOCK_SIZE == 65536 {
-        // M6 A1: at most 4266 B per wg16 workgroup on every pass kernel (24 resident blocks per
-        // SM on an RTX 5090 with 100 KB of shared memory, so a 4080-block batch is one wave).
-        // The final pass declares no histogram: 1 KiB less than the cheap passes.
-        for (level, prices, hist_out) in [
-            (0, PriceSrc::BlockInit, true),
-            (0, PriceSrc::Prior, true),
-            (0, PriceSrc::Hist, true),
-            (2, PriceSrc::Hist, false),
-            (2, PriceSrc::BlockInit, false),
-            (2, PriceSrc::Buffer, false),
-        ] {
-            let c = K3OptConfig { level, prices, hist_out, ..auto };
-            let b = workgroup_bytes(&OPT16, &c);
-            assert!(b <= 4266, "{c:?}: wg16 workgroup footprint {b} B > 4266");
-            if !hist_out && prices == PriceSrc::Hist {
-                assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
+    // M6 A1: the wg16 footprint of every pass kernel. 64 KiB: at most 4266 B (24 resident blocks
+    // per SM on an RTX 5090 with 100 KB of shared memory, so a 4080-block batch is one wave), the
+    // final pass (no histogram) 1020 B below its cheap-pass twin. 16 KiB (4 blocks per
+    // workgroup): 9920 B for a pass that declares the histogram, 5828 B for the final pass,
+    // 5752 B with Buffer prices. Every kernel within 16384 B (WebGPU's minimum limit).
+    for (level, prices, hist_out) in [
+        (0, PriceSrc::BlockInit, true),
+        (0, PriceSrc::Prior, true),
+        (0, PriceSrc::Hist, true),
+        (2, PriceSrc::Hist, false),
+        (2, PriceSrc::BlockInit, false),
+        (2, PriceSrc::Buffer, false),
+    ] {
+        let c = K3OptConfig { level, prices, hist_out, ..auto };
+        let b = workgroup_bytes(&OPT16, &c);
+        assert!(b <= 16384, "{c:?}: wg16 workgroup footprint {b} B > 16384");
+        match BLOCK_SIZE {
+            65536 => {
+                assert!(b <= 4266, "{c:?}: wg16 workgroup footprint {b} B > 4266");
+                if !hist_out && prices == PriceSrc::Hist {
+                    assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
+                }
             }
+            16384 => {
+                let want = match (prices, hist_out) {
+                    (PriceSrc::Hist, false) => 5828,
+                    (PriceSrc::Buffer, _) => 5752,
+                    _ => 9920,
+                };
+                assert_eq!(b, want, "{c:?}: wg16 workgroup footprint {b} B at 16 KiB");
+            }
+            _ => {}
         }
     }
     assert_eq!(ring_for(&OPT16, &auto, need).unwrap(), RingMem::Workgroup);
