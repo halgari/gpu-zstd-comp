@@ -135,6 +135,7 @@ fn scan_positions(a: usize) -> Vec<usize> {
 /// rep repeat at cand + 1 after a first match set offset_1.
 #[test]
 fn scan_finds_exactly_the_skip_sequence() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for p in scan_positions(0) {
         cases.push(Case::random(format!("explicit@{p}"), p as u64).explicit(p, (17 + p % 5).min(p), 8, 8).done());
@@ -155,6 +156,7 @@ fn scan_finds_exactly_the_skip_sequence() {
 /// not serve as the deferral window), then a longer match at P + 1 or P + 2 the deferral takes.
 #[test]
 fn deferral_after_a_wide_step_scan() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for p in [258usize, 260, 300, 330, 512, 515, 600, 702] {
         for d in [1usize, 2] {
@@ -173,6 +175,7 @@ fn deferral_after_a_wide_step_scan() {
 /// greedy parse must not test the rep offset (it only does for p > anchor).
 #[test]
 fn match_shorter_than_its_repeat() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for blen in [4u32, 5, 6, 8, 12] {
         for real in [blen as usize + 4, blen as usize + 5, 40] {
@@ -195,6 +198,7 @@ fn match_shorter_than_its_repeat() {
 /// oracle visits them.
 #[test]
 fn scan_restarts_mid_regime() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for restart in [300usize, 302, 450, 480, 494, 496, 508, 510] {
         for real in [0usize, 2] {
@@ -223,6 +227,7 @@ fn scan_restarts_mid_regime() {
 /// count no trailing literals then (since S4 the sequential one no longer wraps its count).
 #[test]
 fn anchor_past_block_end_terminates() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for (ip, len) in [(PARSE_END - 1, 40u32), (PARSE_END - 30, 63), (BLOCK_SIZE - 60, 62)] {
         let mut c = Case::random(format!("match at {ip} len {len}"), ip as u64);
@@ -258,6 +263,7 @@ fn anchor_past_block_end_terminates() {
 /// neighbour's first word.
 #[test]
 fn full_literal_region_next_to_other_blocks() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
     let mut r = Lcg(99);
     for i in 0..8 {
@@ -283,6 +289,7 @@ fn full_literal_region_next_to_other_blocks() {
 /// T1, MIN_MATCH 6: planted best lengths 4 and 5 are no match, 6 is.
 #[test]
 fn scan_respects_min_match() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for p in scan_positions(0).into_iter().step_by(3) {
         for len in [4u32, 5, 6] {
@@ -297,6 +304,7 @@ fn scan_respects_min_match() {
 /// T2: scans and matches at PARSE_END, with poisoned best[] entries at and past it.
 #[test]
 fn scan_and_matches_at_parse_end() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let poison = |c: &mut Case| {
         for p in PARSE_END..BLOCK_SIZE - 4 {
             c.best[p] = Match { offset: 1, len: 4 };
@@ -342,6 +350,7 @@ fn scan_and_matches_at_parse_end() {
 /// around the lane-window multiples and up to (and just short of) the block end.
 #[test]
 fn capped_extension_geometry() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut lens: Vec<usize> = vec![2, 5, CAP as usize, 300, 1000];
     for w in WIDTHS {
         lens.extend([4 * w - 1, 4 * w, 4 * w + 1, 4 * w + 3, 8 * w, 8 * w + 5]);
@@ -374,6 +383,7 @@ fn capped_extension_geometry() {
 /// T4: rep1 repeats at ip + 1 of lengths around the lane windows; immediate offset_2 chains.
 #[test]
 fn rep_lengths_and_immediate_chains() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut lens: Vec<usize> = vec![4, 5, 64, 200];
     for w in WIDTHS {
         lens.extend([4 * w - 1, 4 * w, 4 * w + 1]);
@@ -409,6 +419,7 @@ fn rep_lengths_and_immediate_chains() {
 /// source, and stopped by a mismatch in the middle.
 #[test]
 fn catch_up_bounds() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut cases = Vec::new();
     for w in WIDTHS {
         for b in [1, w - 1, w, w + 1, 2 * w + 3] {
@@ -454,6 +465,7 @@ fn catch_up_bounds() {
 /// T6: literal runs of every length class at every accumulator phase.
 #[test]
 fn literal_packing() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut gaps: Vec<usize> = vec![0, 1, 2, 3, 4, 5, 7];
     for w in WIDTHS {
         gaps.extend([4 * w - 1, 4 * w, 4 * w + 1, 8 * w + 3]);
@@ -492,6 +504,7 @@ fn literal_packing() {
 /// boundary, the byte tail at the end).
 #[test]
 fn flat_and_periodic_blocks() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let mut blocks: Vec<(String, Vec<u8>)> = vec![("zeros".into(), vec![0; BLOCK_SIZE])];
     let mut r = Lcg(7);
     for period in [1usize, 2, 3, 4, 8, 16] {
@@ -524,6 +537,7 @@ fn flat_and_periodic_blocks() {
 /// of two subgroups; every preset uses the cooperative K3 by default when subgroups exist.
 #[test]
 fn probe_and_mode_selection() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     if !ctx.subgroups {
         eprintln!("no subgroup support: sequential K3 only");

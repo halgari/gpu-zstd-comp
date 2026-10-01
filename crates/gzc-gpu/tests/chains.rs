@@ -74,6 +74,7 @@ fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
 
 #[test]
 fn gpu_preds_match_cpu_all_blocks_one_batch() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     // The Dfast chains are the long- and short-hash preds, in that order.
     let block = &all_blocks()[0].1;
     assert_eq!(chains(block, &LVL3), vec![compute_preds(block, hash_long), compute_preds(block, hash_short)]);
@@ -84,6 +85,7 @@ fn gpu_preds_match_cpu_all_blocks_one_batch() {
 
 #[test]
 fn gpu_preds_match_cpu_batch_of_one() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     for ctx in contexts() {
         for b in all_blocks() {
             check(&ctx, std::slice::from_ref(&b), &LVL3);
@@ -95,6 +97,7 @@ fn gpu_preds_match_cpu_batch_of_one() {
 /// (4 is rung1's; 8 takes the mask(4) = 0xFFFFFFFF branch).
 #[test]
 fn k1_single_hash_preds_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let blocks = all_blocks();
     let block = &blocks[0].1;
     assert_eq!(chains(block, &RUNG1), vec![compute_preds(block, |b: &[u8], p: usize| hash_width(b, p, 4))]);
@@ -113,6 +116,7 @@ fn k1_single_hash_preds_match_cpu() {
 /// The Opt3 chains (optimal-parse presets): the 4-byte chain, then zstd's 3-byte hash3 chain.
 #[test]
 fn k1_opt3_preds_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     // opt16 only implements at blocks of at most 64 KiB.
     if gzc_core::config::LOG2_BLOCK > 16 {
         return;
@@ -136,6 +140,7 @@ fn k1_opt3_preds_match_cpu() {
 /// suitable sizes (`ChainsKernel::subgroup_kernel_possible`; not Metal, which reports 4..=64).
 #[test]
 fn k1_kernel_follows_context() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     for ctx in contexts() {
         let i = &ctx.adapter_info;
         eprintln!("{}: subgroups {} (sizes {}..={})", i.name, ctx.subgroups, i.subgroup_min_size, i.subgroup_max_size);
@@ -162,6 +167,7 @@ fn run_check(ctx: &GpuContext, kernel: &ChainsKernel, params: &MatchParams, bloc
 /// path for subgroups wider than 32 lanes.
 #[test]
 fn k1_head_reuse_across_dispatches() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let blocks = all_blocks();
     for ctx in contexts() {
         let cap = blocks.len() as u32;
@@ -193,6 +199,7 @@ fn k1_head_reuse_across_dispatches() {
 /// dispatches on their own head buffers; neither may disturb the other.
 #[test]
 fn k1_two_contexts_interleaved() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let blocks = all_blocks();
     let ctxs = [GpuContext::new().unwrap(), GpuContext::new().unwrap()];
     let bufs: Vec<(wgpu::Buffer, wgpu::Buffer)> = ctxs
@@ -216,6 +223,7 @@ fn k1_two_contexts_interleaved() {
 /// Dfast (both chains carry the position's fingerprint), Single and Opt3.
 #[test]
 fn k1_pred_words_carry_fingerprints() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let blocks = all_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let packed = pack_blocks(&refs);
@@ -254,6 +262,7 @@ fn k1_pred_words_carry_fingerprints() {
 /// right chains.
 #[test]
 fn k1_failed_self_test_falls_back() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().unwrap();
     if !ChainsKernel::subgroup_kernel_possible(&ctx) {
         return;
@@ -284,6 +293,7 @@ fn pack_blocks_appends_zero_word() {
 /// sorted finder (whenever one of its versions fits the device), else as the chain kernels.
 #[test]
 fn sorted_finder_kernel_names() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     use gzc_core::params::LVL9S12;
     use gzc_gpu::compressor::{GpuParams, Kernels};
     use gzc_gpu::sorted::workgroup_bytes;
@@ -303,6 +313,7 @@ fn sorted_finder_kernel_names() {
 /// The chains of a short key (`MatchParams::hash_bits`), from both K1 kernels.
 #[test]
 fn chains_over_short_keys() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     for ctx in contexts() {
         for params in [MatchParams { hash_bits: 13, ..LVL9 }, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }] {
             let blocks = all_blocks();
@@ -322,6 +333,7 @@ fn chains_over_short_keys() {
 /// its subgroup version exactly when the device has subgroups of >= 32 lanes.
 #[test]
 fn sorted_k1_matches_bucket_sort() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     use gzc_core::params::LVL9S12;
     use gzc_gpu::sorted::{SortKernel, sorted_words, workgroup_bytes};
     let blocks = all_blocks();

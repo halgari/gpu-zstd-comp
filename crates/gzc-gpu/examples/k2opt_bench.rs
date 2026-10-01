@@ -79,10 +79,10 @@ fn main() -> anyhow::Result<()> {
     let cap = batch as u32;
     // lvl9: the production K1 + K2 (Kernels, K3 recorded too but not counted).
     let lvl9 = Kernels::new(&ctx, GpuParams { matching: LVL9, emit_frames: false, huffman: false })?;
-    let lvl9_bufs = BatchBuffers::new(&ctx, cap, false, &LVL9);
+    let lvl9_bufs = BatchBuffers::new(&ctx, cap, false, &LVL9).unwrap();
     // lvl3 (Dfast): the other two-chain K1, for reference.
     let lvl3 = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: false, huffman: false })?;
-    let lvl3_bufs = BatchBuffers::new(&ctx, cap, false, &LVL3);
+    let lvl3_bufs = BatchBuffers::new(&ctx, cap, false, &LVL3).unwrap();
     // opt16: K1 (Opt3) + K2opt.
     let opt = OptCandKernel::new(&ctx, &OPT16)?;
     let data = ctx.storage_buffer("data", data_bytes(cap), false);

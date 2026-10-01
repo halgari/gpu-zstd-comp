@@ -498,6 +498,7 @@ mod tests {
     /// instance), also when a clone of the queue outlives the context.
     #[test]
     fn context_with_transfer_queue_drops_cleanly() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let tq = ctx.transfer.clone();
         drop(ctx);

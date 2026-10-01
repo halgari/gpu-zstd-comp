@@ -57,6 +57,8 @@ pub struct GpuContext {
     pub direct_upload: bool,
     /// Other GPUs' semantics emulated in every shader module (`GpuOptions::emulate`).
     pub emulate: Emulation,
+    /// Set by the device-lost callback (`device_lost`).
+    lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
@@ -205,7 +207,20 @@ impl Prepared {
     }
 
     pub fn context(&self, device: wgpu::Device, queue: wgpu::Queue) -> GpuContext {
+        // wgpu-core reports a device loss only through this callback: errors of the lost type
+        // (the hal error that lost the device, e.g. a Metal counter sample buffer that could not
+        // be created, and every later `create_buffer` on it) reach no error scope and no
+        // uncaptured-error handler; they leave invalid objects that fail much later.
+        let lost = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            let mut g = sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.get_or_insert_with(|| {
+                if message.is_empty() { format!("{reason:?}") } else { format!("{reason:?}: {message}") }
+            });
+        });
         GpuContext {
+            lost,
             device,
             queue,
             adapter_info: self.info.clone(),
@@ -292,6 +307,72 @@ impl Prepared {
 }
 
 impl GpuContext {
+    /// Why the device was lost (reason and wgpu's message), once it is.
+    pub fn device_lost(&self) -> Option<String> {
+        self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Wait for the GPU with non-blocking polls only (`PollType::Poll`), never `PollType::Wait`:
+    /// on Metal. wgpu-hal 30's Metal `Device::wait` can fail with a spurious `DeviceError::Lost`
+    /// (which loses the device) when it runs while another thread is inside `queue.submit` (see
+    /// `pipeline::Completion::poll_only`); a non-blocking poll never calls it.
+    pub(crate) fn poll_only(&self) -> bool {
+        self.adapter_info.backend == wgpu::Backend::Metal
+    }
+
+    /// Waits for the callback behind `rx` (a buffer map or a submitted-work-done callback, which
+    /// fires once `submission` completes; `None`: all submitted work) and returns its value.
+    /// With `poll_only` it polls without blocking (every 200 µs) instead of `PollType::Wait`, and
+    /// gives up once the device is lost.
+    pub(crate) fn wait_callback<T>(
+        &self,
+        rx: &std::sync::mpsc::Receiver<T>,
+        submission: Option<wgpu::SubmissionIndex>,
+        poll_only: bool,
+    ) -> anyhow::Result<T> {
+        use std::sync::mpsc::RecvTimeoutError;
+        if let Ok(r) = rx.try_recv() {
+            return Ok(r);
+        }
+        if !poll_only {
+            let wait = match submission {
+                Some(s) => wgpu::PollType::Wait { submission_index: Some(s), timeout: None },
+                None => wgpu::PollType::wait_indefinitely(),
+            };
+            self.device.poll(wait).context("device poll")?;
+            return rx.recv().context("wgpu callback dropped");
+        }
+        loop {
+            self.device.poll(wgpu::PollType::Poll).context("device poll")?;
+            match rx.recv_timeout(std::time::Duration::from_micros(200)) {
+                Ok(r) => return Ok(r),
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(why) = self.device_lost() {
+                        anyhow::bail!("GPU device lost: {why}");
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => anyhow::bail!("wgpu callback dropped"),
+            }
+        }
+    }
+
+    /// Waits until all work submitted so far is done: `PollType::Wait`, or with `poll_only`
+    /// non-blocking polls until a submitted-work-done callback fires (`wait_callback`).
+    pub(crate) fn wait_idle(&self, poll_only: bool) -> anyhow::Result<()> {
+        if !poll_only {
+            self.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.queue.on_submitted_work_done(move || {
+            let _ = tx.send(());
+        });
+        self.wait_callback(&rx, None, true)?;
+        // Deliver the map callbacks of the work just completed, as `PollType::Wait` would have.
+        self.device.poll(wgpu::PollType::Poll).context("device poll")?;
+        Ok(())
+    }
+
     /// One line naming the adapter and what the context runs with, e.g.
     /// `adapter: NVIDIA GeForce RTX 5090 (Vulkan, driver NVIDIA 610.57.04); subgroups: on (32..=32);
     /// timestamps: on; direct upload: on; transfer queue: on; pack: off; workgroup storage: 49152 B`.
@@ -422,8 +503,7 @@ impl GpuContext {
 
         let (tx, rx) = std::sync::mpsc::channel();
         staging.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
-        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
-        rx.recv().unwrap().expect("map readback buffer");
+        self.wait_callback(&rx, None, self.poll_only()).expect("device poll").expect("map readback buffer");
         {
             let view = staging.get_mapped_range(..).expect("mapped range");
             bytemuck::cast_slice_mut::<T, u8>(&mut out).copy_from_slice(&view[..bytes as usize]);
@@ -494,4 +574,69 @@ pub fn pack_blocks(blocks: &[&[u8]]) -> Vec<u32> {
     }
     out.push(0);
     out
+}
+
+/// wgpu out-of-memory and validation error scopes, pushed together on this thread and popped
+/// together (wgpu 30's scopes are per thread: push and pop them on the thread doing the work).
+/// Popping also reports a device lost meanwhile: wgpu-core hands errors of that type to no scope.
+pub(crate) struct ErrorScopes<'c> {
+    // Fields drop in declaration order and wgpu requires scopes to pop in reverse push order:
+    // `validation` (pushed last) must come first, so an early return drops them correctly.
+    validation: wgpu::ErrorScopeGuard,
+    oom: wgpu::ErrorScopeGuard,
+    ctx: &'c GpuContext,
+}
+
+/// What `ErrorScopes` caught, first one first.
+enum ScopeError {
+    Validation(String),
+    Oom(String),
+    Lost(String),
+}
+
+impl<'c> ErrorScopes<'c> {
+    pub(crate) fn push(ctx: &'c GpuContext) -> Self {
+        let oom = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        Self { validation, oom, ctx }
+    }
+
+    /// The first captured error (validation before out-of-memory), else a device loss.
+    pub(crate) fn pop(self) -> anyhow::Result<()> {
+        match self.take() {
+            None => Ok(()),
+            Some(ScopeError::Validation(e)) => Err(anyhow!("wgpu validation error: {e}")),
+            Some(ScopeError::Oom(e)) => Err(anyhow!("wgpu out of memory: {e}")),
+            Some(ScopeError::Lost(why)) => Err(anyhow!("GPU device lost: {why}")),
+        }
+    }
+
+    /// `pop` for a constructor that allocated `bytes` of buffers for `what`: the error names the
+    /// allocation (and wgpu's message the failing buffer's label).
+    pub(crate) fn pop_alloc(self, what: &str, bytes: u64) -> anyhow::Result<()> {
+        const HINT: &str = "try a smaller --batch or --vram-budget-mb";
+        let mib = bytes.div_ceil(1 << 20);
+        match self.take() {
+            None => Ok(()),
+            Some(ScopeError::Oom(e)) => {
+                Err(anyhow!("GPU allocation of {mib} MiB for {what} failed: out of memory ({HINT}): {e}"))
+            }
+            Some(ScopeError::Validation(e)) => {
+                Err(anyhow!("GPU allocation of {mib} MiB for {what} failed ({HINT}): {e}"))
+            }
+            Some(ScopeError::Lost(why)) => Err(anyhow!("GPU device lost while allocating {mib} MiB for {what}: {why}")),
+        }
+    }
+
+    fn take(self) -> Option<ScopeError> {
+        let Self { validation, oom, ctx } = self;
+        // A validation error's Display is wgpu's full description; an out-of-memory one's is
+        // just "Out of Memory": its source chain names the failing call and the object's label.
+        let validation = pollster::block_on(validation.pop()).map(|e| e.to_string());
+        let oom = pollster::block_on(oom.pop()).map(|e| format!("{:#}", anyhow::Error::new(e)));
+        validation
+            .map(ScopeError::Validation)
+            .or(oom.map(ScopeError::Oom))
+            .or_else(|| ctx.device_lost().map(ScopeError::Lost))
+    }
 }
