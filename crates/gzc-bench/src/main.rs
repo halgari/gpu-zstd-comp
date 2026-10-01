@@ -47,17 +47,9 @@ fn parse_preset(name: &str) -> Result<Preset, String> {
 fn check_presets(presets: &[Preset], cpu: bool, gpu: bool) -> anyhow::Result<()> {
     for p in presets {
         anyhow::ensure!(!cpu || cpu_supports(&p.params), "preset '{}' is not implemented yet on cpu", p.name);
-        anyhow::ensure!(!gpu || gpu_implements(&p.params), "preset '{}' is not implemented yet on gpu", p.name);
+        anyhow::ensure!(!gpu || gpu_supports(&p.params), "preset '{}' is not implemented yet on gpu", p.name);
     }
     Ok(())
-}
-
-/// `gpu_supports`, minus the M6 optimal-parse options (`OptParams::is_m5` false: sparse chains,
-/// S3 prior, gap3, relaxation pruning, drop pass; preset `opt16p1`), which the oracle has but the
-/// GPU kernels do not implement yet (M6 B2/B3). `gpu_supports` only validates the params, so
-/// without this the GPU would run such a preset with M5 kernels and differ from the oracle.
-fn gpu_implements(p: &MatchParams) -> bool {
-    gpu_supports(p) && p.opt.is_none_or(|o| o.is_m5())
 }
 
 #[derive(Parser)]
@@ -115,7 +107,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1; opt16p1 on the cpu only for now).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -218,7 +210,7 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1; opt16p1 on the cpu only for now).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
@@ -236,7 +228,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1; opt16p1 on the cpu only for now).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -599,15 +591,12 @@ mod tests {
         let all_at_this_block: Vec<Preset> =
             all.iter().copied().filter(|p| p.params.opt.is_none() || gzc_core::config::LOG2_BLOCK <= 16).collect();
         assert!(check_presets(&all_at_this_block, true, false).is_ok(), "the cpu implements every preset");
-        // M5 T5: the GPU implements the optimal parse too (blocks of at most 64 KiB), but not
-        // yet the M6 options (opt16p1).
-        let m5: Vec<Preset> = all_at_this_block.iter().copied().filter(|p| p.params.opt.is_none_or(|o| o.is_m5())).collect();
-        assert!(check_presets(&m5, true, true).is_ok(), "cpu and gpu implement every M5 preset");
+        // M5 T5: the GPU implements the optimal parse too (blocks of at most 64 KiB), and since
+        // M6 B4 the M6 options (opt16p1).
+        assert!(check_presets(&all_at_this_block, true, true).is_ok(), "cpu and gpu implement every preset");
         if gzc_core::config::LOG2_BLOCK <= 16 {
             let p1 = parse_preset("opt16p1").unwrap();
-            assert!(check_presets(&[p1], true, false).is_ok(), "the cpu implements opt16p1");
-            let err = check_presets(&[p1], false, true).unwrap_err().to_string();
-            assert!(err.contains("opt16p1") && err.contains("gpu"), "{err}");
+            assert!(check_presets(&[p1], true, true).is_ok(), "cpu and gpu implement opt16p1");
         }
         // opt16 only runs on the gpu at blocks of at most 64 KiB.
         if gzc_core::config::LOG2_BLOCK <= 16 {
@@ -623,7 +612,7 @@ mod tests {
     /// buffers (≈ 1.82 at b1000, where the `head` tables weigh more), so 3458 blocks (copy upload).
     #[test]
     fn resolve_max_batch_shrinks_for_opt() {
-        use gzc_core::params::{LVL9S12SEG, OPT14, OPT16};
+        use gzc_core::params::{LVL9S12SEG, OPT14, OPT16, OPT16P1};
         let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
         let lvl = resolve_max_batch(LVL9S12SEG, inflight, budget_mb, device_max, false).unwrap();
         let o16 = resolve_max_batch(OPT16, inflight, budget_mb, device_max, false).unwrap();
@@ -637,6 +626,14 @@ mod tests {
             let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
             assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
             assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
+        }
+        // M6 opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB at
+        // 64 KiB), so `max` resolves lower: 3125 blocks at 64 KiB.
+        let p1 = resolve_max_batch(OPT16P1, inflight, budget_mb, device_max, false).unwrap();
+        let fits = |b: u32| vram_bytes(&sweep_cfg(OPT16P1, b, inflight)).div_ceil(1 << 20) <= budget_mb;
+        assert!(p1 < o16 && fits(p1) && !fits(p1 + 1), "opt16p1 {p1}, opt16 {o16}");
+        if gzc_core::config::BLOCK_SIZE == 65536 {
+            assert_eq!(p1, 3125, "opt16p1 --batch max at 6 GiB, i3");
         }
     }
 

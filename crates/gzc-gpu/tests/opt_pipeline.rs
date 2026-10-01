@@ -1,22 +1,22 @@
-//! M5 T5: the optimal-parse presets (`opt14`, `opt16`) through the full GPU pipeline (K1 Opt3
-//! chains → K2opt → the K3opt passes → K5 → K4), byte-identical to the CPU oracle
+//! M5 T5: the optimal-parse presets (`opt14`, `opt16`, and since M6 B4 `opt16p1`) through the
+//! full GPU pipeline (K1 Opt3 chains, plus opt16p1's three sparse chains → K2opt → the K3opt
+//! passes, then opt16p1's drop pass → K5 → K4), byte-identical to the CPU oracle
 //! (`reference::compress_block` + `write_frame`) on synthetic blocks and on real corpus blocks, in
 //! every upload/readback mode the adapter has. Run once more with `GZC_NO_SUBGROUPS=1` for the
-//! subgroup-less kernels, and in a `block-16k` build for 16 KiB blocks.
-//! opt14/opt16 only implement at blocks of at most 64 KiB, so this whole file is skipped in a
-//! `block-128k` build.
+//! subgroup-less kernels. The optimal parse only implements at blocks of at most 64 KiB, so this
+//! whole file is skipped in a `block-128k` build.
 #![cfg(not(feature = "block-128k"))]
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
-use gzc_core::params::{MatchParams, OPT14, OPT16};
+use gzc_core::params::{MatchParams, OPT14, OPT16, OPT16P1};
 use gzc_core::reference::compress_block;
 use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{GpuParams, Kernels, compress_batch, compress_frames, max_seqs};
 use gzc_gpu::context::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
-const OPT_PRESETS: [(&str, MatchParams); 2] = [("opt14", OPT14), ("opt16", OPT16)];
+const OPT_PRESETS: [(&str, MatchParams); 3] = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
 
 fn synthetic_blocks() -> Vec<Vec<u8>> {
     gzc_core::synth::test_cases().into_iter().flat_map(|(_, bytes)| chunk_file(&bytes)).map(|b| b.data).collect()
@@ -121,6 +121,50 @@ fn opt_matches_oracle_synthetic() {
     }
 }
 
+/// M6 B4: `gpu_supports` accepts the M6 options at every valid value (sparse chains of stride 4 or
+/// 8), not just opt16p1's. A few such combinations through `compress_frames` on synthetic blocks:
+/// frames equal the oracle's.
+#[test]
+fn m6_variants_match_oracle_synthetic() {
+    use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
+    use gzc_gpu::compressor::gpu_supports;
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let blocks = synthetic_blocks();
+    let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let p1 = OPT16P1.opt.unwrap();
+    let o16 = OPT16.opt.unwrap();
+    let variants = [
+        // opt16's schedule and candidates with the longest drop and the tightest pruning.
+        ("opt16 drop32 top1", MatchParams { opt: Some(OptParams { drop_max_len: 32, relax_lengths: Some(1), inner_gap: 3, ..o16 }), ..OPT16 }),
+        // Two sparse chains at stride 8, a cheap pass, the M5 prior, drop 3.
+        (
+            "s8 x1 m5prior drop3",
+            MatchParams {
+                opt: Some(OptParams {
+                    passes: 1,
+                    seed: Seed::Prior,
+                    prior: PriorTables::M5,
+                    sparse_chains: [Some(SparseChain { width: 5, stride: 8, depth: 3 }), Some(SparseChain { width: 9, stride: 8, depth: 64 }), None],
+                    drop_max_len: 3,
+                    relax_lengths: Some(32),
+                    ..p1
+                }),
+                ..OPT16P1
+            },
+        ),
+    ];
+    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    for (name, m) in variants {
+        assert!(gpu_supports(&m), "{name}");
+        let want = oracle(&blocks, m);
+        let kf = Kernels::new(&ctx, GpuParams { matching: m, emit_frames: true, huffman: true }).unwrap();
+        let frames = compress_frames(&ctx, &kf, &refs).unwrap();
+        for (i, (got, (_, w))) in frames.iter().zip(&want).enumerate() {
+            assert!(got == w, "{name}: block {i}: GPU frame != oracle frame");
+        }
+    }
+}
+
 /// Up to `n` corpus blocks sampled uniformly over the whole corpus (`GZC_CORPUS`, default
 /// `data/corpus`, `.dds`/`.nif`): every k-th of all (file, block) pairs, files in sorted path
 /// order, k = total blocks / n (as `tests/k3opt.rs`). `None` (after a message) when the corpus
@@ -173,7 +217,7 @@ fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
 }
 
 /// Informal (reads the real corpus): `GZC_CORPUS_BLOCKS` (default 4000) uniform-stride corpus
-/// blocks, opt14 and opt16, through the pipeline in every mode (batch 256, a partial last batch):
+/// blocks, opt14, opt16 and opt16p1, through the pipeline in every mode (batch 256, a partial last batch):
 /// frames byte-identical to the oracle's.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test opt_pipeline -- --ignored --nocapture`
 #[test]

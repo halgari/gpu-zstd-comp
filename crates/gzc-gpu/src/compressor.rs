@@ -104,11 +104,13 @@ pub struct GpuParams {
 
 /// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes, greedy,
 /// lazy and lazy2 since M4 Task 5; the M5 optimal parse, presets `opt14`/`opt16`, with K2opt and
-/// the K3opt passes since M5 T5, at blocks of at most 64 KiB: K3opt's 16-bit offsets).
-/// The M6 opt options (sparse chains, gap3, top-4 pruning, the drop pass, the S3 prior: preset
-/// `opt16p1`) are not on the GPU yet, so only M5-shaped `OptParams` are accepted.
+/// the K3opt passes since M5 T5, at blocks of at most 64 KiB: K3opt's 16-bit offsets), and the
+/// M6 opt options (preset `opt16p1`, M6 B4): the S3 prior tables, gap3, top-N pruning and the
+/// drop pass at every value `validate` allows (K3opt and `K3Drop` compile them in), and sparse
+/// chains of stride 4 or 8 (`chains::long_chains_supported`: K1 hashes word-aligned slots).
+/// Valid sparse chains of stride 1 or 2 are refused.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.validate().is_ok() && p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16)
+    p.validate().is_ok() && p.opt.is_none_or(|_| BLOCK_SIZE <= 1 << 16 && chains::long_chains_supported(p))
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
@@ -941,8 +943,8 @@ impl Kernels {
 
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
     /// first `n_blocks` blocks. `n_blocks` is at least 1 and at most `bufs.capacity`. For the
-    /// optimal parse K3 is every K3opt pass plus the fix-up, `timestamp_writes` spanning them all;
-    /// it errors when `bufs` does not fit them.
+    /// optimal parse K3 is the block order, every K3opt pass, the fix-up and (opt16p1) the drop
+    /// pass, `timestamp_writes` spanning them all; it errors when `bufs` does not fit them.
     pub(crate) fn record_parse(
         &self,
         ctx: &GpuContext,
@@ -1724,13 +1726,44 @@ mod tests {
     #[test]
     fn gpu_supports_all_presets() {
         for (name, p) in gzc_core::params::PRESETS {
-            // M5 T5: the optimal-parse presets too (at blocks of at most 64 KiB); M6's opt16p1
-            // not until its K3/drop kernels land.
-            let m5_opt = p.opt.is_none_or(|o| o.is_m5() && BLOCK_SIZE <= 1 << 16);
-            assert_eq!(gpu_supports(&p), m5_opt, "{name}");
+            // M5 T5: the optimal-parse presets too, and since M6 B4 opt16p1 (all at blocks of at
+            // most 64 KiB).
+            assert_eq!(gpu_supports(&p), p.opt.is_none() || BLOCK_SIZE <= 1 << 16, "{name}");
             if gpu_supports(&p) {
                 check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+        if BLOCK_SIZE <= 1 << 16 {
+            use gzc_core::params::{OPT16, OPT16P1, OptParams, PriorTables, Seed, SparseChain};
+            let p1 = OPT16P1.opt.unwrap();
+            let with = |o: OptParams| MatchParams { opt: Some(o), ..OPT16P1 };
+            let sparse = |stride: u32| {
+                with(OptParams { sparse_chains: [Some(SparseChain { width: 8, stride, depth: 16 }), None, None], ..p1 })
+            };
+            // Each M6 option alone on opt16, and at other valid values: accepted.
+            let o16 = OPT16.opt.unwrap();
+            for o in [
+                OptParams { inner_gap: 3, ..o16 },
+                OptParams { relax_lengths: Some(1), ..o16 },
+                OptParams { relax_lengths: Some(32), ..o16 },
+                OptParams { drop_max_len: 3, ..o16 },
+                OptParams { drop_max_len: 32, ..o16 },
+                OptParams { seed: Seed::Prior, prior: PriorTables::S3, ..o16 },
+            ] {
+                assert!(gpu_supports(&MatchParams { opt: Some(o), ..OPT16 }), "{o:?}");
+            }
+            assert!(gpu_supports(&with(OptParams { passes: 2, seed: Seed::BlockInit, prior: PriorTables::M5, ..p1 })));
+            assert!(gpu_supports(&sparse(4)) && gpu_supports(&sparse(8)));
+            // Valid, but K1 cannot hash slots that are not word aligned: refused.
+            for stride in [1, 2] {
+                let m = sparse(stride);
+                assert!(m.validate().is_ok() && !gpu_supports(&m), "stride {stride}");
+                assert!(check_matching(&m).unwrap_err().to_string().contains("not implemented"), "stride {stride}");
+            }
+            // Invalid M6 values stay refused.
+            assert!(!gpu_supports(&with(OptParams { inner_gap: 4, ..p1 })));
+            assert!(!gpu_supports(&with(OptParams { drop_max_len: 2, ..p1 })));
+            assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "S3 prior without the Prior seed");
         }
         assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));

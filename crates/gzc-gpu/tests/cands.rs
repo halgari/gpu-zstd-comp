@@ -161,7 +161,7 @@ fn opt_cand_kernel_rejects_non_opt_params() {
 
 /// Informal (reads the real corpus): K1 + K2opt against `find_cands` on real .dds/.nif blocks.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test cands corpus -- --ignored --nocapture`
-/// `GZC_CANDS_PRESET` names the opt preset (default `opt16`; e.g. `opt16p1`).
+/// `GZC_CANDS_PRESET` (comma-separated) names the opt presets (default `opt16,opt16p1`).
 /// Takes up to `GZC_CORPUS_BLOCKS` (default 4000) blocks sampled uniformly over the whole corpus:
 /// every k-th of all (file, block) pairs, files in sorted path order, k = total blocks / wanted.
 /// Skips (with a message) when the corpus directory does not exist.
@@ -215,12 +215,14 @@ fn corpus_cands_match_cpu() {
     }
     blocks.truncate(want_blocks);
     eprintln!("{} blocks (every {step}th of {total}) from {} files", blocks.len(), files.len());
-    let name = std::env::var("GZC_CANDS_PRESET").unwrap_or_else(|_| "opt16".to_string());
-    let params = gzc_core::params::preset(&name).unwrap();
+    let names = std::env::var("GZC_CANDS_PRESET").unwrap_or_else(|_| "opt16,opt16p1".to_string());
     let ctx = GpuContext::new().expect("GPU required");
-    eprintln!("{name}, subgroups: {}", ctx.subgroups);
-    for chunk in blocks.chunks(500) {
-        check(&ctx, chunk, &params);
+    for name in names.split(',') {
+        let params = gzc_core::params::preset(name).unwrap();
+        eprintln!("{name}, subgroups: {}", ctx.subgroups);
+        for chunk in blocks.chunks(500) {
+            check(&ctx, chunk, &params);
+        }
+        eprintln!("{name}: {} blocks equal", blocks.len());
     }
-    eprintln!("{} blocks equal", blocks.len());
 }
