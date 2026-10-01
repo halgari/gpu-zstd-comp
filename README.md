@@ -45,7 +45,7 @@ in the workspace depends on this tool — it just populates `data/corpus/` on di
 `data/` and `out/` are gitignored; nothing under them is ever committed.
 
 Requires `NEXUS_API_KEY` (a Nexus Mods Premium account, for `download_link`) and
-`7z` on `PATH`.
+`7z` on `PATH` (Linux: `p7zip`/`7zip` package; macOS: `brew install p7zip`; Windows: 7-Zip).
 
 ```sh
 # List a mod's files to find a file_id to pin (prints file_id, category_name,
