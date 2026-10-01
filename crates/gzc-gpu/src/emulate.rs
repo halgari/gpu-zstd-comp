@@ -24,10 +24,14 @@ pub struct Emulation {
     pub vector_rmw: bool,
     /// `GZC_EMULATE_SKEW`: timing skew, for races a slow or preempted GPU would expose. Every
     /// invocation stalls for a pseudo-random time (a dependent ALU chain of up to 512 steps, one call
-    /// in eight) at entry, after every barrier and `workgroupUniformLoad`, and before every subgroup
-    /// operation, so that the phases between barriers start at very different times across the
-    /// workgroup and the lanes of a subgroup arrive at their collectives apart. Output must not
-    /// change. (Slower: a test aid.)
+    /// in eight) at entry, after every barrier and `workgroupUniformLoad`, before every subgroup
+    /// operation, and (in modules that use subgroup operations; one call in four, up to 64 steps) at
+    /// the start of every `if` / `else` / `switch` case body (naga's output, so also the `if`s it
+    /// lowers `&&` / `||` to), so that the phases between barriers start at very
+    /// different times across the workgroup, the lanes of a subgroup arrive at their collectives
+    /// apart, and lanes that took a branch fall behind the ones that did not: a collective that
+    /// counts on the lanes having reconverged after a divergent branch sees them apart. Output must
+    /// not change. (Slower: a test aid.)
     pub skew: bool,
 }
 
@@ -194,6 +198,19 @@ fn gzc_skew() {
         if (x == 0u) { atomicAdd(&gzc_spin, 1u); }
     }
 }
+// The lighter stall at the start of branch bodies (one call in four, up to 64 steps): a full
+// gzc_skew in every branch of K3's coop parse loop ran its dispatches past the driver's
+// preemption timeout.
+fn gzc_skew_branch() {
+    gzc_seed = gzc_seed * 1664525u + 1013904223u;
+    let r = gzc_seed >> 24u;
+    if (r < 64u) {
+        var x = gzc_seed | 1u;
+        let n = ((r & 15u) + 1u) * 4u;
+        for (var i = 0u; i < n; i++) { x = (x ^ (x >> 13u)) * 0x5BD1E995u; }
+        if (x == 0u) { atomicAdd(&gzc_spin, 1u); }
+    }
+}
 ";
 
 /// The parameter name of `@builtin(name)` in an entry point's parameter list, if any.
@@ -203,14 +220,27 @@ fn builtin_param(params: &str, name: &str) -> Option<String> {
     Some(rest.split(':').next()?.trim().to_string())
 }
 
+/// Whether naga's output line `t` (trimmed) opens the body of a branch: `if .. {`, `} else {`,
+/// `case ..: {`, `default: {`.
+fn opens_branch(t: &str) -> bool {
+    t.ends_with('{')
+        && (t.starts_with("if ") || t.starts_with("if(") || t.starts_with("} else") || t.starts_with("case ") || t.starts_with("default"))
+}
+
 /// The timing skew (`Emulation::skew`) on naga's output: every compute entry point gets the
 /// `local_invocation_index` and `workgroup_id` built-ins (when it lacks them), seeds `gzc_seed`
 /// from them and stalls once; every `workgroupBarrier();` / `storageBarrier();` statement and
 /// every `workgroupUniformLoad` binding is followed by a stall, every statement calling a
-/// subgroup built-in preceded by one.
+/// subgroup built-in preceded by one, and, in a module that calls subgroup built-ins, every
+/// branch body (`if` / `else` / `case` / `default`) starts with the lighter `gzc_skew_branch`.
+/// (Only there, and lighter: full stalls in every branch ran K2's and K3's dispatches past the
+/// driver's preemption timeout, NVIDIA Xid 109, and outside those modules nothing depends on
+/// reconvergence.)
 fn skew_timing(s: &str) -> anyhow::Result<String> {
     let mut out = String::with_capacity(s.len() * 2);
     let mut entry = false;
+    let calls_subgroup = |t: &str| t.contains("subgroup") && !t.starts_with('@') && !t.starts_with("fn ");
+    let branch_stalls = s.lines().any(|l| calls_subgroup(l.trim()));
     for line in s.lines() {
         let t = line.trim();
         if t.starts_with("@compute") {
@@ -238,13 +268,15 @@ fn skew_timing(s: &str) -> anyhow::Result<String> {
             ));
             continue;
         }
-        if t.contains("subgroup") && !t.starts_with("@") && !t.starts_with("fn ") {
+        if calls_subgroup(t) {
             out.push_str("gzc_skew();\n");
         }
         out.push_str(line);
         out.push('\n');
         if t == "workgroupBarrier();" || t == "storageBarrier();" || t.contains("workgroupUniformLoad(") {
             out.push_str("gzc_skew();\n");
+        } else if branch_stalls && opens_branch(t) {
+            out.push_str("gzc_skew_branch();\n");
         }
     }
     out.push_str(SKEW_WGSL);
@@ -292,5 +324,27 @@ mod tests {
         assert!(out.contains("fn other(@builtin(local_invocation_index) gzc_lii: u32, @builtin(workgroup_id) gzc_wid: vec3<u32>)"), "{out}");
         assert_eq!(out.matches("gzc_skew();").count(), 2 + 3, "{out}");
         naga::front::wgsl::parse_str(&out).unwrap_or_else(|e| panic!("{}\n{out}", e.emit_to_string(&out)));
+    }
+
+    #[test]
+    fn skew_stalls_inside_divergent_branches() {
+        // Entry and the subgroup call get a full stall; `a && b` (lowered to an `if` with an
+        // `else`), the explicit `if` / `else` and the `switch`'s two bodies a branch stall each.
+        let src = "\
+                   var<workgroup> a: array<u32, 64>;\n\
+                   @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) lid: u32) {\n\
+                   var x = 0u; if (lid < 3u) { x = 1u; } else { x = 2u; }\n\
+                   let c = (lid > 1u) && (x == 2u);\n\
+                   switch (lid & 1u) { case 0u: { x += 1u; } default: { x += 2u; } }\n\
+                   a[lid] = subgroupAdd(select(x, 0u, c)); }";
+        let out = Emulation { skew: true, ..Emulation::NONE }.rewrite(src).unwrap();
+        assert_eq!(out.matches("gzc_skew();").count(), 1 + 1, "{out}");
+        assert_eq!(out.matches("gzc_skew_branch();").count(), 2 + 2 + 2, "{out}");
+        naga::front::wgsl::parse_str(&out).unwrap_or_else(|e| panic!("{}\n{out}", e.emit_to_string(&out)));
+        // Without subgroup calls the branches stay as they are.
+        let plain = src.replace("subgroupAdd(select(x, 0u, c))", "select(x, 0u, c)");
+        let out = Emulation { skew: true, ..Emulation::NONE }.rewrite(&plain).unwrap();
+        assert_eq!(out.matches("gzc_skew();").count(), 1, "{out}");
+        assert_eq!(out.matches("gzc_skew_branch();").count(), 0, "{out}");
     }
 }

@@ -9,7 +9,11 @@
 // Every lane holds the same parse state (r0/r1/r2, ip, anchor, ...). Per-lane values reach
 // control flow only through subgroupBallot / subgroupShuffle / subgroupAll, so all branch and loop
 // conditions are uniform and every collective runs with all W lanes active (no barriers, no
-// workgroup memory). Stores happen on lane 0 only, or on disjoint addresses per lane. Each
+// workgroup memory). Per-lane booleans combine with `&` / `|`, never `&&` / `||`: naga lowers
+// those to an `if` on the left operand, a lane-dependent branch right before the ballot that
+// would need the lanes reconverged after it (VK_KHR_shader_maximal_reconvergence is not
+// enabled; .superpowers/m6-research/subgroup-audit.md). The only per-lane branches are lane 0's
+// stores. Stores happen on lane 0 only, or on disjoint addresses per lane. Each
 // cooperative primitive returns exactly what its sequential counterpart returns, for any W >= 1,
 // so the output never depends on W (see the equivalence notes per function).
 //
@@ -127,10 +131,10 @@ fn coop_catch_up(base: u32, start0: u32, anchor: u32, off: u32, k: u32) -> u32 {
     loop {
         let s = start0 - moved;
         let sk = s - min(k, s);
-        let bound_ok = (k < s) && (sk > anchor) && (sk > off);
+        let bound_ok = (k < s) & (sk > anchor) & (sk > off);
         let a = select(0u, sk - 1u, bound_ok);
         let c = select(0u, sk - 1u - off, bound_ok);
-        let ok = bound_ok && (load_byte(base, a) == load_byte(base, c));
+        let ok = bound_ok & (load_byte(base, a) == load_byte(base, c));
         let cnt = first_lane(subgroupBallot(!ok));
         moved += cnt;
         if (cnt < W) { break; }
@@ -168,9 +172,9 @@ fn win_fill(base: u32, bbase: u32, p: u32, off1: u32, k: u32) {
     win_n = W;
     win_bw = best[bbase + min(p - 1u + k, PARSE_END - 1u)];
     let rp = min(p + k, PARSE_END - 1u);
-    let usable = off1 != 0u && off1 <= rp;
+    let usable = (off1 != 0u) & (off1 <= rp);
     let src = select(rp, rp - off1, usable);
-    win_rep4 = select(0u, 1u, usable && load_u32_nb(base, rp) == load_u32_nb(base, src));
+    win_rep4 = select(0u, 1u, usable & (load_u32_nb(base, rp) == load_u32_nb(base, src)));
 }
 
 // (best[p], rep4 at p) from the window, refilled when p is not covered. p > win_b.
@@ -202,14 +206,14 @@ fn coop_lazy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         // valid lanes, which is the next element of the sequence either way.
         let step = ((ip - anchor) >> 8u) + 1u;
         let cand = ip + k * step;
-        let valid = (((cand - anchor) >> 8u) + 1u == step) && (cand < PARSE_END);
+        let valid = (((cand - anchor) >> 8u) + 1u == step) & (cand < PARSE_END);
         let c = select(ip, cand, valid);
         let bw = best[bbase + c];
         let rp = c + 1u;
-        let usable = offset_1 != 0u && offset_1 <= rp;
+        let usable = (offset_1 != 0u) & (offset_1 <= rp);
         let src = select(rp, rp - offset_1, usable);
-        let rep4 = usable && (load_u32_nb(base, rp) == load_u32_nb(base, src));
-        let hit = valid && (best_len_of(bw) >= MIN_MATCH || rep4);
+        let rep4 = usable & (load_u32_nb(base, rp) == load_u32_nb(base, src));
+        let hit = valid & ((best_len_of(bw) >= MIN_MATCH) | rep4);
         let h = first_lane(subgroupBallot(hit));
         let n_valid = first_lane(subgroupBallot(!valid));
         if (h == W) {
@@ -346,15 +350,15 @@ fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     while (p < PARSE_END) {
         let step = ((p - anchor) >> 8u) + 1u;
         let cand = p + k * step;
-        let valid = (((cand - anchor) >> 8u) + 1u == step) && (cand < PARSE_END);
+        let valid = (((cand - anchor) >> 8u) + 1u == step) & (cand < PARSE_END);
         let c = select(p, cand, valid);
         let bw = best[bbase + c];
-        let usable = c > anchor && c >= r0;
+        let usable = (c > anchor) & (c >= r0);
         let src = select(c, c - r0, usable);
         let x0 = load_u32_nb(base, c) ^ load_u32_nb(base, src);
         let x1 = (load_u32_nb(base, c + 4u) ^ load_u32_nb(base, src + 4u)) & REP_HI_MASK;
-        let rep_ok = usable && x0 == 0u && x1 == 0u;
-        let hit = valid && (rep_ok || best_len_of(bw) >= MIN_MATCH);
+        let rep_ok = usable & (x0 == 0u) & (x1 == 0u);
+        let hit = valid & (rep_ok | (best_len_of(bw) >= MIN_MATCH));
         let h = first_lane(subgroupBallot(hit));
         if (h == W) {
             p += first_lane(subgroupBallot(!valid)) * step;
@@ -401,7 +405,10 @@ fn main_coop(
     // exactly W lanes). li: the lane within this block's W lanes.
     let li = lid % W;
     let b = wid.x * BPW + lid / W;
-    if (b >= arrayLength(&counts) / 2u) { return; }
+    // No early return for lanes past the last block: the layout guard's ballot must see every
+    // lane of the subgroup (a return here is subgroup-uniform only under the host's BPW rule).
+    // They take neither branch below (no loads, no stores).
+    let in_range = b < arrayLength(&counts) / 2u;
     let base = block_base(b);
     let sbase = b * MAX_SEQS * 3u;
     let bbase = b * BLOCK_SIZE;
@@ -415,24 +422,24 @@ fn main_coop(
     // Lane-layout guard: this block's W lanes are one subgroup whose lane ids are 0..W-1.
     let m = subgroupBallot(true);
     // K3_FORCE_FALLBACK (host-injected, test-only) takes the sequential branch below on purpose.
-    let lanes_ok = !K3_FORCE_FALLBACK && sg_size >= W && sid == li && m.x == W_MASK_X && m.y == W_MASK_Y;
+    let lanes_ok = !K3_FORCE_FALLBACK & (sg_size >= W) & (sid == li) & (m.x == W_MASK_X) & (m.y == W_MASK_Y);
     var n_seq = 0u;
-    if (subgroupAll(lanes_ok)) {
+    let coop = subgroupAll(lanes_ok & in_range);
+    if (coop) {
         if (LAZY == 0u) {
             n_seq = coop_greedy_parse(base, sbase, bbase, k);
         } else {
             n_seq = coop_lazy_parse(base, sbase, bbase, k);
         }
-    } else {
+    } else if (in_range & (li == 0u)) {
         // Unexpected lane layout: the exact sequential parse on one lane.
-        if (li != 0u) { return; }
         if (LAZY == 0u) {
             n_seq = greedy_parse(base, sbase, bbase);
         } else {
             n_seq = lazy_parse(base, sbase, bbase);
         }
     }
-    if (li == 0u) {
+    if (in_range & (li == 0u)) {
         counts[b * 2u] = n_seq;
         counts[b * 2u + 1u] = n_lit;
     }

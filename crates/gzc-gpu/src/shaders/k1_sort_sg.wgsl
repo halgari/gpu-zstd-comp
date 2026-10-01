@@ -5,6 +5,11 @@
 // the histogram adds once per tile when all 32 keys are equal (constant runs); the scan uses
 // subgroupExclusiveAdd; the ranking finds equal keys with bit-sliced ballots (KEY_BITS of them,
 // skipped when all keys are equal).
+//
+// Every subgroup operation runs in subgroup-uniform control flow, and no operand comes out of a
+// lane-dependent branch (`|` instead of `||`, which naga lowers to an `if`), so nothing relies on
+// the lanes reconverging after divergence (VK_KHR_shader_maximal_reconvergence is not enabled;
+// .superpowers/m6-research/subgroup-audit.md).
 
 // The 32 words of chunk c (bytes 128c .. 128c + 128 of the block), one per lane; past the block
 // they come from the next block (or the buffer's last word) and only reach dead positions.
@@ -70,6 +75,9 @@ fn match_key(k: u32, live: u32) -> u32 {
 
 const CHUNKS: u32 = (HASHED_POSITIONS + 127u) / 128u;
 
+// The ranking's per-tile handoff of each leader's first slot (two tiles' worth, by parity).
+var<workgroup> first_slot: array<u32, 64>;
+
 @compute @workgroup_size(32)
 fn main_sg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {
     let b = wid.x;
@@ -92,7 +100,7 @@ fn main_sg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_i
             let k = key_word_chunk(w, wn, c, j, lane).x;
             let k0 = subgroupBroadcastFirst(k);
             let lv = subgroupBallot(live).x;
-            if (subgroupAll(k == k0 || !live)) {
+            if (subgroupAll((k == k0) | !live)) {
                 if (lane == 0u && lv != 0u) { cnt_add(k0, countOneBits(lv)); }
             } else if (live) {
                 cnt_add(k, 1u);
@@ -132,13 +140,18 @@ fn main_sg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_i
             let lv = subgroupBallot(live).x;
             let k0 = subgroupBroadcastFirst(k);
             var eq = lv;
-            if (!subgroupAll(k == k0 || !live)) { eq = match_key(k, lv); }
+            if (!subgroupAll((k == k0) | !live)) { eq = match_key(k, lv); }
             let leader = select(0u, firstTrailingBit(eq), eq != 0u);
-            var old = 0u;
-            if (live && lane == leader) { old = cnt_add(k, countOneBits(eq)); }
-            let slot = subgroupShuffle(old, leader) + countOneBits(eq & below);
-            if (live) { rankw[sb + p] = slot | (kw.y & ~PRED_POS); }
+            // The leader's first slot reaches its equal lanes through workgroup memory across the
+            // tile's barrier (not a shuffle right after the leader-only branch, which would need the
+            // lanes reconverged there). The barrier also orders the tiles' cnt_adds; the handoff is
+            // double-buffered by tile parity, so tile j + 1's leaders do not overwrite what tile j's
+            // lanes read before tile j + 1's barrier.
+            let hb = (j & 1u) * 32u;
+            if (live && lane == leader) { first_slot[hb + lane] = cnt_add(k, countOneBits(eq)); }
             workgroupBarrier();
+            let slot = first_slot[hb + leader] + countOneBits(eq & below);
+            if (live) { rankw[sb + p] = slot | (kw.y & ~PRED_POS); }
         }
         w = wn;
         wn = wnn;
