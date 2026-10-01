@@ -202,6 +202,7 @@ fn check_blocks_with(
 /// `ring_for` (before any pipeline is created). Also the footprint T3b is built around.
 #[test]
 fn k3opt_ring_choice() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let auto = K3OptConfig::default();
     let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
@@ -229,6 +230,7 @@ fn k3opt_ring_choice() {
 /// pass prices), at the run's level, on both ring memories.
 #[test]
 fn k3opt_matches_opt_cases() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     /// (name, block, candidate words, params with the pass level, prices, oracle output)
     type Run = (
@@ -299,6 +301,7 @@ fn k3opt_matches_opt_cases() {
 /// and uploaded), on the workgroup ring and the private-memory fallback; frames through K4/K5.
 #[test]
 fn k3opt_matches_oracle_synthetic() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     let all = synthetic_blocks();
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
@@ -407,6 +410,7 @@ fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
 #[test]
 #[ignore]
 fn k3opt_corpus() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
@@ -449,6 +453,7 @@ fn k3opt_corpus() {
 #[test]
 #[ignore]
 fn k3opt_timing() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
@@ -459,7 +464,7 @@ fn k3opt_timing() {
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
     let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
-    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32).unwrap();
     // (wg, ring, level, prices, unbounded loops)
     let table: [(u32, RingMem, u8, PriceSrc, bool); 13] = [
         (16, RingMem::Workgroup, 2, PriceSrc::BlockInit, true),
@@ -646,6 +651,7 @@ fn check_later_pass_tables(ctx: &GpuContext, names: &[String], blocks: &[Vec<u8>
 /// Every `opt::cases` block (with its scripted candidates) through every schedule.
 #[test]
 fn k3opt_passes_opt_cases() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     let cases = opt_test_cases();
     let names: Vec<String> = cases.iter().map(|c| c.name.clone()).collect();
@@ -658,6 +664,7 @@ fn k3opt_passes_opt_cases() {
 /// private ring and at wg32, and the later-pass Buffer-price configs.
 #[test]
 fn k3opt_passes_synthetic() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().expect("GPU required");
     let all = synthetic_blocks();
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
@@ -691,6 +698,7 @@ fn k3opt_passes_synthetic() {
 #[test]
 #[ignore]
 fn k3opt_passes_corpus() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -711,6 +719,7 @@ fn k3opt_passes_corpus() {
 #[test]
 #[ignore]
 fn k3opt_passes_timing() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -737,7 +746,7 @@ fn k3opt_passes_timing() {
     }
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
-    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32);
+    let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32).unwrap();
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     for (name, m) in [("opt14", OPT14), ("opt16", OPT16)] {
         let p = OptPasses::new(&ctx, &m, K3OptConfig::default()).expect("OptPasses::new");

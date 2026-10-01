@@ -98,6 +98,7 @@ fn check_modes(blocks: &[Vec<u8>], m: MatchParams, name: &str, want: &[(BlockOut
 /// streaming pipeline in every mode) equal the oracle's; libzstd decodes every frame.
 #[test]
 fn opt_matches_oracle_synthetic() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     for (name, m) in OPT_PRESETS {
@@ -178,6 +179,7 @@ fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
 #[test]
 #[ignore]
 fn opt_corpus_matches_oracle() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
     let Some(blocks) = corpus_blocks(n) else { return };
     for (name, m) in OPT_PRESETS {

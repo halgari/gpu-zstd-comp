@@ -293,10 +293,12 @@ impl<'a> OptBinds<'a> {
 
 impl OptBuffers {
     /// Buffers for `capacity` blocks under opt params `m` (the scratch's size depends on the
-    /// segments per block and `target_length`).
-    pub fn new(ctx: &GpuContext, m: &MatchParams, capacity: u32) -> Self {
+    /// segments per block and `target_length`). Errors when an allocation fails (out of memory, a
+    /// buffer above the device's limits, or a lost device).
+    pub fn new(ctx: &GpuContext, m: &MatchParams, capacity: u32) -> anyhow::Result<Self> {
         let scratch_per_block = scratch_bytes_per_block(m);
-        Self {
+        let scopes = crate::context::ErrorScopes::push(ctx);
+        let bufs = Self {
             capacity,
             params: *m,
             data: ctx.storage_buffer("k3opt.data", data_bytes(capacity), false),
@@ -307,7 +309,13 @@ impl OptBuffers {
             prices: ctx.storage_buffer("k3opt.prices", prices_bytes(capacity), true),
             scratch: ctx.storage_buffer("k3opt.scratch", capacity as u64 * scratch_per_block, false),
             scratch_per_block,
-        }
+        };
+        let bytes = [&bufs.data, &bufs.cands, &bufs.trace, &bufs.seqs, &bufs.counts, &bufs.prices, &bufs.scratch]
+            .iter()
+            .map(|b| b.size())
+            .sum();
+        scopes.pop_alloc(&format!("the k3opt buffers ({capacity} blocks)"), bytes)?;
+        Ok(bufs)
     }
 
     /// The buffers as bindings.
@@ -662,7 +670,7 @@ pub fn parses_from_cands(
         return Ok(Vec::new());
     }
     crate::compressor::with_error_scopes(ctx, || {
-        let bufs = OptBuffers::new(ctx, &k.params, blocks.len().min(BATCH_CAP) as u32);
+        let bufs = OptBuffers::new(ctx, &k.params, blocks.len().min(BATCH_CAP) as u32)?;
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {
             let at = i * BATCH_CAP;
@@ -867,7 +875,7 @@ pub fn parses_from_passes(
         return Ok((Vec::new(), hs));
     }
     crate::compressor::with_error_scopes(ctx, || {
-        let bufs = OptBuffers::new(ctx, p.params(), blocks.len().min(BATCH_CAP) as u32);
+        let bufs = OptBuffers::new(ctx, p.params(), blocks.len().min(BATCH_CAP) as u32)?;
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {
             let at = i * BATCH_CAP;
@@ -965,13 +973,14 @@ mod tests {
     /// panics (the kernel itself does no bounds checking on these buffers).
     #[test]
     fn check_rejects_bad_buffers() {
+        let _gpu = crate::test_support::gpu_test_slot();
         // opt16 only implements at blocks of at most 64 KiB.
         if BLOCK_SIZE > 1 << 16 {
             return;
         }
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let n = 4u32;
-        let bufs = OptBuffers::new(&ctx, &OPT16, n);
+        let bufs = OptBuffers::new(&ctx, &OPT16, n).unwrap();
         let binds = bufs.binds();
 
         // (a) n = 0 and n > capacity.
@@ -985,7 +994,7 @@ mod tests {
         let o = OPT16.opt.unwrap();
         let smaller = MatchParams { opt: Some(OptParams { target_length: 8, ..o }), ..OPT16 };
         assert!(scratch_bytes_per_block(&smaller) < scratch_bytes_per_block(&OPT16));
-        let small_bufs = OptBuffers::new(&ctx, &smaller, n);
+        let small_bufs = OptBuffers::new(&ctx, &smaller, n).unwrap();
         let e = small_bufs.binds().check(n, &OPT16).unwrap_err();
         assert!(e.to_string().contains("scratch"), "{e}");
 

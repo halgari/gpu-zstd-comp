@@ -237,7 +237,7 @@ mod tests {
 
     fn upload(ctx: &GpuContext, blocks: &[Vec<u8>]) -> Set {
         let n = blocks.len() as u32;
-        let bufs = BatchBuffers::new(ctx, n, false, &probe_params());
+        let bufs = BatchBuffers::new(ctx, n, false, &probe_params()).expect("probe buffers");
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&crate::context::pack_blocks(&refs)));
         Set { bufs, n }

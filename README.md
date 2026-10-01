@@ -34,6 +34,10 @@ cargo test --workspace --no-default-features \
 
 The portable (no-subgroup) kernels: `GZC_NO_SUBGROUPS=1 cargo test --workspace --release`.
 
+GPU tests that open their own device and build full-size pipelines take one of
+`GZC_GPU_TEST_SLOTS` (default 2) slots per test binary (`gzc_gpu::test_support`), so a parallel
+run does not put a dozen devices on one GPU at once; light tests run beside them unthrottled.
+
 ## Corpus (`tools/fetch-corpus`, dev-only)
 
 `gzc-bench` needs a realistic byte corpus to measure ratio/throughput on. Nothing

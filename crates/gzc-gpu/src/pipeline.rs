@@ -54,7 +54,7 @@ use crate::compressor::{
     slot_bytes,
 };
 use gzc_core::params::MatchParams;
-use crate::context::GpuContext;
+use crate::context::{ErrorScopes, GpuContext};
 use crate::transfer::{Commands, RawBuffer, StreamingGuard, Timeline, TransferQueue};
 
 #[derive(Clone, Copy, Debug)]
@@ -634,7 +634,9 @@ impl<'a> Pipeline<'a> {
     /// Compiles the kernels and allocates the shared buffers and every slot, for the frame path
     /// when `cfg.params.emit_frames` and the parse path otherwise. Errors on `batch`/`inflight`
     /// of 0, a batch above `max_batch_blocks`, match params the GPU does not support (see
-    /// `Kernels::new`), or a wgpu out-of-memory/validation error. The frame path packs frames
+    /// `Kernels::new`), a wgpu out-of-memory/validation error, or a lost device; a failed
+    /// allocation errors here ("GPU allocation of N MiB ... failed"), naming the buffer, never
+    /// later as an invalid buffer. The frame path packs frames
     /// (`PackKernel`) iff the context has `GpuContext::pack_frames` (asked for
     /// packing: `GZC_PACK`, or `GpuContext::with_options`).
     pub fn new(ctx: &'a GpuContext, cfg: &PipelineConfig) -> anyhow::Result<Self> {
@@ -642,6 +644,9 @@ impl<'a> Pipeline<'a> {
         let max = max_batch_blocks(&ctx.device.limits(), &m);
         anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
         anyhow::ensure!(cfg.batch >= 1 && cfg.batch <= max, "batch {} not in 1..={max} for this device", cfg.batch);
+        if let Some(why) = ctx.device_lost() {
+            anyhow::bail!("GPU device lost: {why}");
+        }
 
         let scopes = ErrorScopes::push(ctx);
         let frames = cfg.params.emit_frames;
@@ -649,6 +654,10 @@ impl<'a> Pipeline<'a> {
         let kernels = Kernels::new(ctx, cfg.params)?;
         let layout = StagingLayout::new(cfg.batch, frames, &m);
         let pack = (frames && ctx.pack_frames).then(|| PackKernel::new(ctx, &layout));
+        scopes.pop()?;
+        // Every allocation below, checked once at the end (`ErrorScopes::pop_alloc`): an
+        // out-of-memory or invalid buffer fails here, naming the buffer, not at its first use.
+        let scopes = ErrorScopes::push(ctx);
         let mut staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         if pack.is_some() {
             staging_usage |= wgpu::BufferUsages::STORAGE;
@@ -722,13 +731,17 @@ impl<'a> Pipeline<'a> {
             // `data_bytes`: the batch plus one trailing word, which `UploadSlot::submit_with` zeroes
             // after the last submitted block (K3opt reads one word past each block; with the
             // direct upload this buffer is `data`, with the copy upload it is copied along).
+            #[cfg(test)]
+            let upload_size = data_bytes(cfg.batch) + tests::EXTRA_UPLOAD_BYTES.get();
+            #[cfg(not(test))]
+            let upload_size = data_bytes(cfg.batch);
             let upload = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("pipeline.upload"),
-                size: data_bytes(cfg.batch),
+                size: upload_size,
                 usage: upload_usage,
                 mapped_at_creation: true,
             });
-            assert_eq!(upload.size(), data_bytes(cfg.batch), "upload slots keep the trailing zero word");
+            assert_eq!(upload.size(), upload_size, "upload slots keep the trailing zero word");
             slots.push(Slot {
                 upload,
                 upload_mapped: None,
@@ -752,8 +765,9 @@ impl<'a> Pipeline<'a> {
             let frames = x.frames.import(&ctx.device, "batch.frames", usage);
             (frames, x.frame_len.import(&ctx.device, "batch.frame_len", usage))
         });
-        let bufs = BatchBuffers::with_parts(ctx, cfg.batch, frames, &m, data, frame_bufs);
-        scopes.pop()?;
+        let bufs = BatchBuffers::with_parts(ctx, cfg.batch, frames, &m, data, frame_bufs)?;
+        let what = format!("the pipeline (batch {}, inflight {})", cfg.batch, cfg.inflight);
+        scopes.pop_alloc(&what, vram_bytes_with(cfg, direct))?;
         Ok(Self {
             ctx,
             cfg: *cfg,
@@ -772,6 +786,15 @@ impl<'a> Pipeline<'a> {
             #[cfg(test)]
             poll_only: false,
         })
+    }
+
+    /// Every wait for the GPU polls without blocking (`GpuContext::poll_only`: Metal; or the
+    /// test hook).
+    fn poll_only(&self) -> bool {
+        #[cfg(test)]
+        return self.poll_only || self.ctx.poll_only();
+        #[cfg(not(test))]
+        return self.ctx.poll_only();
     }
 
     /// True when batches are read back through the transfer queue (see `Xfer`).
@@ -918,11 +941,7 @@ impl<'a> Pipeline<'a> {
         let fail_after = self.fail_deliveries_after.take();
         #[cfg(not(test))]
         let fail_after = None;
-        let metal = self.ctx.adapter_info.backend == wgpu::Backend::Metal;
-        #[cfg(test)]
-        let poll_only = metal || self.poll_only;
-        #[cfg(not(test))]
-        let poll_only = metal;
+        let poll_only = self.poll_only();
         let completion = Completion {
             ctx: self.ctx,
             xfer: self.xfer.as_ref().map(|x| (x.tq.clone(), x.t_done.clone())),
@@ -1164,7 +1183,7 @@ impl<'a> Pipeline<'a> {
     /// After an error: wait for the GPU, unmap and free every slot still in flight so the
     /// pipeline stays usable, then wait for the sink to drop the batches it still holds.
     fn abandon(&mut self) {
-        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = self.ctx.wait_idle(self.poll_only());
         if let Some(x) = &self.xfer {
             x.tq.idle();
             // A batch whose readback was never submitted leaves t_done behind (and one whose second
@@ -1422,6 +1441,7 @@ impl<'p, 'a> FrameStream<'p, 'a> {
         let t = Instant::now();
         self.pipe.shared.wait_free(i)?;
         let ctx = self.pipe.ctx;
+        let poll_only = self.pipe.poll_only();
         let slot = &mut self.pipe.slots[i];
         slot.staging_requested = false;
         if slot.upload_unmapped {
@@ -1434,18 +1454,13 @@ impl<'p, 'a> FrameStream<'p, 'a> {
             slot.upload_submission = None;
         }
         if let Some(rx) = slot.upload_mapped.take() {
-            // Its submission has completed (the slot is free), so the callback is normally in.
-            let r = match rx.try_recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    let wait = match slot.upload_submission.clone() {
-                        Some(s) => wgpu::PollType::Wait { submission_index: Some(s), timeout: None },
-                        None => wgpu::PollType::wait_indefinitely(),
-                    };
-                    ctx.device.poll(wait).context("device poll")?;
-                    rx.recv().context("upload map callback dropped")?
-                }
-            };
+            // Its submission has completed (the slot is free), so the callback is normally in. On
+            // Metal (`poll_only`) the wait polls without blocking, as the completion thread does:
+            // a `PollType::Wait` here would run beside the completion thread's polls and, with a
+            // shared context, other threads' submits.
+            let r = ctx
+                .wait_callback(&rx, slot.upload_submission.clone(), poll_only)
+                .context("waiting for the upload buffer's map")?;
             if r.is_err() {
                 slot.upload_unmapped = true;
             }
@@ -1703,34 +1718,6 @@ fn upload_threads() -> usize {
     })
 }
 
-/// Out-of-memory and validation error scopes, popped together.
-struct ErrorScopes {
-    // Fields drop in declaration order and wgpu requires scopes to pop in reverse push order:
-    // `validation` (pushed last) must come first, so an early return drops them correctly.
-    validation: wgpu::ErrorScopeGuard,
-    oom: wgpu::ErrorScopeGuard,
-}
-
-impl ErrorScopes {
-    fn push(ctx: &GpuContext) -> Self {
-        let oom = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        Self { oom, validation }
-    }
-
-    fn pop(self) -> anyhow::Result<()> {
-        let validation = pollster::block_on(self.validation.pop());
-        let oom = pollster::block_on(self.oom.pop());
-        if let Some(e) = validation {
-            return Err(anyhow!("wgpu validation error: {e}"));
-        }
-        if let Some(e) = oom {
-            return Err(anyhow!("wgpu out of memory: {e}"));
-        }
-        Ok(())
-    }
-}
-
 /// Bytes a slot owns: its upload buffer and its staging buffer (both mappable; counted although
 /// drivers may place them in host memory).
 fn per_slot_bytes(batch: u32, frames: bool, m: &MatchParams) -> u64 {
@@ -1792,6 +1779,72 @@ mod tests {
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
+    std::thread_local! {
+        /// Test hook: bytes `Pipeline::new` adds to each upload buffer it creates on this thread.
+        pub(super) static EXTRA_UPLOAD_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// An upload buffer far beyond any device (and above wgpu's `max_buffer_size` where that is
+    /// smaller): `Pipeline::new` fails cleanly at once, naming the allocation, rather than
+    /// handing out a pipeline whose upload buffer is invalid ("Buffer with 'pipeline.upload'
+    /// label is invalid" at the first `next_upload_slot`), and the context stays usable.
+    #[test]
+    fn absurd_upload_buffer_fails_cleanly_in_new() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let cfg = PipelineConfig { batch: 4, inflight: 2, params };
+        // 1 PiB: no allocator can place it, and it fails before any memory is committed.
+        EXTRA_UPLOAD_BYTES.set(1 << 50);
+        let r = Pipeline::new(&ctx, &cfg);
+        EXTRA_UPLOAD_BYTES.set(0);
+        let msg = match r {
+            Ok(_) => panic!("a 1 PiB upload buffer was created"),
+            Err(e) => format!("{e:#}"),
+        };
+        eprintln!("Pipeline::new error: {msg}");
+        assert!(msg.starts_with("GPU allocation of ") || msg.starts_with("GPU device lost while allocating"), "{msg}");
+        assert!(msg.contains("batch 4, inflight 2"), "{msg}");
+        if msg.starts_with("GPU allocation") {
+            assert!(msg.contains("pipeline.upload") && msg.contains("--batch"), "{msg}");
+        }
+        // Out of memory and validation errors leave the device usable (a backend that loses the
+        // device instead is reported as such above).
+        if ctx.device_lost().is_none() {
+            let blocks: Vec<Vec<u8>> = distinct_blocks().into_iter().take(6).collect();
+            let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+            let mut got = CollectFrames(vec![None; refs.len()]);
+            Pipeline::new(&ctx, &cfg).unwrap().run_frames(&refs, &mut got).unwrap();
+            for (i, b) in refs.iter().enumerate() {
+                assert!(got.0[i].as_deref() == Some(cpu_frame(b, params).as_slice()), "block {i}");
+            }
+        }
+    }
+
+    /// On a lost device every allocation fails with an error wgpu hands to no error scope (the
+    /// M4 Pro's parallel-test failure: a lost device left 'pipeline.upload' invalid, surfacing at
+    /// the first `next_upload_slot`). `Pipeline::new` must report the loss itself.
+    #[test]
+    fn pipeline_new_on_lost_device_errors() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        ctx.device.destroy();
+        // A hal error loses the device at once (wgpu-core calls the lost callback then); after
+        // `destroy` the callback comes with the next poll.
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
+        assert!(ctx.device_lost().is_some(), "the device-lost callback did not fire");
+        let msg = match Pipeline::new(&ctx, &PipelineConfig { batch: 4, inflight: 2, params }) {
+            Ok(_) => panic!("Pipeline::new succeeded on a destroyed device"),
+            Err(e) => format!("{e:#}"),
+        };
+        eprintln!("Pipeline::new error: {msg}");
+        assert!(msg.starts_with("GPU device lost"), "{msg}");
+        // The allocation check itself, for a loss after the constructor's first check.
+        let e = BatchBuffers::new(&ctx, 2, true, &LVL3).err().expect("batch buffers on a lost device");
+        assert!(format!("{e:#}").starts_with("GPU device lost while allocating"), "{e:#}");
+    }
+
     struct Collect(Vec<Option<BlockOutput>>);
 
     impl BlockSink for Collect {
@@ -1825,6 +1878,7 @@ mod tests {
 
     #[test]
     fn stream_matches_reference_every_index_once() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct: Vec<Vec<u8>> =
             test_cases().into_iter().flat_map(|(_, bytes)| chunk_file(&bytes)).map(|b| b.data).collect();
@@ -1850,6 +1904,7 @@ mod tests {
 
     #[test]
     fn stream_odd_batch_single_slot_and_reuse() {
+        let _gpu = crate::test_support::gpu_test_slot();
         // Odd batch: the staging timestamp region is only 4-byte aligned. One slot: every batch
         // waits for the previous one. The pipeline is reused for a second run.
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
@@ -1871,6 +1926,7 @@ mod tests {
 
     #[test]
     fn stream_handles_empty_input_and_rejects_bad_config() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let mut sink = Collect(Vec::new());
         let stats = compress_stream(&ctx, &cfg(8, 2), &[], &mut sink).unwrap();
@@ -1955,6 +2011,7 @@ mod tests {
     /// and K3opt's prices and scratch.
     #[test]
     fn vram_matches_params() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14] {
             // opt14/opt16 only implement at blocks of at most 64 KiB.
@@ -2000,6 +2057,7 @@ mod tests {
     /// `vram_bytes` in every mode.
     #[test]
     fn opt_stream_every_mode_matches_cpu() {
+        let _gpu = crate::test_support::gpu_test_slot();
         // opt14/opt16 only implement at blocks of at most 64 KiB.
         if gzc_core::config::LOG2_BLOCK > 16 {
             return;
@@ -2043,6 +2101,7 @@ mod tests {
 
     #[test]
     fn stream_frames_match_cpu_every_index_once() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         // Huffman literals (cfg's default).
@@ -2066,6 +2125,7 @@ mod tests {
     /// raw (largest) frames from the random block, partial batches, odd batch sizes.
     #[test]
     fn stream_frames_packed_match_cpu() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::with_options(true, true).expect("GPU required for gzc-gpu tests");
         if !ctx.pack_frames {
             eprintln!("skipped: no MAPPABLE_PRIMARY_BUFFERS");
@@ -2116,6 +2176,7 @@ mod tests {
     /// the chain finder (lvl9) and the bucket-sorted finder with the segmented parse (lvl9s12seg).
     #[test]
     fn stream_frames_every_mode_matches_cpu() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..200).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let modes = mode_contexts();
@@ -2144,6 +2205,7 @@ mod tests {
     /// transfer queue (the parse path) are not affected.
     #[test]
     fn second_transfer_pipeline_errors() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let Some((name, ctx)) = mode_contexts().into_iter().find(|(_, c)| c.transfer.is_some()) else {
             eprintln!("no transfer queue on this adapter: skipped");
             return;
@@ -2178,6 +2240,7 @@ mod tests {
     /// transfer readback), leaves the pipeline usable: the next run delivers every frame right.
     #[test]
     fn stream_frames_recovers_from_failed_delivery() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..300).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
@@ -2201,6 +2264,7 @@ mod tests {
 
     #[test]
     fn stream_frames_odd_batch_single_slot_and_reuse() {
+        let _gpu = crate::test_support::gpu_test_slot();
         // Raw literals (K5 writes Raw sections only): the huffman: false frame path stays covered
         // end to end.
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
@@ -2266,6 +2330,7 @@ mod tests {
     /// once, batches in submission order; the pipeline then runs again.
     #[test]
     fn stream_frames_zero_copy_every_mode() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
         // trailing zero word after partial batches of stale blocks). opt14 only implements at
@@ -2341,6 +2406,7 @@ mod tests {
     /// released.
     #[test]
     fn stream_frames_leases_held_across_stream_end() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
         let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
@@ -2441,6 +2507,7 @@ mod tests {
     /// itself (the lost device), with that validation error only as context.
     #[test]
     fn stream_frames_reports_device_loss_not_the_cleanup_error() {
+        let _gpu = crate::test_support::gpu_test_slot();
         use crate::context::GpuOptions;
         let opts = GpuOptions { direct_upload: Some(false), transfer_queue: false, ..GpuOptions::default() };
         let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
@@ -2472,6 +2539,7 @@ mod tests {
     /// `chunk_file`'s real lengths.
     #[test]
     fn stream_frames_multi_block_payloads() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let params = GpuParams { matching: LVL9S12SEG, emit_frames: true, huffman: true };
         let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
@@ -2547,6 +2615,7 @@ mod tests {
     /// nothing was), not garbage. Recheck on every wgpu upgrade.
     #[test]
     fn upload_slot_bytes_are_initialized() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
         let bs = BLOCK_SIZE;
         for (name, ctx) in &mode_contexts() {
@@ -2586,6 +2655,7 @@ mod tests {
     /// it swallowed the first error; `stream_frames` returns the error; the pipeline is reusable.
     #[test]
     fn failed_submit_is_sticky() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
         let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
@@ -2621,6 +2691,7 @@ mod tests {
     /// `submit_with` tags reach `FrameBatch::tag` with their batch; `submit` tags 0.
     #[test]
     fn frame_batches_carry_their_tags() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
@@ -2656,6 +2727,7 @@ mod tests {
     /// out again.
     #[test]
     fn stream_frames_held_batches_keep_their_bytes() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
@@ -2707,74 +2779,82 @@ mod tests {
     /// batch; the producer failing after four submissions; a bad submit size; a panicking sink.
     #[test]
     fn stream_frames_errors_mid_stream() {
+        let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
         let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
         let blocks: Vec<&[u8]> = (0..200).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         for (name, ctx) in &mode_contexts() {
-            let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
-            // The sink fails on its third batch: the producer, blocked or not, gets an error.
-            let mut seen = 0;
-            let e = pipe
-                .stream_frames(
-                    |_batch| {
-                        seen += 1;
-                        anyhow::ensure!(seen < 3, "sink failed");
-                        Ok(())
-                    },
-                    |stream| stream.upload_blocks(&blocks),
-                )
-                .expect_err("sink error must surface");
-            assert!(e.to_string().contains("sink failed"), "{name}: {e:#}");
-            assert_eq!(seen, 3, "{name}: no delivery after the failing one");
-            // The producer fails after four submissions; batches may still be in flight.
-            let e = pipe
-                .stream_frames(
-                    |_batch| Ok(()),
-                    |stream| {
-                        stream.upload_blocks(&blocks[..64])?;
-                        anyhow::bail!("producer failed")
-                    },
-                )
-                .expect_err("producer error must surface");
-            assert!(e.to_string().contains("producer failed"), "{name}: {e:#}");
-            // Bad submit sizes are refused, and the slot stays usable.
-            let e = pipe
-                .stream_frames(
-                    |_batch| Ok(()),
-                    |stream| {
-                        let slot = stream.next_upload_slot()?;
-                        assert!(slot.capacity() == 16);
-                        slot.submit(17)
-                    }
-                    .map(|_| ()),
-                )
-                .expect_err("17 > capacity");
-            assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
-            let e = pipe
-                .stream_frames(|_batch| Ok(()), |stream| stream.next_upload_slot()?.submit(0).map(|_| ()))
-                .expect_err("0 blocks");
-            assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
-            // A panic on either side propagates without leaving the other side waiting.
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pipe.stream_frames(|_batch| panic!("sink panicked"), |stream| stream.upload_blocks(&blocks))
-            }));
-            assert!(r.is_err(), "{name}: the sink's panic propagates");
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pipe.stream_frames(
-                    |_batch| Ok(()),
-                    |stream| {
-                        stream.upload_blocks(&blocks[..48])?;
-                        panic!("producer panicked")
-                    },
-                )
-            }));
-            assert!(r.is_err(), "{name}: the producer's panic propagates");
-            // After all of that the same pipeline delivers every frame right.
-            let mut sink = CollectFrames(vec![None; blocks.len()]);
-            pipe.run_frames(&blocks, &mut sink).unwrap();
-            for (i, got) in sink.0.into_iter().enumerate() {
-                assert!(got.unwrap() == want[i % distinct.len()], "{name}: index {i}");
+            // Both completion waits (`poll_only`: Metal's), which `abandon` and the producer's
+            // upload-map wait follow too.
+            let poll_modes: &[bool] = if ctx.transfer.is_some() { &[false] } else { &[false, true] };
+            for &poll_only in poll_modes {
+                let name = &format!("{name} poll_only={poll_only}");
+                let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
+                pipe.poll_only = poll_only;
+                // The sink fails on its third batch: the producer, blocked or not, gets an error.
+                let mut seen = 0;
+                let e = pipe
+                    .stream_frames(
+                        |_batch| {
+                            seen += 1;
+                            anyhow::ensure!(seen < 3, "sink failed");
+                            Ok(())
+                        },
+                        |stream| stream.upload_blocks(&blocks),
+                    )
+                    .expect_err("sink error must surface");
+                assert!(e.to_string().contains("sink failed"), "{name}: {e:#}");
+                assert_eq!(seen, 3, "{name}: no delivery after the failing one");
+                // The producer fails after four submissions; batches may still be in flight.
+                let e = pipe
+                    .stream_frames(
+                        |_batch| Ok(()),
+                        |stream| {
+                            stream.upload_blocks(&blocks[..64])?;
+                            anyhow::bail!("producer failed")
+                        },
+                    )
+                    .expect_err("producer error must surface");
+                assert!(e.to_string().contains("producer failed"), "{name}: {e:#}");
+                // Bad submit sizes are refused, and the slot stays usable.
+                let e = pipe
+                    .stream_frames(
+                        |_batch| Ok(()),
+                        |stream| {
+                            let slot = stream.next_upload_slot()?;
+                            assert!(slot.capacity() == 16);
+                            slot.submit(17)
+                        }
+                        .map(|_| ()),
+                    )
+                    .expect_err("17 > capacity");
+                assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
+                let e = pipe
+                    .stream_frames(|_batch| Ok(()), |stream| stream.next_upload_slot()?.submit(0).map(|_| ()))
+                    .expect_err("0 blocks");
+                assert!(e.to_string().contains("not in 1..=16"), "{name}: {e:#}");
+                // A panic on either side propagates without leaving the other side waiting.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pipe.stream_frames(|_batch| panic!("sink panicked"), |stream| stream.upload_blocks(&blocks))
+                }));
+                assert!(r.is_err(), "{name}: the sink's panic propagates");
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pipe.stream_frames(
+                        |_batch| Ok(()),
+                        |stream| {
+                            stream.upload_blocks(&blocks[..48])?;
+                            panic!("producer panicked")
+                        },
+                    )
+                }));
+                assert!(r.is_err(), "{name}: the producer's panic propagates");
+                // After all of that the same pipeline delivers every frame right.
+                let mut sink = CollectFrames(vec![None; blocks.len()]);
+                pipe.run_frames(&blocks, &mut sink).unwrap();
+                for (i, got) in sink.0.into_iter().enumerate() {
+                    assert!(got.unwrap() == want[i % distinct.len()], "{name}: index {i}");
+                }
             }
         }
     }
@@ -2784,6 +2864,7 @@ mod tests {
     /// threads.
     #[test]
     fn run_frames_par_every_index_once() {
+        let _gpu = crate::test_support::gpu_test_slot();
         use std::sync::atomic::AtomicU32;
         struct Par {
             hits: Vec<AtomicU32>,

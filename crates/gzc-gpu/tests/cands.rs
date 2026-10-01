@@ -85,6 +85,7 @@ fn h4_hash_is_injective_in_byte_3() {
 
 #[test]
 fn gpu_cands_match_cpu_opt16() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     // opt16 only implements at blocks of at most 64 KiB.
     if gzc_core::config::LOG2_BLOCK > 16 {
         return;
@@ -99,6 +100,7 @@ fn gpu_cands_match_cpu_opt16() {
 /// opt14 has the same candidates; other depths of the h4 walk (1: h3-dominated, 64: the maximum).
 #[test]
 fn gpu_cands_match_cpu_other_depths() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     // opt14/opt16 only implement at blocks of at most 64 KiB.
     if gzc_core::config::LOG2_BLOCK > 16 {
         return;
@@ -114,6 +116,7 @@ fn gpu_cands_match_cpu_other_depths() {
 
 #[test]
 fn opt_cand_kernel_rejects_non_opt_params() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().unwrap();
     assert!(OptCandKernel::new(&ctx, &gzc_core::params::LVL9).is_err());
 }
@@ -126,6 +129,7 @@ fn opt_cand_kernel_rejects_non_opt_params() {
 #[test]
 #[ignore]
 fn corpus_cands_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
     use std::path::{Path, PathBuf};
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap() {

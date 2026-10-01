@@ -13,7 +13,7 @@
 //! (`decode_output`).
 use crate::chains::{self, ChainsKernel, finder_wgsl, head_bytes, pred_bytes};
 use crate::k3opt::{K3OptConfig, OptBinds, OptPasses};
-use crate::context::{GpuContext, pack_blocks, params_wgsl};
+use crate::context::{ErrorScopes, GpuContext, pack_blocks, params_wgsl};
 use crate::sorted::SortKernel;
 use anyhow::{Context as _, anyhow};
 use gzc_core::codes::{
@@ -71,10 +71,13 @@ pub fn max_seqs(m: &MatchParams) -> u32 {
 
 /// Largest batch `compress_batch`/`compress_frames` allocate buffers for, even when the device
 /// limits would allow more. At 128K blocks, worst case (dfast's two hash chains, `emit_frames`:
-/// `data_bytes` + `chains::head_bytes`/`pred_bytes` + `best_bytes` + `seqs_bytes` + `counts_bytes`
-/// + `frames_bytes` + `frame_len_bytes`, with `head_bytes` capped at `chains::HEAD_TABLES` tables)
-/// is ~2.4 MiB per block, ~608 MiB at this cap.
-const COMPRESS_BATCH_CAP: u32 = 256;
+/// `data_bytes` + `chains::head_bytes`/`pred_bytes` + `best_bytes` + `seqs_bytes` +
+/// `counts_bytes` + `frames_bytes` + `frame_len_bytes`, with `head_bytes` capped at
+/// `chains::HEAD_TABLES` tables) is ~2.4 MiB per block, ~304 MiB at this cap. These one-shot
+/// paths serve the tests, several of
+/// which run at once (each with its own device): 128 keeps their 300-block batches split into
+/// full and partial batches (as 256 did) at half the memory.
+const COMPRESS_BATCH_CAP: u32 = 128;
 
 /// Kernel names, in timestamp-query order, as reported in timing breakdowns (`k4_entropy` and
 /// `k5_huffman` only run with `GpuParams::emit_frames`; K5, which writes the literals section
@@ -265,8 +268,9 @@ pub struct OptScratch {
 impl BatchBuffers {
     /// Buffers for kernels built with match params `m` (head/pred sized by `m.n_hashes()`).
     /// Panics unless `1 <= capacity <= max_batch_blocks(&ctx.device.limits(), m)`. `frames`
-    /// allocates K4's outputs (needed when the kernels emit frames).
-    pub fn new(ctx: &GpuContext, capacity: u32, frames: bool, m: &MatchParams) -> Self {
+    /// allocates K4's outputs (needed when the kernels emit frames). Errors when an allocation
+    /// fails (out of memory, a buffer above the device's limits, or a lost device).
+    pub fn new(ctx: &GpuContext, capacity: u32, frames: bool, m: &MatchParams) -> anyhow::Result<Self> {
         Self::with_parts(ctx, capacity, frames, m, None, None)
     }
 
@@ -282,9 +286,13 @@ impl BatchBuffers {
         m: &MatchParams,
         data: Option<wgpu::Buffer>,
         frame_bufs: Option<(wgpu::Buffer, wgpu::Buffer)>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let max = max_batch_blocks(&ctx.device.limits(), m);
         assert!(capacity >= 1 && capacity <= max, "BatchBuffers capacity {capacity} not in 1..={max}");
+        let bytes = scratch_bytes(capacity, m)
+            + if data.is_none() { data_bytes(capacity) } else { 0 }
+            + if frames && frame_bufs.is_none() { frames_bytes(capacity) + frame_len_bytes(capacity) } else { 0 };
+        let scopes = ErrorScopes::push(ctx);
         let n_hashes = m.n_hashes();
         let (frames, frame_len) = match (frames, frame_bufs) {
             (false, _) => (None, None),
@@ -308,7 +316,7 @@ impl BatchBuffers {
         // zeroed on every submit).
         let data = data.unwrap_or_else(|| ctx.storage_buffer("batch.data", data_bytes(capacity), false));
         assert!(data.size() >= data_bytes(capacity), "data buffer below data_bytes({capacity})");
-        Self {
+        let bufs = Self {
             capacity,
             n_hashes,
             data,
@@ -320,7 +328,9 @@ impl BatchBuffers {
             frames,
             frame_len,
             opt,
-        }
+        };
+        scopes.pop_alloc(&format!("the batch buffers ({capacity} blocks)"), bytes)?;
+        Ok(bufs)
     }
 }
 
@@ -1104,9 +1114,8 @@ pub fn compress_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> 
     let max = max_batch_blocks(&ctx.device.limits(), &m).min(COMPRESS_BATCH_CAP) as usize;
     anyhow::ensure!(max > 0, "device limits too small for one block");
 
-    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, kernels.emits_frames(), &m);
+    let scopes = ErrorScopes::push(ctx);
+    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, kernels.emits_frames(), &m)?;
     let mut out = Vec::with_capacity(blocks.len());
     let mut result = Ok(());
     for batch in blocks.chunks(max) {
@@ -1123,12 +1132,7 @@ pub fn compress_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> 
             break;
         }
     }
-    if let Some(e) = pollster::block_on(validation_scope.pop()) {
-        return Err(anyhow!("wgpu validation error: {e}"));
-    }
-    if let Some(e) = pollster::block_on(oom_scope.pop()) {
-        return Err(anyhow!("wgpu out of memory: {e}"));
-    }
+    scopes.pop()?;
     result?;
     Ok(out)
 }
@@ -1144,9 +1148,8 @@ pub fn compress_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) ->
     let max = max_batch_blocks(&ctx.device.limits(), &m).min(COMPRESS_BATCH_CAP) as usize;
     anyhow::ensure!(max > 0, "device limits too small for one block");
 
-    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, true, &m);
+    let scopes = ErrorScopes::push(ctx);
+    let bufs = BatchBuffers::new(ctx, blocks.len().min(max) as u32, true, &m)?;
     let (frames, frame_len) = (bufs.frames.as_ref().unwrap(), bufs.frame_len.as_ref().unwrap());
     let mut out = Vec::with_capacity(blocks.len());
     let mut result = Ok(());
@@ -1171,12 +1174,7 @@ pub fn compress_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) ->
             break;
         }
     }
-    if let Some(e) = pollster::block_on(validation_scope.pop()) {
-        return Err(anyhow!("wgpu validation error: {e}"));
-    }
-    if let Some(e) = pollster::block_on(oom_scope.pop()) {
-        return Err(anyhow!("wgpu out of memory: {e}"));
-    }
+    scopes.pop()?;
     result?;
     Ok(out)
 }
@@ -1201,9 +1199,8 @@ pub fn frames_from_parses(
     let n = blocks.len() as u32;
     let m = kernels.matching();
     anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
-    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let bufs = BatchBuffers::new(ctx, n, true, &m);
+    let scopes = ErrorScopes::push(ctx);
+    let bufs = BatchBuffers::new(ctx, n, true, &m)?;
     ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
     let mut lit_blocks = vec![vec![0u8; BLOCK_SIZE]; blocks.len()];
     for (b, p) in parses.iter().enumerate() {
@@ -1252,12 +1249,7 @@ pub fn frames_from_parses(
         let bytes: &[u8] = bytemuck::cast_slice(frames);
         lens.iter().enumerate().map(|(b, &len)| Ok(frame_bytes(bytes, b, len)?.to_vec())).collect()
     });
-    if let Some(e) = pollster::block_on(validation_scope.pop()) {
-        return Err(anyhow!("wgpu validation error: {e}"));
-    }
-    if let Some(e) = pollster::block_on(oom_scope.pop()) {
-        return Err(anyhow!("wgpu out of memory: {e}"));
-    }
+    scopes.pop()?;
     result
 }
 
@@ -1278,7 +1270,7 @@ fn submit_from_best(
     let m = kernels.matching();
     anyhow::ensure!(m.opt.is_none(), "best[] tables drive K2's parses; the optimal parse takes candidate words (k3opt)");
     anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
-    let bufs = BatchBuffers::new(ctx, n, frames, &m);
+    let bufs = BatchBuffers::new(ctx, n, frames, &m)?;
     ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
     for (b, best) in bests.iter().enumerate() {
         anyhow::ensure!(
@@ -1324,20 +1316,15 @@ fn submit_from_best(
     Ok(bufs)
 }
 
-/// Runs `f` inside wgpu out-of-memory and validation error scopes, turning either into `Err`.
+/// Runs `f` inside wgpu out-of-memory and validation error scopes, turning either (or a device
+/// lost meanwhile) into `Err`.
 /// `pub(crate)` so other modules that build+probe a pipeline outside `Kernels` (`chains`'
 /// subgroup-kernel self-test) can catch a wgpu validation error at its source, instead of letting
 /// it surface uncaptured (which wgpu may attribute to a later, unrelated error scope).
 pub(crate) fn with_error_scopes<T>(ctx: &GpuContext, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
-    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let scopes = ErrorScopes::push(ctx);
     let result = f();
-    if let Some(e) = pollster::block_on(validation_scope.pop()) {
-        return Err(anyhow!("wgpu validation error: {e}"));
-    }
-    if let Some(e) = pollster::block_on(oom_scope.pop()) {
-        return Err(anyhow!("wgpu out of memory: {e}"));
-    }
+    scopes.pop()?;
     result
 }
 
@@ -1416,7 +1403,7 @@ pub fn best_from_blocks(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -
     anyhow::ensure!(m.opt.is_none(), "best_from_blocks reads K2's best[] words (opt: cands_from_blocks)");
     anyhow::ensure!(n <= max_batch_blocks(&ctx.device.limits(), &m), "too many blocks for one batch");
     with_error_scopes(ctx, || {
-        let bufs = BatchBuffers::new(ctx, n, false, &m);
+        let bufs = BatchBuffers::new(ctx, n, false, &m)?;
         ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("best_from_blocks") });
         kernels.record_best(ctx, &mut enc, &bufs, n, None);
@@ -1627,8 +1614,7 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
     staging.map_async(wgpu::MapMode::Read, .., move |r| {
         let _ = tx.send(r);
     });
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
-    rx.recv().context("map callback dropped")?.context("map readback buffer")?;
+    ctx.wait_callback(&rx, None, ctx.poll_only())?.context("map readback buffer")?;
     let words = {
         let view = staging.get_mapped_range(..).context("mapped range")?;
         bytemuck::pod_collect_to_vec(&view[..])
@@ -1707,6 +1693,7 @@ mod tests {
     /// these `Kernels`' opt-ness, in both directions, before recording any dispatch.
     #[test]
     fn record_front_rejects_mismatched_opt_buffers() {
+        let _gpu = crate::test_support::gpu_test_slot();
         // opt14/opt16 only implement at blocks of at most 64 KiB.
         if BLOCK_SIZE > 1 << 16 {
             return;
@@ -1716,13 +1703,13 @@ mod tests {
         let opt16 = gzc_core::params::OPT16;
 
         let non_opt_kernels = Kernels::new(&ctx, gp(LVL3)).unwrap();
-        let opt_bufs = BatchBuffers::new(&ctx, 4, false, &opt16);
+        let opt_bufs = BatchBuffers::new(&ctx, 4, false, &opt16).unwrap();
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let e = non_opt_kernels.record(&ctx, &mut enc, &opt_bufs, 4).unwrap_err();
         assert!(e.to_string().contains("opt"), "{e}");
 
         let opt_kernels = Kernels::new(&ctx, gp(opt16)).unwrap();
-        let non_opt_bufs = BatchBuffers::new(&ctx, 4, false, &LVL3);
+        let non_opt_bufs = BatchBuffers::new(&ctx, 4, false, &LVL3).unwrap();
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let e = opt_kernels.record(&ctx, &mut enc, &non_opt_bufs, 4).unwrap_err();
         assert!(e.to_string().contains("opt"), "{e}");
