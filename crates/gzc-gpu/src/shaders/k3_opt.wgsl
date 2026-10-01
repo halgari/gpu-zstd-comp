@@ -214,6 +214,12 @@ fn sbase() -> u32 { return gsg * (3u * RING_N); }
 fn lbase() -> u32 { return block_id() * (3u * MAX_SEQS) + seg_id() * LOG_WORDS; }
 // The segment's end (iend: positions [k * SEG, iend)).
 fn seg_end() -> u32 { return (seg_id() + 1u) * SEG; }
+// ilimit (opt::Seg::new): iend - GAP for an inner segment, iend - 8 for the block's last one (GAP
+// == 8 under the M5 presets, where this is iend - 8 for every segment).
+fn ilimit() -> u32 {
+    if (GAP == 8u) { return seg_end() - 8u; }
+    return seg_end() - select(8u, GAP, seg_id() + 1u < NSEG);
+}
 
 // Records of the last get_all_matches: offBase | length << 17 (offBase <= 65538 < 2^17, length
 // <= SEG < 2^15), strictly increasing length.
@@ -404,11 +410,12 @@ fn memo_len(p: u32, ro: u32) -> u32 {
 fn rep_probe(j: u32, p: u32, lim: u32, ob: u32, ro: u32, valid: bool, x: u32, y: u32, h: u32, bestl: ptr<function, u32>) -> bool {
     let d = x ^ y;
     if (!valid || (d & 0xFFFFFFu) != 0u) { return false; }
-    // lim >= 8 at every searched position (p <= ilimit = iend - 8).
+    // lim >= GAP >= 3 at every searched position (p <= ilimit = iend - GAP; 8 in the block's last
+    // segment): with lim == 3 (gap3, p == ilimit) the length is 3 whatever the 4th byte.
     var rl = h;
     if (h == 0u) {
         rl = 3u;
-        if (d == 0u) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
+        if (d == 0u && (GAP >= 4u || lim > 3u)) { rl = 4u + match_len_nb(dbase(), p + 4u, p - ro + 4u, lim - 4u); }
     }
     mem[j] = ro | (rl << 16u);
     if (rl <= *bestl) { return false; }
@@ -854,7 +861,7 @@ fn in_batch() -> bool {
 // The DP pass of the lane's segment (phases 1 and 2).
 fn dp() {
     let s = seg_id() * SEG;
-    // iend = seg_end(), ilimit = seg_end() - 8 (recomputed at use, M6 A1).
+    // iend = seg_end(), ilimit = ilimit() (recomputed at use, M6 A1).
     st_anchor = s;
     if (s == 0u) {
         st_ip = 1u;
@@ -881,12 +888,12 @@ fn dp() {
             // nothing and only moves st_ip on by 1, so a dead stretch is skipped here, without
             // a trip per position. Terminates: st_ip rises by 1 per step.
             loop {
-                if (st_ip >= seg_end() - 8u) { break; }
+                if (st_ip >= ilimit()) { break; }
                 if ((best[cbase() + 2u * st_ip + 1u] & DEAD_BIT) == 0u) { break; }
                 st_ip += 1u;
             }
         }
-        if (!in_series && st_ip >= seg_end() - 8u) { break; }
+        if (!in_series && st_ip >= ilimit()) { break; }
         // The trip's position and its loads, issued before anything depends on them: the 4 bytes
         // at p (x), the byte before it, and p's candidate words (p is clamped to the segment: a
         // series may reach iend, where nothing is searched and x is unused).
@@ -943,7 +950,7 @@ fn dp() {
                     }
                 }
                 if (inr < seg_end()) { trace_put(inr, n); }
-                if (inr > seg_end() - 8u) {
+                if (inr > ilimit()) {
                     advance = true;
                 } else if (cur == last_pos) {
                     finish = true;
@@ -1026,8 +1033,21 @@ fn dp() {
                         let mrep = new_rep(src.r, ob, gll0);
                         let ra = mrep.x | (mrep.y << 16u);
                         let obs = ob << 8u;
-                        let lo = select(MIN_MATCH, (m_rec[max(mi, 2u) - 2u] >> REC_SHIFT) + 1u, mi > 1u);
+                        var lo = select(MIN_MATCH, (m_rec[max(mi, 2u) - 2u] >> REC_SHIFT) + 1u, mi > 1u);
                         var mlen = rec >> REC_SHIFT;
+                        if (RELAX_N > 0u && ob > 3u) {
+                            // Relaxation pruning (opt::Dp::relax_floor): an explicit record relaxes
+                            // only max(lo, L + 1 - RELAX_N) ..= L. Its pruned lengths above lp0 get
+                            // the oracle's fill (its top length is always relaxed then, being above
+                            // every earlier record's), so at a series start they are the
+                            // unreachable PRUNED nodes (price MAXP, litlen 1: the visit's literal
+                            // extension always replaces them, and the match + 1 literal check
+                            // never takes one); at or below lp0 they are left as they are.
+                            let floor = max(lo, mlen + 1u - min(mlen + 1u, RELAX_N));
+                            // Terminates: q rises to c0 + floor.
+                            for (var q = max(c0 + lo, lp0 + 1u); q < c0 + floor; q += 1u) { fill(q); }
+                            lo = floor;
+                        }
                         loop {
                             let v1 = mlen - 1u >= lo;
                             let v2 = mlen - 2u >= lo;
