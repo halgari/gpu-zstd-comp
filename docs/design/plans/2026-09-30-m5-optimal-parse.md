@@ -12,8 +12,8 @@ GPU is byte-identical to a CPU oracle.
   static prices iterated over passes.
 - **K4/K5 and the pipeline:** unchanged apart from sizes.
 
-**Spec:** `docs/superpowers/specs/2026-09-30-m5-optimal-parse-design.md` (binding).
-**Normative kernel/tie-rule detail:** `docs/superpowers/m5/m5-opt-design.md`.
+**Spec:** `docs/design/specs/2026-09-30-m5-optimal-parse-design.md` (binding).
+**Normative kernel/tie-rule detail:** `docs/design/m5/m5-opt-design.md`.
 **Prototypes:** `/tmp/claude-1000/m5d/` (DP port `src/opt.rs`) and `/tmp/claude-1000/m5r/`.
 
 ## Global Constraints

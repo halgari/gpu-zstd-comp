@@ -10,10 +10,17 @@
 // The literals themselves are not written: they are the block bytes the sequences leave
 // uncovered (literal run i = block[anchor_i .. anchor_i + lit_len_i), anchor_i = the sum of
 // lit_len + match_len over the sequences before i, then block[anchor_n_seq .. BLOCK_SIZE)), and
-// K5 / the host gather them from there (speed phase S4).
+// K5 / the host gather them from there.
 // MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH and SEARCH_CAP come
 // from the injected MatchParams. best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset
 // (K2's layout; 0 = no match).
+//
+// Built without naga's loop bounding (GpuContext::shader_unbounded_loops; bounds checks stay on).
+// Terminates, whatever best[] holds: greedy_parse's loop raises p on every pass and ends at
+// PARSE_END. A skip adds at least 1. A stored match adds its length, which is at least 1 (a
+// capped entry that extends to nothing is skipped) and below 2^15 or within the block, so p
+// cannot wrap. match_len runs with p < PARSE_END (common.wgsl). A loop added here needs its own
+// argument.
 
 fn best_len_of(w: u32) -> u32 { return w >> BEST_OFF_BITS; }
 fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }

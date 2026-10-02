@@ -1,7 +1,8 @@
 //! Test aid: rewrite a shader so that, on the machine at hand (an NVIDIA card), it behaves as it
 //! would on another GPU wherever WGSL or its backends leave the behaviour to the implementation.
-//! `GpuOptions::emulate` turns it on for a context (`GZC_EMULATE_*` through `GpuOptions::from_env`); every module
-//! then goes through `Emulation::rewrite` (`GpuContext::wgsl_module`).
+//! `GpuOptions::emulate` turns it on for a context (`GZC_EMULATE_*` through
+//! `GpuOptions::from_env`). Every module then goes through `Emulation::rewrite`
+//! (`GpuContext::wgsl_module`).
 //!
 //! The rewrite works on naga's WGSL output: the source is parsed and validated by naga and written
 //! back, which gives one statement per line, every binary expression fully parenthesized as
@@ -20,7 +21,7 @@ pub struct Emulation {
     /// (`v[i] = x`, `a[j][i] = x`, `a[j].x = x`) becomes a read-modify-write of the whole vector,
     /// which is how Apple's Metal compiler lowers it. Threads of one SIMD group that store
     /// different components of the same vector in one instruction then keep only one thread's
-    /// component, as on an Apple GPU (the M4 Pro frame corruption: K4's prefix-sum scratch).
+    /// component, as on an Apple GPU.
     pub vector_rmw: bool,
     /// `GZC_EMULATE_SKEW`: timing skew, for races a slow or preempted GPU would expose. Every
     /// invocation stalls for a pseudo-random time (a dependent ALU chain of up to 512 steps, one call
@@ -192,7 +193,7 @@ fn gzc_skew() {
     }
 }
 // The lighter stall at the start of branch bodies (one call in four, up to 64 steps): a full
-// gzc_skew in every branch of K3's coop parse loop ran its dispatches past the driver's
+// gzc_skew in every branch of K3's coop parse loop runs its dispatches past the driver's
 // preemption timeout.
 fn gzc_skew_branch() {
     gzc_seed = gzc_seed * 1664525u + 1013904223u;
@@ -226,9 +227,9 @@ fn opens_branch(t: &str) -> bool {
 /// every `workgroupUniformLoad` binding is followed by a stall, every statement calling a
 /// subgroup built-in preceded by one, and, in a module that calls subgroup built-ins, every
 /// branch body (`if` / `else` / `case` / `default`) starts with the lighter `gzc_skew_branch`.
-/// (Only there, and lighter: full stalls in every branch ran K2's and K3's dispatches past the
-/// driver's preemption timeout, NVIDIA Xid 109, and outside those modules nothing depends on
-/// reconvergence.)
+/// Only there, and lighter: full stalls in every branch run K2's and K3's dispatches past the
+/// driver's preemption timeout (NVIDIA Xid 109), and outside those modules nothing depends on
+/// reconvergence.
 fn skew_timing(s: &str) -> anyhow::Result<String> {
     let mut out = String::with_capacity(s.len() * 2);
     let mut entry = false;

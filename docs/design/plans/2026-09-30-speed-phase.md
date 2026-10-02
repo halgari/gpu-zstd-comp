@@ -9,7 +9,7 @@ GPUs (RTX 4060 / RX 7600 class). Ratio and output stay exactly what they are tod
 
 **Inputs:** idea lists `.superpowers/speed/ideas-fable.md` and `ideas-sonnet.md` (read the relevant
 section before each task), context `.superpowers/speed/context.md`, and the M4 spec and results
-(`docs/superpowers/specs/2026-09-29-m4-lazy-lvl9-design.md`, `docs/results/2026-09-29-m4.md`).
+(`docs/design/specs/2026-09-29-m4-lazy-lvl9-design.md`, `docs/results/2026-09-29-m4.md`).
 
 ## Global constraints (every task)
 

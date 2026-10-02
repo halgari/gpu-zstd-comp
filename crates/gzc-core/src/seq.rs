@@ -1,19 +1,30 @@
 //! Sequence and repeat-offset model shared by CPU and GPU parsers.
 
+/// One zstd sequence: `lit_len` literals, then a match of `match_len` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Sequence {
+    /// Literal bytes before the match.
     pub lit_len: u32,
+    /// Match length in bytes, at least `ZSTD_MIN_MATCH`.
     pub match_len: u32,
+    /// zstd's offBase: 1..=3 are repeat codes, larger values are `offset + 3`
+    /// (`off_base_for`).
     pub off_base: u32,
 }
 
+/// A block's parse: its sequences, and every literal byte in order. The literals past the last
+/// sequence's are the block's trailing literals.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockOutput {
+    /// The sequences, in block order.
     pub sequences: Vec<Sequence>,
+    /// The literal bytes of every sequence, then the trailing literals.
     pub literals: Vec<u8>,
 }
 
+/// The repeat-offset history, most recent first.
 pub type Reps = [u32; 3];
+/// The history at the start of a frame (RFC 8878 §3.1.1.5).
 pub const INITIAL_REPS: Reps = [1, 4, 8];
 
 /// zstd offBase for a match at `offset` preceded by `lit_len` literals (RFC 8878 §3.1.1.5).

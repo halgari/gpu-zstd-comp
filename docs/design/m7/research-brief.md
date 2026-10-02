@@ -18,7 +18,7 @@
 - lvl9s12seg (a lazy2 parse) runs at 10.4 GB/s with ratio 1.33926.
 - Projected opt16 on an RTX 4060: about 0.15–0.2 GB/s.
 - Measured and documented, so don't redo these, though you may build on them:
-  - `docs/superpowers/m6/synthesis.md`, with reports a01–a12 in the same folder. Read the synthesis first, then the reports relevant to your angle.
+  - `docs/design/m6/synthesis.md`, with reports a01–a12 in the same folder. Read the synthesis first, then the reports relevant to your angle.
   - Dead ends: rep-history approximations cost 0.1–0.4 %; a 1-pass L16 misses by 0.14 %; a lazy parse with price guidance loses 0.55–0.8 % against opt14; BC-aligned search; and speculative DP chunks, which keep the ratio but only help the slowest tail.
   - Wins that are in progress, so assume they will exist:
     - splitting a frame into several zstd blocks (+0.16 %);

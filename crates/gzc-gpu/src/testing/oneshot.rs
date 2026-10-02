@@ -19,11 +19,11 @@ use crate::sizing::{
 };
 
 /// Largest batch `compress_batch`/`compress_frames` allocate buffers for, even when the device
-/// limits would allow more. Worst case (dfast's two hash chains, `emit_frames`: every
-/// `sizing::BufferSizes` buffer, with `head` capped at `chains::HEAD_TABLES` tables) is ~1.6 MiB per block, ~200 MiB at this cap. These one-shot
-/// paths serve the tests, several of
-/// which run at once (each with its own device): 128 keeps their 300-block batches split into
-/// full and partial batches (as 256 did) at half the memory.
+/// limits would allow more. The worst case is dfast's two hash chains with `emit_frames`: every
+/// `sizing::BufferSizes` buffer, with `head` capped at `chains::HEAD_TABLES` tables, comes to
+/// about 1.6 MiB per block, 200 MiB at this cap. These one-shot paths serve the tests, several
+/// of which run at once, each with its own device. 128 splits their 300-block batches into full
+/// and partial batches.
 const COMPRESS_BATCH_CAP: u32 = 128;
 
 /// Convenience synchronous path used by tests: upload, run, read back, decode into BlockOutputs.
@@ -203,10 +203,10 @@ fn submit_from_best(
             "best[] {b} has {} entries, not in PARSE_END..=BLOCK_SIZE",
             best.len()
         );
-        // Every non-empty (len > 0) scripted entry must be a match the K3 kernels could actually
-        // have produced: a live source before `ip` and a match that stays inside the block.
-        // K3 does not itself bounds-check `best[]` (it trusts K2's output), so a bad scripted
-        // entry from a test would otherwise read/write out of bounds on the GPU.
+        // Every non-empty (len > 0) scripted entry must be a match K2 could have produced: a
+        // live source before `ip` and a match that stays inside the block. K3 trusts K2's output
+        // and does not bounds-check `best[]`, so a bad scripted entry would read or write out of
+        // bounds on the GPU.
         for (ip, entry) in best.iter().enumerate() {
             if entry.len == 0 {
                 continue;

@@ -1,5 +1,5 @@
-// K2 over the bucket-sorted candidate array (speed2 E2; == gzc_core::reference::find_best_window,
-// which equals find_best over the key's hash chains). Appended to k2_best.wgsl (its bindings and
+// K2 over the bucket-sorted candidate array (== gzc_core::reference::find_best_window, which
+// equals find_best over the key's hash chains). Appended to k2_best.wgsl (its bindings and
 // match_len_capped); entry point `main_window`, Single hash only.
 // Input `pred` holds per block the sorted array (k1_sort_sg.wgsl or any builder of the same
 // array, gzc_core::hash::bucket_sort): slot s < HASHED_POSITIONS holds q | pred_fp(q) for the
@@ -14,6 +14,20 @@
 // while they hold p's key, at most DEPTH: exactly p's chain, in chain order (every entry has
 // q < p). Fingerprint skips, the tie rule and the cap early-out are k2_best's (see its header),
 // so the result is find_best's.
+//
+// Built without naga's loop bounding and index clamps (GpuContext::shader_trusted). It must run
+// right after the sorted K1 on the same blocks: that K1 writes slots 0..HASHED_POSITIONS of each
+// block as a permutation of the positions 0..HASHED_POSITIONS, with fingerprint bits above
+// PRED_POS. So every position p = w & PRED_POS read from a slot is below HASHED_POSITIONS. A
+// `pred` written by the chain K1 breaks this. The sorted K1's self-test and the differential
+// tests check the permutation.
+// Terminates: the staging loop raises i by 256 to WIN, the walk counts j to DEPTH, and
+//   match_len_capped is bounded by SEARCH_CAP.
+// Bounds: win / wkey are indexed by i < WIN, and by DEPTH + lid - j with lid < 256 and
+//   j <= DEPTH, which is in 0..WIN. pred[sb + s - DEPTH] is loaded only for s - DEPTH below
+//   HASHED_POSITIONS. best[sb + s] has s < BLOCK_SIZE (the dispatch) and best[sb + p] has
+//   p < HASHED_POSITIONS. hash_width and the byte loads at p and at q < p stay in the block
+//   (k2_best's `data` argument).
 
 const WIN: u32 = 256u + DEPTH;
 const NO_KEY: u32 = 0xFFFFFFFFu;

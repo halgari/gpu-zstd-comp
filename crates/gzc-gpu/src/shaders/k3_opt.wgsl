@@ -1,5 +1,5 @@
-// K3opt: one DP pass of the M5 optimal parse (presets opt14 / opt16), == gzc_core::opt::dp_pass_with
-// on Engine::Ring (the normative GPU spec, documented on opt::Engine), statement by statement.
+// K3opt: one DP pass of the optimal parse, == gzc_core::opt::dp_pass_with on Engine::Ring (the
+// normative GPU spec, documented on opt::Engine), statement by statement.
 // Two entry points, dispatched back to back:
 //
 // main_opt_persist (one invocation per 4 KiB segment; a workgroup is the NSEG lanes of one block,
@@ -10,16 +10,15 @@
 //   ll[36] ml[53] of[32]). Then each lane runs opt::Dp::segment_ring over its segment: segment 0
 //   from ip 1 with INITIAL_REPS, segment k > 0 from ip = anchor = k*SEG with reps [0, 0, 0];
 //   iend = the segment end, ilimit = iend - GAP for an inner segment, iend - 8 for the block's
-//   last one (opt::Seg::new; GAP = OptParams::inner_gap, 8 under the M5 presets, 3 for gap3).
+//   last one (opt::Seg::new; GAP = OptParams::inner_gap: 8, or 3 for gap3).
 //   Phase 1, the DP:
 //   - The lane loop is flattened (one trip per series start probe or series position, no
 //     `continue`) so that the lanes' get_all_matches calls run together; each trip issues its
 //     position's loads (data, candidate words) first.
 //   - The DP nodes live in a ring of RING_N = sufficient_len + 1 slots per lane (position pos of
 //     the series in slot pos % RING_N). Only the prices (ring_p) are in workgroup memory; the
-//     rest of each node is in the global scratch `scr` (M5 T3b:
-//     workgroup memory bounds K3opt's residency, and 4 B per node lets a 2900-block batch run in
-//     one wave on an RTX 5090).
+//     rest of each node is in the global scratch `scr`. Workgroup memory bounds K3opt's
+//     residency, and 4 B per node lets a 2900-block batch run in one wave on an RTX 5090.
 //   - `trace` (the dead K1 pred buffer, 2 words per position) gets (mlen | litlen << 8, offBase)
 //     of every node when it becomes final; the backward trace reads it, never the ring. The entry
 //     at iend (a node at the segment end) is never read and not written (it would be the next
@@ -29,7 +28,8 @@
 //     main_fixup); no lane waits for another's backward trace inside the DP loop.
 //   Phase 2: the logged series' backward traces, last series first (emit), write the
 //   segment's sequences in reverse order (RAW_REVERSED) into its own words of `best` (the
-//   candidate words, 2 per position, no longer read): sequence i from the segment's end at
+//   candidate words, 2 per position, which nothing reads after phase 1): sequence i from the
+//   segment's end at
 //   best[wbase() + 3*i ..], trailer (n_seq, final anchor, sum of match_len, final reps) at
 //   best[wbase() + SEG_META ..], for k3_fixup.wgsl's main_fixup (at most SEG / 3 sequences).
 // main_fixup (k3_fixup.wgsl): concatenation, literal carry and off_base re-encoding against the
@@ -41,10 +41,14 @@
 //
 // Precondition (K2opt's output satisfies it): every candidate record lies in the block before its
 // position, and its length is the true common length capped at SEARCH_CAP. The kernel trusts the
-// words (no bounds checks on offsets); only the host test harness (k3opt.rs `OptBuffers::upload`)
-// validates scripted ones, the pipeline runs it right after K2opt.
+// words (no bounds checks on offsets). The pipeline runs it right after K2opt; the test harness
+// validates scripted words (testing::k3opt, `OptBuffers::upload`).
 //
-// Passes (M5 T4, opt::passes): pass n + 1 is priced from pass n's own output histogram
+// Loops: the host may build this module without naga's loop bounding
+// (K3OptConfig::unbounded; bounds checks stay on), so every loop carries a `// Terminates:` note
+// naming what rises or falls and the bound that ends it. A loop added here needs one.
+//
+// Passes (opt::passes): pass n + 1 is priced from pass n's own output histogram
 // (opt::Hist::of_output of the fixed-up block parse: literal bytes, and each sequence's LL code
 // with the literal carry, ML code, and OF code of the off_base under the block's true decoder
 // reps). A HIST_OUT pass (the cheap ones) keeps the candidate words: its raw sequences go to the
@@ -67,12 +71,12 @@
 // (reference::DEAD_BIT), SCHED_HDR (k3_sched.wgsl), GAP (OptParams::inner_gap) and RELAX_N
 // (OptParams::relax_lengths, 0 for None).
 //
-// M6 options (opt16p1; compile-time, so the M5 presets build the same kernels as before): GAP
+// Options (compile-time): GAP
 // (ilimit above), RELAX_N (relaxation pruning, opt::Dp::relax_floor: an explicit record relaxes
 // only its RELAX_N longest lengths, see the relaxation loop) and the PR_* tables. The drop pass
 // (OptParams::drop_max_len) is its own kernel after the fix-up, k3_drop.wgsl.
 //
-// Persistent passes (M6 A4, a07): the grid is one workgroup per block, but each workgroup loops:
+// Persistent passes: the grid is one workgroup per block, but each workgroup loops:
 // it takes the next item of the batch's heavy-first block order (k3_sched.wgsl) from a global
 // counter and runs prologue, DP and epilogue for that block, until the order is used up. An
 // NVIDIA Vulkan dispatch of this kernel larger than one wave runs as synchronous waves (each
@@ -101,7 +105,7 @@ const_assert 3u * (SEG / 3u) <= LOG_WORDS;
 const_assert SEG / 3u <= LOG_SEQS;
 const HIST_WORDS: u32 = 377u;
 // HIST_OUT counts in the workgroup's `hist` words, no extra workgroup memory (K3opt's residency
-// is bound by it: 870 more bytes per workgroup cost 33 % at wg16, M5 T4 log): word e
+// is bound by it: 870 more bytes per workgroup cost 33 % of the pass's speed): word e
 // holds literal byte e's count in its low 17 bits (at most BLOCK_SIZE <= 65536) and
 // code e's count in its high 15 bits (at most MAX_SEQS < 32768), codes numbered as in the Hist:
 // LL 0..36, ML 36..89, OF 89..121. Counts never go negative, so the packed atomics are exact.
@@ -120,7 +124,7 @@ const SUM_WORDS: u32 = 5u;
 // words: written by dp's HIST_OUT tail, read by hist_epilogue).
 fn summ_base(b: u32, k: u32) -> u32 { return 2u * (b * BLOCK_SIZE + k * SEG); }
 const_assert BLOCK_SIZE <= 65536u;
-// Dead positions (M6 A3, a09; reference::find_cands): DEAD_BIT in a candidate word w1 marks p as
+// Dead positions (reference::find_cands): DEAD_BIT in a candidate word w1 marks p as
 // dead: no earlier position of the block shares p's first 3 bytes, so no candidate and no rep
 // reaches MIN_MATCH there and get_all_matches(p) is empty under every rep state. The DP skips
 // such positions' searches: outside a series in a tight loop before the trip (st_ip += 1 per
@@ -129,8 +133,8 @@ const_assert BLOCK_SIZE <= 65536u;
 // see mem). (A run length per position, capped at K2opt's 256-position tiles, measured no faster
 // here and cost K2opt two workgroup barriers.) DEAD_BIT is injected by the host
 // (reference::DEAD_BIT), so the kernel and the oracle cannot drift apart.
-// Literal-only positions of a series folded into one trip (dp): measured on the optLevel-0
-// passes only (a09: the final pass is faster without; it has fewer `+128` skips).
+// Literal-only positions of a series are folded into one trip (dp) on the optLevel-0 passes
+// only. The final pass is faster without the fold: it has fewer `+128` skips.
 const FOLD: bool = LEVEL == 0u;
 const_assert 3u * (SEG / 3u) <= SEG_META;
 const_assert NSEG * (SEG / 3u) <= MAX_SEQS;
@@ -164,8 +168,8 @@ const LL_CODE: array<u32, 64> = array<u32, 64>(
 // Price tables of the workgroup's block. Every price is in
 // 0..65536 (opt::Prices; a PRICE_MODE 1 table is checked on upload), so the literal, LL and OF
 // prices are stored as u16 pairs (entry 2w in the low half of word w) in u32 words. The ML
-// prices, read four at a time in the relaxation loop, stay i32: unpacking them there measured
-// 0.8 % slower than the 66 B they save per block (M6 A1; 264 B saved per block overall).
+// prices, read four at a time in the relaxation loop, stay i32: unpacking them there is 0.8 %
+// slower, for 66 B per block.
 // Literal prices by byte value.
 var<workgroup> p_lit: array<u32, 128u>;
 // The LL and OF tables, one packed array (tab): LL price by code (litlen >= 64: code
@@ -183,8 +187,8 @@ var<workgroup> p_ml: array<i32, RING_N>;
 var<workgroup> ring_p: array<i32, RING_N * NSEG>;
 fn rix(s: u32) -> u32 { return s * NSEG + seg_id(); }
 // The prologue's literal frequencies (PRICE_MODE 0 / 2); with HIST_OUT, then the pass's packed
-// histogram (see LIT_BITS). A pass that uses neither declares one word (M6 A1: the final pass
-// carried 1 KiB it never touched; workgroup memory bounds K3opt's residency).
+// histogram (see LIT_BITS). A pass that uses neither declares one word, because workgroup memory
+// bounds K3opt's residency.
 // The one-word placeholder (`hist` without HIST_USED) must never be indexed: every access to
 // `hist` must stay under HIST_USED (WGSL clamps or discards an out-of-range workgroup index, so a
 // stray access would not fault, it would silently alias word 0).
@@ -194,9 +198,9 @@ var<workgroup> hist: array<atomic<u32>, select(1u, 256u, HIST_USED)>;
 // (unused by PRICE_MODE 1, the tests' uploaded tables).
 var<workgroup> hsum: array<atomic<u32>, 5u>;
 
-// Lane constants (M6 A1 register diet): everything per lane derives from gsg, the lane's global
-// segment index (block * NSEG + segment, the segment being the lane's local_invocation_index),
-// instead of being held in registers across the DP.
+// Lane constants: everything per lane derives from gsg, the lane's global segment index
+// (block * NSEG + segment, the segment being the lane's local_invocation_index), so that it is
+// recomputed at use and not held in registers across the DP.
 var<private> gsg: u32;
 // The lane's block and its segment in the block (its lane in the workgroup).
 fn block_id() -> u32 { return gsg / NSEG; }
@@ -211,8 +215,8 @@ fn sbase() -> u32 { return gsg * (3u * RING_N); }
 fn lbase() -> u32 { return block_id() * (3u * MAX_SEQS) + seg_id() * LOG_WORDS; }
 // The segment's end (iend: positions [k * SEG, iend)).
 fn seg_end() -> u32 { return (seg_id() + 1u) * SEG; }
-// ilimit (opt::Seg::new): iend - GAP for an inner segment, iend - 8 for the block's last one (GAP
-// == 8 under the M5 presets, where this is iend - 8 for every segment).
+// ilimit (opt::Seg::new): iend - GAP for an inner segment, iend - 8 for the block's last one
+// (with GAP == 8 this is iend - 8 for every segment).
 fn ilimit() -> u32 {
     if (GAP == 8u) { return seg_end() - 8u; }
     return seg_end() - select(8u, GAP, seg_id() + 1u < NSEG);
@@ -235,7 +239,7 @@ var<private> n_seq: u32;
 var<private> ml_sum: u32;
 // Phase 1 series log: seqs[lbase() + 3*i ..] (free until main_fixup).
 var<private> n_series: u32;
-// Rep-length memo (M6 A2, a01 P1): the lane's last search position mem_p and, for each of its
+// Rep-length memo: the lane's last search position mem_p and, for each of its
 // three rep probes, offset | length << 16 with the probe's exact length (its common prefix capped
 // at that position's lim), or 0 when unknown. For the same offset, the capped common prefix at
 // mem_p + d is exactly L - d whenever L >= d + 3 (lim falls by d too), so a later search reuses
@@ -243,7 +247,7 @@ var<private> n_series: u32;
 var<private> mem_p: u32;
 var<private> mem: vec3<u32>;
 
-// load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
+// load_u32_at without its alignment branch (a per-lane branch diverges): both words
 // are loaded, the high one masked when aligned. data[w + 1] is in bounds because every `data`
 // binding ends with one zero word after the batch's last block (`sizing::data_bytes` =
 // n * BLOCK_SIZE + 4, asserted by `OptBinds::check`; the pipeline's copy, direct-upload and
@@ -523,7 +527,7 @@ fn end_series(last: Node, sip: u32, last_pos: u32) {
 // first, each appending its sequences last first to the segment's words of `best`, so the
 // segment's raw sequences end up in reverse order (RAW_REVERSED).
 //
-// One flat loop, one sequence per iteration (M6 A2, a01 P5): a series' header is read when the
+// One flat loop, one sequence per iteration: a series' header is read when the
 // previous series is done, so the warp runs the maximum over its lanes of n_seq iterations, not
 // the sum over series of the longest series' trace. Reads and writes keep the order of the
 // series-by-series form (which the HIST_OUT in-place log relies on, see LOG_SEQS).
@@ -637,9 +641,9 @@ fn cover_chunk(kl: u32, b: u32) {
     atomicAdd(&hsum[4u], n);
 }
 
-// The LL / ML / OF prices under PRICE_MODE, each the value the i32 tables held before M6 A1 (in
-// 0..65536): `q` the block's words in `prices` (PRICE_MODE 1 / 3) and `bases` the LL / ML / OF
-// base weights (PRICE_MODE 3: frac_weight of the table sums).
+// The LL / ML / OF prices under PRICE_MODE, each in 0..65536: `q` the block's words in `prices`
+// (PRICE_MODE 1 / 3) and `bases` the LL / ML / OF base weights (PRICE_MODE 3: frac_weight of the
+// table sums).
 // Entry i < TAB_N of the packed LL / OF table (see T_LLC).
 fn tab_entry(i: u32, q: u32, bases: vec3<u32>) -> u32 {
     if (i < T_OF) {
@@ -815,7 +819,7 @@ fn hist_epilogue(valid: bool, b: u32, k: u32) {
 fn run_block() {
     prologue(in_batch(), block_id());
     if (in_batch()) { dp(); }
-    // The epilogue's arguments are recomputed from gsg, not kept live across the DP (M6 A1).
+    // The epilogue's arguments are recomputed from gsg, not kept live across the DP.
     if (HIST_OUT) { hist_epilogue(in_batch(), block_id(), seg_id()); }
 }
 
@@ -835,7 +839,7 @@ fn main_opt_persist(@builtin(local_invocation_index) lid: u32) {
         let b = atomicLoad(&sched[SCHED_HDR + n + item]);
         // b < n < 2^30, so b >> 30 is 0. It keeps the lane opaque to the compiler, so the lane
         // constants are recomputed from gsg in each trip instead of being hoisted out of the
-        // loop and held in registers (a07: 92 -> 138 registers without it).
+        // loop and held in registers (138 registers instead of 92 without it).
         gsg = b * NSEG + lid + (b >> 30u);
         run_block();
     }
@@ -849,7 +853,7 @@ fn in_batch() -> bool {
 // The DP pass of the lane's segment (phases 1 and 2).
 fn dp() {
     let s = seg_id() * SEG;
-    // iend = seg_end(), ilimit = ilimit() (recomputed at use, M6 A1).
+    // iend = seg_end(), ilimit = ilimit() (recomputed at use).
     st_anchor = s;
     if (s == 0u) {
         st_ip = 1u;
@@ -872,7 +876,7 @@ fn dp() {
     // past the series start) or cur (inside one, cur <= last_pos <= iend - sip, then a commit).
     loop {
         if (!in_series) {
-            // Dead positions (M6 A3, a09; see DEAD_BIT): a series start probe there finds
+            // Dead positions (see DEAD_BIT): a series start probe there finds
             // nothing and only moves st_ip on by 1, so a dead stretch is skipped here, without
             // a trip per position. Terminates: st_ip rises by 1 per step.
             loop {
@@ -905,7 +909,7 @@ fn dp() {
             gll0 = st_ip == st_anchor;
             search = true;
         } else {
-            // FOLD (M6 A3, a09): a position that only needs its literal extension (advance) is
+            // FOLD: a position that only needs its literal extension (advance) is
             // followed by the next one in the same trip, with the same statements, while cur <
             // last_pos (so the next trip would have been that position, in the series).
             // Terminates: cur rises by 1 per fold, to last_pos, which only a LEVEL >= 1 pass
@@ -974,8 +978,8 @@ fn dp() {
         }
 
         // Part 2 (no `continue`: every lane reaches the end of the trip, so the lanes stay
-        // together for the next trip's get_all_matches). Seeding and relaxation are one loop (M5
-        // T3b): a series start is a relaxation from a virtual node n0 at cur 0 with last_pos 0.
+        // together for the next trip's get_all_matches). Seeding and relaxation are one loop: a
+        // series start is a relaxation from a virtual node n0 at cur 0 with last_pos 0.
         // - The records' target sets are disjoint (record i covers mlen in (len_{i-1}, len_i]),
         //   so every target is compared against the ring as it was before this step, whatever the
         //   order: target pos improves iff pos > lp0 || price < its ring price (a target above

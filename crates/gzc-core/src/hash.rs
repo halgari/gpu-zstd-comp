@@ -2,6 +2,7 @@
 use crate::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, NO_POS};
 use crate::params::{Hashes, MatchParams};
 
+/// The little-endian u32 at `b[p..p + 4]`.
 pub fn read_u32(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
 }
@@ -16,10 +17,12 @@ fn mix(lo: u32, hi: u32) -> u32 {
     (lo.wrapping_mul(0x9E37_79B1) ^ hi.wrapping_mul(0x85EB_CA77)).wrapping_mul(0xC2B2_AE3D) >> (32 - HASH_BITS)
 }
 
+/// Hash of the 8 bytes at `p`: the dfast long chain's key.
 pub fn hash_long(b: &[u8], p: usize) -> u32 {
     mix(read_u32(b, p), read_u32(b, p + 4))
 }
 
+/// Hash of the 5 bytes at `p`: the dfast short chain's key.
 pub fn hash_short(b: &[u8], p: usize) -> u32 {
     mix(read_u32(b, p), b[p + 4] as u32)
 }
@@ -28,9 +31,9 @@ pub fn hash_short(b: &[u8], p: usize) -> u32 {
 /// `mix(read_u32(b, p), read_u32(b, p + 4) & mask(width - 4))`, where `mask(0) = 0`,
 /// `mask(k) = (1 << (8 * k)) - 1` for `k < 4`, and `mask(4) = u32::MAX`.
 ///
-/// Invariants (mirrored bit-exactly in WGSL by Task 3): `hash_width(b, p, 5) == hash_short(b, p)`
-/// and `hash_width(b, p, 8) == hash_long(b, p)`. u32 wrapping arithmetic only, so the GPU port
-/// matches exactly.
+/// Invariants: `hash_width(b, p, 5) == hash_short(b, p)` and
+/// `hash_width(b, p, 8) == hash_long(b, p)`. It uses u32 wrapping arithmetic only, so the WGSL
+/// `hash_width` matches it bit for bit.
 pub fn hash_width(b: &[u8], p: usize, width: u32) -> u32 {
     let k = width.wrapping_sub(4);
     let mask: u32 = if k == 0 {
@@ -49,7 +52,7 @@ fn byte_mask(k: u32) -> u32 {
     if k >= 4 { u32::MAX } else { (1u32 << (8 * k)) - 1 }
 }
 
-/// The 16-bit (`HASH_BITS`) key of a sparse candidate chain (`params::SparseChain`, M6 a06/r3):
+/// The 16-bit (`HASH_BITS`) key of a sparse candidate chain (`params::SparseChain`):
 /// the `width` bytes at `p`, `5 <= width <= 12`. With `lo`, `hi`, `h2` the little-endian words
 /// at `p`, `p + 4`, `p + 8`:
 ///
@@ -57,14 +60,12 @@ fn byte_mask(k: u32) -> u32 {
 ///                 ^ ((h2 & mask(width - 8)) * 0x27D4EB2F)) * 0xC2B2AE3D >> 16`
 ///
 /// in wrapping u32 arithmetic, `mask` as in `hash_width`, and the `h2` term 0 (not read) for
-/// `width <= 8`, where this equals `hash_width(b, p, width)`. The `S3_CHAINS` keys, with
+/// `width <= 8`, where this equals `hash_width(b, p, width)`. The `SPARSE_CHAINS` keys, with
 /// `K1 = 0x9E3779B1`, `K2 = 0x85EBCA77`, `K3 = 0x27D4EB2F`, `K4 = 0xC2B2AE3D`:
 /// - width 6: `((lo * K1) ^ ((hi & 0xFFFF) * K2)) * K4 >> 16`, i.e. `hash_width(b, p, 6)`
 ///   (reads bytes `p..p + 8`);
 /// - width 10: `((lo * K1) ^ (hi * K2) ^ ((h2 & 0xFFFF) * K3)) * K4 >> 16` (reads `p..p + 12`);
 /// - width 12: `((lo * K1) ^ (hi * K2) ^ (h2 * K3)) * K4 >> 16` (reads `p..p + 12`).
-///
-/// Width 10 is a06's h10 GPU prototype hash.
 pub fn hash_sparse(b: &[u8], p: usize, width: u32) -> u32 {
     debug_assert!((5..=12).contains(&width), "hash_sparse width {width}");
     let lo = read_u32(b, p);
@@ -86,7 +87,7 @@ pub fn key(h: u32, bits: u32) -> u32 {
     h >> (HASH_BITS - bits)
 }
 
-/// The bucket-sorted candidate array of a Single-hash `params` (speed2 E2): every hashed position
+/// The bucket-sorted candidate array of a Single-hash `params`: every hashed position
 /// `p < HASHED_POSITIONS`, ordered by key (`key(hash_width(block, p, min_match), hash_bits)`)
 /// ascending, positions ascending inside a key (a stable counting sort by key). Returns
 /// `(sorted, rank)`: `sorted[s]` is the position in slot `s` (`HASHED_POSITIONS` slots, the rest
@@ -187,7 +188,7 @@ mod tests {
     }
 
     /// `hash_sparse` is `hash_width` up to 8 bytes, depends on exactly its `width` bytes, and
-    /// matches its formula for the S3 widths on hand-built words.
+    /// matches its formula for the `SPARSE_CHAINS` widths on hand-built words.
     #[test]
     fn hash_sparse_formula_and_width() {
         let b = crate::synth::random(5, crate::config::BLOCK_SIZE);

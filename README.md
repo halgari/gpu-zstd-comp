@@ -199,5 +199,7 @@ Build one `Compressor` and reuse it. `cargo doc --no-deps -p gzc-gpu --open` has
 - `crates/gzc-gpu`: the library: `Compressor`, the WGSL kernels and the GPU pipeline.
 - `crates/gzc-bench`: the benchmark CLI.
 - `tools/fetch-corpus`: downloads the test corpus.
+- `docs/reference.md`: the reference for the CLI, the library and the environment variables.
 - `docs/results/`: measured results per machine.
-- `docs/superpowers/`: design notes and research.
+- `docs/design/`: specs, plans and research notes, kept as written at the time.
+- `docs/README.md`: an index of the above.

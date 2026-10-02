@@ -1,4 +1,4 @@
-//! Targeted tests for the subgroup-cooperative K3 (speed phase S3, `k3_coop.wgsl`): scripted
+//! Targeted tests for the subgroup-cooperative K3 (`k3_coop.wgsl`): scripted
 //! `best[]` tables that put matches, rep repeats and literal runs on the step-regime
 //! and lane-window boundaries of the cooperative primitives. Expected values come from
 //! `reference::greedy_parse` / `reference::compress_block`. The same tests run against the
@@ -130,7 +130,7 @@ fn scan_positions(a: usize) -> Vec<usize> {
     dedup(v.into_iter().map(|x| a + x).collect())
 }
 
-/// T1: one planted explicit match (found iff it is on the skip sequence), and a planted 4-byte
+/// One planted explicit match (found iff it is on the skip sequence), and a planted 4-byte
 /// rep repeat at cand + 1 after a first match set the rep offset.
 #[test]
 fn scan_finds_exactly_the_skip_sequence() {
@@ -192,7 +192,7 @@ fn scan_restarts_mid_regime() {
 
 /// A best[] entry that claims a match past the block end (K2 never writes one) puts the anchor
 /// past BLOCK_SIZE. K3 must still terminate (no GPU hang; the device stays usable). Both K3s
-/// count no trailing literals then (since S4 the sequential one no longer wraps its count).
+/// count no trailing literals then.
 #[test]
 fn anchor_past_block_end_terminates() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -253,7 +253,7 @@ fn full_literal_region_next_to_other_blocks() {
     }
 }
 
-/// T1, MIN_MATCH 6: planted best lengths 4 and 5 are no match, 6 is.
+/// MIN_MATCH 6: planted best lengths 4 and 5 are no match, 6 is.
 #[test]
 fn scan_respects_min_match() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -267,7 +267,7 @@ fn scan_respects_min_match() {
     check(MatchParams { min_match: 8, ..RUNG1 }, &cases);
 }
 
-/// T2: scans and matches at PARSE_END, with poisoned best[] entries at and past it.
+/// Scans and matches at PARSE_END, with poisoned best[] entries at and past it.
 #[test]
 fn scan_and_matches_at_parse_end() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -310,7 +310,7 @@ fn scan_and_matches_at_parse_end() {
     check(LVL3, &cases);
 }
 
-/// T3: capped best[] entries extended to their true length, for every (p & 3, q & 3), lengths
+/// Capped best[] entries extended to their true length, for every (p & 3, q & 3), lengths
 /// around the lane-window multiples and up to (and just short of) the block end.
 #[test]
 fn capped_extension_geometry() {
@@ -343,7 +343,7 @@ fn capped_extension_geometry() {
     check(RUNG1, &cases);
 }
 
-/// T4: rep repeats of lengths around the lane windows; chains of alternating-offset repeats.
+/// Rep repeats of lengths around the lane windows; chains of alternating-offset repeats.
 #[test]
 fn rep_lengths_and_immediate_chains() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -376,7 +376,7 @@ fn rep_lengths_and_immediate_chains() {
     check(LVL3, &cases);
 }
 
-/// T6: literal runs of every length class at every accumulator phase.
+/// Literal runs of every length class at every accumulator phase.
 #[test]
 fn literal_packing() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -412,7 +412,7 @@ fn literal_packing() {
     check(LVL3, &cases);
 }
 
-/// T8: flat and periodic blocks through K1/K2/K3 (long extensions to the block end, every lane
+/// Flat and periodic blocks through K1/K2/K3 (long extensions to the block end, every lane
 /// boundary, the byte tail at the end).
 #[test]
 fn flat_and_periodic_blocks() {
@@ -445,7 +445,7 @@ fn flat_and_periodic_blocks() {
     }
 }
 
-/// T9: the lane probe accepts every W up to the minimum subgroup size and rejects a workgroup
+/// The lane probe accepts every W up to the minimum subgroup size and rejects a workgroup
 /// of two subgroups; an unsegmented greedy parse uses the cooperative K3 by default when subgroups
 /// exist, and a segmented or optimal parse has no K3 mode.
 #[test]

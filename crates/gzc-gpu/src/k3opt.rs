@@ -1,57 +1,65 @@
-//! K3opt (M5 stage S2): one DP pass of the optimal parse on the GPU (`shaders/k3_opt.wgsl`),
-//! byte-identical to `gzc_core::opt::dp_pass_with(.., Engine::Ring)`, then the segmented parse's
-//! fix-up (`shaders/k3_fixup.wgsl`).
+//! K3opt: the optimal parse on the GPU. One DP pass (`shaders/k3_opt.wgsl`) is byte-identical
+//! to `gzc_core::opt::dp_pass_with(.., Engine::Ring)`; the segmented parse's fix-up
+//! (`shaders/k3_fixup.wgsl`) follows the final pass.
 //!
-//! In the pipeline (M5 T5) `kernels::Kernels` runs `OptPasses` as its K3 on the shared
-//! `BatchBuffers` (`OptBinds::of_batch`). The harnesses in `testing::k3opt` have their own buffers
-//! (`OptBuffers`) and feed K2opt's candidate words from the host (`parses_from_cands`, the
-//! counterpart of `testing::parses_from_best`), so they run on `reference::find_cands` output
-//! or on scripted candidates (`opt::cases`). Prices come either from zstd's first-block statistics computed in
-//! the kernel's prologue (`PriceSrc::BlockInit`, the oracle's `Seed::BlockInit` pass 0) or from
-//! explicit per-block tables (`PriceSrc::Buffer`, e.g. `opt::cases`' tables or a later pass's).
+//! In the pipeline, `kernels::Kernels` runs `OptPasses` as its K3 on the shared `BatchBuffers`
+//! (`OptBinds::of_batch`). The harnesses in `testing::k3opt` have their own buffers and feed the
+//! candidate words from the host, so they can run on `reference::find_cands` output or on
+//! scripted candidates (`opt::cases`).
 //!
-//! Passes (M5 T4): `OptPasses` runs a preset's whole `opt::passes` schedule, one dispatch per
-//! pass. Pass 0 is priced by the seed (`PriceSrc::BlockInit`, or `PriceSrc::Prior`: the prior
-//! tables plus the cover literals, from the resident candidate words); each cheap pass
-//! (optLevel 0, `hist_out`) keeps the candidate words and leaves its output histogram
-//! (`opt::Hist` of the fixed-up parse, 377 words per block) in the `prices` buffer from its
-//! workgroup epilogue, and the next pass's prologue turns it into price tables
-//! (`PriceSrc::Hist`). Only the final pass (at the preset's optLevel) writes its parse and runs
-//! the fix-up. `parses_from_passes` / `time_passes` are the host harnesses.
+//! # Passes
 //!
-//! M6 (`opt16p1`, B3): `inner_gap` (gap3), `relax_lengths` (top-N pruning) and `prior` (the S3
-//! prior tables) are compile-time options of the pass kernel (the M5 presets build the same
-//! kernels as before); with `drop_max_len > 0` `OptPasses` runs the drop pass (`K3Drop`,
-//! `shaders/k3_drop.wgsl`, `opt::drop_pass`) after the final pass's fix-up.
+//! `OptPasses` runs a preset's whole `opt::passes` schedule, one dispatch per pass.
+//! - Pass 0 is priced by the seed: `PriceSrc::BlockInit`, or `PriceSrc::Prior` (the prior tables
+//!   plus the cover literals, computed from the resident candidate words).
+//! - Each cheap pass (optLevel 0, `hist_out`) keeps the candidate words. Its workgroup epilogue
+//!   leaves the pass's output histogram in the `prices` buffer (`opt::Hist` of the fixed-up
+//!   parse, 377 words per block), and the next pass's prologue turns it into price tables
+//!   (`PriceSrc::Hist`).
+//! - Only the final pass, at the preset's optLevel, writes its parse and runs the fix-up.
 //!
-//! Buffers per block: data (BLOCK_SIZE, plus the batch's trailing zero word: `ld32` reads one word
-//! past a block), candidate words (`sizing::best_bytes_for`, 8 B per position; after the DP
-//! each segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace
-//! (`sizing::trace_bytes`, 8 B per position: K1's `pred` in the pipeline), seqs
-//! (`MAX_SEQS_OPT` × 12 B; the DP's series log until the fix-up), counts, the price tables
-//! (`PRICE_WORDS` words), and the DP nodes' payload scratch (`scratch_bytes_per_block`, 6336 B at
-//! 64 KiB: only the nodes' prices stay in workgroup memory, M5 T3b).
+//! # Options
 //!
-//! Buffer life cycle (the pipeline's order K1 → K2opt → K3opt passes → K5 → K4): the cheap passes
-//! overwrite the first `SUM_WORDS` trace words of each segment (so K1's `pred` chains) and the
-//! `seqs` series-log words; the final pass overwrites the candidate words (`best`) with its raw
+//! `inner_gap` (gap3), `relax_lengths` (top-N pruning) and `prior` (which prior tables) are
+//! compile-time options of the pass kernel. With `drop_max_len > 0`, `OptPasses` runs the drop
+//! pass (`K3Drop`, `shaders/k3_drop.wgsl`, `opt::drop_pass`) after the final pass's fix-up.
+//!
+//! # Buffers per block
+//!
+//! - data: BLOCK_SIZE bytes, plus the batch's trailing zero word (`ld32` reads one word past a
+//!   block).
+//! - candidate words: `sizing::best_bytes_for`, 8 B per position. After the DP each segment's
+//!   first words take its raw sequences, as `k3_seg.wgsl` does with `best`.
+//! - trace: `sizing::trace_bytes`, 8 B per position. In the pipeline this is K1's `pred`.
+//! - seqs: `MAX_SEQS_OPT` × 12 B. Until the fix-up it holds the DP's series log.
+//! - counts, and the price tables (`PRICE_WORDS` words).
+//! - the DP nodes' payload scratch: `scratch_bytes_per_block`, 6336 B. Only the nodes' prices
+//!   stay in workgroup memory.
+//!
+//! # Buffer life cycle
+//!
+//! The pipeline's order is K1 → K2opt → K3opt passes → K5 → K4. The cheap passes overwrite the
+//! first `SUM_WORDS` trace words of each segment (so K1's `pred` chains) and the `seqs`
+//! series-log words. The final pass overwrites the candidate words (`best`) with its raw
 //! sequences. K3opt is therefore the last reader of `pred` and `best`: K2opt reads the chains
 //! before the first pass, and K5/K4 read only `data`, `seqs` and `counts`.
 //!
-//! Precondition: the candidate words come from K2opt (or `reference::find_cands`): every record
-//! lies in the block before its position (1 <= offset <= position) with its true common length
-//! capped at `SEARCH_CAP`, and every dead mark (M6 A3) is on a dead position. The kernel does
-//! not bounds-check them; only the host harness (`OptBuffers::upload`) validates scripted words.
+//! # Precondition
 //!
-//! Workgroups: one per block, its 16 lanes the block's 16 segments (the fastest size measured on
-//! an RTX 5090 at 64 KiB blocks, M5 T3 and T3b logs in `docs/results/m5-log.md`). The passes are
-//! persistent (M6 A4): each workgroup takes blocks in the batch's heavy-first order
-//! (`k3_sched.wgsl`) until none is left. Residency (M6 A1, A4): a pass kernel needs at most
-//! 4068 B of workgroup memory (`workgroup_bytes`; the final pass 3048 B) and 80 (final) / 85..86
-//! (cheap) registers (`vkstats`): 23 cheap-pass workgroups per SM on an RTX 5090 (3910 blocks
-//! resident), and a batch beyond that has no second-wave cliff (the loop takes the remaining
-//! blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
-//! `vkstats` on every pass kernel after a change (`GpuOptions::dump_wgsl` writes the composed modules).
+//! The candidate words come from K2opt or `reference::find_cands`: every record lies in the
+//! block before its position (1 <= offset <= position) with its true common length capped at
+//! `SEARCH_CAP`, and every dead mark is on a dead position. The kernel does not bounds-check
+//! them. Only the test harness (`testing::k3opt`, `OptBuffers::upload`) validates scripted
+//! words.
+//!
+//! # Workgroups
+//!
+//! One workgroup per block; its 16 lanes are the block's 16 segments. The passes are
+//! persistent: each workgroup takes blocks in the batch's heavy-first order (`k3_sched.wgsl`)
+//! until none is left. Workgroup memory bounds how many workgroups are resident at once: a pass
+//! kernel needs at most 4068 B of it (`workgroup_bytes`; the final pass 3048 B). After a change
+//! to a pass kernel, check its register count and workgroup memory in the driver's pipeline
+//! statistics (`GpuOptions::dump_wgsl` writes the composed modules).
 use crate::context::{GpuContext, params_wgsl};
 use crate::kernels::{BatchBuffers, K3_FIXUP_WGSL};
 use crate::sizing::{
@@ -63,22 +71,25 @@ use gzc_core::opt::{Hist, Prices};
 use gzc_core::params::{MatchParams, PriorTables};
 
 const K3_OPT_WGSL: &str = include_str!("shaders/k3_opt.wgsl");
+const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
 
 // K3opt and K3Drop keep offsets and literal counts in 16-bit fields (k3_opt.wgsl's const_asserts).
 const _: () = assert!(BLOCK_SIZE <= 1 << 16, "K3opt/K3Drop need blocks of at most 64 KiB");
-const K3_SCHED_WGSL: &str = include_str!("shaders/k3_sched.wgsl");
 
 /// Header words of the `sched` buffer (`k3_sched.wgsl`): the persistent passes' block counter at
 /// word 0, then 3 unused words.
 pub const SCHED_HDR: u32 = 4;
 
-/// `k3_sched.wgsl`'s weight samples runs of `WEIGHT_RUN` positions every `WEIGHT_STRIDE` positions
-/// (M6 A4): one 64-byte burst of candidate words in 33, 1986 positions per block. Over 2900 corpus
-/// blocks the sampled count's Spearman correlation with the full count is 0.996. A full scan cost
-/// about 1.4 % of opt16's K3 time, and every 33rd position alone (0.998) still 0.3 %: each
-/// position is its own memory burst. (Single positions at a power-of-two stride alias with
-/// periodic data: 0.79..0.84; the runs cover every phase mod 8, and 264 = 8 * 33 every other.)
+/// `k3_sched.wgsl`'s weight samples runs of `WEIGHT_RUN` positions every `WEIGHT_STRIDE`
+/// positions: one 64-byte burst of candidate words in 33, 1986 positions per block.
+///
+/// Over 2900 corpus blocks the sampled count's Spearman correlation with the full count is
+/// 0.996. A full scan costs about 1.4 % of opt16's K3 time. Every 33rd position alone (0.998)
+/// still costs 0.3 %, because each position is its own memory burst. Single positions at a
+/// power-of-two stride alias with periodic data (0.79..0.84); the runs cover every phase mod 8,
+/// and 264 = 8 * 33 every other.
 pub const WEIGHT_RUN: u32 = 8;
+/// Positions between the starts of two sampled runs (see `WEIGHT_RUN`).
 pub const WEIGHT_STRIDE: u32 = 264;
 
 /// Sequences per block of the optimal parse (min match 3): `BLOCK_SIZE / 3 + 1`.
@@ -108,6 +119,7 @@ pub enum PriceSrc {
 pub struct K3OptConfig {
     /// optLevel of the pass: 0 or 2.
     pub level: u8,
+    /// Where the pass's price tables come from.
     pub prices: PriceSrc,
     /// Build without naga's forced loop bounding (`GpuContext::shader_unbounded_loops`); every
     /// loop has a `Terminates:` note in the kernel.
@@ -161,7 +173,7 @@ pub fn workgroup_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
     ring_bytes(m) + table_bytes(m, cfg)
 }
 
-/// Workgroup bytes of the DP entry point besides the rings, per pass (M6 A1), exactly what
+/// Workgroup bytes of the DP entry point besides the rings, per pass, exactly what
 /// `k3_opt.wgsl` declares for its one block per workgroup:
 /// - `p_lit`: 128 words of u16 literal-price pairs;
 /// - `p_tab`: the LL-by-code (36), LL-by-litlen (64) and OF (32) prices as u16 pairs, 66 words;
@@ -183,13 +195,13 @@ fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
 /// `limit` bytes; `K3Opt::new` fails with this error before any pipeline is created. At most
 /// 4068 B at `target_length` 32, well under WebGPU's 16 KiB minimum limit, so it fits every
 /// conforming device.
-pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<()> {
+pub fn check_ring_fits(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<()> {
     let need = workgroup_bytes(m, cfg);
     ensure!(need <= limit, "the K3opt rings and price tables need {need} B of workgroup memory > limit {limit}");
     Ok(())
 }
 
-/// The block schedule's kernels (`k3_sched.wgsl`, M6 A4): each block's weight, then the
+/// The block schedule's kernels (`k3_sched.wgsl`): each block's weight, then the
 /// heavy-first order.
 struct Sched {
     weight: wgpu::ComputePipeline,
@@ -206,8 +218,11 @@ pub struct K3Opt {
     /// The block order's kernels.
     sched: Sched,
     grid: Option<u32>,
+    /// Where the pass's price tables come from.
     pub prices: PriceSrc,
+    /// optLevel of the pass: 0 or 2.
     pub level: u8,
+    /// A cheap pass: it writes its histogram and skips the fix-up (`K3OptConfig::hist_out`).
     pub hist_out: bool,
     /// The opt params the pass was built for (`OptBuffers::new` sizes the scratch by them).
     pub params: MatchParams,
@@ -303,12 +318,12 @@ fn wgsl_array_u32(name: &str, v: &[u32]) -> String {
 /// 3..131.
 fn tables_wgsl(prior: PriorTables) -> String {
     use gzc_core::codes::{
-        LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF, ml_code,
+        LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF, ml_code,
     };
     let bi = Prices::block_init(&vec![0u8; BLOCK_SIZE]);
     let (ll, ml, of) = match prior {
-        PriorTables::M5 => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
-        PriorTables::S3 => (OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF),
+        PriorTables::Base => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
+        PriorTables::Sparse => (OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF),
     };
     let pr = Prices::from_hist(&Hist { lit: [0; 256], ll, ml, of });
     let u = |t: &[u8]| t.iter().map(|&x| x as u32).collect::<Vec<u32>>();
@@ -329,7 +344,7 @@ fn tables_wgsl(prior: PriorTables) -> String {
 
 const K3_DROP_WGSL: &str = include_str!("shaders/k3_drop.wgsl");
 
-/// The drop pass (M6 B3, `shaders/k3_drop.wgsl`): `opt::drop_pass` on the fixed-up parses of a
+/// The drop pass (`shaders/k3_drop.wgsl`): `opt::drop_pass` on the fixed-up parses of a
 /// final K3opt pass (`seqs`, `counts`, and the per-segment trailers the pass left in `best`), in
 /// place. One workgroup of 64 lanes per block: the output's histogram and its prices, one lane per
 /// 4 KiB segment for the decisions (`opt::drop_decisions`), then the compaction and the
@@ -407,7 +422,7 @@ impl K3Opt {
         let o = m.opt.ok_or_else(|| anyhow!("K3opt needs opt params"))?;
         ensure!(cfg.level == 0 || cfg.level == 2, "optLevel {}", cfg.level);
         let suff = o.target_length.min(4095);
-        ring_for(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
+        check_ring_fits(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
         let body = format!(
             "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst SUFF: u32 = {suff}u;\n\
              const LEVEL: u32 = {}u;\nconst PRICE_MODE: u32 = {}u;\nconst HIST_OUT: bool = {};\n\
@@ -601,8 +616,9 @@ impl K3Opt {
         let max_groups = ctx.device.limits().max_compute_workgroups_per_dimension;
         ensure!(n <= max_groups, "k3opt: {n} workgroups > {max_groups}");
         // The pass's block counter starts at 0 (the order is `record_order`'s). The grid
-        // stays one workgroup per block (a07: the same as one per resident slot, which wgpu
-        // cannot query); the workgroups that start after the order is used up exit at once.
+        // stays one workgroup per block: that behaves the same as one per resident slot, a
+        // number wgpu cannot query. The workgroups that start after the order is used up exit
+        // at once.
         enc.clear_buffer(bufs.sched, 0, Some(4 * SCHED_HDR as u64));
         let groups = n.min(self.grid.unwrap_or(u32::MAX).max(1));
         {
@@ -637,14 +653,15 @@ fn sched_binding<'a>(bufs: &OptBinds<'a>, n: u32) -> wgpu::BindingResource<'a> {
     })
 }
 
-/// The DP passes of an opt preset (`opt::passes`, M5 T4): `o.passes` cheap passes at optLevel 0
-/// (`hist_out`: each writes its `opt::Hist` for the next one's prologue and keeps the candidate
-/// words), then the final pass at `o.level` with the fix-up. Pass 0 is priced by the seed
-/// (`Seed::BlockInit` → `PriceSrc::BlockInit`, `Seed::Prior` → `PriceSrc::Prior`), every later
-/// pass by the previous pass's histogram (`PriceSrc::Hist`). One dispatch per pass (plus the
-/// fix-up): the candidates, the data and the histograms stay resident in `OptBuffers`. With
-/// `drop_max_len > 0` (M6 `opt16p1`) the drop pass (`K3Drop`) follows the fix-up, as
-/// `opt::parse` applies `opt::drop_pass` to the final pass's output.
+/// The DP passes of an opt preset (`opt::passes`): `o.passes` cheap passes at optLevel 0, then
+/// the final pass at `o.level` with the fix-up.
+///
+/// A cheap pass (`hist_out`) writes its `opt::Hist` for the next one's prologue and keeps the
+/// candidate words. Pass 0 is priced by the seed (`Seed::BlockInit` → `PriceSrc::BlockInit`,
+/// `Seed::Prior` → `PriceSrc::Prior`), every later pass by the previous pass's histogram
+/// (`PriceSrc::Hist`). Each pass is one dispatch, plus the fix-up: the candidates, the data and
+/// the histograms stay resident on the GPU. With `drop_max_len > 0` the drop pass (`K3Drop`)
+/// follows the fix-up, as `opt::parse` applies `opt::drop_pass` to the final pass's output.
 pub struct OptPasses {
     /// The kernel of each pass, in order (a kernel shared by several passes appears once per pass).
     kernels: Vec<std::sync::Arc<K3Opt>>,
@@ -705,7 +722,7 @@ impl OptPasses {
         self.drop.as_ref()
     }
 
-    /// Records the block order (M6 A4, once for all passes: K2opt's candidate words are intact
+    /// Records the block order (once for all passes: K2opt's candidate words are intact
     /// until the final pass), every pass and the drop pass on the first `n` blocks of `bufs`
     /// (uploaded blocks and candidate words). Timestamps: pass i's DP at `2i`/`2i + 1`, the final
     /// fix-up at `2 * n_passes()` and `2 * n_passes() + 1`, the block order at `2 * n_passes() + 2`

@@ -618,8 +618,7 @@ mod tests {
         assert!(check_presets(&[cpu_only], false, true).is_err());
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
-        // M5 T5: the GPU implements the optimal parse too, and since M6 B4 the M6 options
-        // (opt16p1).
+        // The GPU implements every preset, opt16p1 included.
         assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
         let p1 = parse_preset("opt16p1").unwrap();
         assert!(check_presets(&[p1], true, true).is_ok(), "cpu and gpu implement opt16p1");
@@ -647,7 +646,7 @@ mod tests {
         let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
         assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
         assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
-        // M6 opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB),
+        // opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB),
         // so the budget allows fewer: 3125 blocks. On a device whose storage
         // bindings stop at 2 GiB (an RTX 5090 under wgpu) `device_max` is lower still: the pred
         // buffer, 704 KiB per block, caps the batch at 2978 (`max_batch_blocks`).

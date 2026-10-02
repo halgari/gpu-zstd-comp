@@ -4,7 +4,7 @@
 //! persistent grid of at most `HEAD_TABLES` workgroups, each reusing one head table for the chains
 //! it builds (workgroup w: chains w, w + G, ..), so `head` holds at most `HEAD_TABLES` tables
 //! (64 MiB) however large the batch, and the live tables stay in L2 (one table per block, 410 MB
-//! for a 1638-block batch, made K1 DRAM-bound):
+//! for a 1638-block batch, makes K1 DRAM-bound):
 //! - with subgroups (`GpuContext::subgroups`, subgroup sizes 32..=128, and a passing self-test)
 //!   `k1_chains_sg.wgsl`: a table clear per workgroup per dispatch, tag-stamped entries so the
 //!   table is not cleared between chains, and ballot-matched tiles with 2 barriers per 256
@@ -122,7 +122,7 @@ fn long_hash(lo: u32, hi: u32, h2: u32, w: u32) -> u32 {
 }
 ";
 
-/// The sparse long chains of `p` (M6 `OptParams::sparse_chains`, in walk order after h4 and h3),
+/// The sparse long chains of `p` (`OptParams::sparse_chains`, in walk order after h4 and h3),
 /// empty for every other preset.
 pub(crate) fn long_chains(p: &MatchParams) -> Vec<SparseChain> {
     p.opt.iter().flat_map(|o| o.sparse_chains.into_iter().flatten()).collect()
@@ -367,11 +367,11 @@ impl ChainsKernel {
     /// Guards the subgroup kernel's assumptions (full, equally sized subgroups of >= 32 lanes
     /// covering the 256-lane workgroup, exact ballots): builds the chains of small-alphabet, text
     /// and texture-like blocks, twice on one head buffer and once with one workgroup building all
-    /// of them in a row, and compares them with `gzc_core::reference::chains` — both the decoded
-    /// predecessor (`pred_of_word`) and the raw K1 word (predecessor bits plus the `pred_fp`
-    /// fingerprint), so a subgroup kernel that gets the predecessor right but the fingerprint
-    /// wrong (K2 relies on it to skip candidates without loading bytes) still fails here and falls
-    /// back.
+    /// of them in a row, and compares them with `gzc_core::reference::chains`. It compares both
+    /// the decoded predecessor (`pred_of_word`) and the raw K1 word (predecessor bits plus the
+    /// `pred_fp` fingerprint). K2 relies on the fingerprint to skip candidates without loading
+    /// bytes, so a kernel that gets the predecessor right and the fingerprint wrong must fail
+    /// here and fall back.
     fn self_test(&self, ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<()> {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         let alphabet: Vec<u8> = (0..BLOCK_SIZE)

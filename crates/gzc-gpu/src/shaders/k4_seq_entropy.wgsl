@@ -25,6 +25,54 @@
 // Prepended by the host: MAX_SEQS, FRAME_WORDS, HDR_LEN / HDR_W0..2 (frame header bytes) and the
 // TAB_* offsets into `tab` (code tables, FRAC, predefined distributions from
 // gzc_core).
+//
+// Built without naga's loop bounding and index clamps (GpuContext::shader_trusted), so the
+// kernel must terminate and stay in bounds for every input it can be given. It relies on these
+// input facts, which K3 and K5 guarantee and which a harness that scripts a parse checks first
+// (testing::frames_from_parses):
+// - n_seq <= MAX_SEQS;
+// - every sequence has lit_len <= BLOCK_SIZE, 3 <= match_len <= BLOCK_SIZE and
+//   1 <= off_base <= BLOCK_SIZE + 3, so its codes are LL < 36, ML < 53 and OF <= 16;
+// - frame_len[b] is K5's section length, at most BLOCK_SIZE + 3.
+// A loop or index added here needs its own argument.
+//
+// Terminates:
+// - Counted loops run to a constant, to n_seq, to an alphabet size (<= 53), to a table size
+//   (<= 512) or to a word count of the frame.
+// - fse_normalize's `while (sum > size)` lowers sum by 1 per pass. It always finds a symbol
+//   with norm > 1: every used symbol has norm >= 1 and size exceeds their number
+//   (choose_table_log), so sum > size leaves one above 1.
+// - ncount: `symbol` rises on every outer pass. The zero-run loops raise `symbol` to len, then
+//   `start` to `symbol`. `while (remaining < threshold)` halves threshold and stops because
+//   remaining >= 1: the norms sum to the table size and remaining starts one above it.
+// - build_table: the binary search shrinks [lo, hi]. `while (vcum[s + 1u] <= j)` stops at
+//   s <= len - 1 because j < visits = vcum[len].
+// - The RLE check raises w0 by 8 * WG per round, to real_words.
+// - The chunked encode lowers hi by at least 1 per pass (lo < hi), or stops at STOP.
+//
+// Bounds, workgroup and function arrays:
+// - hist, norm, tt_dfs, tt_dnb [H_ALL]: h_off(k) + s, with s a code or a symbol below stream
+//   k's alphabet. ncount reads norm[h + symbol] with symbol < len: a zero run ends before len,
+//   because symbol len - 1 is used.
+// - cumul, vcum [54]: a symbol, or len <= 53.
+// - sp [128]: a cell / 4, with cell below the table size (<= 512).
+// - st [S_ALL]: s_off(k) + a cell of stream k's table (LL and ML have 512 cells, OF 256). The
+//   state transitions index (state >> nb) + tt_dfs, which is a cell of the symbol's own range
+//   [cumul, cumul + norm) for any state of the table: the FSE construction.
+// - sbuf [1024]: (k + 1) * C + r, with k <= 2 and r < C.
+// - stg [STG]: a chunk places at most 31 + C * 76 bits (see STG), so its last word is below STG.
+// - scan [WG], bld / fin / tlog / mode / len / sym [3], q_* / x_* [PER]: lid, k < 3, q < PER.
+//
+// Bounds, storage buffers:
+// - frames: store_word checks FRAME_WORDS. The direct stores are at words below PREFIX_WORDS,
+//   at the first sequences word (at most (HDR_LEN + 3 + BLOCK_SIZE + 3) / 4, below FRAME_WORDS)
+//   and, for the Raw copy, below raw_words, the size of a Raw frame.
+// - data: the RLE check reads words below real_words <= BLOCK_SIZE / 4. The Raw copy reads up
+//   to word BLOCK_SIZE / 4 of the block: the next block's first word, or the trailing zero word.
+// - seqs, counts and frame_len are indexed inside block b's own words, and b is checked
+//   against the batch size.
+// - tab: a table offset plus lit_len <= 63, match_len - 3 <= 127, a code, a FRAC index below
+//   256, or a symbol below def_len.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> seqs: array<u32>;
@@ -86,8 +134,8 @@ var<workgroup> sbuf: array<u32, 1024>;
 var<workgroup> stg: array<atomic<u32>, STG>;
 // wg_scan's per-thread values. Scalars: a store to one component of a workgroup vector is a
 // read-modify-write of the whole vector on Apple GPUs (Metal), so threads storing neighbouring
-// components of one vec4 lost each other's values there (short, corrupt frames on an M4 Pro;
-// `GZC_EMULATE_VEC_RMW` reproduces it elsewhere).
+// components of one vec4 lose each other's values there (`GZC_EMULATE_VEC_RMW` reproduces it
+// elsewhere).
 var<workgroup> scan: array<u32, WG>;
 var<workgroup> nseq_wg: u32;
 var<workgroup> pos_wg: u32;

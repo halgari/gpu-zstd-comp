@@ -6,13 +6,14 @@
 //! - allocates every storage buffer (`GpuContext::storage_buffer`), the pipeline's upload slots
 //!   and the transfer queue's frame buffers `POISON_PAD` bytes larger than asked, so a read past a
 //!   buffer's logical end lands on garbage instead of robust-access zeros;
-//! - fills, before every batch, every scratch and output buffer of the batch (and the input
-//!   `data` past the batch's trailing zero word, plus all the padding) with a fresh garbage
-//!   pattern (`GpuContext::poison_from`); only the protocol's inputs survive: the batch's blocks and
-//!   their trailing zero word, and host-written kernel inputs;
+//! - fills, before every batch, every scratch and output buffer of the batch with a fresh
+//!   garbage pattern (`GpuContext::poison_from`), and likewise the input `data` past the batch's
+//!   trailing zero word and all the padding. Only the protocol's inputs survive: the batch's
+//!   blocks and their trailing zero word, and host-written kernel inputs;
 //! - builds every pipeline without workgroup-memory zero-initialisation and, before each batch,
-//!   runs a kernel that leaves garbage in the workgroup memory of every SM (`GpuContext::poison_workgroup_memory`), so
-//!   a kernel that reads workgroup memory it did not write sees that garbage.
+//!   runs a kernel that leaves garbage in the workgroup memory of every SM
+//!   (`GpuContext::poison_workgroup_memory`), so a kernel that reads workgroup memory it did not
+//!   write sees that garbage.
 //!
 //! The pattern changes per fill (`GpuOptions::poison_seed` fixes the first seed): random words, all
 //! ones, small random words (0..256) or random positions (17 bits), so stale values range from
@@ -54,9 +55,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#;
 
 /// Workgroup words `poison_workgroup_memory` fills per workgroup: the device's limit minus 1 KiB of
-/// headroom, at most 32 KiB (more than any of our kernels declares). Never the full limit: with
+/// headroom, at most 32 KiB (more than any kernel here declares). Never the full limit: with
 /// `Emulation::skew` the skew rewrite adds a workgroup counter to this kernel too, and a kernel 4 B
-/// over the limit crashed a GTX 1660 Super's channel (Xid 13 `SKEDCHECK18_L1_CONFIG_TOO_SMALL`)
+/// over the limit crashes a GTX 1660 Super's channel (Xid 13 `SKEDCHECK18_L1_CONFIG_TOO_SMALL`)
 /// instead of failing validation.
 fn dirty_words(ctx: &GpuContext) -> u32 {
     (ctx.device.limits().max_compute_workgroup_storage_size.saturating_sub(1024) / 4).min(8192)

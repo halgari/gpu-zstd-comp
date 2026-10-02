@@ -11,6 +11,8 @@ use crate::huffman::{write_literals_section, write_raw_rle_header};
 use crate::seq::BlockOutput;
 use crate::seqenc::write_sequences_section_auto;
 
+/// What a frame carries besides the block. The default is what the GPU writes: no checksum,
+/// Huffman literals.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameOptions {
     /// Append the 4-byte xxh64 content checksum.
@@ -20,6 +22,7 @@ pub struct FrameOptions {
 }
 
 impl Default for FrameOptions {
+    /// No checksum, entropy-coded literals.
     fn default() -> Self {
         FrameOptions { checksum: false, huffman: true }
     }
@@ -507,7 +510,7 @@ mod tests {
             let mut frame = roundtrip(block, out, opts);
             let want = (xxhash_rust::xxh64::xxh64(block, 0) as u32).to_le_bytes();
             assert_eq!(&frame[frame.len() - 4..], &want);
-            // libzstd must actually verify it
+            // libzstd must reject a wrong checksum
             *frame.last_mut().unwrap() ^= 1;
             assert!(zstd::bulk::decompress(&frame, BLOCK_SIZE).is_err());
         }

@@ -136,7 +136,7 @@ fn k1_opt3_preds_match_cpu() {
     }
 }
 
-/// M6 sparse long chains in other shapes than S3: two chains, stride 8, the extreme
+/// Sparse long chains in other shapes than `opt16p1`'s: two chains, stride 8, the extreme
 /// widths 5 and 12 (`long_hash`'s masks), and a 5- and 8-byte key (no third word).
 fn long_chain_variants() -> Vec<MatchParams> {
     let lc = |width, stride, depth| Some(SparseChain { width, stride, depth });
@@ -151,7 +151,7 @@ fn long_chain_variants() -> Vec<MatchParams> {
     ]
 }
 
-/// The S3 chains (`opt16p1`): h4, h3, then the 6-, 10- and 12-byte sparse chains on every 4th
+/// `opt16p1`'s chains: h4, h3, then the 6-, 10- and 12-byte sparse chains on every 4th
 /// position, compact in K1's pred buffer; decoded, they equal `reference::chains`. Also other
 /// long chain shapes (`long_chain_variants`).
 #[test]
@@ -373,7 +373,7 @@ fn chains_over_short_keys() {
     }
 }
 
-/// The bucket-sorted K1 (speed2 E2): every slot equals `gzc_core::hash::bucket_sort` (position
+/// The bucket-sorted K1: every slot equals `gzc_core::hash::bucket_sort` (position
 /// and fingerprint bits), for 11..=13-bit keys and min_match 4 and 6, in one batch and block by
 /// block, for both versions (subgroup and workgroup-memory). The sorted K1 is selected for the
 /// sorted presets whenever the table fits the device's workgroup memory, never for 16-bit keys;

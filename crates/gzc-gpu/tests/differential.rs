@@ -493,8 +493,8 @@ fn gpu_frames_batch_of_300_mixed() {
 
 /// With subgroups off (`GpuOptions::subgroups`), K1 builds only its fallback kernel
 /// (`ChainsKernel::with_options` only attempts the subgroup kernel when `ctx.subgroups()`) and
-/// `compressor::k3_mode` (which also checks `ctx.subgroups()`) picks the sequential K3 instead of
-/// the cooperative one — the code path a GPU without subgroup support runs everywhere. Runs the
+/// `kernels::k3_mode` (which also checks `ctx.subgroups()`) picks the sequential K3 instead of
+/// the cooperative one: the code path a GPU without subgroup support runs everywhere. Runs the
 /// full frame pipeline for every preset on a few synthetic blocks, so plain `cargo test` covers
 /// fallback K1 and sequential K3 together, without needing such hardware.
 #[test]
@@ -1071,7 +1071,7 @@ fn k5_random_scripts_match_cpu() {
 }
 
 /// K5 gathers the literals from the block through a per-thread index over groups of
-/// G = ceil(n_seq / 256) sequences (speed phase S4). Scripts with hundreds to thousands of
+/// G = ceil(n_seq / 256) sequences. Scripts with hundreds to thousands of
 /// sequences (G > 1), mostly empty literal runs (so group starts and seeks land on runs of
 /// length 0) with a few long ones (runs across group and thread boundaries), trailing literals of
 /// every size including none; Raw and Huffman (1 and 4 streams) sections; K5 with and without

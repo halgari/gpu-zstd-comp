@@ -1,8 +1,8 @@
-// K3 greedy parse, subgroup-cooperative (speed phase S3, design .superpowers/speed/s3-design.md).
-// Appended by the host after k3_reps.wgsl and k3_parse.wgsl (whose bindings, rep history, literal
-// count, off_base_for / apply_off_base and sequential greedy_parse it reuses), and
-// compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
-// subgroup size, or GZC_K3_W) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
+// K3 greedy parse, subgroup-cooperative. Appended by the host after k3_reps.wgsl and
+// k3_parse.wgsl (whose bindings, rep history, literal count, off_base_for / apply_off_base and
+// sequential greedy_parse it reuses), and compiled on a device with Features::SUBGROUP with
+// `const W: u32` (the workgroup size: the adapter's minimum subgroup size, or
+// GpuOptions::k3_width) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
 // `main_coop`, one block per workgroup of W lanes, which form one (possibly partial) subgroup.
 //
 // Every lane holds the same parse state (r0/r1/r2, ip, anchor, ...). Per-lane values reach
@@ -11,8 +11,9 @@
 // workgroup memory). Per-lane booleans combine with `&` / `|`, never `&&` / `||`: naga lowers
 // those to an `if` on the left operand, a lane-dependent branch right before the ballot that
 // would need the lanes reconverged after it (VK_KHR_shader_maximal_reconvergence is not
-// enabled; .superpowers/m6-research/subgroup-audit.md). The only per-lane branches are lane 0's
-// stores. Stores happen on lane 0 only, or on disjoint addresses per lane. Each
+// enabled). The only per-lane branches are lane 0's stores, which feed no subgroup operation.
+// Stores happen on lane 0 only, or on disjoint addresses per lane.
+// docs/design/m6/subgroup-audit.md lists every subgroup call with its argument. Each
 // cooperative primitive returns exactly what its sequential counterpart returns, for any W >= 1,
 // so the output never depends on W (see the equivalence notes per function).
 //
@@ -41,7 +42,8 @@ fn load_u32_nb(base: u32, byte_off: u32) -> u32 {
     return (data[w] >> sh) | select(hi, 0u, sh == 0u);
 }
 
-// == match_len(base, p, q, cap) (common.wgsl), q < p. Lane k compares the word at n + 4k; the
+// == match_len(base, p, q, 0xFFFFFFFFu) (common.wgsl), q < p: the common prefix up to the block
+// end. Lane k compares the word at n + 4k; the
 // lanes the sequential loop would still compare (n + 4k + 4 <= max) are a prefix of the lanes, so
 // the first lane that mismatches or is invalid is where the sequential word loop returns or
 // stops. The byte tail is the sequential one. Invalid lanes load at p / q (in the block).
@@ -51,8 +53,8 @@ const NO_DIFF: u32 = 0xFFFFFFFFu;
 const MATCH_FIRST_EQ: u32 = 1u;
 const MATCH_WIDE: u32 = 2u;
 
-fn coop_match_len(base: u32, p: u32, q: u32, cap: u32, k: u32, mode: u32) -> u32 {
-    let max = min(BLOCK_SIZE - p, cap);
+fn coop_match_len(base: u32, p: u32, q: u32, k: u32, mode: u32) -> u32 {
+    let max = BLOCK_SIZE - p;
     var n = 0u;
     if (mode == MATCH_FIRST_EQ) {
         n = 4u;
@@ -143,13 +145,13 @@ fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
         var len = 0u;
         if (p_rep) {
             off = r0;
-            len = coop_match_len(base, p, p - r0, 0xFFFFFFFFu, k, MATCH_FIRST_EQ);
+            len = coop_match_len(base, p, p - r0, k, MATCH_FIRST_EQ);
         } else {
             off = best_off_of(p_bw);
             len = best_len_of(p_bw);
             if (len == SEARCH_CAP) {
                 // K2 stopped comparing at the cap: extend to the full length.
-                len = coop_match_len(base, p, p - off, 0xFFFFFFFFu, k, MATCH_WIDE);
+                len = coop_match_len(base, p, p - off, k, MATCH_WIDE);
             }
         }
         if (len == 0u) {
@@ -172,8 +174,7 @@ fn main_coop(
     @builtin(subgroup_invocation_id) sid: u32,
     @builtin(subgroup_size) sg_size: u32,
 ) {
-    // One block per workgroup. li: the lane within this block's W lanes.
-    let li = lid;
+    // One block per workgroup; lid is the lane within the block's W lanes.
     let b = wid.x;
     // No early return for a workgroup past the last block: its lanes take neither branch below
     // (no loads, no stores).
@@ -191,16 +192,16 @@ fn main_coop(
     // Lane-layout guard: this block's W lanes are one subgroup whose lane ids are 0..W-1.
     let m = subgroupBallot(true);
     // K3_FORCE_FALLBACK (host-injected, test-only) takes the sequential branch below on purpose.
-    let lanes_ok = !K3_FORCE_FALLBACK & (sg_size >= W) & (sid == li) & (m.x == W_MASK_X) & (m.y == W_MASK_Y);
+    let lanes_ok = !K3_FORCE_FALLBACK & (sg_size >= W) & (sid == lid) & (m.x == W_MASK_X) & (m.y == W_MASK_Y);
     var n_seq = 0u;
     let coop = subgroupAll(lanes_ok & in_range);
     if (coop) {
         n_seq = coop_greedy_parse(base, sbase, bbase, k);
-    } else if (in_range & (li == 0u)) {
+    } else if (in_range & (lid == 0u)) {
         // Unexpected lane layout: the exact sequential parse on one lane.
         n_seq = greedy_parse(base, sbase, bbase);
     }
-    if (in_range & (li == 0u)) {
+    if (in_range & (lid == 0u)) {
         counts[b * 2u] = n_seq;
         counts[b * 2u + 1u] = n_lit;
     }

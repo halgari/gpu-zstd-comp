@@ -13,6 +13,10 @@
 //   parse's own (which started empty); the rest of its off_bases are already right. This needs
 //   every raw off_base to be off_base_for(offset, lit_len) under the segment's own history.
 //   counts = (n_seq, n_lit) as in k3_parse.wgsl.
+//
+// Terminates (k3_seg and k3_opt build it without naga's loop bounding): the segment loops count to
+// NSEG. The copy raises i by FIXUP_WG and the re-encode raises i by 1, both to the segment's
+// sequence count n, which the parse kernel wrote in the same pass (at most SEG / 3).
 
 const FIXUP_WG: u32 = 64u;
 

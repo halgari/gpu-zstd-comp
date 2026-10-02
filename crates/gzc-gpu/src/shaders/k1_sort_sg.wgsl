@@ -8,8 +8,8 @@
 //
 // Every subgroup operation runs in subgroup-uniform control flow, and no operand comes out of a
 // lane-dependent branch (`|` instead of `||`, which naga lowers to an `if`), so nothing relies on
-// the lanes reconverging after divergence (VK_KHR_shader_maximal_reconvergence is not enabled;
-// .superpowers/m6-research/subgroup-audit.md).
+// the lanes reconverging after divergence (VK_KHR_shader_maximal_reconvergence is not enabled).
+// docs/design/m6/subgroup-audit.md lists every subgroup call with its argument.
 
 // The 32 words of chunk c (bytes 128c .. 128c + 128 of the block), one per lane; past the block
 // they come from the next block (or the buffer's last word) and only reach dead positions.

@@ -1,6 +1,6 @@
-//! Optimal parse for the M5 presets `opt14` / `opt16`: an integer port of libzstd 1.5.7
-//! `ZSTD_compressBlock_opt_generic` (`lib/compress/zstd_opt.c`, noDict, one block), design in
-//! `docs/superpowers/m5/m5-opt-design.md` §1–§2.
+//! The optimal parse of the presets `opt14`, `opt16` and `opt16p1`: an integer port of libzstd
+//! 1.5.7 `ZSTD_compressBlock_opt_generic` (`lib/compress/zstd_opt.c`, noDict, one block). The
+//! design and its measurements are in `docs/design/m5/m5-opt-design.md` §1–§2.
 //!
 //! This is the normative oracle the GPU K3opt kernel mirrors bit-exactly: integer-only,
 //! deterministic, every tie rule explicit. The DP body follows the C function statement by
@@ -27,7 +27,7 @@
 //!   pass runs `OptParams::level`.
 //! - After a series whose last stretch ends in literals, the next series starts after those
 //!   literals (`ip = anchor + litlen`). zstd 1.5.7 intends this too, but its `} {` typo in the
-//!   store loop makes it restart at the anchor; the prototype measured the intended form.
+//!   store loop makes it restart at the anchor.
 //!
 //! Tie rules (pinned by `cases`): the literal extension replaces `opt[cur]` when its price is
 //! `<=`; a relaxation replaces `opt[pos]` only when `<` (or `pos > last_pos`); relaxation lengths
@@ -36,7 +36,7 @@
 //! when strictly longer than every earlier one; `ZSTD_newRep` updates a node's reps from its
 //! predecessor when the node ends a match.
 //!
-//! M6 options (`OptParams`; all off in `opt14`/`opt16`, on in `opt16p1`):
+//! Options (`OptParams`; all off in `opt14` and `opt16`, all on in `opt16p1`):
 //! - `inner_gap`: inner segments use `ilimit = iend - inner_gap` (3: "gap3"); the block's last
 //!   segment keeps `iend - 8` (`Seg::new`).
 //! - `relax_lengths: Some(n)`: an explicit record (offBase > 3) of length `L` and start length
@@ -49,7 +49,7 @@
 //! - `drop_max_len`: `drop_pass` after the final DP pass.
 //! - `prior`: which prior tables `Seed::Prior` uses (`seed_prices`).
 use crate::codes::{
-    ll_code, ml_code, LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF,
+    ll_code, ml_code, LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF,
 };
 use crate::config::BLOCK_SIZE;
 use crate::lazy::{encode_raw, RawSeq};
@@ -86,9 +86,13 @@ pub fn frac_weight(raw: u32) -> u32 {
 /// Symbol counts of one parse: literal bytes, and LL / ML / OF codes of its sequences.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hist {
+    /// Literal bytes by value.
     pub lit: [u32; 256],
+    /// Sequences by LL code.
     pub ll: [u32; 36],
+    /// Sequences by ML code.
     pub ml: [u32; 53],
+    /// Sequences by OF code.
     pub of: [u32; 32],
 }
 
@@ -126,9 +130,13 @@ impl Hist {
 /// with `W = frac_weight`. Every entry is in 0..65536 (fits the GPU's u16 tables).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prices {
+    /// Price of a literal byte, by value.
     pub lit: [i32; 256],
+    /// Price of an LL code, extra bits included.
     pub ll: [i32; 36],
+    /// Price of an ML code, extra bits included.
     pub ml: [i32; 53],
+    /// Price of an OF code, extra bits included.
     pub of: [i32; 32],
 }
 
@@ -218,11 +226,11 @@ pub fn cover_literals(block: &[u8], cands: &[CandWords]) -> [u32; 256] {
 }
 
 /// Pass-0 prices for `seed`; `Seed::Prior` uses the `prior` tables (`codes::OPT_PRIOR_*` or
-/// `codes::OPT_PRIOR_S3_*`) and the block's cover literals.
+/// `codes::OPT_PRIOR_SPARSE_*`) and the block's cover literals.
 pub fn seed_prices(block: &[u8], cands: &[CandWords], seed: Seed, prior: PriorTables) -> Prices {
     let (ll, ml, of) = match prior {
-        PriorTables::M5 => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
-        PriorTables::S3 => (OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF),
+        PriorTables::Base => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
+        PriorTables::Sparse => (OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF),
     };
     match seed {
         Seed::BlockInit => Prices::block_init(block),
@@ -859,7 +867,9 @@ struct SegState {
 ///   Debug builds assert that every ring read finds the position it expects in its slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
+    /// zstd's `opt[]` array.
     Linear,
+    /// The GPU's ring of nodes and per-position trace.
     Ring,
 }
 
@@ -923,8 +933,11 @@ pub fn dp_pass_with(
 /// One pass of `passes`: the prices it ran with, its optLevel, and its output.
 #[derive(Clone, Debug)]
 pub struct Pass {
+    /// The static prices the pass ran with.
     pub prices: Prices,
+    /// The pass's optLevel: 0 or 2.
     pub level: u8,
+    /// The block's parse after this pass.
     pub out: BlockOutput,
 }
 
@@ -967,7 +980,7 @@ pub fn parse_with(block: &[u8], cands: &[CandWords], params: &MatchParams, engin
     }
 }
 
-/// The drop pass (M6, r4; `OptParams::drop_max_len`): `drop_decisions` at the parse's own prices
+/// The drop pass (`OptParams::drop_max_len`): `drop_decisions` at the parse's own prices
 /// (`Prices::from_hist(&Hist::of_output(out))`, the histogram of the final DP pass's output),
 /// then `apply_drops`.
 pub fn drop_pass(block: &[u8], out: &BlockOutput, max_len: u32, seg_log2: u32) -> BlockOutput {
@@ -1072,10 +1085,10 @@ pub fn apply_drops(block: &[u8], out: &BlockOutput, dropped: &[bool]) -> BlockOu
 /// `params.opt.level` with the price tables `p` verbatim (the GPU loads them in place of its
 /// pass-0 prologue); with `prices: None`, the full `parse` of `params` (seed and passes).
 /// Every case fits the first four 4 KiB segments (`gap3_inner_segments_only` also uses the
-/// block's last segment), so it runs at 16, 32 and 64 KiB blocks.
+/// block's last segment).
 ///
-/// `opt_test_cases` are the M5 cases; `m6_test_cases` the M6 DP options (gap3, relaxation
-/// pruning); `drop_test_cases` the drop pass (`DropCase`).
+/// `opt_test_cases` are the cases of the base DP, `option_test_cases` those of the DP options
+/// (gap3, relaxation pruning) and `drop_test_cases` those of the drop pass (`DropCase`).
 pub mod cases {
     use super::{dp_pass_with, parse_with, Engine, Prices, BITCOST_MULTIPLIER};
     use crate::config::BLOCK_SIZE;
@@ -1087,9 +1100,14 @@ pub mod cases {
 
     /// One scripted block: `expect` lists `(params, prices, sequences)` runs.
     pub struct OptCase {
+        /// The case's name, for failure messages.
         pub name: String,
+        /// The block, `BLOCK_SIZE` bytes.
         pub block: Vec<u8>,
+        /// The scripted candidate words, one pair per position.
         pub cands: Vec<CandWords>,
+        /// The runs: params, the price tables or `None` for the full parse, and the sequences
+        /// the run must produce.
         pub expect: Vec<(MatchParams, Option<Prices>, Vec<Sequence>)>,
     }
 
@@ -1578,9 +1596,9 @@ pub mod cases {
         .collect()
     }
 
-    /// A single optLevel-2 pass with M6 options `gap` (`inner_gap`) and `relax`
+    /// A single optLevel-2 pass with the options `gap` (`inner_gap`) and `relax`
     /// (`relax_lengths`).
-    fn m6_pass(gap: u8, relax: Option<u8>) -> MatchParams {
+    fn option_pass(gap: u8, relax: Option<u8>) -> MatchParams {
         MatchParams { opt: Some(OptParams { inner_gap: gap, relax_lengths: relax, ..pass(2).opt.unwrap() }), ..OPT16 }
     }
 
@@ -1608,7 +1626,7 @@ pub mod cases {
         cands[b + 3] = one(900, 3);
         cands[z] = one(400, 5);
         let g3 = vec![seq(a as u32, 4, 303), seq((b - SEG) as u32, 3, 703), seq(0, 3, 903)];
-        let runs = vec![(m6_pass(3, None), Some(flat()), g3), (m6_pass(8, None), Some(flat()), vec![])];
+        let runs = vec![(option_pass(3, None), Some(flat()), g3), (option_pass(8, None), Some(flat()), vec![])];
         vec![case("gap3_inner_segments_only", block, cands, runs)]
     }
 
@@ -1654,7 +1672,7 @@ pub mod cases {
         };
         let all = [vec![seq(p1 as u32, 6, 1003), seq(0, 20, 3003)], tail(p1 + 26)].concat();
         let top4 = [vec![seq(p1 as u32 + 6, 20, 3003)], tail(p1 + 26)].concat();
-        let runs = vec![(m6_pass(8, None), Some(pr.clone()), all), (m6_pass(8, Some(4)), Some(pr), top4)];
+        let runs = vec![(option_pass(8, None), Some(pr.clone()), all), (option_pass(8, Some(4)), Some(pr), top4)];
         vec![case("relax_top4_explicit_records_only", block, cands, runs)]
     }
 
@@ -1680,13 +1698,12 @@ pub mod cases {
         pr.of[oc(2000)] = 60000;
         let g3 = vec![seq(b as u32, 6, 703), seq(1, 3, 1)];
         let g8 = vec![seq(b as u32, 6, 703)];
-        let runs = vec![(m6_pass(3, None), Some(pr.clone()), g3), (m6_pass(8, None), Some(pr), g8)];
+        let runs = vec![(option_pass(3, None), Some(pr.clone()), g3), (option_pass(8, None), Some(pr), g8)];
         vec![case("gap3_rep_capped_at_ilimit", block, cands, runs)]
     }
 
-    /// The M6 DP cases (gap3, relaxation pruning), in order. Kept apart from `opt_test_cases`,
-    /// which the M5 GPU kernel replays.
-    pub fn m6_test_cases() -> Vec<OptCase> {
+    /// The DP option cases (gap3, relaxation pruning), in order.
+    pub fn option_test_cases() -> Vec<OptCase> {
         [gap3_inner_segments_only, gap3_rep_capped_at_ilimit, relax_top4_explicit_records_only]
             .into_iter()
             .flat_map(|f| f())
@@ -1697,12 +1714,19 @@ pub mod cases {
     /// `prices` and `max_len` of `super::drop_decisions`, and the expected decisions and output
     /// (`super::apply_drops`). Segments are `OPT16.segment_log2` (4 KiB).
     pub struct DropCase {
+        /// The case's name, for failure messages.
         pub name: String,
+        /// The block, `BLOCK_SIZE` bytes.
         pub block: Vec<u8>,
+        /// The parse the drop pass starts from.
         pub input: BlockOutput,
+        /// The drop prices.
         pub prices: Prices,
+        /// `OptParams::drop_max_len`.
         pub max_len: u32,
+        /// The expected decision for each input sequence.
         pub dropped: Vec<bool>,
+        /// The expected sequences after the drops.
         pub expect: Vec<Sequence>,
     }
 
@@ -1864,10 +1888,10 @@ mod tests {
         v
     }
 
-    /// `opt16p1` and its M6 options one at a time: each on `opt16` (gap3, top-4 pruning also at
-    /// optLevel 0, drop pass, S3 prior), and `opt16p1` without pruning / drop / gap3, with a
+    /// `opt16p1` and its options one at a time: each on `opt16` (gap3, top-4 pruning also at
+    /// optLevel 0, drop pass, sparse prior), and `opt16p1` without pruning / drop / gap3, with a
     /// cheap pass.
-    fn m6_variants() -> Vec<MatchParams> {
+    fn option_variants() -> Vec<MatchParams> {
         let (o16, p1) = (OPT16.opt.unwrap(), OPT16P1.opt.unwrap());
         let on16 = |o: OptParams| MatchParams { opt: Some(o), ..OPT16 };
         let on1 = |o: OptParams| MatchParams { opt: Some(o), ..OPT16P1 };
@@ -1877,7 +1901,7 @@ mod tests {
             on16(OptParams { relax_lengths: Some(4), ..o16 }),
             on16(OptParams { relax_lengths: Some(2), level: 0, ..o16 }),
             on16(OptParams { drop_max_len: 6, ..o16 }),
-            on16(OptParams { seed: Seed::Prior, prior: PriorTables::S3, passes: 1, ..o16 }),
+            on16(OptParams { seed: Seed::Prior, prior: PriorTables::Sparse, passes: 1, ..o16 }),
             on1(OptParams { relax_lengths: None, ..p1 }),
             on1(OptParams { drop_max_len: 0, ..p1 }),
             on1(OptParams { inner_gap: 8, ..p1 }),
@@ -1885,11 +1909,11 @@ mod tests {
         ]
     }
 
-    /// Every synthetic block round-trips through libzstd for every M6 variant (no match crosses a
+    /// Every synthetic block round-trips through libzstd for every option variant (no match crosses a
     /// segment), and the ring engine gives the same output.
     #[test]
-    fn m6_synthetic_roundtrip_and_ring() {
-        for params in m6_variants() {
+    fn option_variants_roundtrip_and_ring() {
+        for params in option_variants() {
             assert_eq!(params.validate(), Ok(()), "{params:?}");
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
@@ -1924,7 +1948,7 @@ mod tests {
             let cands = find_cands(&blk.data, &chains(&blk.data, &OPT16P1), &OPT16P1);
             let ps = passes(&blk.data, &cands, &OPT16P1);
             assert_eq!(ps.len(), 1, "{name}");
-            assert_eq!(ps[0].prices, seed_prices(&blk.data, &cands, Seed::Prior, PriorTables::S3), "{name}");
+            assert_eq!(ps[0].prices, seed_prices(&blk.data, &cands, Seed::Prior, PriorTables::Sparse), "{name}");
             let last = &ps[0].out;
             let out = parse(&blk.data, &cands, &OPT16P1);
             assert_eq!(out, drop_pass(&blk.data, last, o.drop_max_len as u32, OPT16P1.segment_log2), "{name}");
@@ -1952,9 +1976,9 @@ mod tests {
     }
 
     #[test]
-    fn m6_opt_cases() {
+    fn option_cases_match() {
         let mut failed = Vec::new();
-        for c in cases::m6_test_cases() {
+        for c in cases::option_test_cases() {
             for (i, (params, prices, want)) in c.expect.iter().enumerate() {
                 assert_eq!(params.validate(), Ok(()));
                 let out = run_case(&c.block, &c.cands, params, prices.as_ref(), Engine::Linear);
@@ -2094,7 +2118,7 @@ mod tests {
 
     /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`;
     /// `GZC_CORPUS_BLOCKS` sets the count) round-trip through libzstd for every variant
-    /// (`variants` and `m6_variants`), and every other one of them (2000, i.e. every ~50th block
+    /// (`variants` and `option_variants`), and every other one of them (2000, i.e. every ~50th block
     /// at 64 KiB) gives the same output on the ring engine. Runs on `GZC_TEST_THREADS` threads
     /// (default 16, at most the cores). Skipped with a message when the corpus is absent.
     /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-core opt_corpus_roundtrip -- --ignored`
@@ -2102,7 +2126,7 @@ mod tests {
     #[ignore]
     fn opt_corpus_roundtrip() {
         let Some(sample) = corpus_sample() else { return };
-        let vars = [variants(), m6_variants()].concat();
+        let vars = [variants(), option_variants()].concat();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let cap: usize = std::env::var("GZC_TEST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);

@@ -54,12 +54,12 @@
 ## Documents to read (paths relative to the repo root /home/tbaldrid/oss/gpu-zstd-comp)
 - `docs/results/2026-09-30-m5.md`: results and follow-ups.
 - `docs/results/m5-log.md`: per-task logs with every measured variant.
-- `docs/superpowers/m5/k3opt-perf.md`: the perf study (ranked, measured).
-- `docs/superpowers/m5/m5-opt-design.md`: normative design and projections.
-- `docs/superpowers/m5/m5-ratio-drivers.md`: what drives the L14/L16 ratio (measured ablations).
-- `docs/superpowers/m5/m5-rt-npu.md`: RT cores, NPUs and tensor cores (no-go).
-- `docs/superpowers/specs/2026-09-30-m5-optimal-parse-design.md`: spec, with as-built notes.
-- `docs/superpowers/speed/speed2-synthesis.md`: earlier speed research, including dead ends.
+- `docs/design/m5/k3opt-perf.md`: the perf study (ranked, measured).
+- `docs/design/m5/m5-opt-design.md`: normative design and projections.
+- `docs/design/m5/m5-ratio-drivers.md`: what drives the L14/L16 ratio (measured ablations).
+- `docs/design/m5/m5-rt-npu.md`: RT cores, NPUs and tensor cores (no-go).
+- `docs/design/specs/2026-09-30-m5-optimal-parse-design.md`: spec, with as-built notes.
+- `docs/design/speed/speed2-synthesis.md`: earlier speed research, including dead ends.
 - Code:
   - `crates/gzc-gpu/src/shaders/{k1_chains*.wgsl, k2_opt.wgsl, k3_opt.wgsl, k3_fixup.wgsl, common.wgsl}`
   - `crates/gzc-gpu/src/{k3opt.rs, compressor.rs, pipeline.rs, context.rs}`

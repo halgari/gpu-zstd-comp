@@ -1,6 +1,7 @@
 # gpu-zstd-comp reference
 
-Details behind the README: the corpus tool, the benchmark CLI, the streaming API and the tuning and test switches.
+Details behind the README: the corpus tool, the benchmark CLI, the presets, the library API and
+the environment variables.
 
 ## Corpus (`tools/fetch-corpus`, dev-only)
 
@@ -67,12 +68,12 @@ reference, and no preset uses it.)
 
 | Preset | What it is | Compare against |
 |---|---|---|
-| `lvl3` | dfast chains (8 B + 5 B), min match 5, depth 1, greedy | M3 output (byte-identical) / L3 |
-| `lvl9seg` | single 4 B hash chain, depth 32, lazy2, the parse split into independent 4 KiB segments (speed-2 E1) | L9 |
-| `lvl9s12seg` | `lvl9seg` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2): the fastest preset at L9 ratio, except on Apple GPUs, where `lvl9seg` is faster | L9 |
-| `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 |
-| `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 |
-| `opt16p1` | M6: one optimal-parse pass over more candidates (three extra hash chains on every 4th position), a retrained prior seed, then short matches turned back into literals where cheaper | L16 |
+| `lvl3` | two hash chains (8 B and 5 B keys, as zstd's dfast), min match 5, depth 1, greedy | L3 |
+| `lvl9seg` | single 4 B hash chain, depth 32, lazy2, the parse split into independent 4 KiB segments | L9 |
+| `lvl9s12seg` | `lvl9seg` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block. The fastest preset at L9 ratio, except on Apple GPUs, where `lvl9seg` is faster | L9 |
+| `opt14` | optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 |
+| `opt16` | optimal parse, block-init seed + 3 re-pricing passes | L16 |
+| `opt16p1` | one optimal-parse pass over more candidates (three extra hash chains on every 4th position), a prior seed trained for them, then short matches turned back into literals where cheaper | L16 |
 
 Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for byte):
 
@@ -294,8 +295,8 @@ tests read them once, through `GpuOptions::try_from_env()` / `from_env()`; each 
 of `GpuOptions`. A program that builds `GpuOptions::default()` is not affected by them. Boolean
 knobs follow one convention: a knob that is off by default is turned on by any value but `0`;
 one that is on by default is turned off by `0` only. Every other variable takes the values
-listed with it. Any other value is an error that names the variable (`gzc-bench` exits with
-it); none is silently ignored.
+listed with it. A variable set to the empty string counts as unset. Any other value a variable
+does not take is an error that names the variable (`gzc-bench` exits with it).
 
 - `GZC_NO_SUBGROUPS` (anything but `0`): a device without subgroups, i.e. the portable kernels
   every GPU can run. Chain presets use the fallback K1 (`k1_chains.wgsl`); the sorted preset
@@ -314,20 +315,21 @@ it); none is silently ignored.
   default: auto-detected. The segmented and optimal parses have one K3 each.
 - `GZC_K3_W=4|8|16|32|64`: cooperative K3's lanes per block (at most the device's
   minimum subgroup size).
-- `GZC_TRANSFER_QUEUE=0`: turns off the transfer-queue readback (speed-2 E3). By default, on a
+- `GZC_TRANSFER_QUEUE=0`: turns off the transfer-queue readback. By default, on a
   Vulkan 1.2+ adapter with timeline semaphores and a transfer-only queue family, the frame path
   reads each batch back on that dedicated copy queue, overlapping the next batch's kernels. Only
   one such pipeline may exist per `GpuContext` (a second `Pipeline::new` errors), and nothing else
   may submit to the context's queue from another thread while it exists (see
   `GpuContext`).
 - `GZC_DIRECT_UPLOAD=0|1`: the kernels read each batch straight from its mapped upload buffer, with
-  no upload copy and no shared `data` buffer (E8). Default: on when host-visible device-local
+  no upload copy and no shared `data` buffer. Default: on when host-visible device-local
   memory covers VRAM (full ReBAR / SAM); `0` turns it off, `1` forces it on wherever
   `MAPPABLE_PRIMARY_BUFFERS` exists (without ReBAR the kernels would then read over PCIe).
 - `GZC_UPLOAD_THREADS=N`: threads writing a batch into its upload buffer (default 4, at most the
   available cores).
 - `GZC_CHECKED_SHADERS` (anything but `0`): builds K2/K4/K5 with naga's bounds checks and loop
-  bounding (E9 builds them unchecked); a debugging aid.
+  bounding; a debugging aid. By default they are built without them, and each kernel's source
+  says why that is safe (`GpuContext::shader_trusted`).
 - `GZC_DUMP_WGSL=<dir>`: writes every shader module's final WGSL to `<dir>/<label>.<n>.wgsl`
   (a dev aid for offline register and shared-memory statistics).
 - `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
@@ -335,8 +337,8 @@ it); none is silently ignored.
 - `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW` (anything but `0`), **test only**: every
   shader is rewritten (through naga) to behave as on other GPUs: shifts take their amount mod 32
   (Apple, AMD; NVIDIA gives 0 for a shift by 32 or more), and a store to one component of a
-  workgroup vector is a read-modify-write of the whole vector (Apple's Metal, which corrupted
-  every frame on an M4 Pro until K4 stopped doing it). `tests/differential_emulated.rs` runs the
+  workgroup vector is a read-modify-write of the whole vector (Apple's Metal; K4 avoids such
+  stores). `tests/differential_emulated.rs` runs the
   differential suite with both on (`GpuOptions::emulate`). `GZC_EMULATE_SKEW`, **test only**:
   timing skew, every invocation stalls pseudo-randomly at entry, after each barrier and before
   each subgroup operation, for races a slow or preempted GPU would expose (much slower). Meant
@@ -346,7 +348,7 @@ it); none is silently ignored.
 - `GZC_K3_FORCE_FALLBACK` (anything but `0`), **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
-  actually fails the guard.
+  fails the guard.
 - `GZC_POISON` (anything but `0`), **test only**: memory poisoning (`GpuOptions::poison`). Every
   buffer gets 4 KiB of padding, and before every batch garbage fills every scratch and output
   buffer, the input past the batch's trailing zero word and the padding; workgroup memory loses
@@ -357,7 +359,32 @@ it); none is silently ignored.
 **Backends.** The transfer-queue readback and the direct-upload ReBAR detection only work on
 Vulkan. On Metal they are off: readback runs on the main queue and uploads are copied, unless
 `GZC_DIRECT_UPLOAD=1`. That gives correct output at lower speed. DX12 currently gives wrong
-output (see Known problems), so set `WGPU_BACKEND=vulkan` on Windows.
+output (see "Known issues" in the [README](../README.md#status)), so set `WGPU_BACKEND=vulkan`
+on Windows.
 
-**Library users:** the `block-16k`/`32k`/`64k`/`128k` Cargo features were removed in M6;
-the block size is always 64 KiB. Drop any `features = ["block-…"]` from dependent manifests.
+## Test-only environment variables
+
+These are read by tests and examples, directly, not through `GpuOptions`. A value that does
+not parse is ignored or panics, depending on the test.
+
+| Variable | Default | Read by | What it sets |
+|---|---|---|---|
+| `GZC_CORPUS` | `data/corpus` | every corpus test (`gzc_core::testdata`) | The corpus directory. A corpus test skips, with a message, when it does not exist. |
+| `GZC_CORPUS_BLOCKS` | 4000 (300 in `differential`, 2900 in the timing test) | the corpus tests of `gzc-gpu` and `gzc_core::opt` | Blocks sampled uniformly over the corpus. |
+| `GZC_CORPUS_PRESETS` | all | `differential::corpus_blocks_match_cpu_per_preset` | Comma-separated presets to run. |
+| `GZC_CANDS_PRESET` | `opt16,opt16p1` | `cands::corpus_cands_match_cpu` | Comma-separated optimal-parse presets to run. |
+| `GZC_CORPUS_MB` | 500 | `gzc_core::frame`'s `corpus_ratio` | MB of corpus files to read, in sorted path order. |
+| `GZC_CORPUS_EXT` | `dds` and `nif` | `gzc_core::frame`'s `corpus_ratio` | One file extension to keep. |
+| `GZC_TEST_THREADS` | 16 | `gzc_core::opt`'s `opt_corpus_roundtrip` | Threads, at most the machine's cores. |
+| `GZC_GPU_TEST_SLOTS` | 2 | `gzc_gpu::testing::gpu_test_slot` | Heavy GPU tests of one test binary that run at once. |
+| `GZC_SWEEP_N` | 16 | `opt_pipeline::option_sweep_matches_oracle_synthetic` | Option combinations in the sweep. |
+| `GZC_TIMING_PRESETS` | `opt14`, `opt16`, `opt16p1` | `k3opt::k3opt_passes_timing` | Comma-separated presets to time, in this order. |
+| `GZC_TIMING_WARMUP` | unset | `k3opt::k3opt_passes_timing` | When set, one untimed `opt16` run goes first. |
+| `THREADS` | 16 | the `opt_sample` example of `gzc-core` | Threads. |
+
+The corpus tests are `#[ignore]`d. Run them with `-- --include-ignored`, for example:
+
+```sh
+GZC_CORPUS=data/corpus GZC_CORPUS_BLOCKS=400 cargo test --release -p gzc-gpu \
+  --test opt_pipeline --test k3opt -- --include-ignored --skip timing
+```

@@ -291,7 +291,7 @@ fn staging_regions_are_aligned() {
     }
 }
 
-/// M6 `opt16p1`'s sparse chains cost 3 * BLOCK_SIZE / 4 pred words (192 KiB at 64 KiB) per
+/// `opt16p1`'s sparse chains cost 3 * BLOCK_SIZE / 4 pred words (192 KiB) per
 /// block over opt16 once the head tables are capped, which `vram_bytes` counts, so a VRAM
 /// budget's largest batch (gzc-bench `--batch max`) is smaller.
 #[test]
@@ -348,7 +348,7 @@ fn vram_counts_scratch_once_and_slots_per_inflight() {
     assert!((0.12..0.13).contains(&mib(per_slot)), "{}", mib(per_slot));
 }
 
-/// `vram_bytes` equals the bytes of every buffer a `Pipeline` actually creates (shared scratch
+/// `vram_bytes` equals the bytes of every buffer a `Pipeline` creates (shared scratch
 /// once), per preset: single-hash presets allocate one chain's head/pred; the optimal parse
 /// adds its second candidate word, the 8 B-per-position trace (in `pred`), the larger `seqs`
 /// and K3opt's prices and scratch.
@@ -383,7 +383,7 @@ fn vram_matches_params() {
     let opt_extra = crate::sizing::best_bytes(10) + o.seqs - seqs_bytes_for(10, &LVL3) + o.opt_prices + o.opt_scratch + o.opt_sched;
     assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
     assert_eq!(scratch(OPT14), scratch(OPT16));
-    // opt16p1 (M6): three more head tables and sparse pred words; K3opt's buffers (and the
+    // opt16p1: three more head tables and sparse pred words; K3opt's buffers (and the
     // drop pass, which has none) are the same.
     let p1_extra = pred_bytes_for(10, &OPT16P1) - pred_bytes_for(10, &OPT16)
         + head_bytes(10, 5)
@@ -391,8 +391,8 @@ fn vram_matches_params() {
     assert_eq!(scratch(OPT16P1) - scratch(OPT16), p1_extra);
 }
 
-/// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4; M6 B4: opt16p1 with
-/// its sparse chains and drop pass) through the streaming pipeline in every upload/readback
+/// The optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4; opt16p1 with its sparse
+/// chains and drop pass) through the streaming pipeline in every upload/readback
 /// mode, over partial batches and reuse, equals the CPU oracle's frames (which libzstd
 /// decodes); the parse path too. `allocated_bytes` equals `vram_bytes` in every mode.
 #[test]
@@ -637,9 +637,9 @@ impl Batches {
 fn stream_frames_zero_copy_every_mode() {
     let _gpu = crate::testing::gpu_test_slot();
     let distinct = distinct_blocks();
-    // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
-    // trailing zero word after partial batches of stale blocks). M6 B4: opt16p1 (sparse
-    // chains, drop pass) as well.
+    // The optimal parse too: its K3opt reads one word past each block, which is the slot's
+    // trailing zero word after partial batches of stale blocks. opt16p1 adds sparse chains and
+    // the drop pass.
     for matching in [LVL9S12SEG, OPT14, OPT16P1] {
         zero_copy_every_mode(&distinct, GpuParams { matching, emit_frames: true, huffman: true });
     }
@@ -1166,8 +1166,8 @@ fn stream_frames_errors_mid_stream() {
 }
 
 /// Parallel delivery (`run_frames_par`): every index exactly once and right, whatever the
-/// thread count (more threads than frames in a batch included), and actually from several
-/// threads.
+/// thread count (more threads than frames in a batch included), and from more than one
+/// thread.
 #[test]
 fn run_frames_par_every_index_once() {
     let _gpu = crate::testing::gpu_test_slot();

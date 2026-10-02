@@ -26,7 +26,7 @@ impl StagingLayout {
     pub(super) fn new(cap: u32, frames: bool, m: &MatchParams) -> Self {
         // Every region starts STAGING_ALIGN-aligned: a GPU->staging copy to a destination that is
         // only 4-byte aligned runs several times slower (RTX 5090 / Vulkan: 6-10 ms more per
-        // batch for the ~200 MB frames region), which showed up as a batch-size-dependent loss.
+        // batch for the ~200 MB frames region).
         let al = |x: u64| x.next_multiple_of(STAGING_ALIGN);
         let (a, ts) = if frames {
             let a = al(frame_len_bytes(cap));

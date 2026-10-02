@@ -7,13 +7,13 @@
 use crate::bits::BitWriter;
 use crate::fse::{FseCTable, FseState, choose_table_log, normalize, write_ncount};
 
-/// Longest code we emit (zstd's `LitHufLog`; the format allows at most 11).
+/// Longest code emitted (zstd's `LitHufLog`; the format allows at most 11).
 pub const HUF_MAX_BITS: u32 = 11;
 /// Largest table log for the FSE-compressed weights (`MAX_FSE_TABLELOG_FOR_HUFF_HEADER`).
 const WEIGHTS_MAX_LOG: u32 = 6;
 /// Weights are 0..=11 (a weight is at most `max_bits`), so 12 histogram cells.
 const WEIGHT_ALPHABET: usize = HUF_MAX_BITS as usize + 1;
-/// Below this many literals we never try Huffman.
+/// Below this many literals Huffman is never tried.
 pub const MIN_HUF_LITERALS: usize = 64;
 
 /// Huffman code for the literal alphabet.

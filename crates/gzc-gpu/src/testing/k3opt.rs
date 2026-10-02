@@ -11,7 +11,7 @@ use gzc_core::seq::BlockOutput;
 use crate::context::{GpuContext, pack_blocks};
 use crate::k3opt::{OptBinds, PRICE_WORDS};
 pub use crate::k3opt::{
-    K3Drop, K3Opt, K3OptConfig, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE, ring_bytes, ring_for,
+    K3Drop, K3Opt, K3OptConfig, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE, ring_bytes, check_ring_fits,
     scratch_bytes_per_block, workgroup_bytes,
 };
 use crate::kernels::{MAX_SEQS_OPT, decode_output, with_error_scopes};
@@ -42,7 +42,7 @@ pub struct OptBuffers {
     /// passes).
     pub scratch: wgpu::Buffer,
     scratch_per_block: u64,
-    /// The block schedule (`sched_bytes`, M6 A4).
+    /// The block schedule (`sched_bytes`).
     pub sched: wgpu::Buffer,
 }
 
@@ -176,7 +176,7 @@ fn check_dead_marks_par(blocks: &[&[u8]], cands: &[&[CandWords]]) -> anyhow::Res
     })
 }
 
-/// The kernel also trusts the dead marks (`reference::find_cands`, M6 A3): it skips the search at
+/// The kernel also trusts the dead marks (`reference::find_cands`): it skips the search at
 /// every marked position. Checks that each marked position `p` is really dead: words `[0,
 /// DEAD_BIT]` (no record), `p < PARSE_END`, and no earlier position with its first 3 bytes.
 /// `seen` is the caller's scratch (empty, or all zero as this leaves it).
@@ -462,11 +462,11 @@ pub fn parses_from_passes(
 }
 
 /// GPU time (ms, median of `reps` runs after one warm-up) of each DP pass of `p`, of the final
-/// fix-up, of the block order (M6 A4) and of the drop pass
-/// (M6 B3; 0 without one), on the first `n` blocks of `bufs`: `n_passes() + 3` values, then the
-/// span from the block order's start to the end of the drop pass, or without one of the fix-up
-/// (dispatch gaps included). The final pass overwrites part of the candidate words, so `reupload`
-/// runs before every run (outside the timed passes).
+/// fix-up, of the block order and of the drop pass (0 without one), on the first `n` blocks of
+/// `bufs`: `n_passes() + 3` values. One more value follows: the span from the block order's
+/// start to the end of the drop pass, or without one of the fix-up, dispatch gaps included. The
+/// final pass overwrites part of the candidate words, so `reupload` runs before every run,
+/// outside the timed passes.
 pub fn time_passes(
     ctx: &GpuContext,
     p: &OptPasses,
@@ -567,7 +567,7 @@ mod tests {
         assert!(e.to_string().contains("data"), "{e}");
     }
 
-    /// `check_dead_marks` (M6 A3) accepts `find_cands`' marks, also twice with the same scratch,
+    /// `check_dead_marks` accepts `find_cands`' marks, also twice with the same scratch,
     /// and rejects a mark on a position with an earlier 3-byte match, on a position with a record,
     /// and at `PARSE_END`.
     #[test]
