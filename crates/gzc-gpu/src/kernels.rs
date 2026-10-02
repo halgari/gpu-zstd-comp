@@ -92,6 +92,7 @@ pub(crate) const TRUNC_KERNEL_NAME: &str = "k3_trunc";
 /// as for `reference::compress_block`) and which output stages run.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuParams {
+    /// The match finder and parse parameters.
     pub matching: MatchParams,
     /// Also run K4, which turns each block's parse into its complete zstd frame.
     pub emit_frames: bool,
@@ -156,6 +157,7 @@ const _: () = assert!(256 < 1u64 << (32 - BEST_OFF_BITS), "capped lengths must f
 
 /// Per-batch buffers, allocated for `capacity` blocks and reused.
 pub struct BatchBuffers {
+    /// Blocks the buffers hold.
     pub capacity: u32,
     /// Hash chains per block the head/pred buffers hold (`MatchParams::n_hashes`).
     pub n_hashes: u32,
@@ -438,7 +440,10 @@ pub enum K3Mode {
     Seq,
     /// `k3_coop.wgsl`: one workgroup of `w` lanes, a single subgroup, per block (needs
     /// `Features::SUBGROUP`).
-    Coop { w: u32 },
+    Coop {
+        /// Lanes per block.
+        w: u32,
+    },
 }
 
 /// Ballot bits (x, y) of `w` active lanes 0..w.

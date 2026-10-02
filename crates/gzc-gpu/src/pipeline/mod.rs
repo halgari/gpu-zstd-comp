@@ -72,15 +72,18 @@ pub use slots::FrameBatch;
 pub(crate) use stream::check_blocks;
 pub use stream::{FrameStream, Region, UploadSlot, payload_blocks, payload_real_lens};
 
+/// What a [`Pipeline`] is built for.
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineConfig {
     /// Blocks per batch (one submission).
     pub batch: u32,
     /// Batches in flight (slots).
     pub inflight: u32,
+    /// The match parameters and which output stages run.
     pub params: GpuParams,
 }
 
+/// Where the time of one stream went.
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
     /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
@@ -145,6 +148,7 @@ pub const TRANSFER_NAMES: [&str; 11] = [
 /// Receives each block's parse; called exactly once per index, in arbitrary order. `Pipeline::run`
 /// calls it on the pipeline's completion thread (hence `Send` there).
 pub trait BlockSink {
+    /// Takes block `index`'s parse.
     fn put(&mut self, index: usize, out: BlockOutput);
 }
 
@@ -153,12 +157,14 @@ pub trait BlockSink {
 /// submission order and in index order within a batch, while the calling thread uploads the next
 /// batches. `frame` borrows the batch's staging buffer: copy (or write) it out before returning.
 pub trait FrameSink {
+    /// Takes block `index`'s frame.
     fn put(&mut self, index: usize, frame: &[u8]);
 }
 
 /// A frame sink that several delivery threads call at once (`Pipeline::run_frames_par`): exactly
 /// once per index, in arbitrary order. `frame` borrows the staging buffer as in `FrameSink`.
 pub trait ParFrameSink: Sync {
+    /// Takes block `index`'s frame.
     fn put(&self, index: usize, frame: &[u8]);
 }
 

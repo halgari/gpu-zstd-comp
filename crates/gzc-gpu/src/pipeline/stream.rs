@@ -267,6 +267,7 @@ impl<'a> Region<'a> {
         self.bytes.len()
     }
 
+    /// True for a region of no bytes.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }

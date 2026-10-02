@@ -2,10 +2,10 @@
 //! byte-identical to `gzc_core::opt::dp_pass_with(.., Engine::Ring)`, then the segmented parse's
 //! fix-up (`shaders/k3_fixup.wgsl`).
 //!
-//! In the pipeline (M5 T5) `compressor::Kernels` runs `OptPasses` as its K3 on the shared
+//! In the pipeline (M5 T5) `kernels::Kernels` runs `OptPasses` as its K3 on the shared
 //! `BatchBuffers` (`OptBinds::of_batch`). The harnesses here have their own buffers
 //! (`OptBuffers`) and feed K2opt's candidate words from the host (`parses_from_cands`, the
-//! counterpart of `compressor::parses_from_best`), so they run on `reference::find_cands` output
+//! counterpart of `testing::parses_from_best`), so they run on `reference::find_cands` output
 //! or on scripted candidates (`opt::cases`). Prices come either from zstd's first-block statistics computed in
 //! the kernel's prologue (`PriceSrc::BlockInit`, the oracle's `Seed::BlockInit` pass 0) or from
 //! explicit per-block tables (`PriceSrc::Buffer`, e.g. `opt::cases`' tables or a later pass's).
@@ -27,7 +27,7 @@
 //! Buffers per block: data (BLOCK_SIZE, plus the batch's trailing zero word: `ld32` reads one word
 //! past a block), candidate words (`sizing::best_bytes_for`, 8 B per position; after the DP
 //! each segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace
-//! (`compressor::trace_bytes`, 8 B per position: K1's `pred` in the pipeline), seqs
+//! (`sizing::trace_bytes`, 8 B per position: K1's `pred` in the pipeline), seqs
 //! (`MAX_SEQS_OPT` × 12 B; the DP's series log until the fix-up), counts, the price tables
 //! (`PRICE_WORDS` words), and the DP nodes' payload scratch (`scratch_bytes_per_block`, 6336 B at
 //! 64 KiB: only the nodes' prices stay in workgroup memory, M5 T3b).
@@ -234,7 +234,7 @@ pub struct OptBuffers {
     pub seqs: wgpu::Buffer,
     pub counts: wgpu::Buffer,
     /// `PRICE_WORDS` words per block: `opt::Prices` (`PriceSrc::Buffer`) or `opt::Hist`
-    /// (`PriceSrc::Hist`, `hist_out`), both as lit[256] ll[36] ml[53] of[32].
+    /// (`PriceSrc::Hist`, `hist_out`), both as `lit[256]` `ll[36]` `ml[53]` `of[32]`.
     pub prices: wgpu::Buffer,
     /// The DP nodes' payload (`scratch_bytes_per_block` per block; K3opt-owned, dead between
     /// passes).

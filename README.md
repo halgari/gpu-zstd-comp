@@ -164,16 +164,38 @@ cargo run --release -p gzc-bench -- gpu --input <dir> --ext dds,nif \
 cargo run --release -p gzc-bench -- cpu --input <dir> --levels 9,16 --threads 8
 ```
 
+## Library use
+
+The `gzc-gpu` crate is the library. Compressing a buffer takes five lines:
+
+```rust
+use gzc_gpu::{Compressor, Level};
+
+let compressor = Compressor::new(Level::Zstd16)?;
+let frames = compressor.compress(&data)?; // one zstd frame per 64 KiB block
+std::fs::write("out.zst", frames.as_bytes())?; // or frames.frame(i) for block i
+```
+
+- `Level::Zstd3`, `Zstd9`, `Zstd14` and `Zstd16` stand for the presets `lvl3`, `lvl9s12seg`,
+  `opt14` and `opt16p1`. The output for a level is the same on every GPU.
+- `compress_blocks` takes blocks that are already split; any of them may be shorter than 64 KiB.
+- `stream` compresses while data arrives: the caller writes straight into GPU upload memory and
+  gets finished batches of frames back, with no copy in between.
+- `CompressorOptions` sets the GPU memory budget (6144 MiB by default, sized for an 8 GB card).
+- Errors are typed: no adapter, unsupported parameters, out of memory, device lost, bad input.
+
+Build one `Compressor` and reuse it. `cargo doc --no-deps -p gzc-gpu --open` has the full API.
+
 `docs/reference.md` covers the rest:
 - the full benchmark CLI;
 - the corpus download tool (it needs a Nexus Mods API key);
-- the streaming API for embedding the compressor in another program;
+- the library API, including streaming;
 - the tuning and test environment switches.
 
 ## Layout
 
 - `crates/gzc-core`: the CPU reference encoder, the frame writer, hashing, and the test data.
-- `crates/gzc-gpu`: the WGSL kernels and the GPU pipeline.
+- `crates/gzc-gpu`: the library: `Compressor`, the WGSL kernels and the GPU pipeline.
 - `crates/gzc-bench`: the benchmark CLI.
 - `tools/fetch-corpus`: downloads the test corpus.
 - `docs/results/`: measured results per machine.

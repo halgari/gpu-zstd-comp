@@ -276,6 +276,7 @@ impl FrameBatch {
         self.spans.len()
     }
 
+    /// True for a batch of no frames. A stream never delivers one.
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
     }
