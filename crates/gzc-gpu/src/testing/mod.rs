@@ -33,14 +33,7 @@ pub mod sorted {
     pub use crate::sorted::{SortKernel, sorted_words, workgroup_bytes};
 }
 
-/// The K3opt passes, their own buffers and the harnesses that run them alone.
-pub mod k3opt {
-    pub use crate::k3opt::{
-        K3Drop, K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
-        drops_from_parses, parses_from_cands, parses_from_passes, ring_bytes, ring_for, scratch_bytes_per_block,
-        time_passes, workgroup_bytes,
-    };
-}
+pub mod k3opt;
 
 /// Buffer sizes.
 pub mod sizing {
