@@ -198,7 +198,7 @@ fn k3opt_workgroup_memory() {
     let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
     assert_eq!(ring_bytes(&OPT16), 16 * (target + 1) * 4);
-    // M6 A1: the footprint of every pass kernel: at most 4266 B (23..24 resident blocks per SM
+    // M6 A1: the footprint of every pass kernel: at most 4068 B (24 resident blocks per SM
     // on an RTX 5090 with 100 KB of shared memory), the final pass (no histogram) 1020 B below
     // its cheap-pass twin. Every kernel within 16384 B (WebGPU's minimum limit).
     for (level, prices, hist_out) in [
@@ -212,7 +212,7 @@ fn k3opt_workgroup_memory() {
         let c = K3OptConfig { level, prices, hist_out, ..auto };
         let b = workgroup_bytes(&OPT16, &c);
         assert!(b <= 16384, "{c:?}: workgroup footprint {b} B > 16384");
-        assert!(b <= 4266, "{c:?}: workgroup footprint {b} B > 4266");
+        assert!(b <= 4068, "{c:?}: workgroup footprint {b} B > 4068");
         assert!(ring_for(&OPT16, &c, 16384).is_ok(), "{c:?}");
         if !hist_out && prices == PriceSrc::Hist {
             assert_eq!(b + 1020, workgroup_bytes(&OPT16, &K3OptConfig { hist_out: true, ..c }));
