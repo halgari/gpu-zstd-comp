@@ -47,7 +47,10 @@ use anyhow::{Context as _, anyhow};
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
-use crate::compressor::{BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, decode_output, k4_tables_bytes, max_seqs};
+use crate::compressor::{
+    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, TRUNC_KERNEL_NAME, decode_output, k4_tables_bytes,
+    max_seqs,
+};
 use crate::sizing::{
     counts_bytes, data_bytes, frame_len_bytes, frames_bytes, max_batch_blocks, scratch_bytes, seqs_bytes_for, slot_bytes,
 };
@@ -67,7 +70,8 @@ pub struct PipelineConfig {
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
     /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
-    /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals), in milliseconds;
+    /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals, and last "k3_trunc"
+    /// when some batch held a partial block and so ran K3t), in milliseconds;
     /// empty when the device has no timestamp queries; a kernel whose timestamps the device left
     /// unwritten (in any batch) is left out. That happens on Metal (an M4 Pro): with counters
     /// sampled at stage boundaries only (no `TIMESTAMP_QUERY_INSIDE_ENCODERS`) it left K4's pair,
@@ -144,9 +148,10 @@ pub trait ParFrameSink: Sync {
     fn put(&self, index: usize, frame: &[u8]);
 }
 
-/// Timestamp queries per slot: the kernels' begin/end pairs, then a start and an end marker (see
+/// Timestamp queries per slot: the kernels' begin/end pairs, then a start and an end marker, then
+/// K3t's pair, written and resolved only by a batch that holds a partial block (see
 /// `Pipeline::submit`).
-const PIPELINE_QUERIES: u32 = KERNEL_QUERIES + 2;
+const PIPELINE_QUERIES: u32 = KERNEL_QUERIES + 4;
 
 /// Alignment of each region of a slot's staging buffer (see `StagingLayout::new`).
 const STAGING_ALIGN: u64 = 256;
@@ -197,6 +202,8 @@ struct Job {
     /// Transfer readback: the batch's value on the `Xfer` timelines.
     seq: u64,
     staging: Arc<Staging>,
+    /// The batch held a partial block: it ran K3t, and its timestamps include K3t's pair.
+    partial: bool,
 }
 
 /// A slot's staging buffer: mapped through wgpu after the submission, or (transfer readback)
@@ -917,14 +924,19 @@ impl<'a> Pipeline<'a> {
         let (kernel_ms, gpu_ms) = if self.ctx.timestamps {
             let period_ns = self.ctx.queue.get_timestamp_period() as f64;
             let ms = |t: u64| t as f64 * period_ns / 1e6;
+            let mut kernel_ms: Vec<(String, f64)> = names
+                .iter()
+                .zip(&cprof.ticks)
+                .zip(&cprof.ticks_bad)
+                .filter(|(_, bad)| !**bad)
+                .map(|((name, &t), _)| (name.to_string(), ms(t)))
+                .collect();
+            // K3t ran only for the batches holding a partial block.
+            if cprof.trunc_batches > 0 && !cprof.trunc_bad {
+                kernel_ms.push((TRUNC_KERNEL_NAME.to_string(), ms(cprof.trunc_ticks)));
+            }
             (
-                names
-                    .iter()
-                    .zip(&cprof.ticks)
-                    .zip(&cprof.ticks_bad)
-                    .filter(|(_, bad)| !**bad)
-                    .map(|((name, &t), _)| (name.to_string(), ms(t)))
-                    .collect(),
+                kernel_ms,
                 if cprof.markers_bad {
                     Vec::new()
                 } else {
@@ -995,8 +1007,19 @@ impl<'a> Pipeline<'a> {
         }
 
         let n_queries = 2 * self.kernels.names().len() as u32;
-        let resolved = (n_queries + 2) as u64 * wgpu::QUERY_SIZE as u64;
+        // The queries a batch resolves: the kernels' pairs, the two markers, and K3t's pair
+        // (after the markers) only when the batch runs K3t: a batch of full blocks neither writes
+        // nor resolves it.
+        let n_resolve = n_queries + 2 + if partial { 2 } else { 0 };
+        let resolved = n_resolve as u64 * wgpu::QUERY_SIZE as u64;
         let queries = slot.queries.as_ref().map(|q| &q.set);
+        let ts_trunc = || {
+            queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(n_queries + 2),
+                end_of_pass_write_index: Some(n_queries + 3),
+            })
+        };
         // Start/end markers: empty passes whose timestamps (written at BOTTOM_OF_PIPE on Vulkan,
         // i.e. once all earlier commands completed) bracket the batch's copies.
         let marker = |enc: &mut wgpu::CommandEncoder, index: u32| {
@@ -1030,12 +1053,12 @@ impl<'a> Pipeline<'a> {
                 let mut enc =
                     ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
                 if partial {
-                    self.kernels.record_truncate(ctx, &mut enc, bufs, n);
+                    self.kernels.record_truncate(ctx, &mut enc, bufs, n, ts_trunc());
                 }
                 self.kernels.record_entropy(ctx, &mut enc, bufs, n, queries);
                 marker(&mut enc, n_queries + 1);
                 if let Some(q) = &slot.queries {
-                    enc.resolve_query_set(&q.set, 0..n_queries + 2, &q.resolve, 0);
+                    enc.resolve_query_set(&q.set, 0..n_resolve, &q.resolve, 0);
                 }
                 // SAFETY: both timelines live in `xfer` until `Pipeline`'s Drop waited for the queues.
                 let submission = unsafe {
@@ -1060,7 +1083,7 @@ impl<'a> Pipeline<'a> {
                 // so no kernel processes the stale blocks of a partial batch.
                 if partial {
                     self.kernels.record_front(ctx, &mut enc, bufs, n, queries)?;
-                    self.kernels.record_truncate(ctx, &mut enc, bufs, n);
+                    self.kernels.record_truncate(ctx, &mut enc, bufs, n, ts_trunc());
                     self.kernels.record_entropy(ctx, &mut enc, bufs, n, queries);
                 } else {
                     self.kernels.record_timed(ctx, &mut enc, bufs, n, queries)?;
@@ -1075,7 +1098,7 @@ impl<'a> Pipeline<'a> {
                 }
                 marker(&mut enc, n_queries + 1);
                 if let Some(q) = &slot.queries {
-                    enc.resolve_query_set(&q.set, 0..n_queries + 2, &q.resolve, 0);
+                    enc.resolve_query_set(&q.set, 0..n_resolve, &q.resolve, 0);
                     enc.copy_buffer_to_buffer(&q.resolve, 0, staging, layout.ts, resolved);
                 }
                 let submission = ctx.queue.submit([enc.finish()]);
@@ -1095,7 +1118,7 @@ impl<'a> Pipeline<'a> {
         slot.upload_mapped = Some(upload_mapped);
         slot.upload_unmapped = false;
         slot.upload_submission = Some(submission.clone());
-        Ok(Job { slot: i, first, n, tag, submission, mapped, seq, staging: slot.staging.clone() })
+        Ok(Job { slot: i, first, n, tag, submission, mapped, seq, staging: slot.staging.clone(), partial })
     }
 
     /// After an error: wait for the GPU, unmap and free every slot still in flight so the
@@ -1176,6 +1199,11 @@ struct CompletionProfile {
     idle: u64,
     /// End marker of the last batch finished (ticks), for `idle`.
     last_end: Option<u64>,
+    /// K3t's ticks over the batches that ran it (`Job::partial`), how many did, and whether one
+    /// had an unwritten timestamp.
+    trunc_ticks: u64,
+    trunc_batches: u32,
+    trunc_bad: bool,
     wait: f64,
     deliver: f64,
     /// When the last wait for the GPU returned, for `host_drain`.
@@ -1252,7 +1280,7 @@ impl Completion<'_> {
             prof.last_wait = Some(done);
             let lease = self.lease(&job, mapped)?;
             if self.timed {
-                self.add_timestamps(lease.bytes(), prof);
+                self.add_timestamps(lease.bytes(), job.partial, prof);
             }
             if let Some(k) = &mut self.fail_after {
                 if *k == 0 {
@@ -1298,12 +1326,21 @@ impl Completion<'_> {
         Ok(Lease { shared: self.shared.clone(), slot: job.slot, staging: job.staging.clone(), view, ptr, len })
     }
 
-    fn add_timestamps(&self, view: &[u8], prof: &mut CompletionProfile) {
+    /// Adds one batch's timestamps (the kernels' pairs, the two markers, then K3t's pair when the
+    /// batch was `partial`) to the profile.
+    fn add_timestamps(&self, view: &[u8], partial: bool, prof: &mut CompletionProfile) {
         let nk = self.n_kernels;
         // Only 4-byte aligned in general (seqs_bytes(1) is not a multiple of 8).
         let t = self.layout.ts as usize;
+        let pairs = nk + 1 + partial as usize;
         let stamps: Vec<u64> =
-            view[t..t + (nk + 1) * 16].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+            view[t..t + pairs * 16].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        if partial {
+            let (t0, t1) = (stamps[2 * nk + 2], stamps[2 * nk + 3]);
+            prof.trunc_ticks += t1.saturating_sub(t0);
+            prof.trunc_batches += 1;
+            prof.trunc_bad |= unwritten_stamp(t0) || unwritten_stamp(t1);
+        }
         for (k, acc) in prof.ticks.iter_mut().enumerate() {
             *acc += stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
             prof.ticks_bad[k] |= unwritten_stamp(stamps[2 * k]) || unwritten_stamp(stamps[2 * k + 1]);
@@ -1899,20 +1936,31 @@ mod tests {
     /// preset's frames equal the CPU oracle's (`compress_block_to_frame` of the real bytes, which
     /// pins full blocks to their unchanged padded-parse frames) and decode with libzstd to exactly
     /// the files. Covers batches mixing full and partial blocks, an all-full batch, RLE and
-    /// 1-byte-FCS (< 256 bytes) blocks; every upload/readback mode for three presets, Raw literals
-    /// for lvl3.
+    /// 1-byte-FCS (< 256 bytes) blocks, lengths 2 and 3 (around zstd's minimum match), a segment
+    /// boundary (4095, 4096, 4097) and zero-tailed blocks (real bytes that run on into the
+    /// padding, so K3t cuts a match that crosses the real length); every upload/readback mode
+    /// for three presets, Raw literals for lvl3. Every frame declares its block's real length
+    /// (K4 takes it from the cut parse, the host from `lens`), and K3t is timed exactly when a
+    /// batch holds a partial block.
     #[test]
     fn partial_blocks_frames_match_cpu_every_preset() {
         let _gpu = crate::test_support::gpu_test_slot();
         let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
         let bs = BLOCK_SIZE;
-        let mut files: Vec<Vec<u8>> = [1, 100, 255, 256, 257, 4097, bs - 1, bs, bs + 31_000, 2 * bs + 3]
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| source[i * 7777..][..n].to_vec())
-            .collect();
+        let lens = [1, 2, 3, 100, 255, 256, 257, 4095, 4096, 4097, bs - 1, bs, bs + 31_000, 2 * bs + 3];
+        let mut files: Vec<Vec<u8>> =
+            lens.iter().enumerate().map(|(i, &n)| source[i * 7777..][..n].to_vec()).collect();
         files.push(vec![7u8; bs + 300]);
         files.push(vec![7u8; 200]);
+        // Zero-tailed: text whose last bytes are zeros, and all-zero partial blocks.
+        for n in [3000, bs + 4096, bs / 2] {
+            let mut f = source[50_000..][..n].to_vec();
+            let cut = n - (n % bs) / 2;
+            f[cut..].fill(0);
+            files.push(f);
+        }
+        files.push(vec![0u8; 5000]);
+        files.push(vec![0u8; 3]);
         // Eight full blocks: one batch of 8 with no partial block.
         files.push(source[3 * bs..11 * bs].to_vec());
         let blocks: Vec<gzc_core::block::Block> = files.iter().flat_map(|f| chunk_file(f)).collect();
@@ -1935,7 +1983,7 @@ mod tests {
                 for (mode, ctx) in modes {
                     let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 8, inflight: 2, params }).unwrap();
                     let mut sink = CollectFrames(vec![None; real.len()]);
-                    pipe.run_frames(&real, &mut sink).unwrap();
+                    let stats = pipe.run_frames(&real, &mut sink).unwrap();
                     for (i, got) in sink.0.iter().enumerate() {
                         let got = got.as_ref().unwrap_or_else(|| panic!("{name} {mode}: block {i} never delivered"));
                         assert!(
@@ -1943,6 +1991,27 @@ mod tests {
                             "{name} huffman={huffman} {mode}: block {i} ({} bytes): GPU frame != CPU frame",
                             real[i].len()
                         );
+                        assert_eq!(
+                            zstd::zstd_safe::get_frame_content_size(got).ok().flatten(),
+                            Some(real[i].len() as u64),
+                            "{name} {mode}: block {i}: K4's declared content size is not the block's length"
+                        );
+                    }
+                    // K3t ran (some batch held a partial block): timed last, after the kernels.
+                    if ctx.timestamps {
+                        let (last, ms) = stats.kernel_ms.last().expect("kernel timers");
+                        assert_eq!(last, TRUNC_KERNEL_NAME, "{name} {mode}: {:?}", stats.kernel_ms);
+                        assert!(*ms > 0.0, "{name} {mode}: {:?}", stats.kernel_ms);
+                        assert_eq!(stats.kernel_ms.iter().filter(|(n, _)| n == TRUNC_KERNEL_NAME).count(), 1);
+                    }
+                    // Full blocks only: no K3t, no timer for it.
+                    let full: Vec<&[u8]> = real.iter().copied().filter(|b| b.len() == bs).collect();
+                    let mut sink = CollectFrames(vec![None; full.len()]);
+                    let stats = pipe.run_frames(&full, &mut sink).unwrap();
+                    assert!(stats.kernel_ms.iter().all(|(n, _)| n != TRUNC_KERNEL_NAME), "{name} {mode}: {:?}", stats.kernel_ms);
+                    assert!(sink.0.iter().all(|f| f.is_some()));
+                    if huffman && m == LVL3 {
+                        assert_frame_timers(ctx, &stats, name);
                     }
                 }
             }

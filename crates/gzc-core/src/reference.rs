@@ -831,15 +831,42 @@ mod tests {
 
     /// A file of `k` full blocks plus `r` bytes round-trips through libzstd to exactly its bytes
     /// for every preset: each block's frame declares and holds only its real length, and a full
-    /// block's frame is the padded-parse frame it always was.
+    /// block's frame is the padded-parse frame it always was. `r` covers the shortest blocks (1,
+    /// 2, 3: below, at and above zstd's minimum match), both frame-header forms (255, 256, 257)
+    /// and a segment boundary (4095, 4096, 4097). The sources: text, an all-equal file, text
+    /// whose last bytes are zeros (the real bytes run on into the padding, so a match found on
+    /// the padded block crosses the real length and is cut) and an all-zero file.
     #[test]
     fn partial_last_block_roundtrips_every_preset() {
         let file = synth::text(7, 2 * BLOCK_SIZE + BLOCK_SIZE / 2);
         let rle = vec![9u8; BLOCK_SIZE + 300];
+        let zeros = vec![0u8; 3 * BLOCK_SIZE];
+        let lens = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 100),
+            (1, 255),
+            (1, 256),
+            (1, 257),
+            (0, 4095),
+            (1, 4096),
+            (0, 4097),
+            (2, 31_000),
+            (1, BLOCK_SIZE - 1),
+            (2, 0),
+        ];
         for (name, p) in crate::params::PRESETS {
-            for (k, r) in [(0, 1), (0, 100), (1, 255), (1, 256), (1, 257), (0, 4097), (2, 31_000), (1, BLOCK_SIZE - 1), (2, 0)] {
-                for src in [&file, &rle] {
-                    let bytes = &src[..(k * BLOCK_SIZE + r).min(src.len())];
+            for (k, r) in lens {
+                for (s, src) in [&file, &rle, &file, &zeros].into_iter().enumerate() {
+                    let mut bytes = src[..(k * BLOCK_SIZE + r).min(src.len())].to_vec();
+                    if s == 2 {
+                        // Zero-tailed: the last two thirds of the last block's real bytes.
+                        let n = bytes.len();
+                        let tail = if r == 0 { BLOCK_SIZE } else { r };
+                        bytes[n - tail + tail / 3..].fill(0);
+                    }
+                    let bytes = &bytes[..];
                     let mut dec = Vec::new();
                     for blk in chunk_file(bytes) {
                         let real = &blk.data[..blk.real_len];

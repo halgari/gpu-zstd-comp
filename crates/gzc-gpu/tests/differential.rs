@@ -1419,6 +1419,52 @@ fn stream_frames_match_cpu_non_lvl3_presets() {
     }
 }
 
+/// Partial blocks (a file's last block, given as its real bytes) through the streaming pipeline:
+/// frames equal the CPU oracle's, declare exactly the block's length (K4's content size ==
+/// `lens`) and decode to the block's bytes. Lengths around zstd's minimum match (1, 2, 3), both
+/// frame-header forms (255, 256, 257), a segment boundary (4095, 4096, 4097) and zero-tailed
+/// blocks, mixed with full blocks. Part of the emulated suite too (`differential_emulated.rs`):
+/// K3t and K4's real-length paths under the other GPUs' semantics.
+#[test]
+fn partial_blocks_frames_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let ctx = context(true);
+    let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
+    let mut blocks: Vec<Vec<u8>> = [1, 2, 3, 255, 256, 257, 4095, 4096, 4097, 31_000, BLOCK_SIZE - 1, BLOCK_SIZE]
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| source[i * 5003..][..n].to_vec())
+        .collect();
+    // Zero-tailed: the real bytes end in zeros, like the padding after them.
+    let mut tailed = source[70_000..][..9000].to_vec();
+    tailed[4000..].fill(0);
+    blocks.push(tailed);
+    blocks.push(vec![0u8; 5000]);
+    blocks.push(source[2 * BLOCK_SIZE..3 * BLOCK_SIZE].to_vec());
+    let real: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let opt16p1 = ("opt16p1", gzc_core::params::OPT16P1);
+    for (name, matching) in GPU_PRESETS.into_iter().chain([opt16p1]) {
+        let params = GpuParams { matching, emit_frames: true, huffman: true };
+        // 15 blocks in batches of 4: three with partial blocks, the last one a single full block.
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 4, inflight: 2, params }).expect("Pipeline::new");
+        let mut sink = CollectFrames(vec![None; real.len()]);
+        pipe.run_frames(&real, &mut sink).expect("run_frames");
+        for (i, got) in sink.0.iter().enumerate() {
+            let got = got.as_ref().unwrap_or_else(|| panic!("{name}: block {i} never delivered"));
+            let want = gzc_core::reference::compress_block_to_frame(real[i], matching, params.frame_options());
+            let len = real[i].len();
+            assert!(*got == want, "{name}: block {i} ({len} bytes): {}", first_byte_diff(got, &want));
+            assert_eq!(
+                zstd::zstd_safe::get_frame_content_size(got).ok().flatten(),
+                Some(len as u64),
+                "{name}: block {i}: declared content size"
+            );
+            let back = zstd::bulk::decompress(got, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: block {i}: libzstd: {e}"));
+            assert!(back == real[i], "{name}: block {i} ({len} bytes) did not round-trip");
+        }
+    }
+}
+
 /// Informal (not in the normal suite; reads the real corpus): a few hundred real .dds/.nif blocks
 /// per preset, GPU frames against CPU frames.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test differential corpus_blocks -- --ignored --nocapture`

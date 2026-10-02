@@ -96,6 +96,10 @@ pub const SORTED_KERNEL_NAMES: [&str; 5] = ["k1_sort", "k2_window", "k3_parse", 
 /// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
 pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
 
+/// K3t's name in timing breakdowns (`Kernels::record_truncate`). It is not one of `KERNEL_NAMES`:
+/// it runs only for a batch that holds a partial block, with timestamp writes its caller places.
+pub const TRUNC_KERNEL_NAME: &str = "k3_trunc";
+
 /// Parameters for the GPU path: the match finder / parse (`params::LVL3` etc., same meaning
 /// as for `reference::compress_block`) and which output stages run.
 #[derive(Clone, Copy, Debug)]
@@ -905,8 +909,16 @@ impl Kernels {
     /// K3t: cuts the parse of every partial block of the batch to its real length, from
     /// `bufs.lens` (one u32 per block, BLOCK_SIZE for a full block, written by the caller before
     /// this runs). Recorded between K3 (`record_front`) and `record_entropy`, and only for a batch
-    /// holding a partial block (it leaves full blocks alone). `1 <= n_blocks <= bufs.capacity`.
-    pub(crate) fn record_truncate(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+    /// holding a partial block (it leaves full blocks alone), in its own compute pass with
+    /// `timestamp_writes`. `1 <= n_blocks <= bufs.capacity`.
+    pub(crate) fn record_truncate(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites>,
+    ) {
         let (pipeline, layout) = self.trunc.as_ref().expect("Kernels built without emit_frames");
         let lens = bufs.lens.as_ref().expect("BatchBuffers allocated without frames");
         assert!(n_blocks >= 1 && n_blocks <= bufs.capacity, "n_blocks {n_blocks} not in 1..={}", bufs.capacity);
@@ -927,7 +939,7 @@ impl Kernels {
                 wgpu::BindGroupEntry { binding: 3, resource: bufs.counts.as_entire_binding() },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3t"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3t"), timestamp_writes });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);
