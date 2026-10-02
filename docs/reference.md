@@ -199,8 +199,6 @@ by `0` only.
   default: auto-detected. The segmented and optimal parses have one K3 each.
 - `GZC_K3_W=4|8|16|32|64`: cooperative K3's lanes per block (at most the device's
   minimum subgroup size).
-- `GZC_K3_BPW=2`: two blocks per cooperative-K3 workgroup (needs min == max subgroup
-  size == W); opt-in, worthwhile on Ada's 24-workgroups-per-SM limit.
 - `GZC_TRANSFER_QUEUE=0`: turns off the transfer-queue readback (speed-2 E3). By default, on a
   Vulkan 1.2+ adapter with timeline semaphores and a transfer-only queue family, the frame path
   reads each batch back on that dedicated copy queue, overlapping the next batch's kernels. Only

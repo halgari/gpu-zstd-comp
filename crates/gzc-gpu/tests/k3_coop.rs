@@ -457,16 +457,11 @@ fn probe_and_mode_selection() {
     }
     let min = ctx.adapter_info.subgroup_min_size;
     for w in [4u32, 8, 16, 32, 64].into_iter().filter(|&w| w <= min) {
-        assert!(probe_lanes(&ctx, w, 1).unwrap(), "probe failed for W = {w} (min subgroup size {min})");
+        assert!(probe_lanes(&ctx, w).unwrap(), "probe failed for W = {w} (min subgroup size {min})");
     }
     if 2 * ctx.adapter_info.subgroup_max_size <= 64 {
         let w = 2 * ctx.adapter_info.subgroup_max_size;
-        assert!(!probe_lanes(&ctx, w, 1).unwrap(), "probe accepted two subgroups (W = {w})");
-    }
-    // BPW = 2 (stage E, opt-in) is only offered when every subgroup has exactly W lanes.
-    let max = ctx.adapter_info.subgroup_max_size;
-    if min == max && (4..=32).contains(&min) {
-        assert!(probe_lanes(&ctx, min, 2).unwrap(), "probe failed for W = {min}, 2 blocks per workgroup");
+        assert!(!probe_lanes(&ctx, w).unwrap(), "probe accepted two subgroups (W = {w})");
     }
     let kernels = Kernels::new(&ctx, GpuParams { matching: RUNG1, emit_frames: false, huffman: false }).unwrap();
     // The default W is the minimum subgroup size clamped to 8..=64; on a device with smaller
@@ -476,11 +471,10 @@ fn probe_and_mode_selection() {
         1 << (31 - w.leading_zeros())
     };
     let forced_w = std::env::var("GZC_K3_W").ok().map(|v| v.parse::<u32>().unwrap());
-    let bpw = if std::env::var("GZC_K3_BPW").as_deref() == Ok("2") { 2 } else { 1 };
     let w = forced_w.unwrap_or(default_w);
     match std::env::var("GZC_K3_MODE").as_deref() {
         Ok("seq") => assert_eq!(kernels.k3_mode(), Some(K3Mode::Seq)),
-        _ if probe_lanes(&ctx, w, bpw).unwrap() => assert_eq!(kernels.k3_mode(), Some(K3Mode::Coop { w, bpw })),
+        _ if probe_lanes(&ctx, w).unwrap() => assert_eq!(kernels.k3_mode(), Some(K3Mode::Coop { w })),
         _ => assert_eq!(kernels.k3_mode(), Some(K3Mode::Seq)),
     }
     let greedy = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: false, huffman: false }).unwrap();

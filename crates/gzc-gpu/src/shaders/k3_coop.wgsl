@@ -3,8 +3,7 @@
 // count, off_base_for / apply_off_base and sequential greedy_parse it reuses), and
 // compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
 // subgroup size, or GZC_K3_W) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
-// `main_coop`, one block per W lanes, which form one (possibly partial) subgroup; BPW (1 or 2)
-// blocks per workgroup.
+// `main_coop`, one block per workgroup of W lanes, which form one (possibly partial) subgroup.
 //
 // Every lane holds the same parse state (r0/r1/r2, ip, anchor, ...). Per-lane values reach
 // control flow only through subgroupBallot / subgroupShuffle / subgroupAll, so all branch and loop
@@ -166,20 +165,18 @@ fn coop_greedy_parse(base: u32, sbase: u32, bbase: u32, k: u32) -> u32 {
     return n_seq;
 }
 
-@compute @workgroup_size(W * BPW)
+@compute @workgroup_size(W)
 fn main_coop(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lid: u32,
     @builtin(subgroup_invocation_id) sid: u32,
     @builtin(subgroup_size) sg_size: u32,
 ) {
-    // BPW blocks per workgroup, one per subgroup of W lanes (BPW > 1 only when every subgroup has
-    // exactly W lanes). li: the lane within this block's W lanes.
-    let li = lid % W;
-    let b = wid.x * BPW + lid / W;
-    // No early return for lanes past the last block: the layout guard's ballot must see every
-    // lane of the subgroup (a return here is subgroup-uniform only under the host's BPW rule).
-    // They take neither branch below (no loads, no stores).
+    // One block per workgroup. li: the lane within this block's W lanes.
+    let li = lid;
+    let b = wid.x;
+    // No early return for a workgroup past the last block: its lanes take neither branch below
+    // (no loads, no stores).
     let in_range = b < arrayLength(&counts) / 2u;
     let base = block_base(b);
     let sbase = b * MAX_SEQS * 3u;

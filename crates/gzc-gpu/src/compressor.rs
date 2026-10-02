@@ -438,9 +438,9 @@ pub(crate) fn pipeline_from_module(
 pub enum K3Mode {
     /// `k3_parse.wgsl`: one lane per block.
     Seq,
-    /// `k3_coop.wgsl`: one subgroup of `w` lanes per block (needs `Features::SUBGROUP`), `bpw`
-    /// blocks per workgroup.
-    Coop { w: u32, bpw: u32 },
+    /// `k3_coop.wgsl`: one workgroup of `w` lanes, a single subgroup, per block (needs
+    /// `Features::SUBGROUP`).
+    Coop { w: u32 },
 }
 
 /// Ballot bits (x, y) of `w` active lanes 0..w.
@@ -457,8 +457,7 @@ fn lane_mask(w: u32) -> (u32, u32) {
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
 /// ids 0..W-1 (else `Seq`; `GZC_NO_SUBGROUPS` makes the context subgroup-less, see
 /// `GpuContext::new`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
-/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size) and `GZC_K3_BPW=1|2` (blocks per
-/// workgroup; 2 needs minimum == maximum subgroup size == W). The output never depends on them.
+/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size). The output never depends on them.
 pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
     let forced = std::env::var("GZC_K3_MODE").ok();
     match forced.as_deref() {
@@ -488,32 +487,22 @@ pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
             1 << (31 - w.leading_zeros())
         }
     };
-    let bpw = match std::env::var("GZC_K3_BPW").as_deref() {
-        Ok("2") => {
-            let max = ctx.adapter_info.subgroup_max_size;
-            anyhow::ensure!(min == max && w == min, "GZC_K3_BPW=2 needs W == min == max subgroup size ({w}, {min}, {max})");
-            2
-        }
-        Ok("1") | Err(_) => 1,
-        Ok(v) => anyhow::bail!("GZC_K3_BPW={v}: expected 1 or 2"),
-    };
-    if !probe_lanes(ctx, w, bpw)? {
-        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}, BPW = {bpw}");
-        eprintln!("gzc: subgroup lane probe failed for W = {w}, BPW = {bpw}; using the sequential K3");
+    if !probe_lanes(ctx, w)? {
+        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}");
+        eprintln!("gzc: subgroup lane probe failed for W = {w}; using the sequential K3");
         return Ok(K3Mode::Seq);
     }
-    Ok(K3Mode::Coop { w, bpw })
+    Ok(K3Mode::Coop { w })
 }
 
-/// Dispatches one `@workgroup_size(w * bpw)` workgroup that records each lane's local index,
-/// subgroup lane id, subgroup size and `subgroupBallot(true)`; true when every group of `w`
-/// lanes is one subgroup with lane id == local index % w, size >= w (== w when bpw > 1) and
-/// exactly the w-lane ballot (what `k3_coop.wgsl` assumes).
-pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
-    let n = w * bpw;
+/// Dispatches one `@workgroup_size(w)` workgroup that records each lane's local index,
+/// subgroup lane id, subgroup size and `subgroupBallot(true)`; true when the `w` lanes are one
+/// subgroup with lane id == local index, size >= w and exactly the w-lane ballot (what
+/// `k3_coop.wgsl` assumes).
+pub fn probe_lanes(ctx: &GpuContext, w: u32) -> anyhow::Result<bool> {
     let src = format!(
         "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
-         @compute @workgroup_size({n})\n\
+         @compute @workgroup_size({w})\n\
          fn main(@builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) sid: u32,\n\
                  @builtin(subgroup_size) sz: u32) {{\n\
              let m = subgroupBallot(true);\n\
@@ -525,7 +514,7 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
         let module = ctx.wgsl_module("k3_probe", &src, wgpu::ShaderRuntimeChecks::checked());
         let layout = storage_layout(ctx, "k3_probe", &[false]);
         let pipeline = pipeline_from_module(ctx, "k3_probe", &layout, &module, "main");
-        let buf = ctx.storage_buffer("k3_probe", 5 * 4 * n as u64, true);
+        let buf = ctx.storage_buffer("k3_probe", 5 * 4 * w as u64, true);
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k3_probe"),
             layout: &layout,
@@ -540,12 +529,9 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
             pass.dispatch_workgroups(1, 1, 1);
         }
         ctx.queue.submit([enc.finish()]);
-        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * n as usize);
+        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * w as usize);
         let (mx, my) = lane_mask(w);
-        Ok(v.chunks(5).enumerate().all(|(i, l)| {
-            let size_ok = if bpw > 1 { l[2] == w } else { l[2] >= w };
-            l[0] == i as u32 && l[1] == i as u32 % w && size_ok && l[3] == mx && l[4] == my
-        }))
+        Ok(v.chunks(5).enumerate().all(|(i, l)| l[0] == i as u32 && l[1] == i as u32 && l[2] >= w && l[3] == mx && l[4] == my))
     })
 }
 
@@ -584,7 +570,7 @@ impl Kernels {
         let k3_mode = if unsegmented { Some(k3_mode(ctx)?) } else { None };
         let parse_coop = match k3_mode {
             None | Some(K3Mode::Seq) => None,
-            Some(K3Mode::Coop { w, bpw }) => {
+            Some(K3Mode::Coop { w }) => {
                 let (mx, my) = lane_mask(w);
                 // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
                 let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
@@ -592,7 +578,7 @@ impl Kernels {
                 // sequential fallback (the path a failed lane-layout guard takes).
                 let force_fallback = std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1");
                 let body = format!(
-                    "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
+                    "const W: u32 = {w}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
                      const REP_HI_MASK: u32 = {rep_hi}u;\nconst K3_FORCE_FALLBACK: bool = {force_fallback};\n\
                      {k3_body}\n{K3_COOP_WGSL}"
                 );
@@ -922,11 +908,7 @@ impl Kernels {
         let seq = self.parse.as_ref().expect("the sequential K3 exists for an unsegmented parse");
         pass.set_pipeline(self.parse_coop.as_ref().unwrap_or(seq));
         pass.set_bind_group(0, &k3, &[]);
-        let per_workgroup = match self.k3_mode {
-            Some(K3Mode::Coop { bpw, .. }) => bpw,
-            _ => 1,
-        };
-        pass.dispatch_workgroups(n_blocks.div_ceil(per_workgroup), 1, 1);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
         Ok(())
     }
 
