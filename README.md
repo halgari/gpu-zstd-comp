@@ -19,6 +19,20 @@ because each block starts with no history. 64 KiB is our trade-off: small enough
 reads through a VFS, and large enough to stay close to whole-file ratios. All numbers here are for
 64 KiB blocks.
 
+## Why not nvCOMP
+
+NVIDIA's nvCOMP library already compresses zstd on the GPU. We didn't use it, for four reasons:
+
+- **No high compression levels.** nvCOMP's GPU zstd compressor has one fixed mode, built for
+  speed, with no compression-level setting. Its options struct contains only reserved bytes. We
+  needed ratios at libzstd level 9, 14 and 16.
+- **Closed source.** From version 2.3 on, nvCOMP's compression code has been a binary-only
+  download under NVIDIA's proprietary license. We can't tune it or fix it ourselves.
+- **Not actively developed in the open.** The public nvcomp GitHub repository was archived
+  (read-only) in July 2026, and releases are binary drops.
+- **NVIDIA only.** It runs on CUDA, so AMD, Intel and Apple GPUs can't use it. This project runs
+  wherever wgpu does: Vulkan, Metal, and in principle DX12.
+
 ## Performance
 
 The test set is 6.49 GB of DDS and NIF files from two texture mods, split into 100,754 blocks. The
