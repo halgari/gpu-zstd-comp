@@ -180,7 +180,8 @@ std::fs::write("out.zst", frames.as_bytes())?; // or frames.frame(i) for block i
   `opt14` and `opt16p1`. The output for a level is the same on every GPU.
 - `compress_blocks` takes blocks that are already split; any of them may be shorter than 64 KiB.
 - `stream` compresses while data arrives: the caller writes straight into GPU upload memory and
-  gets finished batches of frames back, with no copy in between.
+  gets finished batches of frames back, with no copy in between. `compress` holds all its
+  output in memory; use `stream` for large inputs.
 - `CompressorOptions` sets the GPU memory budget (6144 MiB by default, sized for an 8 GB card).
 - Errors are typed: no adapter, unsupported parameters, out of memory, device lost, bad input.
 

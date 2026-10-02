@@ -180,13 +180,20 @@ for (i, frame) in frames.iter().enumerate() {
 - `Compressor::compress_blocks(&blocks)` takes blocks of 1 to 65536 bytes. Any block may be
   short, so it also serves independent chunks.
 - `Frames` holds every frame in one buffer: `len()`, `frame(i)`, `iter()`, and `as_bytes()`,
-  which is a zstd stream of the whole input.
+  which is a zstd stream of the whole input. `compress` keeps all frames in memory and reserves
+  that buffer up front at the input's size plus 64 bytes per block. Use `stream` for input that
+  should not be held twice.
 - `CompressorOptions` has the match parameters (any preset of `gzc_core::params`), the VRAM
   budget (6144 MiB), an explicit batch size, the batches in flight (3) and the `GpuOptions`.
   Without an explicit batch the compressor takes the largest batch that fits the budget and the
-  device, as `--batch max` does (`gzc_gpu::pipeline::max_batch_for_budget`).
+  device, as `--batch max` does (`gzc_gpu::pipeline::max_batch_for_budget`). The budget caps
+  what the compressor asks for. It is not checked against the memory the adapter has or has
+  free; on a smaller or busy card, building the compressor fails with `OutOfMemory`.
 - A `Compressor` is `Send + Sync`; calls on one compressor run one after another. Build it once:
   it owns the device, the kernels and the buffers.
+- A context that reads frames back through a transfer queue serves one compressor at a time.
+  `Compressor::with_context` on such a context while another compressor is alive is
+  `InvalidInput`.
 
 ### Streaming
 
@@ -206,8 +213,8 @@ compressor.stream(
         // On the calling thread.
         let mut batch = stream.next_batch()?;
         let mut payloads = batch.reserve(&[file_a.len(), file_b.len()])?;
-        payloads[0].write(0, &file_a);
-        payloads[1].write(0, &file_b);
+        payloads[0].write(&file_a);
+        payloads[1].write(&file_b);
         drop(payloads);
         batch.submit()?;
         Ok(())
@@ -221,18 +228,26 @@ compressor.stream(
   boundary and only its last block may be short. The batch zeroes the padding and keeps every
   block's real length, and `Batch::submit()` takes no block count. A short block therefore
   always gets a frame of exactly its own bytes.
-- Payloads are disjoint and `Send`: several threads can fill them at once. A batch need not be
-  full, so a flush timer can submit what it has.
+- A `Payload` is written front to back: `write(&bytes)` appends, and it implements
+  `std::io::Write`. It counts what it was given. Upload memory is reused and never cleared, so
+  `Batch::submit()` is `InvalidInput` unless every reserved payload was written to its end;
+  nothing is submitted then. A frame can therefore never hold bytes of an earlier batch.
+- Payloads are disjoint and `Send`: several threads can fill them at once, one thread per
+  payload. To fill one large file from several threads, reserve it as several payloads of whole
+  blocks; the frames are the same. A batch need not be full, so a flush timer can submit what
+  it has.
 - `FrameBatch` (`first_index()`, `tag()`, `len()`, `frame(k)`, `frames()`) is `Send + Sync`. Its
   readback buffer is reused once it is dropped, which may happen on a writer thread. Holding
   as many batches as are in flight stalls the stream.
-- `Stream::compress_blocks(&blocks)` is the copying form inside a stream.
+- `Stream::submit_blocks(&blocks)` is the copying form inside a stream.
 - An error from either closure stops the stream and is returned as it was. A panic is re-raised.
   The compressor stays usable.
+- The compressor is busy until `stream` returns. Calling it from inside either closure is
+  `InvalidInput`; a call from another thread waits.
 
-A `Payload` is mapped GPU upload memory, which may be write-combined. Write it front to back and
-never read it. A decompressor reads its own output back for matches, so do not decode into a
-payload: decode into ordinary memory and copy the result in.
+A `Payload` is mapped GPU upload memory, which may be write-combined and cannot be read. A
+decompressor reads its own output back for matches, so do not decode into a payload: decode into
+ordinary memory and write the result in.
 
 ### Errors
 
@@ -244,9 +259,12 @@ lower the VRAM budget.
 ### Device options
 
 `GpuOptions` says how the device is opened and which kernels are built. `GpuOptions::default()`
-reads nothing from the environment. `GpuOptions::from_env()` (and
-`CompressorOptions::from_env(level)`) applies the `GZC_*` variables below; `gzc-bench` and the
-tests use it. No option changes the compressed output. wgpu's own `WGPU_BACKEND` variable picks
+reads nothing from the environment. `GpuOptions::try_from_env()` (and
+`CompressorOptions::try_from_env(level)`) applies the `GZC_*` variables below and returns
+`InvalidInput` for a value a variable does not take. `from_env()` is the same, panicking on
+such a value; `gzc-bench` and the tests use these. A `GpuOptions` value out of range
+(`k3_width: Some(7)`, `k1_groups: Some(0)`) is `InvalidInput` when the device is opened. No
+option changes the compressed output. wgpu's own `WGPU_BACKEND` variable picks
 the backend either way.
 
 ### The pipeline underneath (`gzc_gpu::pipeline`)
@@ -262,7 +280,9 @@ pipelines on one `Arc<GpuContext>`, per-kernel timing (`PipelineStats`), the par
   `UploadSlot` hands out whole-block regions (`regions_mut`) and leaves the lengths to the
   caller: finish each payload with `Region::pad(len)`, or call `set_real_len` after writing
   through the `unsafe` `blocks_mut`, then `submit(n)`. A caller that skips this gets a 64 KiB
-  frame for a short block. `Batch::reserve` exists to rule that out.
+  frame for a short block. This layer does not track writes either: a submitted block that was
+  not fully written holds an earlier batch's bytes. `Batch` and `Payload` exist to rule both
+  out.
 - `run_frames(&blocks, &mut FrameSink)`, `run_frames_par(&blocks, &ParFrameSink, threads)` and
   `run(&blocks, &mut BlockSink)` copy the blocks in. Sinks are called on the completion thread,
   so they must be `Send`.
@@ -270,11 +290,12 @@ pipelines on one `Arc<GpuContext>`, per-kernel timing (`PipelineStats`), the par
 ## Tuning / diagnostics
 
 Environment knobs for the GPU kernels and host pipeline (`crates/gzc-gpu`). `gzc-bench` and the
-tests read them once, through `GpuOptions::from_env()`; each one sets a field of `GpuOptions`. A
-program that builds `GpuOptions::default()` is not affected by them. Boolean knobs follow one
-convention: a knob that is off by default is turned on by any value but `0`; one that is on by
-default is turned off by `0` only. A value that does not parse stops the program with a message
-naming the variable.
+tests read them once, through `GpuOptions::try_from_env()` / `from_env()`; each one sets a field
+of `GpuOptions`. A program that builds `GpuOptions::default()` is not affected by them. Boolean
+knobs follow one convention: a knob that is off by default is turned on by any value but `0`;
+one that is on by default is turned off by `0` only. Every other variable takes the values
+listed with it. Any other value is an error that names the variable (`gzc-bench` exits with
+it); none is silently ignored.
 
 - `GZC_NO_SUBGROUPS` (anything but `0`): a device without subgroups, i.e. the portable kernels
   every GPU can run. Chain presets use the fallback K1 (`k1_chains.wgsl`); the sorted preset
@@ -322,7 +343,7 @@ naming the variable.
   for fast GPUs: on a GTX 1660 Super the stalled kernels run long enough to lose the device.
   `cargo run --release -p gzc-gpu --example gpu_hog -- [GiB] [s]` is a second GPU tenant for
   contention runs.
-- `GZC_K3_FORCE_FALLBACK=1`, **test only**, not a tuning knob: makes every workgroup of
+- `GZC_K3_FORCE_FALLBACK` (anything but `0`), **test only**, not a tuning knob: makes every workgroup of
   the cooperative K3 kernel take its in-kernel sequential fallback path (the one a
   failed lane-layout guard takes), so tests can exercise it without a device that
   actually fails the guard.
