@@ -1,10 +1,19 @@
 //! File-to-block chunking with zero-padding of the final block.
 use crate::config::BLOCK_SIZE;
 
+/// One BLOCK_SIZE block of a file: `data` zero-padded to BLOCK_SIZE, of which the first
+/// `real_len` bytes are the file's (BLOCK_SIZE except for a file's last block).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
     pub data: Vec<u8>,
     pub real_len: usize,
+}
+
+impl Block {
+    /// The block's real bytes, what its frame holds (`reference::compress_block_to_frame`).
+    pub fn real(&self) -> &[u8] {
+        &self.data[..self.real_len]
+    }
 }
 
 pub fn chunk_file(bytes: &[u8]) -> Vec<Block> {

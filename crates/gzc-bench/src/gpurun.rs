@@ -76,8 +76,9 @@ impl FrameSink for Discard {
 /// out). The calling thread uploads; with `writer_threads == 0` the pipeline's completion thread
 /// copies and records every frame (`Pipeline::run_frames`), with N > 0 N delivery threads share
 /// each batch (`Pipeline::run_frames_par`). One untimed warmup batch runs first on the same pipeline; the
-/// timed region spans from the first upload to the last frame recorded. With `verify`, every frame
-/// is then decompressed with libzstd and compared with its padded block. `kernel_ms` holds the
+/// timed region spans from the first upload to the last frame recorded. Each block goes up as its
+/// real bytes (`Block::real_len`). With `verify`, every frame is then decompressed with libzstd and
+/// compared with the block's real bytes. `kernel_ms` holds the
 /// timed run's summed per-kernel GPU time (when the device supports timestamps); a per-batch
 /// breakdown is printed to stderr. `cfg.params.emit_frames` is forced on. `preset` names
 /// `cfg.params.matching` in the run's config label.
@@ -98,7 +99,7 @@ pub fn run_gpu(
         pipe.transfer_readback(),
         vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)
     );
-    let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.data.as_slice()).collect();
+    let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.real()).collect();
 
     pipe.run_frames(&blocks[..blocks.len().min(cfg.batch as usize)], &mut Discard)?;
 
@@ -120,7 +121,7 @@ pub fn run_gpu(
     if verify {
         kept.par_iter().zip(&corpus.blocks).enumerate().try_for_each(|(i, (frame, block))| {
             let dec = zstd::bulk::decompress(frame.get().expect("frame kept"), BLOCK_SIZE)?;
-            anyhow::ensure!(dec == block.data, "block {i} did not round-trip through the GPU frame");
+            anyhow::ensure!(dec == block.real(), "block {i} did not round-trip through the GPU frame");
             Ok(())
         })?;
         crate::result::log_frame_digest(corpus, kept.iter().map(|f| f.get().expect("frame kept").as_slice()));
@@ -170,9 +171,9 @@ pub fn run_gpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gzc_core::frame::{FrameOptions, write_frame};
+    use gzc_core::frame::FrameOptions;
     use gzc_core::params::LVL3;
-    use gzc_core::reference::compress_block;
+    use gzc_core::reference::compress_block_to_frame;
 
     #[test]
     fn gpu_run_synthetic_verifies() {
@@ -181,7 +182,7 @@ mod tests {
         // literals and with raw ones.
         let cpu_bytes = |huffman| -> u64 {
             let opts = FrameOptions { checksum: false, huffman };
-            corpus.blocks.iter().map(|b| write_frame(&b.data, &compress_block(&b.data, LVL3), opts).len() as u64).sum()
+            corpus.blocks.iter().map(|b| compress_block_to_frame(b.real(), LVL3, opts).len() as u64).sum()
         };
         let ctx = GpuContext::new().unwrap();
         for (writers, huffman) in [(0, true), (2, true), (0, false)] {

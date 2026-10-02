@@ -1,7 +1,8 @@
 //! zstd frame writer: header, block header, literals and sequences sections.
 //!
 //! Every block becomes one single-segment zstd frame holding exactly one zstd block
-//! (RFC 8878 §3.1). Frame content size is always `BLOCK_SIZE`.
+//! (RFC 8878 §3.1). The frame's content size is the block's real length (`Block::real_len`):
+//! `BLOCK_SIZE`, or less for a file's last block.
 
 use xxhash_rust::xxh64::xxh64;
 
@@ -36,13 +37,30 @@ pub fn write_literals_raw(lits: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(lits);
 }
 
-/// Magic number + Frame_Header_Descriptor + Frame_Content_Size (single segment, no dictionary).
+/// Magic number + Frame_Header_Descriptor + Frame_Content_Size (single segment, no dictionary)
+/// of a full block's frame.
 pub fn frame_header(opts: FrameOptions) -> Vec<u8> {
+    frame_header_for(opts, BLOCK_SIZE)
+}
+
+/// Content sizes below this get the 1-byte Frame_Content_Size field (a 6-byte header, against 7).
+pub const SHORT_FCS_LIMIT: usize = 256;
+
+/// `frame_header` of a frame holding `content_size` bytes (`1..=BLOCK_SIZE`): FCS_Field_Size flag
+/// 1 (2 bytes holding size - 256, which covers 256..=65791), or flag 0 (1 byte) below
+/// `SHORT_FCS_LIMIT`.
+pub fn frame_header_for(opts: FrameOptions, content_size: usize) -> Vec<u8> {
+    const _: () = assert!(BLOCK_SIZE >= SHORT_FCS_LIMIT && BLOCK_SIZE < 65536 + 256);
+    assert!((1..=BLOCK_SIZE).contains(&content_size), "frame content size {content_size}");
     let mut h = MAGIC.to_le_bytes().to_vec();
-    // FCS_Field_Size flag 1: 2 bytes holding value - 256, which covers 256..=65791.
-    const _: () = assert!(BLOCK_SIZE >= 256 && BLOCK_SIZE < 65536 + 256);
-    h.push((1 << 6) | (1 << 5) | ((opts.checksum as u8) << 2));
-    h.extend_from_slice(&((BLOCK_SIZE - 256) as u16).to_le_bytes());
+    let checksum = (opts.checksum as u8) << 2;
+    if content_size >= SHORT_FCS_LIMIT {
+        h.push((1 << 6) | (1 << 5) | checksum);
+        h.extend_from_slice(&((content_size - 256) as u16).to_le_bytes());
+    } else {
+        h.push((1 << 5) | checksum);
+        h.push(content_size as u8);
+    }
     h
 }
 
@@ -53,17 +71,25 @@ fn block_header(block_type: u32, size: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes()[..3]);
 }
 
-/// Encode `block` (exactly `BLOCK_SIZE` bytes) as one zstd frame, using `out` as its parse.
+/// Encode `block` (`1..=BLOCK_SIZE` bytes: a block's real bytes) as one zstd frame, using `out`
+/// as its parse (covering exactly `block`; `seq::truncate_output` cuts a padded block's parse).
+/// The block is RLE when every byte is equal, else Compressed when that is smaller than the block,
+/// else Raw. Below `SHORT_FCS_LIMIT` bytes it is never Compressed: the GPU writes a compressed
+/// block's literals section at a fixed offset after the 7-byte header.
 pub fn write_frame(block: &[u8], out: &BlockOutput, opts: FrameOptions) -> Vec<u8> {
-    assert_eq!(block.len(), BLOCK_SIZE, "frames always hold exactly one full block");
-    let mut f = frame_header(opts);
+    let n = block.len();
+    assert!((1..=BLOCK_SIZE).contains(&n), "a frame holds 1..=BLOCK_SIZE bytes, not {n}");
+    let mut f = frame_header_for(opts, n);
     if block.iter().all(|&b| b == block[0]) {
-        block_header(BLOCK_RLE, BLOCK_SIZE, &mut f);
+        block_header(BLOCK_RLE, n, &mut f);
         f.push(block[0]);
+    } else if n < SHORT_FCS_LIMIT {
+        block_header(BLOCK_RAW, n, &mut f);
+        f.extend_from_slice(block);
     } else {
         debug_assert_eq!(
             out.literals.len() as u64 + out.sequences.iter().map(|s| s.match_len as u64).sum::<u64>(),
-            BLOCK_SIZE as u64,
+            n as u64,
             "BlockOutput does not cover the block"
         );
         let mut content = Vec::with_capacity(out.literals.len() + 16 + out.sequences.len() * 4);
@@ -73,11 +99,11 @@ pub fn write_frame(block: &[u8], out: &BlockOutput, opts: FrameOptions) -> Vec<u
             write_literals_raw(&out.literals, &mut content);
         }
         write_sequences_section_auto(&out.sequences, &mut content);
-        if content.len() < BLOCK_SIZE {
+        if content.len() < n {
             block_header(BLOCK_COMPRESSED, content.len(), &mut f);
             f.extend_from_slice(&content);
         } else {
-            block_header(BLOCK_RAW, BLOCK_SIZE, &mut f);
+            block_header(BLOCK_RAW, n, &mut f);
             f.extend_from_slice(block);
         }
     }

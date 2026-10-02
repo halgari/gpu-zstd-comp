@@ -106,6 +106,8 @@ pub struct BufferSizes {
     pub counts: u64,
     pub frames: u64,
     pub frame_len: u64,
+    /// The blocks' real lengths (K3t's input), one u32 per block.
+    pub lens: u64,
     pub opt_prices: u64,
     pub opt_scratch: u64,
     pub opt_sched: u64,
@@ -123,6 +125,7 @@ impl BufferSizes {
             counts: counts_bytes(n_blocks),
             frames: frames_bytes(n_blocks),
             frame_len: frame_len_bytes(n_blocks),
+            lens: frame_len_bytes(n_blocks),
             opt_prices: if opt { prices_bytes(n_blocks) } else { 0 },
             opt_scratch: if opt { n_blocks as u64 * scratch_bytes_per_block(m) } else { 0 },
             opt_sched: if opt { sched_bytes(n_blocks) } else { 0 },
@@ -134,10 +137,10 @@ impl BufferSizes {
         self.head + self.pred + self.best + self.seqs + self.counts + self.opt_prices + self.opt_scratch + self.opt_sched
     }
 
-    /// The buffers `Pipeline` allocates once and shares between its slots: data, plus frames and
-    /// frame_len with `frames`.
+    /// The buffers `Pipeline` allocates once and shares between its slots: data, plus frames,
+    /// frame_len and lens with `frames`.
     pub fn shared(&self, frames: bool) -> u64 {
-        self.data + if frames { self.frames + self.frame_len } else { 0 }
+        self.data + if frames { self.frames + self.frame_len + self.lens } else { 0 }
     }
 
     /// Every buffer that K1's bound (`max_blocks_per_batch_for`, which covers data and head)
@@ -152,10 +155,11 @@ pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
     BufferSizes::new(n_blocks, m).scratch()
 }
 
-/// Bytes of the remaining `BatchBuffers` (data, plus frames and frame_len with `frames`) for
-/// `n_blocks`; the pipeline allocates them once, shared by all its slots (`BufferSizes::shared`).
+/// Bytes of the remaining `BatchBuffers` (data, plus frames, frame_len and lens with `frames`)
+/// for `n_blocks`; the pipeline allocates them once, shared by all its slots
+/// (`BufferSizes::shared`).
 pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
-    data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + frame_len_bytes(n_blocks) } else { 0 }
+    data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + 2 * frame_len_bytes(n_blocks) } else { 0 }
 }
 
 /// Largest `n_blocks` one `ChainsKernel::record` call may take under `limits` for the chains of
@@ -281,7 +285,7 @@ mod tests {
     fn buffer_sizes_partition_every_buffer() {
         for (_, m) in gzc_core::params::PRESETS {
             let s = BufferSizes::new(7, &m);
-            let all = s.data + s.head + s.pred + s.best + s.seqs + s.counts + s.frames + s.frame_len
+            let all = s.data + s.head + s.pred + s.best + s.seqs + s.counts + s.frames + s.frame_len + s.lens
                 + s.opt_prices + s.opt_scratch + s.opt_sched;
             assert_eq!(s.scratch() + s.shared(true), all);
             assert_eq!(s.shared(true), slot_bytes(7, true));

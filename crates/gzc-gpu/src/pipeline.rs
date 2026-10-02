@@ -822,6 +822,7 @@ impl<'a> Pipeline<'a> {
             + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| size(b)).sum::<u64>()
             + opt(&s.frames)
             + opt(&s.frame_len)
+            + opt(&s.lens)
             + k3opt;
         let per_slot: u64 = self.slots.iter().map(|slot| size(&slot.upload) + slot.staging.size()).sum();
         // Transfer readback: frames / frame_len are imports of `Xfer`'s buffers (same sizes).
@@ -862,12 +863,13 @@ impl<'a> Pipeline<'a> {
         self.stream_with(Box::new(handler), |stream| stream.upload_blocks(blocks))
     }
 
-    /// Streams `blocks` (each BLOCK_SIZE bytes) through the slots, handing every block's zstd
-    /// frame (K4 output) to `sink` exactly once, on the completion thread (see `FrameSink`) while
-    /// this thread uploads. Errors on a parse-path pipeline, and on wgpu validation or
-    /// out-of-memory errors.
+    /// Streams `blocks` through the slots, handing every block's zstd frame (K4 output) to `sink`
+    /// exactly once, on the completion thread (see `FrameSink`) while this thread uploads. A block
+    /// is its real bytes, 1..=BLOCK_SIZE of them (`Block::real_len`: a file's last block may be
+    /// short), and its frame decodes to exactly those. Errors on a parse-path pipeline, and on
+    /// wgpu validation or out-of-memory errors.
     pub fn run_frames(&mut self, blocks: &[&[u8]], sink: &mut (impl FrameSink + Send)) -> anyhow::Result<PipelineStats> {
-        check_blocks(blocks)?;
+        check_frame_blocks(blocks)?;
         self.stream_frames(
             |batch| {
                 batch.frames().for_each(|(i, frame)| sink.put(i, frame));
@@ -886,7 +888,7 @@ impl<'a> Pipeline<'a> {
         sink: &impl ParFrameSink,
         threads: usize,
     ) -> anyhow::Result<PipelineStats> {
-        check_blocks(blocks)?;
+        check_frame_blocks(blocks)?;
         self.stream_frames(
             |batch| {
                 batch.deliver_par(sink, threads);
@@ -1064,7 +1066,17 @@ impl<'a> Pipeline<'a> {
     /// requests the maps; returns the batch for the completion thread. The slot's upload buffer
     /// holds the blocks (mapped); it is persistent rather than `queue.write_buffer`, which would
     /// allocate a fresh staging buffer per call that lives until the submission completes.
-    fn submit(&mut self, i: usize, first: usize, n: u32, tag: u64) -> anyhow::Result<Job> {
+    fn submit(&mut self, i: usize, first: usize, n: u32, tag: u64, lens: &[u32]) -> anyhow::Result<Job> {
+        debug_assert_eq!(lens.len(), n as usize);
+        // A batch holding a partial block runs K3t (`Kernels::record_truncate`) on the blocks'
+        // real lengths; a batch of full blocks records exactly what it always did.
+        let partial = self.layout.frames && lens.iter().any(|&l| l < BLOCK_SIZE as u32);
+        if partial {
+            // Applied at the start of this batch's first submission below, so after every earlier
+            // batch's K3t read `lens`.
+            let buf = self.bufs.lens.as_ref().expect("frame-path buffers have lens");
+            self.ctx.queue.write_buffer(buf, 0, bytemuck::cast_slice(lens));
+        }
         if self.direct {
             // The kernels read this slot's upload buffer; the bind groups recorded below hold it.
             self.bufs.data = self.slots[i].upload.clone();
@@ -1121,6 +1133,9 @@ impl<'a> Pipeline<'a> {
                 unsafe { x.tq.submit_wgpu(&ctx.queue, enc.finish(), None, None)? };
                 let mut enc =
                     ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pipeline") });
+                if partial {
+                    self.kernels.record_truncate(ctx, &mut enc, bufs, n);
+                }
                 self.kernels.record_entropy(ctx, &mut enc, bufs, n, queries);
                 marker(&mut enc, n_queries + 1);
                 if let Some(q) = &slot.queries {
@@ -1147,7 +1162,13 @@ impl<'a> Pipeline<'a> {
             (None, Staging::Wgpu(staging)) => {
                 // record_timed binds exactly counts_bytes(n) (K3) and frame_len_bytes(n) (K5, K4),
                 // so no kernel processes the stale blocks of a partial batch.
-                self.kernels.record_timed(ctx, &mut enc, bufs, n, queries)?;
+                if partial {
+                    self.kernels.record_front(ctx, &mut enc, bufs, n, queries)?;
+                    self.kernels.record_truncate(ctx, &mut enc, bufs, n);
+                    self.kernels.record_entropy(ctx, &mut enc, bufs, n, queries);
+                } else {
+                    self.kernels.record_timed(ctx, &mut enc, bufs, n, queries)?;
+                }
                 if let Some(pack) = &self.pack {
                     pack.record(ctx, &mut enc, bufs, n, staging);
                 } else if layout.frames {
@@ -1471,17 +1492,23 @@ impl<'p, 'a> FrameStream<'p, 'a> {
         }
         let view = slot.upload.get_mapped_range_mut(..).context("upload mapped range")?;
         self.prof.upload_wait += t.elapsed().as_secs_f64();
-        Ok(UploadSlot { stream: self, slot: i, view, acquired: Instant::now() })
+        let lens = vec![BLOCK_SIZE as u32; self.slot_capacity()];
+        Ok(UploadSlot { stream: self, slot: i, view, lens, acquired: Instant::now() })
     }
 
-    /// Copies `blocks` (each BLOCK_SIZE bytes) into as many slots as they need and submits them:
-    /// the `&[&[u8]]` form of the API. The copy is split over `GZC_UPLOAD_THREADS` threads.
+    /// Copies `blocks` into as many slots as they need and submits them: the `&[&[u8]]` form of
+    /// the API. The copy is split over `GZC_UPLOAD_THREADS` threads. On the frame path a block is
+    /// its real bytes (1..=BLOCK_SIZE, zero-padded in the slot, see `run_frames`); on the parse
+    /// path every block is BLOCK_SIZE bytes.
     pub fn upload_blocks(&mut self, blocks: &[&[u8]]) -> anyhow::Result<()> {
-        check_blocks(blocks)?;
+        if self.pipe.layout.frames { check_frame_blocks(blocks)? } else { check_blocks(blocks)? }
         for chunk in blocks.chunks(self.slot_capacity()) {
             let mut slot = self.next_upload_slot()?;
             let region = slot.regions_mut(&[chunk.len()])?.pop().expect("one region");
             copy_blocks(region, chunk);
+            for (k, b) in chunk.iter().enumerate() {
+                slot.set_real_len(k, b.len())?;
+            }
             slot.submit(chunk.len())?;
         }
         Ok(())
@@ -1490,9 +1517,9 @@ impl<'p, 'a> FrameStream<'p, 'a> {
     /// Submits slot `i`'s first `n` blocks. Any failure aborts the stream: a slot whose
     /// submission failed after it was marked in flight would never come free, so every later
     /// call must error rather than wait for it.
-    fn submit(&mut self, i: usize, n: u32, tag: u64) -> anyhow::Result<()> {
+    fn submit(&mut self, i: usize, n: u32, tag: u64, lens: &[u32]) -> anyhow::Result<()> {
         let t = Instant::now();
-        let job = match self.pipe.submit(i, self.next_index, n, tag) {
+        let job = match self.pipe.submit(i, self.next_index, n, tag, lens) {
             Ok(job) => job,
             Err(e) => {
                 self.pipe.shared.abort();
@@ -1529,6 +1556,8 @@ pub struct UploadSlot<'s, 'p, 'a> {
     stream: &'s mut FrameStream<'p, 'a>,
     slot: usize,
     view: wgpu::BufferViewMut,
+    /// Each block's real length (`set_real_len`, `Region::pad`), BLOCK_SIZE until set.
+    lens: Vec<u32>,
     acquired: Instant,
 }
 
@@ -1580,14 +1609,26 @@ impl UploadSlot<'_, '_, '_> {
     pub fn regions_mut(&mut self, blocks: &[usize]) -> anyhow::Result<Vec<Region<'_>>> {
         let (total, cap) = (blocks.iter().sum::<usize>(), self.capacity());
         anyhow::ensure!(total <= cap, "regions of {total} blocks exceed the slot's {cap}");
-        let mut rest = self.view.slice(..total * BLOCK_SIZE);
+        let mut rest = Region { bytes: self.view.slice(..total * BLOCK_SIZE), lens: &mut self.lens[..total] };
         let mut out = Vec::with_capacity(blocks.len());
         for &b in blocks {
             let (region, tail) = rest.split_at(b * BLOCK_SIZE);
-            out.push(Region(region));
+            out.push(region);
             rest = tail;
         }
         Ok(out)
+    }
+
+    /// Sets block `k`'s real length to `len` (1..=BLOCK_SIZE; every block starts at BLOCK_SIZE):
+    /// its frame then declares and holds only the block's first `len` bytes. For blocks written
+    /// through `blocks_mut`; the rest of the block must be zero, as `chunk_file` pads a file's last
+    /// block. `Region::pad` sets it for a region's payload.
+    pub fn set_real_len(&mut self, k: usize, len: usize) -> anyhow::Result<()> {
+        let cap = self.capacity();
+        anyhow::ensure!(k < cap, "block {k} is past the slot's {cap}");
+        anyhow::ensure!((1..=BLOCK_SIZE).contains(&len), "a block's real length is 1..={BLOCK_SIZE}, not {len}");
+        self.lens[k] = len as u32;
+        Ok(())
     }
 
     /// Submits the slot's first `n` blocks (1..=capacity(): a partial batch, e.g. when a flush
@@ -1601,19 +1642,23 @@ impl UploadSlot<'_, '_, '_> {
     pub fn submit_with(self, n: usize, tag: u64) -> anyhow::Result<usize> {
         let cap = self.capacity();
         anyhow::ensure!((1..=cap).contains(&n), "cannot submit {n} blocks: not in 1..={cap}");
-        let UploadSlot { stream, slot, mut view, acquired } = self;
+        let UploadSlot { stream, slot, mut view, lens, acquired } = self;
         // Trailing zero word after the last block (the slot may hold stale blocks beyond it).
         view.slice(n * BLOCK_SIZE..n * BLOCK_SIZE + 4).copy_from_slice(&[0u8; 4]);
         drop(view);
         stream.prof.upload_write += acquired.elapsed().as_secs_f64();
         let first = stream.next_index;
-        stream.submit(slot, n as u32, tag)?;
+        stream.submit(slot, n as u32, tag, &lens[..n])?;
         Ok(first)
     }
 }
 
 /// A write-only piece of an upload slot (`UploadSlot::regions_mut`), a whole number of blocks.
-pub struct Region<'a>(wgpu::WriteOnly<'a, [u8]>);
+pub struct Region<'a> {
+    bytes: wgpu::WriteOnly<'a, [u8]>,
+    /// The real lengths of the region's blocks (`UploadSlot::lens`).
+    lens: &'a mut [u32],
+}
 
 // SAFETY: `WriteOnly<[u8]>` lacks `Send` only because wgpu's impl needs a sized `T`; like a
 // `&mut [u8]`, a byte range of it may move to another thread, and `regions_mut` hands out
@@ -1623,28 +1668,28 @@ unsafe impl Send for Region<'_> {}
 impl<'a> Region<'a> {
     /// Bytes in the region.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.bytes.is_empty()
     }
 
     /// Writes `bytes` at `offset` (panics past the end).
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
-        self.0.slice(offset..offset + bytes.len()).copy_from_slice(bytes);
+        self.bytes.slice(offset..offset + bytes.len()).copy_from_slice(bytes);
     }
 
     /// The region as wgpu's `WriteOnly`, for writers that take one.
     pub fn write_only(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
-        self.0.slice(..)
+        self.bytes.slice(..)
     }
 
     /// Finishes a `len`-byte payload written at the start of the region: zero-fills the rest of
-    /// its last block, the padding `chunk_file` gives a file's last block (the slot's old bytes
-    /// would otherwise be compressed with it), and returns the blocks it occupies
-    /// (`payload_blocks(len)`; `payload_real_lens(len)` gives their real lengths). Errors if they
-    /// do not fit in the region.
+    /// its last block (the padding `chunk_file` gives a file's last block; the GPU parses the
+    /// padded block), records the blocks' real lengths (`payload_real_lens(len)`), so the last
+    /// block's frame declares and holds only its real bytes, and returns the blocks the payload
+    /// occupies (`payload_blocks(len)`). Errors if they do not fit in the region.
     #[must_use = "the returned block count is what to submit"]
     pub fn pad(&mut self, len: usize) -> anyhow::Result<usize> {
         let blocks = payload_blocks(len);
@@ -1654,13 +1699,19 @@ impl<'a> Region<'a> {
             "a {len}-byte payload needs {blocks} blocks, the region has {}",
             self.len() / BLOCK_SIZE
         );
-        self.0.slice(len..end).fill(0);
+        self.bytes.slice(len..end).fill(0);
+        for (l, real) in self.lens.iter_mut().zip(payload_real_lens(len)) {
+            *l = real as u32;
+        }
         Ok(blocks)
     }
 
+    /// Splits at byte `mid`, a multiple of BLOCK_SIZE.
     fn split_at(self, mid: usize) -> (Region<'a>, Region<'a>) {
-        let (a, b) = self.0.split_at(mid);
-        (Region(a), Region(b))
+        debug_assert_eq!(mid % BLOCK_SIZE, 0);
+        let (a, b) = self.bytes.split_at(mid);
+        let (la, lb) = self.lens.split_at_mut(mid / BLOCK_SIZE);
+        (Region { bytes: a, lens: la }, Region { bytes: b, lens: lb })
     }
 }
 
@@ -1684,6 +1735,14 @@ pub(crate) fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every block must hold 1..=BLOCK_SIZE bytes (its real bytes; the frame path).
+fn check_frame_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
+    if let Some(i) = blocks.iter().position(|b| !(1..=BLOCK_SIZE).contains(&b.len())) {
+        anyhow::bail!("block {i} is {} bytes, expected 1..=BLOCK_SIZE ({BLOCK_SIZE})", blocks[i].len());
+    }
+    Ok(())
+}
+
 /// Copies `blocks` back to back into `dst`, split over `upload_threads()` threads (this one
 /// included): one thread's stores into the (write-combined, ReBAR) upload buffer run at ~18 GB/s,
 /// two or more at the link's ~26 GB/s (RTX 5090).
@@ -1691,6 +1750,8 @@ fn copy_blocks(dst: Region<'_>, blocks: &[&[u8]]) {
     let copy = |mut dst: Region<'_>, src: &[&[u8]]| {
         for (k, b) in src.iter().enumerate() {
             dst.write(k * BLOCK_SIZE, b);
+            // A short (partial) block is zero-padded, as `chunk_file` pads it.
+            dst.bytes.slice(k * BLOCK_SIZE + b.len()..(k + 1) * BLOCK_SIZE).fill(0);
         }
     };
     let per = blocks.len().div_ceil(upload_threads()).max(64);
@@ -1756,7 +1817,6 @@ mod tests {
     use super::*;
     use crate::sizing::{BufferSizes, chain_pred_bytes, head_bytes, pred_bytes_for};
     use gzc_core::block::chunk_file;
-    use gzc_core::frame::write_frame;
     use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
@@ -1936,8 +1996,70 @@ mod tests {
         test_cases().into_iter().flat_map(|(_, bytes)| chunk_file(&bytes)).map(|b| b.data).collect()
     }
 
+    /// The CPU oracle's frame of a block given as its real bytes (1..=BLOCK_SIZE).
     fn cpu_frame(block: &[u8], params: GpuParams) -> Vec<u8> {
-        write_frame(block, &compress_block(block, params.matching), params.frame_options())
+        gzc_core::reference::compress_block_to_frame(block, params.matching, params.frame_options())
+    }
+
+    /// Files of k BLOCK_SIZE blocks plus r bytes, each block given as its real bytes: every
+    /// preset's frames equal the CPU oracle's (`compress_block_to_frame` of the real bytes, which
+    /// pins full blocks to their unchanged padded-parse frames) and decode with libzstd to exactly
+    /// the files. Covers batches mixing full and partial blocks, an all-full batch, RLE and
+    /// 1-byte-FCS (< 256 bytes) blocks; every upload/readback mode for three presets, Raw literals
+    /// for lvl3.
+    #[test]
+    fn partial_blocks_frames_match_cpu_every_preset() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
+        let bs = BLOCK_SIZE;
+        let mut files: Vec<Vec<u8>> = [1, 100, 255, 256, 257, 4097, bs - 1, bs, bs + 31_000, 2 * bs + 3]
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| source[i * 7777..][..n].to_vec())
+            .collect();
+        files.push(vec![7u8; bs + 300]);
+        files.push(vec![7u8; 200]);
+        // Eight full blocks: one batch of 8 with no partial block.
+        files.push(source[3 * bs..11 * bs].to_vec());
+        let blocks: Vec<gzc_core::block::Block> = files.iter().flat_map(|f| chunk_file(f)).collect();
+        let real: Vec<&[u8]> = blocks.iter().map(|b| b.real()).collect();
+        let default_ctx = [("default".to_string(), GpuContext::new().expect("GPU required for gzc-gpu tests"))];
+        let all_modes = mode_contexts();
+        for (name, m) in gzc_core::params::PRESETS {
+            let modes = if [LVL3, LVL9S12SEG, OPT16P1].contains(&m) { &all_modes[..] } else { &default_ctx[..] };
+            let raw_lits = if m == LVL3 { &[true, false][..] } else { &[true][..] };
+            for &huffman in raw_lits {
+                let params = GpuParams { matching: m, emit_frames: true, huffman };
+                let want: Vec<Vec<u8>> = real.iter().map(|b| cpu_frame(b, params)).collect();
+                let mut at = 0;
+                for f in &files {
+                    let n = payload_blocks(f.len());
+                    let dec: Vec<u8> = want[at..at + n].iter().flat_map(|w| zstd::bulk::decompress(w, bs).unwrap()).collect();
+                    assert!(dec == *f, "{name}: a {}-byte file did not round-trip", f.len());
+                    at += n;
+                }
+                for (mode, ctx) in modes {
+                    let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 8, inflight: 2, params }).unwrap();
+                    let mut sink = CollectFrames(vec![None; real.len()]);
+                    pipe.run_frames(&real, &mut sink).unwrap();
+                    for (i, got) in sink.0.iter().enumerate() {
+                        let got = got.as_ref().unwrap_or_else(|| panic!("{name} {mode}: block {i} never delivered"));
+                        assert!(
+                            *got == want[i],
+                            "{name} huffman={huffman} {mode}: block {i} ({} bytes): GPU frame != CPU frame",
+                            real[i].len()
+                        );
+                    }
+                }
+            }
+        }
+        let ctx = &default_ctx[0].1;
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let mut pipe = Pipeline::new(ctx, &PipelineConfig { batch: 8, inflight: 2, params }).unwrap();
+        let mut sink = CollectFrames(vec![None; 2]);
+        let e = pipe.run_frames(&[&[1u8; 10][..], &[][..]], &mut sink).unwrap_err().to_string();
+        assert!(e.contains("block 1"), "{e}");
+        assert!(pipe.run_frames(&[&vec![1u8; bs + 1][..]], &mut sink).is_err());
     }
 
     #[test]
@@ -2552,7 +2674,7 @@ mod tests {
         for p in &payloads {
             let blocks = chunk_file(p);
             want_lens.extend(blocks.iter().map(|b| b.real_len));
-            want.extend(blocks.iter().map(|b| cpu_frame(&b.data, params)));
+            want.extend(blocks.iter().map(|b| cpu_frame(b.real(), params)));
             assert_eq!(payload_blocks(p.len()), blocks.len());
         }
         let lens: Vec<usize> = payloads.iter().flat_map(|p| payload_real_lens(p.len())).collect();

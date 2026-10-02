@@ -43,6 +43,8 @@ const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
 /// `main_fixup` and the rep helpers (`K3_REPS_WGSL`), shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
 pub(crate) const K3_FIXUP_WGSL: &str =
     concat!(include_str!("shaders/k3_reps.wgsl"), "\n", include_str!("shaders/k3_fixup.wgsl"));
+/// K3t: cuts a partial block's parse to its real length (frame path, batches with one only).
+const K3_TRUNC_WGSL: &str = include_str!("shaders/k3_trunc.wgsl");
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -167,6 +169,9 @@ pub struct BatchBuffers {
     pub frames: Option<wgpu::Buffer>,
     /// K4 output, `[block]` frame length in bytes (allocated only with `frames: true`).
     pub frame_len: Option<wgpu::Buffer>,
+    /// K3t input, `[block]` real length in bytes (allocated only with `frames: true`; see
+    /// `Kernels::record_truncate`).
+    pub lens: Option<wgpu::Buffer>,
     /// Optimal parse only (`m.opt`): K3opt's own buffers.
     pub opt: Option<OptScratch>,
 }
@@ -211,7 +216,8 @@ impl BatchBuffers {
         let size = BufferSizes::new(capacity, m);
         let bytes = size.scratch()
             + if data.is_none() { size.data } else { 0 }
-            + if frames && frame_bufs.is_none() { size.frames + size.frame_len } else { 0 };
+            + if frames && frame_bufs.is_none() { size.frames + size.frame_len } else { 0 }
+            + if frames { size.lens } else { 0 };
         let scopes = ErrorScopes::push(ctx);
         let n_hashes = m.n_hashes();
         let (frames, frame_len) = match (frames, frame_bufs) {
@@ -222,6 +228,7 @@ impl BatchBuffers {
                 Some(ctx.storage_buffer("batch.frame_len", size.frame_len, true)),
             ),
         };
+        let lens = frame_len.is_some().then(|| ctx.storage_buffer("batch.lens", size.lens, false));
         let opt = m.opt.is_some().then(|| {
             let scratch_per_block = crate::k3opt::scratch_bytes_per_block(m);
             OptScratch {
@@ -248,6 +255,7 @@ impl BatchBuffers {
             counts: ctx.storage_buffer("batch.counts", size.counts, true),
             frames,
             frame_len,
+            lens,
             opt,
         };
         scopes.pop_alloc(&format!("the batch buffers ({capacity} blocks)"), bytes)?;
@@ -291,6 +299,8 @@ pub struct Kernels {
     opt: Option<OptPasses>,
     entropy: Option<EntropyKernel>,
     huffman: Option<HuffmanKernel>,
+    /// K3t (`k3_trunc.wgsl`) and its layout, with `emit_frames`.
+    trunc: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     params: GpuParams,
 }
 
@@ -348,8 +358,10 @@ fn k4_tables(max_seqs: u32) -> (Vec<u32>, String) {
 
     let hdr = frame_header(HEADER_OPTIONS);
     // K4 writes frame words [0, 4) byte by byte: header + block header + a literals header of up
-    // to 3 bytes must fit in 16 bytes.
-    assert!(hdr.len() <= 10, "frame header longer than K4 expects");
+    // to 3 bytes must fit in 16 bytes. Its `hdr_byte` rebuilds the header of any content size
+    // from this one: magic, descriptor, 2-byte content size (`frame_header_for`).
+    assert_eq!(hdr.len(), 7, "frame header layout K4 expects");
+    assert_eq!(&hdr[5..], &((BLOCK_SIZE - 256) as u16).to_le_bytes(), "2-byte FCS");
     let mut hw = [0u8; 12];
     hw[..hdr.len()].copy_from_slice(&hdr);
     let w = |i: usize| u32::from_le_bytes(hw[4 * i..4 * i + 4].try_into().unwrap());
@@ -618,6 +630,11 @@ impl Kernels {
             let pipeline = compute_pipeline(ctx, "k5_huffman", &layout, &format!("{consts}{K5_WGSL}"));
             HuffmanKernel { pipeline, layout }
         });
+        let trunc = params.emit_frames.then(|| {
+            let layout = storage_layout(ctx, "k3t", &[true, true, false, false]);
+            let body = format!("const MAX_SEQS: u32 = {}u;\n{K3_TRUNC_WGSL}", max_seqs(&m));
+            (pipeline_from_module(ctx, "k3_trunc", &layout, &ctx.shader("k3_trunc", &body), "main"), layout)
+        });
         let params = GpuParams { huffman, ..params };
         let chains = ChainsKernel::new(ctx, &m)?;
         let sorted = SortKernel::new(ctx, &m)?.map(|k1| {
@@ -649,6 +666,7 @@ impl Kernels {
             opt,
             entropy,
             huffman: huffman_kernel,
+            trunc,
             params,
         })
     }
@@ -911,6 +929,37 @@ impl Kernels {
         queries: Option<&wgpu::QuerySet>,
     ) {
         self.record_entropy_from(ctx, enc, bufs, n_blocks, queries, &bufs.data);
+    }
+
+    /// K3t: cuts the parse of every partial block of the batch to its real length, from
+    /// `bufs.lens` (one u32 per block, BLOCK_SIZE for a full block, written by the caller before
+    /// this runs). Recorded between K3 (`record_front`) and `record_entropy`, and only for a batch
+    /// holding a partial block (it leaves full blocks alone). `1 <= n_blocks <= bufs.capacity`.
+    pub(crate) fn record_truncate(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+        let (pipeline, layout) = self.trunc.as_ref().expect("Kernels built without emit_frames");
+        let lens = bufs.lens.as_ref().expect("BatchBuffers allocated without frames");
+        assert!(n_blocks >= 1 && n_blocks <= bufs.capacity, "n_blocks {n_blocks} not in 1..={}", bufs.capacity);
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k3t"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: lens,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(n_blocks as u64 * 4),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.seqs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: bufs.counts.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3t"), timestamp_writes: None });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
     }
 
     /// `record_entropy` with K5 gathering the literals from `lit_src` (`data`'s layout) instead of
@@ -1777,7 +1826,8 @@ mod tests {
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let b = BatchBuffers::new(&ctx, 7, true, &m).unwrap();
         let o = b.opt.as_ref().unwrap();
-        let sizes = [&b.data, &b.head, &b.pred, &b.best, &b.seqs, &b.counts, b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap()]
+        let frames = [b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap(), b.lens.as_ref().unwrap()];
+        let sizes = [&b.data, &b.head, &b.pred, &b.best, &b.seqs, &b.counts, frames[0], frames[1], frames[2]]
             .iter()
             .chain([&o.prices, &o.scratch, &o.sched].iter())
             .map(|x| x.size())

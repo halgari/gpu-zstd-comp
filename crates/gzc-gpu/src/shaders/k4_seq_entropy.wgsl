@@ -5,8 +5,11 @@
 //   - RLE (every byte equal), else
 //   - Compressed: literals section + sequences section (gzc_core::seqenc::
 //     write_sequences_section_auto: per-stream predefined / RLE / computed FSE table), if the
-//     content is smaller than BLOCK_SIZE, else
+//     content is smaller than the block and the block is at least SHORT_FCS_LIMIT bytes, else
 //   - Raw.
+// The block's length is its real length: BLOCK_SIZE, or less for a partial block whose parse K3t
+// cut (the counted literals plus the match bytes). The frame header declares it, in 2 bytes, or
+// in 1 below SHORT_FCS_LIMIT (a 6-byte header, gzc_core::frame::frame_header_for).
 // K5 has already written the literals section (Raw, RLE or Compressed) into the frame at byte
 // HDR_LEN + 3, and frame_len[b] holds its length on entry: K4 keeps K5's bytes, writing only the
 // headers below it and the sequences section after it.
@@ -56,6 +59,11 @@ var<workgroup> not_rle: atomic<u32>;
 var<workgroup> rle_flag: u32;
 var<workgroup> raw_flag: u32;
 var<workgroup> section_wg: u32;
+var<workgroup> match_bytes: atomic<u32>;
+var<workgroup> real_wg: u32;
+
+// gzc_core::frame::SHORT_FCS_LIMIT.
+const SHORT_FCS_LIMIT: u32 = 256u;
 
 // ---- chunked backward sequence encode ----
 // Sequences are encoded in chunks of C, last chunk first. Per chunk:
@@ -434,38 +442,51 @@ fn put_s(v: u32, n: u32) {
 
 // ---- frame prefix bytes ----
 
-fn hdr_byte(k: u32) -> u32 {
-    let w = select(select(HDR_W2, HDR_W1, k < 8u), HDR_W0, k < 4u);
-    return (w >> ((k & 3u) * 8u)) & 0xFFu;
+// Length of the frame header of a `real`-byte block: HDR_LEN, one less below SHORT_FCS_LIMIT.
+fn hdr_len(real: u32) -> u32 {
+    return select(HDR_LEN, HDR_LEN - 1u, real < SHORT_FCS_LIMIT);
 }
 
-// Byte k of a frame whose block header is `bh` (3 bytes), followed by `extra_len` bytes of `extra`,
-// then block bytes from word `src` of data.
-fn prefix_byte(k: u32, bh: u32, extra: u32, extra_len: u32, src: u32) -> u32 {
-    if (k < HDR_LEN) { return hdr_byte(k); }
-    let j = k - HDR_LEN;
+// Byte k < hdr_len(real) of the frame header of a `real`-byte block: the magic (HDR_W0), the
+// descriptor (HDR_W1's low byte, with the FCS_Field_Size flag cleared below SHORT_FCS_LIMIT) and
+// the content size (real - 256 in 2 bytes, or real in 1).
+fn hdr_byte(k: u32, real: u32) -> u32 {
+    if (k < 4u) { return (HDR_W0 >> (k * 8u)) & 0xFFu; }
+    let one_byte_fcs = real < SHORT_FCS_LIMIT;
+    if (k == 4u) { return select(HDR_W1 & 0xFFu, HDR_W1 & 0x3Fu, one_byte_fcs); }
+    let fcs = select(real - 256u, real, one_byte_fcs);
+    return (fcs >> ((k - 5u) * 8u)) & 0xFFu;
+}
+
+// Byte k of the frame of a `real`-byte block whose block header is `bh` (3 bytes), followed by
+// `extra_len` bytes of `extra`, then block bytes from word `src` of data.
+fn prefix_byte(k: u32, real: u32, bh: u32, extra: u32, extra_len: u32, src: u32) -> u32 {
+    let hl = hdr_len(real);
+    if (k < hl) { return hdr_byte(k, real); }
+    let j = k - hl;
     if (j < 3u) { return (bh >> (j * 8u)) & 0xFFu; }
     if (j < 3u + extra_len) { return (extra >> ((j - 3u) * 8u)) & 0xFFu; }
     let i = j - 3u - extra_len;
     return (data[src + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
 }
 
-fn prefix_word(w: u32, bh: u32, extra: u32, extra_len: u32, src: u32) -> u32 {
+fn prefix_word(w: u32, real: u32, bh: u32, extra: u32, extra_len: u32, src: u32) -> u32 {
     var v = 0u;
     for (var i = 0u; i < 4u; i++) {
-        v |= prefix_byte(4u * w + i, bh, extra, extra_len, src) << (8u * i);
+        v |= prefix_byte(4u * w + i, real, bh, extra, extra_len, src) << (8u * i);
     }
     return v;
 }
 
 // Frame word w with its bytes below the literals section (frame + block header, block header
-// `bh`) set, keeping the bytes K5 wrote from HDR_LEN + 3 on.
-fn prefix_word_over_section(w: u32, bh: u32) -> u32 {
+// `bh`) set, keeping the bytes K5 wrote from HDR_LEN + 3 on. `real` >= SHORT_FCS_LIMIT (a
+// compressed block's header is HDR_LEN bytes).
+fn prefix_word_over_section(w: u32, real: u32, bh: u32) -> u32 {
     var v = frames[fbase + w];
     for (var i = 0u; i < 4u; i++) {
         let k = 4u * w + i;
         if (k < HDR_LEN + 3u) {
-            v = (v & ~(0xFFu << (8u * i))) | (prefix_byte(k, bh, 0u, 0u, 0u) << (8u * i));
+            v = (v & ~(0xFFu << (8u * i))) | (prefix_byte(k, real, bh, 0u, 0u, 0u) << (8u * i));
         }
     }
     return v;
@@ -499,14 +520,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     // ---- histograms and the RLE-block check ----
     for (var i = lid; i < H_ALL; i += WG) { atomicStore(&hist[i], 0u); }
     if (lid < 3u) { bld[lid] = 0u; }
-    if (lid == 0u) { atomicStore(&not_rle, 0u); }
+    if (lid == 0u) {
+        atomicStore(&not_rle, 0u);
+        atomicStore(&match_bytes, 0u);
+    }
     workgroupBarrier();
     for (var i = lid; i < n_seq; i += WG) {
         let s = sbase + i * 3u;
         atomicAdd(&hist[H_LL + ll_code(seqs[s])], 1u);
         atomicAdd(&hist[H_ML + ml_code(seqs[s + 1u])], 1u);
         atomicAdd(&hist[H_OF + highbit(seqs[s + 2u])], 1u);
+        atomicAdd(&match_bytes, seqs[s + 1u]);
     }
+    workgroupBarrier();
+    // The block's real length: its literals plus its match bytes (BLOCK_SIZE for a full block).
+    if (lid == 0u) { real_wg = min(counts[2u * b + 1u] + atomicLoad(&match_bytes), BLOCK_SIZE); }
+    let real = workgroupUniformLoad(&real_wg);
+    let real_words = (real + 3u) / 4u;
     // The RLE check runs in rounds of 8 words per thread and stops after the first round that
     // finds a byte differing from the first (most blocks: the first round).
     let first = data[base] & 0xFFu;
@@ -516,23 +546,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         var diff = 0u;
         for (var q = 0u; q < 8u; q++) {
             let w = w0 + q * WG + lid;
-            if (w < BLOCK_SIZE / 4u) { diff |= data[base + w] ^ first4; }
+            if (w < real_words) {
+                // The last word of a partial block: only its first real - 4 w bytes count.
+                let rest = real - 4u * w;
+                let mask = select(0xFFFFFFFFu, (1u << (8u * rest)) - 1u, rest < 4u);
+                diff |= (data[base + w] ^ first4) & mask;
+            }
         }
         if (diff != 0u) { atomicOr(&not_rle, 1u); }
         workgroupBarrier();
         if (lid == 0u) { rle_flag = atomicLoad(&not_rle); }
         w0 += 8u * WG;
-        if (workgroupUniformLoad(&rle_flag) != 0u || w0 >= BLOCK_SIZE / 4u) { break; }
+        if (workgroupUniformLoad(&rle_flag) != 0u || w0 >= real_words) { break; }
     }
     workgroupBarrier();
     if (lid == 0u) { rle_flag = atomicLoad(&not_rle); }
     if (workgroupUniformLoad(&rle_flag) == 0u) {
         if (lid == 0u) {
-            let bh = 1u | (1u << 1u) | (BLOCK_SIZE << 3u);
+            let bh = 1u | (1u << 1u) | (real << 3u);
             for (var w = 0u; w < PREFIX_WORDS; w++) {
-                frames[fbase + w] = prefix_word(w, bh, first, 1u, 0u);
+                frames[fbase + w] = prefix_word(w, real, bh, first, 1u, 0u);
             }
-            frame_len[b] = HDR_LEN + 4u;
+            frame_len[b] = hdr_len(real) + 4u;
         }
         return;
     }
@@ -789,19 +824,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let end = put_end();
         put_flush();
         let content = end - (HDR_LEN + 3u);
-        if (pos == STOP || wpos >= FRAME_WORDS || content >= BLOCK_SIZE) {
+        if (pos == STOP || wpos >= FRAME_WORDS || content >= real || real < SHORT_FCS_LIMIT) {
             raw_flag = 1u;
         } else {
             raw_flag = 0u;
             let bh = 1u | (2u << 1u) | (content << 3u);
             let first_seq_word = seq_start / 4u;
             for (var w = 0u; w < min(PREFIX_WORDS, first_seq_word); w++) {
-                frames[fbase + w] = prefix_word_over_section(w, bh);
+                frames[fbase + w] = prefix_word_over_section(w, real, bh);
             }
             // The first sequences-section word starts with prefix / literal bytes.
             let keep = (seq_start & 3u) * 8u;
             if (keep > 0u) {
-                var low = prefix_word_over_section(first_seq_word, bh);
+                var low = prefix_word_over_section(first_seq_word, real, bh);
                 low &= (1u << keep) - 1u;
                 frames[fbase + first_seq_word] = (frames[fbase + first_seq_word] & ~((1u << keep) - 1u)) | low;
             }
@@ -812,17 +847,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     // ---- raw fallback: header + the block verbatim, over whatever was written above ----
     storageBarrier();
     if (workgroupUniformLoad(&raw_flag) == 1u) {
-        let raw_start = HDR_LEN + 3u;
-        let raw_words = (raw_start + BLOCK_SIZE + 3u) / 4u;
+        let raw_start = hdr_len(real) + 3u;
+        let raw_words = (raw_start + real + 3u) / 4u;
         for (var w = PREFIX_WORDS + lid; w < raw_words; w += WG) {
             frames[fbase + w] = data_word(base, 4u * w - raw_start);
         }
         if (lid == 0u) {
-            let bh = 1u | (BLOCK_SIZE << 3u);
+            let bh = 1u | (real << 3u);
             for (var w = 0u; w < PREFIX_WORDS; w++) {
-                frames[fbase + w] = prefix_word(w, bh, 0u, 0u, base);
+                frames[fbase + w] = prefix_word(w, real, bh, 0u, 0u, base);
             }
-            frame_len[b] = raw_start + BLOCK_SIZE;
+            frame_len[b] = raw_start + real;
         }
     }
 }

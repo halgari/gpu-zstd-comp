@@ -8,7 +8,7 @@ use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_sparse, hash_width, key};
 use crate::lazy::{lazy_parse, lazy_parse_segmented};
 use crate::params::{Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
-use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
+use crate::seq::{apply_off_base, off_base_for, truncate_output, BlockOutput, Sequence, INITIAL_REPS};
 
 /// A candidate match at some position: offset back from that position, and length.
 /// `len == 0` means no match was found (or none met `min_match`).
@@ -384,11 +384,19 @@ pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     parse(block, &best, &params)
 }
 
-/// Compress one full-size block straight to a zstd frame: `compress_block` followed
-/// by `write_frame`. This is the CPU reference compressor's end-to-end entry point,
+/// Compress one block, given as its real bytes (`1..=BLOCK_SIZE`, `Block::real_len`), straight to
+/// a zstd frame that decodes to exactly those bytes: `compress_block` on the zero-padded block,
+/// `seq::truncate_output` to its real length, then `write_frame`. This is the CPU reference compressor's end-to-end entry point,
 /// used by `gzc-bench ref` and exercised by `all_synthetic_frames_roundtrip` below.
 pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOptions) -> Vec<u8> {
-    let out = compress_block(block, params);
+    if block.len() == BLOCK_SIZE {
+        return write_frame(block, &compress_block(block, params), opts);
+    }
+    // A partial block: parse it zero-padded (as `chunk_file` pads it), cut the parse at its end.
+    assert!((1..BLOCK_SIZE).contains(&block.len()), "a block holds 1..=BLOCK_SIZE bytes, not {}", block.len());
+    let mut padded = block.to_vec();
+    padded.resize(BLOCK_SIZE, 0);
+    let out = truncate_output(&compress_block(&padded, params), &padded, block.len());
     write_frame(block, &out, opts)
 }
 
@@ -780,8 +788,11 @@ mod tests {
 
     /// xxh64 of the concatenated lvl3 frames, first captured on the unmodified M3 code (ddeee75);
 /// re-captured when `synth::nif_like` switched to a platform-independent sine (the lvl3 code
-/// itself unchanged: the old anchors still passed on Linux immediately before the switch).
-    const M3_LVL3_ANCHOR: u64 = 0xd3354ac3c8f4a5d2;
+/// itself unchanged: the old anchors still passed on Linux immediately before the switch), and
+/// when a partial block's frame started declaring and holding only its real length (was
+/// 0xd3354ac3c8f4a5d2; the full-block frames are pinned unchanged by
+/// `lvl3_full_block_frames_match_anchor`).
+    const M3_LVL3_ANCHOR: u64 = 0x441bb7015bd4cc45;
 
     /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
     /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.
@@ -790,12 +801,81 @@ mod tests {
         let mut all = Vec::new();
         for (_, bytes) in synth::test_cases() {
             for blk in chunk_file(&bytes) {
-                all.extend_from_slice(&compress_block_to_frame(&blk.data, LVL3, FrameOptions::default()));
+                let real = &blk.data[..blk.real_len];
+                all.extend_from_slice(&compress_block_to_frame(real, LVL3, FrameOptions::default()));
             }
         }
         let h = xxhash_rust::xxh64::xxh64(&all, 0);
         println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
         assert_eq!(h, M3_LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+    }
+
+    /// xxh64 of the concatenated lvl3 frames of the synthetic cases' full blocks only, captured
+    /// before frames of partial blocks started declaring their real length: unchanged by that.
+    const LVL3_FULL_BLOCK_ANCHOR: u64 = 0xc4c446cbce783267;
+
+    /// `lvl3_frames_match_m3_anchor` restricted to full blocks (`real_len == BLOCK_SIZE`).
+    #[test]
+    fn lvl3_full_block_frames_match_anchor() {
+        let mut all = Vec::new();
+        for (_, bytes) in synth::test_cases() {
+            for blk in chunk_file(&bytes).into_iter().filter(|b| b.real_len == BLOCK_SIZE) {
+                all.extend_from_slice(&compress_block_to_frame(&blk.data, LVL3, FrameOptions::default()));
+            }
+        }
+        let h = xxhash_rust::xxh64::xxh64(&all, 0);
+        println!("lvl3 full-block anchor: {h:#018x} ({} bytes)", all.len());
+        assert_eq!(h, LVL3_FULL_BLOCK_ANCHOR, "lvl3 full-block frames changed");
+    }
+
+    /// A file of `k` full blocks plus `r` bytes round-trips through libzstd to exactly its bytes
+    /// for every preset: each block's frame declares and holds only its real length, and a full
+    /// block's frame is the padded-parse frame it always was.
+    #[test]
+    fn partial_last_block_roundtrips_every_preset() {
+        let file = synth::text(7, 2 * BLOCK_SIZE + BLOCK_SIZE / 2);
+        let rle = vec![9u8; BLOCK_SIZE + 300];
+        for (name, p) in crate::params::PRESETS {
+            for (k, r) in [(0, 1), (0, 100), (1, 255), (1, 256), (1, 257), (0, 4097), (2, 31_000), (1, BLOCK_SIZE - 1), (2, 0)] {
+                for src in [&file, &rle] {
+                    let bytes = &src[..(k * BLOCK_SIZE + r).min(src.len())];
+                    let mut dec = Vec::new();
+                    for blk in chunk_file(bytes) {
+                        let real = &blk.data[..blk.real_len];
+                        let frame = compress_block_to_frame(real, p, FrameOptions::default());
+                        let got = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                            .unwrap_or_else(|e| panic!("{name} k{k} r{r}: libzstd rejected frame: {e}"));
+                        assert_eq!(got.len(), blk.real_len, "{name} k{k} r{r}");
+                        assert_eq!(zstd::zstd_safe::get_frame_content_size(&frame).ok().flatten(), Some(blk.real_len as u64));
+                        if blk.real_len == BLOCK_SIZE {
+                            let padded = write_frame(&blk.data, &compress_block(&blk.data, p), FrameOptions::default());
+                            assert_eq!(frame, padded, "{name}: a full block's frame changed");
+                        }
+                        dec.extend_from_slice(&got);
+                    }
+                    assert!(dec == bytes, "{name} k{k} r{r}: file did not round-trip");
+                }
+            }
+        }
+    }
+
+    /// `truncate_output` is the identity at BLOCK_SIZE and otherwise covers exactly `len` bytes
+    /// with no match shorter than zstd's 3 bytes.
+    #[test]
+    fn truncate_output_cuts_at_len() {
+        use crate::seq::{truncate_output, ZSTD_MIN_MATCH};
+        for (_, bytes) in synth::test_cases() {
+            let blk = &chunk_file(&bytes)[0];
+            for p in [LVL3, crate::params::OPT16P1] {
+                let out = compress_block(&blk.data, p);
+                assert_eq!(truncate_output(&out, &blk.data, BLOCK_SIZE), out);
+                for len in [1, 2, 3, 255, 4096, 30_001, BLOCK_SIZE - 1] {
+                    let t = truncate_output(&out, &blk.data, len);
+                    assert!(t.sequences.iter().all(|s| s.match_len >= ZSTD_MIN_MATCH));
+                    assert_eq!(reconstruct(&t).unwrap(), blk.data[..len], "len {len}");
+                }
+            }
+        }
     }
 
     /// `rung1` (Single chain, min_match 4, greedy parse): every synthetic test case
