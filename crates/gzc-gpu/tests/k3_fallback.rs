@@ -3,7 +3,8 @@
 //! branch; its output must still equal the CPU oracle. A separate test binary, because the
 //! variable is read by `Kernels::new` and must not leak into other tests.
 use gzc_core::block::chunk_file;
-use gzc_core::params::{LVL3, RUNG1};
+use gzc_core::fixtures::RUNG1;
+use gzc_core::params::LVL3;
 use gzc_core::reference::compress_block;
 use gzc_core::synth::test_cases;
 use gzc_gpu::compressor::{GpuParams, K3Mode, Kernels, compress_batch};

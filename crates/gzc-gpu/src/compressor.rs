@@ -1603,7 +1603,8 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
 mod tests {
     use super::*;
     use crate::sizing::{best_words, pred_bytes_for, scratch_bytes, slot_bytes, trace_bytes};
-    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, RUNG1, RUNG2};
+    use gzc_core::fixtures::{LVL9, RUNG1, RUNG2};
+    use gzc_core::params::{LVL3, LVL9S12SEG, LVL9SEG};
 
     const MIB: u64 = 1 << 20;
 

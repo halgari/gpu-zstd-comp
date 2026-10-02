@@ -145,7 +145,7 @@ fn opt_cand_kernel_rejects_unaligned_long_chains() {
 fn opt_cand_kernel_rejects_non_opt_params() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let ctx = GpuContext::new().unwrap();
-    assert!(OptCandKernel::new(&ctx, &gzc_core::params::LVL9).is_err());
+    assert!(OptCandKernel::new(&ctx, &gzc_core::fixtures::LVL9).is_err());
 }
 
 /// Informal (reads the real corpus): K1 + K2opt against `find_cands` on real .dds/.nif blocks.

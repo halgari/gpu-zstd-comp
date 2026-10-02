@@ -1748,7 +1748,8 @@ mod tests {
     use super::*;
     use crate::sizing::{BufferSizes, chain_pred_bytes, head_bytes, pred_bytes_for};
     use gzc_core::block::chunk_file;
-    use gzc_core::params::{LVL3, LVL9SEG, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
+    use gzc_core::fixtures::RUNG1;
+    use gzc_core::params::{LVL3, LVL9SEG, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 

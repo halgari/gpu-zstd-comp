@@ -404,7 +404,8 @@ pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOpt
 mod tests {
     use super::*;
     use crate::block::chunk_file;
-    use crate::params::{LVL3, RUNG1};
+    use crate::fixtures::RUNG1;
+    use crate::params::LVL3;
     use crate::seq::reconstruct;
     use crate::synth;
 
@@ -531,14 +532,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid params")]
     fn invalid_params_panic_clearly() {
-        compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::params::LVL9 });
+        compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::fixtures::LVL9 });
     }
 
     /// The window walk over the bucket-sorted array equals the chain walk, for 11/12/13-bit keys and
     /// the 16-bit one, at depths 4, 16 and 32 (shallow walks rarely reach other buckets).
     #[test]
     fn window_walk_equals_chain_walk() {
-        use crate::params::{LVL9, LVL9S12SEG};
+        use crate::fixtures::LVL9;
+        use crate::params::LVL9S12SEG;
         let s13 = MatchParams { hash_bits: 13, ..LVL9 };
         let d16 = MatchParams { depth: 16, ..LVL9S12SEG };
         for params in [LVL9S12SEG, d16, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {

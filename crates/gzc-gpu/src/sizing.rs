@@ -208,7 +208,8 @@ pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
 mod tests {
     use super::*;
     use gzc_core::config::LOG2_BLOCK;
-    use gzc_core::params::{LVL3, RUNG1};
+    use gzc_core::fixtures::RUNG1;
+    use gzc_core::params::LVL3;
 
     const MIB: u64 = 1 << 20;
 

@@ -5,7 +5,8 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS};
 use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
-use gzc_core::params::{Hashes, LVL3, LVL9SEG, SparseChain, MatchParams, OPT16, OPT16P1, OptParams, RUNG1};
+use gzc_core::fixtures::RUNG1;
+use gzc_core::params::{Hashes, LVL3, LVL9SEG, SparseChain, MatchParams, OPT16, OPT16P1, OptParams};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
 use gzc_gpu::chains::{

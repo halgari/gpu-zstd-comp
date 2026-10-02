@@ -365,7 +365,8 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
 #[doc(hidden)]
 pub mod cases {
     use crate::config::{BLOCK_SIZE, PARSE_END};
-    use crate::params::{MatchParams, LVL9, LVL9SEG, RUNG2};
+    use crate::fixtures::{LVL9, RUNG2};
+    use crate::params::{MatchParams, LVL9SEG};
     use crate::reference::{match_len, Match};
     use crate::seq::Sequence;
     use crate::synth;
@@ -916,7 +917,8 @@ mod tests {
     use super::*;
     use crate::block::chunk_file;
     use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{LVL9, LVL9SEG, RUNG1, RUNG2};
+    use crate::fixtures::{LVL9, RUNG1, RUNG2};
+    use crate::params::LVL9SEG;
     use crate::reference::{chains, compress_block, find_best};
     use crate::seq::reconstruct;
     use crate::synth;

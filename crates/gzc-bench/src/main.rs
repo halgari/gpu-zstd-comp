@@ -588,7 +588,7 @@ mod tests {
         let lvl3 = parse_preset("lvl3").unwrap();
         assert!(check_presets(&[lvl3], true, true).is_ok());
         // An unsegmented lazy parse is CPU-only (no preset has one; the GPU refuses the params).
-        let cpu_only = Preset { name: "lazy2-unsegmented", params: gzc_core::params::LVL9 };
+        let cpu_only = Preset { name: "lazy2-unsegmented", params: gzc_core::fixtures::LVL9 };
         assert!(check_presets(&[cpu_only], true, false).is_ok());
         assert!(check_presets(&[cpu_only], false, true).is_err());
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();

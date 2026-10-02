@@ -5,7 +5,8 @@
 //! sequential K3 with `GZC_K3_MODE=seq`, and at other widths with `GZC_K3_W=8|16` (the boundaries
 //! for W = 8, 16 and 32 are always all included).
 use gzc_core::config::{BLOCK_SIZE, PARSE_END};
-use gzc_core::params::{LVL3, MatchParams, RUNG1};
+use gzc_core::fixtures::RUNG1;
+use gzc_core::params::{LVL3, MatchParams};
 use gzc_core::reference::{Match, compress_block, greedy_parse};
 use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{
