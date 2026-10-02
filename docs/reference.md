@@ -79,11 +79,11 @@ Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for by
 
 | Preset | Ratio | libzstd | libzstd ratio |
 |---|---:|---|---:|
-| `lvl9seg` | 1.33931 | L9 | 1.33786 |
-| `lvl9s12seg` | 1.33926 | L9 | 1.33786 |
-| `opt14` | 1.37064 | L14 | 1.36827 |
-| `opt16` | 1.37144 | L16 | 1.37100 |
-| `opt16p1` | 1.37229 | L16 | 1.37100 |
+| `lvl9seg` | 1.33934 | L9 | 1.33786 |
+| `lvl9s12seg` | 1.33929 | L9 | 1.33786 |
+| `opt14` | 1.37067 | L14 | 1.36827 |
+| `opt16` | 1.37148 | L16 | 1.37100 |
+| `opt16p1` | 1.37232 | L16 | 1.37100 |
 
 ```sh
 cargo run --release -p gzc-bench -- ref --synthetic --threads 1,8 --verify

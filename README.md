@@ -53,7 +53,7 @@ At matching compression ratios, the GPU presets compare with libzstd on a Ryzen 
 
 - **Level 9 ratio:** `lvl9s12seg` on an RTX 5090 runs 6× faster than libzstd on all 32 threads,
   and 14× faster than 8 threads.
-- **Level 16 ratio:** `opt16p1` beats libzstd level 16's ratio (1.37229 against 1.37100). It runs
+- **Level 16 ratio:** `opt16p1` beats libzstd level 16's ratio (1.37232 against 1.37100). It runs
   6.8× faster than 32 threads and 18× faster than 8.
 - **On a GTX 1660 Super**, a common budget card, `opt16p1` still clears 1 Gbit/s at level-16
   ratio.
@@ -121,11 +121,11 @@ matches it byte for byte.
 | Preset | Ratio | Comparable to | Notes |
 |---|---:|---|---|
 | `lvl3` | 1.264 | zstd level 3 | greedy parse |
-| `lvl9seg` | 1.33931 | zstd level 9 (1.33786) | lazy parse over hash chains; the faster level-9 preset on Apple GPUs |
-| `lvl9s12seg` | 1.33926 | zstd level 9 (1.33786) | lazy parse over the sorted finder; the fastest level-9 preset elsewhere |
-| `opt14` | 1.37064 | zstd level 14 (1.36827) | optimal parse, 2 passes |
-| `opt16` | 1.37144 | zstd level 16 (1.37100) | optimal parse, 4 passes |
-| `opt16p1` | 1.37229 | zstd level 16 (1.37100) | optimal parse, 1 pass; faster than `opt16` |
+| `lvl9seg` | 1.33934 | zstd level 9 (1.33786) | lazy parse over hash chains; the faster level-9 preset on Apple GPUs |
+| `lvl9s12seg` | 1.33929 | zstd level 9 (1.33786) | lazy parse over the sorted finder; the fastest level-9 preset elsewhere |
+| `opt14` | 1.37067 | zstd level 14 (1.36827) | optimal parse, 2 passes |
+| `opt16` | 1.37148 | zstd level 16 (1.37100) | optimal parse, 4 passes |
+| `opt16p1` | 1.37232 | zstd level 16 (1.37100) | optimal parse, 1 pass; faster than `opt16` |
 
 ## Status
 
