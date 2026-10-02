@@ -56,25 +56,25 @@ pub const OPT_PRIOR_LL: [u32; 36] = [10175, 5362, 2777, 4261, 18544, 5612, 2888,
 pub const OPT_PRIOR_ML: [u32; 53] = [25759, 27428, 4277, 1151, 574, 3224, 654, 830, 269, 673, 131, 66, 68, 101, 18, 22, 24, 13, 6, 6, 12, 18, 5, 7, 9, 18, 5, 4, 4, 5, 5, 4, 6, 3, 7, 6, 9, 10, 9, 15, 15, 8, 12, 17, 11, 7, 3, 6, 0, 0, 0, 0, 0];
 /// Prior OF-code frequencies (see `OPT_PRIOR_LL`).
 pub const OPT_PRIOR_OF: [u32; 32] = [4961, 3407, 239, 594, 1319, 1327, 1638, 2138, 2903, 3911, 5472, 7608, 9595, 9986, 7960, 2479, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-/// Prior LL-code frequencies of `PriorTables::S3` (`Seed::Prior` in preset `opt16p1`, M6 B0).
+/// Prior LL-code frequencies of `PriorTables::Sparse` (`Seed::Prior` in preset `opt16p1`, M6 B0).
 ///
 /// Training set: the same blocks as `OPT_PRIOR_*`, every 50th 64 KiB block at offset 25 of
 /// `data/corpus` (`--ext dds,nif` order, 2015 blocks), so block-disjoint from the 1/50
 /// evaluation sample (every 50th block, offset 0). Training parse: `opt16`'s schedule
 /// (`BlockInit` seed, 3 cheap passes, the optLevel-2 final pass) over `opt16p1`'s candidates (h4
 /// 8 deep, h3, the S3 sparse chains) and gap3 segment ends, with no relaxation pruning and no
-/// drop pass (`opt_sample.rs`'s `s3_train_params`). Each table is the summed code histogram of
+/// drop pass (`opt_sample.rs`'s `sparse_train_params`). Each table is the summed code histogram of
 /// that parse's output, scaled to 65536 (round to nearest). Regenerate (byte-identical) with
-/// `cargo run --release -p gzc-core --example opt_sample -- train-s3 data/corpus 50 25`.
+/// `cargo run --release -p gzc-core --example opt_sample -- train-sparse data/corpus 50 25`.
 ///
 /// The B0 study measured the sensitivity on the full corpus at 64 KiB (without pruning): these
 /// tables 1.37235, block-disjoint cross-fitted tables 1.37236, cross-mod tables 1.37215, the M5
 /// `OPT_PRIOR_*` tables 1.37211.
-pub const OPT_PRIOR_S3_LL: [u32; 36] = [9299, 5308, 2743, 3874, 19329, 5865, 3657, 1371, 2248, 969, 685, 949, 3552, 1971, 534, 253, 338, 193, 400, 190, 337, 570, 227, 240, 185, 183, 50, 13, 3, 0, 0, 0, 0, 0, 0, 0];
-/// Prior ML-code frequencies of `PriorTables::S3` (see `OPT_PRIOR_S3_LL`).
-pub const OPT_PRIOR_S3_ML: [u32; 53] = [25790, 27806, 3674, 1205, 579, 1714, 470, 1670, 446, 1431, 169, 72, 74, 100, 17, 23, 24, 14, 5, 5, 10, 22, 5, 8, 10, 18, 5, 4, 4, 6, 4, 3, 5, 3, 9, 7, 9, 10, 10, 14, 15, 8, 13, 18, 11, 7, 4, 6, 0, 0, 0, 0, 0];
-/// Prior OF-code frequencies of `PriorTables::S3` (see `OPT_PRIOR_S3_LL`).
-pub const OPT_PRIOR_S3_OF: [u32; 32] = [3643, 3103, 243, 608, 1327, 1337, 1659, 2174, 2954, 4059, 5697, 7886, 9904, 10252, 8139, 2550, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub const OPT_PRIOR_SPARSE_LL: [u32; 36] = [9299, 5308, 2743, 3874, 19329, 5865, 3657, 1371, 2248, 969, 685, 949, 3552, 1971, 534, 253, 338, 193, 400, 190, 337, 570, 227, 240, 185, 183, 50, 13, 3, 0, 0, 0, 0, 0, 0, 0];
+/// Prior ML-code frequencies of `PriorTables::Sparse` (see `OPT_PRIOR_SPARSE_LL`).
+pub const OPT_PRIOR_SPARSE_ML: [u32; 53] = [25790, 27806, 3674, 1205, 579, 1714, 470, 1670, 446, 1431, 169, 72, 74, 100, 17, 23, 24, 14, 5, 5, 10, 22, 5, 8, 10, 18, 5, 4, 4, 6, 4, 3, 5, 3, 9, 7, 9, 10, 10, 14, 15, 8, 13, 18, 11, 7, 4, 6, 0, 0, 0, 0, 0];
+/// Prior OF-code frequencies of `PriorTables::Sparse` (see `OPT_PRIOR_SPARSE_LL`).
+pub const OPT_PRIOR_SPARSE_OF: [u32; 32] = [3643, 3103, 243, 608, 1327, 1337, 1659, 2174, 2954, 4059, 5697, 7886, 9904, 10252, 8139, 2550, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// Floor log2 of a nonzero value.
 fn highbit(v: u32) -> u32 {

@@ -445,7 +445,7 @@ impl Prepared {
             // The adapter's workgroup storage, where it is above wgpu's 16 KiB default:
             // `SortKernel::new` (sorted.rs) picks its kernel by this limit (it builds a version
             // only when `sorted::workgroup_bytes` fits, so a table that does not fit 16 KiB may
-            // still run sorted). K3opt's rings and tables fit the default (`k3opt::ring_for`); the
+            // still run sorted). K3opt's rings and tables fit the default (`k3opt::check_ring_fits`); the
             // other kernels do not read the limit.
             max_compute_workgroup_storage_size: al
                 .max_compute_workgroup_storage_size

@@ -123,7 +123,7 @@ fn opt_matches_oracle_synthetic() {
 /// 8), not just opt16p1's. A few such combinations through `compress_frames` on synthetic blocks:
 /// frames equal the oracle's.
 #[test]
-fn m6_variants_match_oracle_synthetic() {
+fn option_variants_match_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
     use gzc_gpu::testing::gpu_supports;
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -136,12 +136,12 @@ fn m6_variants_match_oracle_synthetic() {
         ("opt16 drop32 top1", MatchParams { opt: Some(OptParams { drop_max_len: 32, relax_lengths: Some(1), inner_gap: 3, ..o16 }), ..OPT16 }),
         // Two sparse chains at stride 8, a cheap pass, the M5 prior, drop 3.
         (
-            "s8 x1 m5prior drop3",
+            "s8 x1 base-prior drop3",
             MatchParams {
                 opt: Some(OptParams {
                     passes: 1,
                     seed: Seed::Prior,
-                    prior: PriorTables::M5,
+                    prior: PriorTables::Base,
                     sparse_chains: [Some(SparseChain { width: 5, stride: 8, depth: 3 }), Some(SparseChain { width: 9, stride: 8, depth: 64 }), None],
                     drop_max_len: 3,
                     relax_lengths: Some(32),
@@ -186,7 +186,7 @@ fn opt_corpus_matches_oracle() {
 /// of option combinations, each one byte-identical to the oracle end to end on the synthetic
 /// blocks. `GZC_SWEEP_N` sets the number of combinations (default 16).
 #[test]
-fn m6_option_sweep_matches_oracle_synthetic() {
+fn option_sweep_matches_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
     use gzc_gpu::testing::gpu_supports;
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -211,8 +211,8 @@ fn m6_option_sweep_matches_oracle_synthetic() {
                 depth: [1u32, 3, 16, 64][rnd(4) as usize],
             });
         }
-        let prior = [PriorTables::M5, PriorTables::S3][rnd(2) as usize];
-        let seed = if prior == PriorTables::S3 { Seed::Prior } else { [Seed::BlockInit, Seed::Prior][rnd(2) as usize] };
+        let prior = [PriorTables::Base, PriorTables::Sparse][rnd(2) as usize];
+        let seed = if prior == PriorTables::Sparse { Seed::Prior } else { [Seed::BlockInit, Seed::Prior][rnd(2) as usize] };
         let o = OptParams {
             level: [0u8, 2][rnd(2) as usize],
             target_length: [8u32, 16, 32][rnd(3) as usize],

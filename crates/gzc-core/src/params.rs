@@ -69,8 +69,8 @@ pub struct OptParams {
 impl OptParams {
     /// True when every M6 field has its M5 value: the opt params the GPU K1/K2opt/K3opt kernels of
     /// M5 implement (no sparse chains, M5 prior tables, gap 8, no pruning, no drop pass).
-    pub fn is_m5(&self) -> bool {
-        self.prior == PriorTables::M5
+    pub fn is_baseline(&self) -> bool {
+        self.prior == PriorTables::Base
             && self.sparse_chains == [None; 3]
             && self.inner_gap == 8
             && self.relax_lengths.is_none()
@@ -82,10 +82,10 @@ impl OptParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriorTables {
     /// `codes::OPT_PRIOR_{LL,ML,OF}`, trained on `opt16`'s output (M5; `opt14`).
-    M5,
-    /// `codes::OPT_PRIOR_S3_{LL,ML,OF}`, trained on the opt16 schedule over `OPT16P1`'s
+    Base,
+    /// `codes::OPT_PRIOR_SPARSE_{LL,ML,OF}`, trained on the opt16 schedule over `OPT16P1`'s
     /// candidates and segment ends (M6; `opt16p1`).
-    S3,
+    Sparse,
 }
 
 /// A sparse candidate chain (M6; a06 §2, r3 "S3"). Only *sparse positions*
@@ -104,7 +104,7 @@ pub struct SparseChain {
 }
 
 /// r3's "S3" sparse chains (`OPT16P1`): 6-, 10- and 12-byte keys, every 4th position, 16 deep.
-pub const S3_CHAINS: [Option<SparseChain>; 3] = [
+pub const SPARSE_CHAINS: [Option<SparseChain>; 3] = [
     Some(SparseChain { width: 6, stride: 4, depth: 16 }),
     Some(SparseChain { width: 10, stride: 4, depth: 16 }),
     Some(SparseChain { width: 12, stride: 4, depth: 16 }),
@@ -219,7 +219,7 @@ fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
     want((8..=32).contains(&o.target_length), format!("opt target_length {} not in 8..=32", o.target_length))?;
     want(o.passes <= 7, format!("opt passes {} not in 0..=7", o.passes))?;
     want(o.k == 2, format!("opt k {} not 2", o.k))?;
-    want(o.prior == PriorTables::M5 || o.seed == Seed::Prior, format!("opt prior {:?} needs seed Prior", o.prior))?;
+    want(o.prior == PriorTables::Base || o.seed == Seed::Prior, format!("opt prior {:?} needs seed Prior", o.prior))?;
     let n = o.sparse_chains.iter().flatten().count();
     want(o.sparse_chains[..n].iter().all(Option::is_some), format!("opt sparse chains not packed first: {:?}", o.sparse_chains))?;
     for c in o.sparse_chains.iter().flatten() {
@@ -277,7 +277,7 @@ pub const OPT16: MatchParams = MatchParams {
         passes: 3,
         seed: Seed::BlockInit,
         k: 2,
-        prior: PriorTables::M5,
+        prior: PriorTables::Base,
         sparse_chains: [None; 3],
         inner_gap: 8,
         relax_lengths: None,
@@ -288,9 +288,9 @@ pub const OPT16: MatchParams = MatchParams {
 /// the block's cover literals, 1 cheap pass, then the optLevel-2 final pass.
 pub const OPT14: MatchParams = MatchParams { opt: Some(OptParams { passes: 1, seed: Seed::Prior, ..OPT16.opt.unwrap() }), ..OPT16 };
 /// An L16-class optimal parse with **one** DP pass (M6 B0/B1, "opt16-class, 1 pass"):
-/// - candidates: the h4 chain 8 deep, h3 4 deep, and the three `S3_CHAINS` sparse chains (6-, 10-
+/// - candidates: the h4 chain 8 deep, h3 4 deep, and the three `SPARSE_CHAINS` sparse chains (6-, 10-
 ///   and 12-byte keys at every 4th position, 16 deep each), merged by `reference::find_cands`;
-/// - pass-0 prices: `Seed::Prior` with the `PriorTables::S3` tables plus the cover literals;
+/// - pass-0 prices: `Seed::Prior` with the `PriorTables::Sparse` tables plus the cover literals;
 /// - one optLevel-2 pass (`passes: 0`) with gap3 segment ends (`inner_gap: 3`) and top-4
 ///   relaxation pruning (`relax_lengths: Some(4)`);
 /// - then the drop pass for explicit matches of at most 6 bytes (`opt::drop_pass`).
@@ -308,8 +308,8 @@ pub const OPT16P1: MatchParams = MatchParams {
     opt: Some(OptParams {
         passes: 0,
         seed: Seed::Prior,
-        prior: PriorTables::S3,
-        sparse_chains: S3_CHAINS,
+        prior: PriorTables::Sparse,
+        sparse_chains: SPARSE_CHAINS,
         inner_gap: 3,
         relax_lengths: Some(4),
         drop_max_len: 6,
@@ -365,7 +365,7 @@ mod tests {
             passes: 3,
             seed: Seed::BlockInit,
             k: 2,
-            prior: PriorTables::M5,
+            prior: PriorTables::Base,
             sparse_chains: [None; 3],
             inner_gap: 8,
             relax_lengths: None,
@@ -374,19 +374,19 @@ mod tests {
         let o16 = MatchParams { hashes: Hashes::Opt3, min_match: 3, depth: 32, lazy: 0, search_cap: 64, hash_bits: 16, segment_log2: 12, opt: Some(opt) };
         assert_eq!(OPT16, o16);
         assert_eq!(OPT14, MatchParams { opt: Some(OptParams { passes: 1, seed: Seed::Prior, ..opt }), ..o16 });
-        let s3 = |width| Some(SparseChain { width, stride: 4, depth: 16 });
+        let sparse = |width| Some(SparseChain { width, stride: 4, depth: 16 });
         let p1 = OptParams {
             passes: 0,
             seed: Seed::Prior,
-            prior: PriorTables::S3,
-            sparse_chains: [s3(6), s3(10), s3(12)],
+            prior: PriorTables::Sparse,
+            sparse_chains: [sparse(6), sparse(10), sparse(12)],
             inner_gap: 3,
             relax_lengths: Some(4),
             drop_max_len: 6,
             ..opt
         };
         assert_eq!(OPT16P1, MatchParams { depth: 8, opt: Some(p1), ..o16 });
-        assert!(OPT14.opt.unwrap().is_m5() && OPT16.opt.unwrap().is_m5() && !p1.is_m5());
+        assert!(OPT14.opt.unwrap().is_baseline() && OPT16.opt.unwrap().is_baseline() && !p1.is_baseline());
         assert_eq!((OPT16.n_hashes(), OPT16.min_seq_len(), OPT14.min_seq_len()), (2, 3, 3));
         assert_eq!((OPT16P1.n_hashes(), OPT16P1.min_seq_len()), (5, 3));
         assert_eq!(LVL3.n_hashes(), 2);
@@ -453,8 +453,8 @@ mod tests {
             MatchParams { opt: Some(OptParams { k: 3, ..o }), ..OPT16 },
             MatchParams { opt: None, ..OPT16 },
             // M6 fields
-            MatchParams { opt: Some(OptParams { prior: PriorTables::S3, ..o }), ..OPT16 },
-            MatchParams { opt: Some(OptParams { sparse_chains: [None, S3_CHAINS[0], None], ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { prior: PriorTables::Sparse, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { sparse_chains: [None, SPARSE_CHAINS[0], None], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 4, stride: 4, depth: 16 }), None, None], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 13, stride: 4, depth: 16 }), None, None], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 8, stride: 3, depth: 16 }), None, None], ..o }), ..OPT16 },
@@ -478,7 +478,7 @@ mod tests {
             MatchParams { opt: Some(OptParams { level: 0, target_length: 8, passes: 0, ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { passes: 7, seed: Seed::Prior, ..o }), ..OPT16 },
             OPT16P1,
-            MatchParams { opt: Some(OptParams { prior: PriorTables::S3, seed: Seed::Prior, ..o }), ..OPT16 },
+            MatchParams { opt: Some(OptParams { prior: PriorTables::Sparse, seed: Seed::Prior, ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 5, stride: 1, depth: 1 }), None, None], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 12, stride: 8, depth: 64 }); 3], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { inner_gap: 3, relax_lengths: Some(1), drop_max_len: 3, ..o }), ..OPT16 },

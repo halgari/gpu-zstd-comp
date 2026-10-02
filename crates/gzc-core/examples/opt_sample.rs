@@ -9,13 +9,13 @@
 //! ```text
 //! cargo run --release -p gzc-core --example opt_sample -- eval  <corpus> <every> <offset> [zstd]
 //! cargo run --release -p gzc-core --example opt_sample -- train <corpus> <every> <offset>
-//! cargo run --release -p gzc-core --example opt_sample -- train-s3 <corpus> <every> <offset>
+//! cargo run --release -p gzc-core --example opt_sample -- train-sparse <corpus> <every> <offset>
 //! ```
 //! `eval` prints the ratio (real bytes / frame bytes) of opt14 and opt16 (and libzstd L14/L16
 //! with `zstd`), and checks every opt frame with libzstd. `train` sums the LL/ML/OF code
 //! histograms of opt16's output over the sample and prints them scaled to 65536 per table
-//! (round to nearest): the `OPT_PRIOR_*` constants. `train-s3` does the same for `s3_train_params`
-//! (the opt16 schedule over opt16p1's candidates and segment ends): the `OPT_PRIOR_S3_*`
+//! (round to nearest): the `OPT_PRIOR_*` constants. `train-sparse` does the same for `sparse_train_params`
+//! (the opt16 schedule over opt16p1's candidates and segment ends): the `OPT_PRIOR_SPARSE_*`
 //! constants. `eval` also prints opt16p1. `THREADS` (default 16) sets the thread count.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,11 +99,11 @@ fn eval(blocks: &[Blk], zstd: bool) {
     }
 }
 
-/// The parse the `OPT_PRIOR_S3_*` tables are trained on (M6 B0): `OPT16P1`'s candidates (h4 8
+/// The parse the `OPT_PRIOR_SPARSE_*` tables are trained on (M6 B0): `OPT16P1`'s candidates (h4 8
 /// deep, h3, the S3 sparse chains) and gap3 segment ends, with `OPT16`'s schedule (`BlockInit`
 /// seed, 3 cheap passes, the optLevel-2 final pass), no relaxation pruning and no drop pass.
-fn s3_train_params() -> MatchParams {
-    let o = OptParams { passes: 3, seed: Seed::BlockInit, prior: PriorTables::M5, relax_lengths: None, drop_max_len: 0, ..OPT16P1.opt.unwrap() };
+fn sparse_train_params() -> MatchParams {
+    let o = OptParams { passes: 3, seed: Seed::BlockInit, prior: PriorTables::Base, relax_lengths: None, drop_max_len: 0, ..OPT16P1.opt.unwrap() };
     MatchParams { opt: Some(o), ..OPT16P1 }
 }
 
@@ -129,7 +129,7 @@ fn train(blocks: &[Blk], p: MatchParams, prefix: &str) {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let usage = "usage: opt_sample eval|train|train-s3 <corpus> <every> <offset> [zstd]";
+    let usage = "usage: opt_sample eval|train|train-sparse <corpus> <every> <offset> [zstd]";
     let (mode, dir) = (a.get(1).expect(usage), PathBuf::from(a.get(2).expect(usage)));
     let every: usize = a.get(3).expect(usage).parse().unwrap();
     let offset: usize = a.get(4).expect(usage).parse().unwrap();
@@ -137,7 +137,7 @@ fn main() {
     match mode.as_str() {
         "eval" => eval(&blocks, a.get(5).is_some_and(|s| s == "zstd")),
         "train" => train(&blocks, OPT16, "OPT_PRIOR"),
-        "train-s3" => train(&blocks, s3_train_params(), "OPT_PRIOR_S3"),
+        "train-sparse" => train(&blocks, sparse_train_params(), "OPT_PRIOR_SPARSE"),
         _ => panic!("{usage}"),
     }
 }

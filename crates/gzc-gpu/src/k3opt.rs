@@ -183,7 +183,7 @@ fn table_bytes(m: &MatchParams, cfg: &K3OptConfig) -> u32 {
 /// `limit` bytes; `K3Opt::new` fails with this error before any pipeline is created. At most
 /// 4068 B at `target_length` 32, well under WebGPU's 16 KiB minimum limit, so it fits every
 /// conforming device.
-pub fn ring_for(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<()> {
+pub fn check_ring_fits(m: &MatchParams, cfg: &K3OptConfig, limit: u32) -> anyhow::Result<()> {
     let need = workgroup_bytes(m, cfg);
     ensure!(need <= limit, "the K3opt rings and price tables need {need} B of workgroup memory > limit {limit}");
     Ok(())
@@ -303,12 +303,12 @@ fn wgsl_array_u32(name: &str, v: &[u32]) -> String {
 /// 3..131.
 fn tables_wgsl(prior: PriorTables) -> String {
     use gzc_core::codes::{
-        LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF, ml_code,
+        LL_BITS, ML_BITS, OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF, OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF, ml_code,
     };
     let bi = Prices::block_init(&vec![0u8; BLOCK_SIZE]);
     let (ll, ml, of) = match prior {
-        PriorTables::M5 => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
-        PriorTables::S3 => (OPT_PRIOR_S3_LL, OPT_PRIOR_S3_ML, OPT_PRIOR_S3_OF),
+        PriorTables::Base => (OPT_PRIOR_LL, OPT_PRIOR_ML, OPT_PRIOR_OF),
+        PriorTables::Sparse => (OPT_PRIOR_SPARSE_LL, OPT_PRIOR_SPARSE_ML, OPT_PRIOR_SPARSE_OF),
     };
     let pr = Prices::from_hist(&Hist { lit: [0; 256], ll, ml, of });
     let u = |t: &[u8]| t.iter().map(|&x| x as u32).collect::<Vec<u32>>();
@@ -407,7 +407,7 @@ impl K3Opt {
         let o = m.opt.ok_or_else(|| anyhow!("K3opt needs opt params"))?;
         ensure!(cfg.level == 0 || cfg.level == 2, "optLevel {}", cfg.level);
         let suff = o.target_length.min(4095);
-        ring_for(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
+        check_ring_fits(m, &cfg, ctx.device.limits().max_compute_workgroup_storage_size)?;
         let body = format!(
             "{}const MAX_SEQS: u32 = {MAX_SEQS_OPT}u;\nconst SEG_LOG2: u32 = {}u;\nconst SUFF: u32 = {suff}u;\n\
              const LEVEL: u32 = {}u;\nconst PRICE_MODE: u32 = {}u;\nconst HIST_OUT: bool = {};\n\

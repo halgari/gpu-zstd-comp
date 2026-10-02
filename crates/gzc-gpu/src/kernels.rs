@@ -1161,11 +1161,11 @@ mod tests {
             OptParams { relax_lengths: Some(32), ..o16 },
             OptParams { drop_max_len: 3, ..o16 },
             OptParams { drop_max_len: 32, ..o16 },
-            OptParams { seed: Seed::Prior, prior: PriorTables::S3, ..o16 },
+            OptParams { seed: Seed::Prior, prior: PriorTables::Sparse, ..o16 },
         ] {
             assert!(gpu_supports(&MatchParams { opt: Some(o), ..OPT16 }), "{o:?}");
         }
-        assert!(gpu_supports(&with(OptParams { passes: 2, seed: Seed::BlockInit, prior: PriorTables::M5, ..p1 })));
+        assert!(gpu_supports(&with(OptParams { passes: 2, seed: Seed::BlockInit, prior: PriorTables::Base, ..p1 })));
         assert!(gpu_supports(&sparse(4)) && gpu_supports(&sparse(8)));
         // Valid, but K1 cannot hash slots that are not word aligned: refused.
         for stride in [1, 2] {
@@ -1176,7 +1176,7 @@ mod tests {
         // Invalid M6 values stay refused.
         assert!(!gpu_supports(&with(OptParams { inner_gap: 4, ..p1 })));
         assert!(!gpu_supports(&with(OptParams { drop_max_len: 2, ..p1 })));
-        assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "S3 prior without the Prior seed");
+        assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "sparse prior without the Prior seed");
         assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
         // Lazy parses run on the GPU in segments only: the unsegmented ones (valid, and what the

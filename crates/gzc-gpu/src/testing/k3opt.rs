@@ -11,7 +11,7 @@ use gzc_core::seq::BlockOutput;
 use crate::context::{GpuContext, pack_blocks};
 use crate::k3opt::{OptBinds, PRICE_WORDS};
 pub use crate::k3opt::{
-    K3Drop, K3Opt, K3OptConfig, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE, ring_bytes, ring_for,
+    K3Drop, K3Opt, K3OptConfig, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE, ring_bytes, check_ring_fits,
     scratch_bytes_per_block, workgroup_bytes,
 };
 use crate::kernels::{MAX_SEQS_OPT, decode_output, with_error_scopes};

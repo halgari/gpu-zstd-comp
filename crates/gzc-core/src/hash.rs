@@ -57,7 +57,7 @@ fn byte_mask(k: u32) -> u32 {
 ///                 ^ ((h2 & mask(width - 8)) * 0x27D4EB2F)) * 0xC2B2AE3D >> 16`
 ///
 /// in wrapping u32 arithmetic, `mask` as in `hash_width`, and the `h2` term 0 (not read) for
-/// `width <= 8`, where this equals `hash_width(b, p, width)`. The `S3_CHAINS` keys, with
+/// `width <= 8`, where this equals `hash_width(b, p, width)`. The `SPARSE_CHAINS` keys, with
 /// `K1 = 0x9E3779B1`, `K2 = 0x85EBCA77`, `K3 = 0x27D4EB2F`, `K4 = 0xC2B2AE3D`:
 /// - width 6: `((lo * K1) ^ ((hi & 0xFFFF) * K2)) * K4 >> 16`, i.e. `hash_width(b, p, 6)`
 ///   (reads bytes `p..p + 8`);

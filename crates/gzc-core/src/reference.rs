@@ -690,10 +690,10 @@ mod tests {
     /// `sparse_chain_preds`: only sparse positions (`p % stride == 0`, `p < SPARSE_END`) are
     /// linked, each to the previous sparse position with the same `hash_sparse`; on all-zero
     /// data that is `p - stride`, the last sparse position is `SPARSE_END - stride` (for strides
-    /// dividing 12), and `chains` appends one such chain per `S3_CHAINS` entry.
+    /// dividing 12), and `chains` appends one such chain per `SPARSE_CHAINS` entry.
     #[test]
     fn sparse_chain_links_sparse_positions_only() {
-        use crate::params::{OPT16P1, S3_CHAINS};
+        use crate::params::{OPT16P1, SPARSE_CHAINS};
         let zeros = synth::zeros(BLOCK_SIZE);
         for stride in [1u32, 2, 4, 8] {
             let c = SparseChain { width: 10, stride, depth: 16 };
@@ -704,13 +704,13 @@ mod tests {
                 assert_eq!(q, want, "stride {stride} p={p}");
             }
         }
-        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 16], (BLOCK_SIZE - 20) as u32);
-        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 12], NO_POS);
+        assert_eq!(sparse_chain_preds(&zeros, &SPARSE_CHAINS[0].unwrap())[BLOCK_SIZE - 16], (BLOCK_SIZE - 20) as u32);
+        assert_eq!(sparse_chain_preds(&zeros, &SPARSE_CHAINS[0].unwrap())[BLOCK_SIZE - 12], NO_POS);
         let text = synth::text(3, BLOCK_SIZE);
         let ch = chains(&text, &OPT16P1);
         assert_eq!(ch.len(), 5);
         assert_eq!(cand_depths(&OPT16P1), [8, OPT_H3_DEPTH, 16, 16, 16]);
-        for (i, c) in S3_CHAINS.iter().flatten().enumerate() {
+        for (i, c) in SPARSE_CHAINS.iter().flatten().enumerate() {
             assert_eq!(ch[2 + i], sparse_chain_preds(&text, c));
             for (p, &q) in ch[2 + i].iter().enumerate() {
                 if q != NO_POS {
@@ -795,12 +795,12 @@ mod tests {
 /// when a partial block's frame started declaring and holding only its real length (was
 /// 0xd3354ac3c8f4a5d2; the full-block frames are pinned unchanged by
 /// `lvl3_full_block_frames_match_anchor`).
-    const M3_LVL3_ANCHOR: u64 = 0x441bb7015bd4cc45;
+    const LVL3_ANCHOR: u64 = 0x441bb7015bd4cc45;
 
     /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
     /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.
     #[test]
-    fn lvl3_frames_match_m3_anchor() {
+    fn lvl3_frames_match_anchor() {
         let mut all = Vec::new();
         for (_, bytes) in synth::test_cases() {
             for blk in chunk_file(&bytes) {
@@ -810,14 +810,14 @@ mod tests {
         }
         let h = xxhash_rust::xxh64::xxh64(&all, 0);
         println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
-        assert_eq!(h, M3_LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+        assert_eq!(h, LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
     }
 
     /// xxh64 of the concatenated lvl3 frames of the synthetic cases' full blocks only, captured
     /// before frames of partial blocks started declaring their real length: unchanged by that.
     const LVL3_FULL_BLOCK_ANCHOR: u64 = 0xc4c446cbce783267;
 
-    /// `lvl3_frames_match_m3_anchor` restricted to full blocks (`real_len == BLOCK_SIZE`).
+    /// `lvl3_frames_match_anchor` restricted to full blocks (`real_len == BLOCK_SIZE`).
     #[test]
     fn lvl3_full_block_frames_match_anchor() {
         let mut all = Vec::new();
