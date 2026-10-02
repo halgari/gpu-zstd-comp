@@ -116,7 +116,7 @@ pub fn bucket_sort(block: &[u8], params: &MatchParams) -> (Vec<u32>, Vec<u32>) {
     (sorted, rank)
 }
 
-/// pred[p] = most recent q < p with hash(q) == hash(p), else NO_POS. len == BLOCK_SIZE.
+/// `pred[p]` = most recent q < p with hash(q) == hash(p), else NO_POS. len == BLOCK_SIZE.
 pub fn compute_preds<F: Fn(&[u8], usize) -> u32>(block: &[u8], hash: F) -> Vec<u32> {
     assert_eq!(block.len(), BLOCK_SIZE);
     let mut head = vec![NO_POS; 1 << HASH_BITS];

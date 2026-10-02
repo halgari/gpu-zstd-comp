@@ -365,7 +365,8 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
 #[doc(hidden)]
 pub mod cases {
     use crate::config::{BLOCK_SIZE, PARSE_END};
-    use crate::params::{MatchParams, LVL9, LVL9SEG, RUNG2};
+    use crate::fixtures::{LVL9, RUNG2};
+    use crate::params::{MatchParams, LVL9SEG};
     use crate::reference::{match_len, Match};
     use crate::seq::Sequence;
     use crate::synth;
@@ -637,7 +638,7 @@ pub mod cases {
         )]
     }
 
-    /// Deviation 3 changes output: the dedup store at 296 (offset 20 == reps[0]) leaves the
+    /// Deviation 3 changes output: the dedup store at 296 (offset 20 == `reps[0]`) leaves the
     /// decoder's reps at [20, 1, 4], so offset_2 = 1 (zstd: offset_2 = offset_1 = 20). An
     /// offset-1 run right after the match is then stored by the immediate loop as
     /// (ll 0, repcode 1); zstd would probe offset 20 there, which does not match.
@@ -788,7 +789,7 @@ pub mod cases {
 
     /// A match running across the end of segment 0 is cut at the segment end (length 6 of 20);
     /// segment 1 then starts with the rest (ll 0), which the true reps store explicitly (offset
-    /// == reps[0] with ll 0 is not a repcode).
+    /// == `reps[0]` with ll 0 is not a repcode).
     pub fn seg_match_clamped_at_segment_end() -> Vec<LazyCase> {
         let mut block = background(31);
         plant(&mut block, SEG - 6, 100, 20);
@@ -845,8 +846,8 @@ pub mod cases {
     }
 
     /// Segment 1 parses with empty reps (its first match is explicit there), but the true
-    /// history makes it repcode 1 (ll > 0, offset == reps[0]); and a segment starting with a
-    /// match at its first byte (ll 0) at the true reps[1] becomes repcode 1 as well.
+    /// history makes it repcode 1 (ll > 0, offset == `reps[0]`); and a segment starting with a
+    /// match at its first byte (ll 0) at the true `reps[1]` becomes repcode 1 as well.
     pub fn seg_true_reps_across_segments() -> Vec<LazyCase> {
         let mut block = background(34);
         plant(&mut block, 100, 50, 10);
@@ -916,7 +917,8 @@ mod tests {
     use super::*;
     use crate::block::chunk_file;
     use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{LVL9, LVL9SEG, RUNG1, RUNG2};
+    use crate::fixtures::{LVL9, RUNG1, RUNG2};
+    use crate::params::LVL9SEG;
     use crate::reference::{chains, compress_block, find_best};
     use crate::seq::reconstruct;
     use crate::synth;

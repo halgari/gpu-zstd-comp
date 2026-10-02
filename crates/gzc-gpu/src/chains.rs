@@ -23,15 +23,15 @@ const K1_SG_WGSL: &str = include_str!("shaders/k1_chains_sg.wgsl");
 
 /// Most chains one workgroup of the subgroup kernel may build in a dispatch: its j-th chain stamps
 /// head entries `(j + 1) << LOG2_BLOCK | (pos + 1)` in a u32.
-pub const MAX_TAG: u32 = (1u32 << (32 - LOG2_BLOCK)) - 1;
+pub(crate) const MAX_TAG: u32 = (1u32 << (32 - LOG2_BLOCK)) - 1;
 
 /// Head tables K1 allocates at most (one per workgroup of its persistent grid).
-pub const HEAD_TABLES: u32 = 256;
+pub(crate) const HEAD_TABLES: u32 = 256;
 
 /// Workgroups (live head tables) of the subgroup kernel by default: 128 x 256 KiB = 32 MiB, sized
 /// for the ~32 MB L2 of 8 GB-class target GPUs. The RTX 5090 (96 MB L2) is fastest at 224-256
-/// (`GZC_K1_GROUPS`).
-pub const DEFAULT_SG_GROUPS: u32 = 128;
+/// (`GpuOptions::k1_groups`).
+pub(crate) const DEFAULT_SG_GROUPS: u32 = 128;
 
 /// Predecessor bits of a K1 pred word (see `pred_fp`); `PRED_NONE` there means none.
 pub const PRED_POS: u32 = 0x1_FFFF;
@@ -45,7 +45,7 @@ pub fn pred_of_word(w: u32) -> u32 {
 
 /// Fingerprint bits K1 stores in the pred word of position `p < HASHED_POSITIONS` of `block`
 /// (common.wgsl `pred_fp`): bits 17..24 hash bytes p..p+4, bits 24..32 are byte p + 4.
-pub fn pred_fp(block: &[u8], p: usize) -> u32 {
+pub(crate) fn pred_fp(block: &[u8], p: usize) -> u32 {
     let lo = u32::from_le_bytes(block[p..p + 4].try_into().unwrap());
     ((lo.wrapping_mul(0x85EB_CA6B) >> 25) << 17) | ((block[p + 4] as u32) << 24)
 }
@@ -54,7 +54,7 @@ pub fn pred_fp(block: &[u8], p: usize) -> u32 {
 /// common.wgsl `pred_fp3`) for position `p < HASHED_POSITIONS`: bits 17..24 hash bytes p..p+3,
 /// bits 24..32 are byte p + 3. A differing hash field means a match shorter than 3 bytes, a
 /// differing byte field one of at most 3.
-pub fn pred_fp3(block: &[u8], p: usize) -> u32 {
+pub(crate) fn pred_fp3(block: &[u8], p: usize) -> u32 {
     let lo = u32::from_le_bytes(block[p..p + 4].try_into().unwrap());
     ((((lo & 0xFF_FFFF).wrapping_mul(0x85EB_CA6B)) >> 25) << 17) | (lo & 0xFF00_0000)
 }
@@ -68,7 +68,7 @@ pub fn chain_fp(params: &MatchParams, chain: usize, block: &[u8], p: usize) -> u
 /// `params_wgsl(p)` plus the finder's constants: `KEY_SHIFT = HASH_BITS - p.hash_bits`, so a
 /// kernel's key is `hash >> KEY_SHIFT` (== `gzc_core::hash::key`), and `OPT3` (the `Opt3` chains:
 /// chain 0 `hash_width(.., 4)`, chain 1 `hash3` with `pred_fp3` fingerprints).
-pub fn finder_wgsl(p: &MatchParams) -> String {
+pub(crate) fn finder_wgsl(p: &MatchParams) -> String {
     format!(
         "{}const KEY_SHIFT: u32 = {}u;\nconst OPT3: bool = {};\n{}",
         params_wgsl(p),
@@ -82,7 +82,7 @@ pub fn finder_wgsl(p: &MatchParams) -> String {
 /// chains, `PRED_PER_BLOCK` words per block, and for k < `N_SPARSE` (at most 3) sparse chain k's
 /// key width `SP_W{k}`, stride `SP_S{k}`, walk depth `SP_D{k}`, hashed slots `SP_N{k}` and word
 /// offset in the block `SP_OFF{k}` (width, depth, slots and offset 0, stride 1 for absent chains).
-pub fn layout_wgsl(p: &MatchParams) -> String {
+pub(crate) fn layout_wgsl(p: &MatchParams) -> String {
     let longs = long_chains(p);
     let full = full_chains(p);
     let mut s = format!(
@@ -124,19 +124,19 @@ fn long_hash(lo: u32, hi: u32, h2: u32, w: u32) -> u32 {
 
 /// The sparse long chains of `p` (M6 `OptParams::sparse_chains`, in walk order after h4 and h3),
 /// empty for every other preset.
-pub fn long_chains(p: &MatchParams) -> Vec<SparseChain> {
+pub(crate) fn long_chains(p: &MatchParams) -> Vec<SparseChain> {
     p.opt.iter().flat_map(|o| o.sparse_chains.into_iter().flatten()).collect()
 }
 
 /// Chains of `p` stored at full length (one pred word per position): `n_hashes` minus the sparse
 /// long chains.
-pub fn full_chains(p: &MatchParams) -> u32 {
+pub(crate) fn full_chains(p: &MatchParams) -> u32 {
     p.n_hashes() - long_chains(p).len() as u32
 }
 
 /// Positions a sparse long chain hashes: `p % stride == 0` and `p < BLOCK_SIZE - 12`
 /// (`gzc_core::reference::sparse_chain_preds`), as slots `p / stride`.
-pub fn long_chain_slots(c: &SparseChain) -> u32 {
+pub(crate) fn long_chain_slots(c: &SparseChain) -> u32 {
     (BLOCK_SIZE as u32 - 12).div_ceil(c.stride)
 }
 
@@ -168,14 +168,14 @@ pub fn pred_words_per_block(p: &MatchParams) -> u64 {
 
 /// Whether K1 can build `p`'s sparse long chains: their slots must be word aligned (stride 4 or
 /// 8), so a lane's key bytes are three whole data words.
-pub fn long_chains_supported(p: &MatchParams) -> bool {
+pub(crate) fn long_chains_supported(p: &MatchParams) -> bool {
     long_chains(p).iter().all(|c| c.stride % 4 == 0 && c.width <= 12)
 }
 
 /// Expands one block's K1 pred words (`chain_span` layout) into `gzc_core::reference::chains`
 /// form: one BLOCK_SIZE-long array per chain, `pred_of_word` decoded, `NO_POS` off a sparse
 /// chain's slots.
-pub fn expand_preds(p: &MatchParams, words: &[u32]) -> Vec<Vec<u32>> {
+pub(crate) fn expand_preds(p: &MatchParams, words: &[u32]) -> Vec<Vec<u32>> {
     (0..p.n_hashes())
         .map(|c| {
             let (off, len) = chain_span(p, c);
@@ -252,7 +252,7 @@ pub fn gpu_preds_with(ctx: &GpuContext, kernel: &ChainsKernel, blocks: &[&[u8]])
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainsOptions {
     /// Workgroups (= live head tables) per dispatch, capped by the tables of the head buffer;
-    /// `None` = `GZC_K1_GROUPS` if set, else `DEFAULT_SG_GROUPS` for the subgroup kernel and all
+    /// `None` = `GpuOptions::k1_groups` if set, else `DEFAULT_SG_GROUPS` for the subgroup kernel and all
     /// tables for the fallback. Fewer live tables suit GPUs with a smaller L2.
     pub groups: Option<u32>,
     /// Pick each lane's ballot word at run time even for subgroups of at most 32 lanes (tests use
@@ -273,10 +273,8 @@ pub struct ChainsKernel {
     params: MatchParams,
     subgroups: bool,
     opts: ChainsOptions,
-    /// `GZC_K1_GROUPS`, parsed and validated once at construction (`build`), not per `record`
-    /// call: `None` if it's unset, else the workgroup count it named. A non-numeric or
-    /// non-positive value errors clearly here, the same way `GZC_K3_MODE`/`GZC_K3_W` do.
-    env_groups: Option<u32>,
+    /// The context's `GpuOptions::k1_groups`, checked at construction (`build`).
+    ctx_groups: Option<u32>,
 }
 
 impl ChainsKernel {
@@ -305,7 +303,7 @@ impl ChainsKernel {
             // validation error from the subgroup shader/pipeline (not just a wrong self-test
             // result) also falls back here instead of surfacing uncaptured, which wgpu may
             // attribute to a later, unrelated error scope (e.g. `Pipeline::new`'s).
-            let built = crate::compressor::with_error_scopes(ctx, || {
+            let built = crate::kernels::with_error_scopes(ctx, || {
                 let k = Self::build(ctx, params, opts, true)?;
                 k.self_test(ctx, params)?;
                 Ok(k)
@@ -319,14 +317,10 @@ impl ChainsKernel {
     }
 
     fn build(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions, subgroups: bool) -> anyhow::Result<Self> {
-        let env_groups = match std::env::var("GZC_K1_GROUPS") {
-            Ok(v) => {
-                let g: u32 = v.parse().map_err(|_| anyhow::anyhow!("GZC_K1_GROUPS={v}: not a number"))?;
-                anyhow::ensure!(g > 0, "GZC_K1_GROUPS={v}: expected a positive number");
-                Some(g)
-            }
-            Err(_) => None,
-        };
+        let ctx_groups = ctx.opts.k1_groups;
+        if ctx_groups == Some(0) {
+            return Err(crate::error::invalid_input("k1_groups (GZC_K1_GROUPS) must be at least 1"));
+        }
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -367,7 +361,7 @@ impl ChainsKernel {
             compilation_options: ctx.compilation_options(),
             cache: None,
         });
-        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), params: *params, subgroups, opts, env_groups })
+        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), params: *params, subgroups, opts, ctx_groups })
     }
 
     /// Guards the subgroup kernel's assumptions (full, equally sized subgroups of >= 32 lanes
@@ -423,7 +417,7 @@ impl ChainsKernel {
             params: self.params,
             subgroups: self.subgroups,
             opts: self.opts,
-            env_groups: self.env_groups,
+            ctx_groups: self.ctx_groups,
         }
     }
 
@@ -510,7 +504,7 @@ impl ChainsKernel {
         let tables = (head.size() / TABLE_BYTES).min(HEAD_TABLES as u64) as u32;
         assert!(tables >= n_tasks.min(HEAD_TABLES), "head buffer smaller than head_bytes({n_blocks}, {})", self.n_hashes);
         let max_wg = ctx.device.limits().max_compute_workgroups_per_dimension;
-        let wanted = self.opts.groups.or(self.env_groups).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
+        let wanted = self.opts.groups.or(self.ctx_groups).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
         // At most MAX_TAG chains per workgroup (the subgroup kernel's tags).
         let groups = wanted.max(n_tasks.div_ceil(MAX_TAG)).min(n_tasks).min(tables).min(max_wg);
         assert!(n_tasks.div_ceil(groups) <= MAX_TAG, "{n_tasks} chains over {groups} workgroups");

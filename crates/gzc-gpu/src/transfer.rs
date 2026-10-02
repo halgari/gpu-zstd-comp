@@ -5,7 +5,7 @@
 //! the copy engine behind a transfer-only queue family runs that copy concurrently with the next
 //! batch's kernels at no measurable cost to them (measured: `docs/results/speed2-log.md`).
 //!
-//! `GpuContext::with_gpu_options` creates the `VkDevice` itself (with one extra queue of a
+//! `GpuContext::new` creates the `VkDevice` itself (with one extra queue of a
 //! transfer-only family) when the adapter is Vulkan 1.2 with timeline semaphores and has such a
 //! family, and wraps its queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
 //! `create_device_from_hal`); the extra queue is driven here with raw Vulkan (ash): a command
@@ -104,7 +104,7 @@ pub(crate) struct RawDevice {
 impl RawDevice {
     /// Creates the device `p` describes (what wgpu's `open_with_callback` would create) with one
     /// extra queue, queue 0 of `family` (from `transfer_family`). Errors on a non-Vulkan adapter.
-    pub fn new(p: &Prepared, family: u32) -> anyhow::Result<Self> {
+    pub(crate) fn new(p: &Prepared, family: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(family != 0, "family 0 holds the main queue");
         // SAFETY: the hal adapter is only used while `p.adapter` lives.
         let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -129,7 +129,7 @@ impl RawDevice {
 
     /// The `GpuContext` whose wgpu device and queue are queue 0 of family 0 on this device (what
     /// `GpuContext::new` would give without the transfer queue).
-    pub fn context(&self, p: &Prepared) -> anyhow::Result<GpuContext> {
+    pub(crate) fn context(&self, p: &Prepared) -> anyhow::Result<GpuContext> {
         // SAFETY: as in `new`.
         let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
             .ok_or_else(|| anyhow!("the transfer queue needs the Vulkan backend"))?;
@@ -159,8 +159,21 @@ impl RawDevice {
     }
 }
 
+/// The error of a failed buffer or memory allocation of `size` bytes: `OutOfMemory` when Vulkan
+/// says so, with what to try next.
+fn alloc_error(call: &str, size: u64, e: vk::Result) -> anyhow::Error {
+    let mib = size.div_ceil(1 << 20);
+    if matches!(e, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY) {
+        let hint = crate::error::OOM_HINT;
+        let msg = format!("GPU allocation of {mib} MiB for a transfer-queue buffer failed: out of memory ({hint}): {call}: {e}");
+        crate::error::tagged(crate::error::Kind::OutOfMemory, msg)
+    } else {
+        anyhow!("{call} ({size} bytes): {e}")
+    }
+}
+
 /// The extra queue of a transfer-only family on the context's `VkDevice`.
-pub struct TransferQueue {
+pub(crate) struct TransferQueue {
     owner: Arc<DeviceOwner>,
     /// `vkQueueSubmit` / `vkQueueWaitIdle` need external synchronization of the queue.
     queue: Mutex<vk::Queue>,
@@ -201,11 +214,13 @@ impl TransferQueue {
     /// context is still alive: its staged semaphores and timelines assume it is the only one
     /// submitting.
     pub(crate) fn begin_streaming(self: &Arc<Self>) -> anyhow::Result<StreamingGuard> {
-        anyhow::ensure!(
-            self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
-            "another transfer-readback Pipeline is alive on this GpuContext (one per context: drop it first, \
-             or open this context with GpuOptions::transfer_queue off / GZC_TRANSFER_QUEUE=0)"
-        );
+        if self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return Err(crate::error::invalid_input(
+                "this GpuContext reads frames back through its transfer queue, which serves one Compressor (one \
+                 frame Pipeline) at a time, and another one is alive: drop that one first, or open the context \
+                 with GpuOptions::transfer_queue off",
+            ));
+        }
         Ok(StreamingGuard { tq: self.clone() })
     }
 
@@ -245,7 +260,7 @@ impl TransferQueue {
         // SAFETY: plain object creation on a live device; every object is destroyed by RawBuffer
         // (or here on failure).
         unsafe {
-            let buffer = d.create_buffer(&info, None).context("vkCreateBuffer")?;
+            let buffer = d.create_buffer(&info, None).map_err(|e| alloc_error("vkCreateBuffer", size, e))?;
             let req = d.get_buffer_memory_requirements(buffer);
             let pick = if host {
                 self.memory_type(
@@ -273,11 +288,19 @@ impl TransferQueue {
                 .allocation_size(req.size)
                 .memory_type_index(type_index)
                 .push_next(&mut dedicated);
-            let memory = match d.allocate_memory(&alloc, None) {
+            #[cfg(test)]
+            let allocated = if tests::fail_allocation() {
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            } else {
+                d.allocate_memory(&alloc, None)
+            };
+            #[cfg(not(test))]
+            let allocated = d.allocate_memory(&alloc, None);
+            let memory = match allocated {
                 Ok(m) => m,
                 Err(e) => {
                     d.destroy_buffer(buffer, None);
-                    return Err(anyhow!("vkAllocateMemory({size} bytes): {e}"));
+                    return Err(alloc_error("vkAllocateMemory", size, e));
                 }
             };
             let mut raw =
@@ -499,7 +522,7 @@ impl TransferQueue {
     }
 
     /// Blocks until the transfer queue is idle.
-    pub fn idle(&self) {
+    pub(crate) fn idle(&self) {
         let queue = self.queue.lock().unwrap();
         // SAFETY: plain wait; the queue is externally synchronized by the lock.
         let _ = unsafe { self.device().queue_wait_idle(*queue) };
@@ -528,7 +551,7 @@ impl RawBuffer {
     /// Every GPU write to the buffer has completed (the caller waited for the submission that
     /// wrote it, e.g. its timeline value), and none is pending while the slice lives: the GPU may
     /// otherwise change bytes behind a shared reference.
-    pub unsafe fn mapped(&self) -> &[u8] {
+    pub(crate) unsafe fn mapped(&self) -> &[u8] {
         assert!(!self.ptr.is_null(), "not a host buffer");
         if !self.coherent {
             let range = vk::MappedMemoryRange::default().memory(self.memory).offset(0).size(vk::WHOLE_SIZE);
@@ -548,7 +571,7 @@ impl RawBuffer {
     ///   uses the buffer on queues of the families it was created for.
     /// - `self` outlives every GPU use of the returned buffer (drop it only after the device is
     ///   idle).
-    pub unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    pub(crate) unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         // SAFETY: the caller's contract; externally owned, so wgpu-hal never vkDestroyBuffers it
         // (`Buffer::from_raw` would).
         unsafe {
@@ -602,19 +625,38 @@ impl Drop for Commands {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::context::GpuContext;
+pub(crate) mod tests {
+    std::thread_local! {
+        /// Test hook: the transfer-queue allocation after this many more on this thread fails as
+        /// if the device were out of memory (then the hook clears).
+        pub(crate) static FAIL_ALLOCATION_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Counts the hook down; true for the allocation that must fail.
+    pub(super) fn fail_allocation() -> bool {
+        match FAIL_ALLOCATION_AFTER.get() {
+            Some(0) => {
+                FAIL_ALLOCATION_AFTER.set(None);
+                true
+            }
+            Some(k) => {
+                FAIL_ALLOCATION_AFTER.set(Some(k - 1));
+                false
+            }
+            None => false,
+        }
+    }
 
     /// A context with a transfer queue tears down cleanly (the VkDevice goes before the Vulkan
     /// instance), also when a clone of the queue outlives the context.
     #[test]
     fn context_with_transfer_queue_drops_cleanly() {
-        let _gpu = crate::test_support::gpu_test_slot();
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
         let tq = ctx.transfer.clone();
         drop(ctx);
         drop(tq);
-        let again = GpuContext::new().unwrap();
+        let again = crate::testing::gpu();
         drop(again);
     }
 }

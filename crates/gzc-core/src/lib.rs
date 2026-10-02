@@ -17,4 +17,6 @@ pub mod lazy;
 pub mod reference;
 pub mod opt;
 #[doc(hidden)]
+pub mod fixtures;
+#[doc(hidden)]
 pub mod testdata;

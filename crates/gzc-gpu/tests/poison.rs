@@ -7,8 +7,8 @@ use gzc_core::block::chunk_file;
 use gzc_core::frame::write_frame;
 use gzc_core::params::{LVL3, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1};
 use gzc_core::reference::compress_block;
-use gzc_gpu::compressor::{GpuParams, Kernels, compress_frames};
-use gzc_gpu::context::{GpuContext, GpuOptions};
+use gzc_gpu::testing::{GpuParams, Kernels, compress_frames};
+use gzc_gpu::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
 
 fn blocks() -> Vec<Vec<u8>> {
@@ -26,8 +26,8 @@ fn presets() -> Vec<(&'static str, MatchParams)> {
     ]
 }
 
-fn poisoned(opts: GpuOptions) -> GpuContext {
-    let ctx = GpuContext::with_gpu_options(GpuOptions { poison: true, ..opts }).expect("GPU required for gzc-gpu tests");
+fn poisoned(opts: GpuOptions) -> std::sync::Arc<GpuContext> {
+    let ctx = gzc_gpu::testing::gpu_with(GpuOptions { poison: true, ..opts });
     assert!(ctx.poisoning());
     ctx
 }
@@ -40,7 +40,7 @@ fn cpu_frame(block: &[u8], params: GpuParams) -> Vec<u8> {
 /// then in batches of 3 (partial batches leave stale blocks past the trailing word).
 #[test]
 fn poisoned_frames_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = blocks();
     for subgroups in [true, false] {
         let ctx = poisoned(GpuOptions { subgroups, ..GpuOptions::from_env() });
@@ -66,10 +66,11 @@ fn poisoned_frames_match_cpu() {
 /// expose. A few blocks only: the stalls make the kernels much slower.
 #[test]
 fn poisoned_skewed_frames_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks: Vec<Vec<u8>> = blocks().into_iter().step_by(4).collect();
-    let emulate = gzc_gpu::context::Emulation { skew: true, ..gzc_gpu::context::Emulation::NONE };
-    let ctx = poisoned(GpuOptions { emulate, ..GpuOptions::from_env() });
+    let emulate = gzc_gpu::Emulation { skew: true, ..gzc_gpu::Emulation::NONE };
+    let env = GpuOptions::from_env();
+    let ctx = poisoned(GpuOptions { emulate: emulate.or(env.emulate), ..env });
     for (name, matching) in [("lvl3", LVL3), ("lvl9seg", LVL9SEG), ("lvl9s12seg", LVL9S12SEG)] {
         let params = GpuParams { matching, emit_frames: true, huffman: true };
         let kernels = Kernels::new(&ctx, params).expect("Kernels::new");
@@ -94,13 +95,13 @@ impl FrameSink for CollectFrames {
 /// slot reuse.
 #[test]
 fn poisoned_pipeline_every_mode_matches_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let distinct = blocks();
     let blocks: Vec<&[u8]> = (0..61).map(|i| distinct[i % distinct.len()].as_slice()).collect();
     for transfer_queue in [false, true] {
         for direct in [false, true] {
             let ctx = poisoned(GpuOptions { direct_upload: Some(direct), transfer_queue, ..GpuOptions::from_env() });
-            if ctx.direct_upload != direct || ctx.transfer.is_some() != transfer_queue {
+            if ctx.direct_upload() != direct || ctx.transfer_readback() != transfer_queue {
                 eprintln!("mode direct={direct} transfer={transfer_queue} unsupported here: skipped");
                 continue;
             }

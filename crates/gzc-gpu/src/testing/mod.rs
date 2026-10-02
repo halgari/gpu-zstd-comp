@@ -1,3 +1,5 @@
+//! Test and benchmark support. Not part of the public API: anything here may change.
+//!
 //! Shared by the lib tests and the integration tests (each test binary is its own process).
 //!
 //! `gpu_test_slot`: tests that open a device of their own and build full-size pipelines or batch
@@ -8,7 +10,47 @@
 //! no slot and keep running beside them. Each test binary has its own slots (a runner that
 //! starts several binaries at once, such as nextest, can still put more on the GPU).
 
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+mod oneshot;
+pub use oneshot::*;
+
+pub use crate::context::pack_blocks;
+pub use crate::kernels::{
+    BatchBuffers, GpuParams, K3Mode, Kernels, gather_literals, gpu_supports, max_seqs, probe_lanes,
+};
+
+/// K1 and its checks.
+pub mod chains {
+    pub use crate::chains::{
+        ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_span, expected_words, gpu_preds, gpu_preds_with,
+        pred_of_word, pred_words_per_block,
+    };
+}
+
+/// The bucket-sorted K1.
+pub mod sorted {
+    pub use crate::sorted::{SortKernel, sorted_words, workgroup_bytes};
+}
+
+pub mod k3opt;
+
+/// Buffer sizes.
+pub mod sizing {
+    pub use crate::sizing::{chain_pred_bytes, head_bytes};
+}
+
+use crate::context::{GpuContext, GpuOptions};
+
+/// A context opened with `GpuOptions::from_env()`. Panics without a GPU.
+pub fn gpu() -> Arc<GpuContext> {
+    gpu_with(GpuOptions::from_env())
+}
+
+/// A context opened with `options`. Panics without a GPU.
+pub fn gpu_with(options: GpuOptions) -> Arc<GpuContext> {
+    Arc::new(GpuContext::new(options).expect("GPU required for gzc-gpu tests"))
+}
 
 static SLOTS: Mutex<Option<usize>> = Mutex::new(None);
 static FREED: Condvar = Condvar::new();

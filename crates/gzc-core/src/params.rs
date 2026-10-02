@@ -244,28 +244,13 @@ pub const LVL3: MatchParams =
 /// | block | L9 | lvl9seg | lvl9s12seg |
 /// |---|---|---|---|
 /// | 64 KiB | 1.33786 | 1.33931 | 1.33926 |
-pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
+pub const LVL9SEG: MatchParams =
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 12, opt: None };
 
 /// `lvl9seg` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
 /// instead of 16-bit hash chains. Validated >= libzstd L9 (table at `LVL9SEG`).
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-
-// Not presets: parameter sets the tests use as fixtures. `RUNG1` (a single greedy chain) runs on
-// the GPU like any valid greedy params; `RUNG2` and `LVL9` are unsegmented lazy parses, which
-// only the CPU oracle implements (`gzc_gpu::compressor::gpu_supports` refuses them). The
-// hand-built deferral cases of `lazy::cases` pin the lazy rules on them.
-/// Test fixture: single 4-byte hash, depth 8, greedy.
-#[doc(hidden)]
-pub const RUNG1: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
-/// Test fixture (CPU only): `RUNG1` with an unsegmented lazy parse.
-#[doc(hidden)]
-pub const RUNG2: MatchParams = MatchParams { lazy: 1, ..RUNG1 };
-/// Test fixture (CPU only): `LVL9SEG`'s finder with an unsegmented lazy2 parse.
-#[doc(hidden)]
-pub const LVL9: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 
 /// Optimal parse aimed at libzstd L16 (btultra, M5): `Opt3` candidates (h4 chain 32 deep + h3
 /// chain 4 deep, two records per position), the zstd optimal-parse DP per 4 KiB segment with
@@ -354,6 +339,7 @@ pub fn preset(name: &str) -> Result<MatchParams, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{LVL9, RUNG1, RUNG2};
 
     #[test]
     fn presets_validate() {

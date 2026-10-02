@@ -48,7 +48,7 @@ impl HufTable {
 /// 3. the two-queue tree's depths are already non-increasing along that order (debug-asserted);
 ///    they are limited to 11 with a port of libzstd's `HUF_setMaxHeight` run on the reversed
 ///    (count-descending) order;
-/// 4. canonical codes per RFC 8878 (see [`from_lengths`]).
+/// 4. canonical codes per RFC 8878 (see `from_lengths`).
 pub fn build_table(counts: &[u32; 256]) -> Option<HufTable> {
     // 1. ascending (count, symbol)
     let mut leaves: Vec<(u32, u8)> = (0..256).filter(|&s| counts[s] > 0).map(|s| (counts[s], s as u8)).collect();

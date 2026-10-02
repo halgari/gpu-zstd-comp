@@ -7,11 +7,11 @@ use gzc_core::config::{BLOCK_SIZE, HASH_BITS};
 use gzc_core::params::MatchParams;
 
 use crate::chains::{HEAD_TABLES, pred_words_per_block};
-use crate::compressor::{FRAME_STRIDE, max_seqs};
+use crate::kernels::{FRAME_STRIDE, max_seqs};
 use crate::k3opt::{PRICE_WORDS, SCHED_HDR, scratch_bytes_per_block};
 
 /// Bytes of the packed `data` buffer for `n_blocks` (blocks plus one trailing zero word).
-pub fn data_bytes(n_blocks: u32) -> u64 {
+pub(crate) fn data_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * BLOCK_SIZE as u64 + 4
 }
 
@@ -38,17 +38,17 @@ pub(crate) const fn best_bytes(n_blocks: u32) -> u64 {
 
 /// u32 words per position of the `best` buffer under match params `m`: 1 (K2's best match), or 2
 /// for the optimal parse (`m.opt`: K2opt's two candidate words, `reference::CandWords`).
-pub fn best_words(m: &MatchParams) -> u32 {
+pub(crate) fn best_words(m: &MatchParams) -> u32 {
     if m.opt.is_some() { 2 } else { 1 }
 }
 
 /// Bytes of the `best` buffer under match params `m`: `best_bytes`, times `best_words(m)`.
-pub fn best_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
+pub(crate) fn best_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
     best_bytes(n_blocks) * best_words(m) as u64
 }
 
 /// Bytes of the `seqs` buffer under match params `m`: `[block][max_seqs(m)]` × 3 u32.
-pub fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
+pub(crate) fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
     n_blocks as u64 * max_seqs(m) as u64 * 12
 }
 
@@ -56,40 +56,40 @@ pub fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
 /// and for the optimal parse at least K3opt's DP trace, which reuses the buffer once K2opt has
 /// read the chains (`trace_bytes`). Opt3 has two full chains, so the two are equal; M6's sparse
 /// long chains add `BLOCK_SIZE / stride` words per block each (S3: 11 B per position).
-pub fn pred_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
+pub(crate) fn pred_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
     let chains = chain_pred_bytes(n_blocks, m);
     if m.opt.is_some() { chains.max(trace_bytes(n_blocks)) } else { chains }
 }
 
 /// Bytes of K3opt's DP trace for `n_blocks`: `[block][pos][2]` u32 (`tbase = 2 * b * BLOCK_SIZE`
 /// in `k3_opt.wgsl`), 8 B per position.
-pub fn trace_bytes(n_blocks: u32) -> u64 {
+pub(crate) fn trace_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * BLOCK_SIZE as u64 * 8
 }
 
 /// Bytes of the `counts` buffer: `[block]` × (n_seq, n_lit) u32.
-pub fn counts_bytes(n_blocks: u32) -> u64 {
+pub(crate) fn counts_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * 8
 }
 
 /// Bytes of the `frames` buffer: `[block][FRAME_STRIDE]` frame bytes.
-pub fn frames_bytes(n_blocks: u32) -> u64 {
+pub(crate) fn frames_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * FRAME_STRIDE as u64
 }
 
 /// Bytes of the `frame_len` buffer: `[block]` u32.
-pub fn frame_len_bytes(n_blocks: u32) -> u64 {
+pub(crate) fn frame_len_bytes(n_blocks: u32) -> u64 {
     n_blocks as u64 * 4
 }
 
 /// Bytes of K3opt's `prices` buffer for `n` blocks (`k3opt::PRICE_WORDS` words per block).
-pub fn prices_bytes(n: u32) -> u64 {
+pub(crate) fn prices_bytes(n: u32) -> u64 {
     n as u64 * PRICE_WORDS as u64 * 4
 }
 
 /// Bytes of K3opt's `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight,
 /// the heavy-first block order and each block's rank in it (4 B per block each).
-pub fn sched_bytes(n: u32) -> u64 {
+pub(crate) fn sched_bytes(n: u32) -> u64 {
     (SCHED_HDR as u64 + 3 * n as u64) * 4
 }
 
@@ -97,7 +97,7 @@ pub fn sched_bytes(n: u32) -> u64 {
 /// The K3opt buffers are 0 without `m.opt`; `frames` and `frame_len` are allocated only on the
 /// frame path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BufferSizes {
+pub(crate) struct BufferSizes {
     pub data: u64,
     pub head: u64,
     pub pred: u64,
@@ -114,7 +114,7 @@ pub struct BufferSizes {
 }
 
 impl BufferSizes {
-    pub fn new(n_blocks: u32, m: &MatchParams) -> Self {
+    pub(crate) fn new(n_blocks: u32, m: &MatchParams) -> Self {
         let opt = m.opt.is_some();
         Self {
             data: data_bytes(n_blocks),
@@ -133,13 +133,14 @@ impl BufferSizes {
     }
 
     /// The scratch buffers: head, pred, best, seqs, counts and K3opt's own.
-    pub fn scratch(&self) -> u64 {
+    pub(crate) fn scratch(&self) -> u64 {
         self.head + self.pred + self.best + self.seqs + self.counts + self.opt_prices + self.opt_scratch + self.opt_sched
     }
 
     /// The buffers `Pipeline` allocates once and shares between its slots: data, plus frames,
     /// frame_len and lens with `frames`.
-    pub fn shared(&self, frames: bool) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn shared(&self, frames: bool) -> u64 {
         self.data + if frames { self.frames + self.frame_len + self.lens } else { 0 }
     }
 
@@ -151,14 +152,14 @@ impl BufferSizes {
 }
 
 /// Bytes of the scratch buffers for `n_blocks` under match params `m` (`BufferSizes::scratch`).
-pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
+pub(crate) fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
     BufferSizes::new(n_blocks, m).scratch()
 }
 
 /// Bytes of the remaining `BatchBuffers` (data, plus frames, frame_len and lens with `frames`)
 /// for `n_blocks`; the pipeline allocates them once, shared by all its slots
 /// (`BufferSizes::shared`).
-pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
+pub(crate) fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
     data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + 2 * frame_len_bytes(n_blocks) } else { 0 }
 }
 
@@ -168,7 +169,7 @@ pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
 /// kernels' u32 pred indices cannot wrap (head indices `table << HASH_BITS` stay below 2^24). The
 /// block count is also kept within `max_compute_workgroups_per_dimension`, which K2 dispatches
 /// over. 0 if one block doesn't fit.
-pub fn max_blocks_per_batch_for(limits: &wgpu::Limits, p: &MatchParams) -> u32 {
+pub(crate) fn max_blocks_per_batch_for(limits: &wgpu::Limits, p: &MatchParams) -> u32 {
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let nh = p.n_hashes() as u64;
     let pred_words = pred_words_per_block(p);
@@ -208,7 +209,8 @@ pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
 mod tests {
     use super::*;
     use gzc_core::config::LOG2_BLOCK;
-    use gzc_core::params::{LVL3, RUNG1};
+    use gzc_core::fixtures::RUNG1;
+    use gzc_core::params::LVL3;
 
     const MIB: u64 = 1 << 20;
 

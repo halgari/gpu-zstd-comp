@@ -1261,9 +1261,9 @@ pub mod cases {
         vec![case("later_record_not_priced_below_earlier", block, cands, vec![(pass(2), Some(pr), want)])]
     }
 
-    /// Rep candidates with `ll0` (right after a match) are rep[1], rep[2], rep[0] - 1 (zstd's
+    /// Rep candidates with `ll0` (right after a match) are `rep[1]`, `rep[2]`, `rep[0]` - 1 (zstd's
     /// numbering, `ZSTD_newRep` on every node that ends a match): after 300 then 900, a match
-    /// at offset 300 (= rep[1]) and then one at 299 (= rep[0] - 1 after the repcode) are found
+    /// at offset 300 (= `rep[1]`) and then one at 299 (= `rep[0]` - 1 after the repcode) are found
     /// with no explicit candidate. An unused expensive 24-byte record at `p` keeps all four in
     /// one series, so the node reps (not only the committed ones) are exercised.
     pub fn rep_candidates_after_a_match() -> Vec<OptCase> {
@@ -1387,7 +1387,7 @@ pub mod cases {
 
     /// A candidate running past the segment end is clamped to it (`iend`), which ends the
     /// series; the next segment starts at its first byte with empty reps and takes the rest,
-    /// stored explicitly by the true reps (offset == reps[0] with ll 0 is not a repcode).
+    /// stored explicitly by the true reps (offset == `reps[0]` with ll 0 is not a repcode).
     pub fn seg_candidate_clamped_at_segment_end() -> Vec<OptCase> {
         let p = SEG - 10;
         let mut block = synth::random(110, BLOCK_SIZE);
@@ -1518,8 +1518,8 @@ pub mod cases {
 
     /// A series that ends in a match commits it and the next series starts right there with
     /// `ll0`: its rep candidates come from `opt[0].rep` (the committed reps) with zstd's `ll0`
-    /// numbering. After 300 then 900 (each its own series), the match at offset 300 (= rep[1])
-    /// and then at 299 (= rep[0] - 1) start series of their own, with no explicit candidate.
+    /// numbering. After 300 then 900 (each its own series), the match at offset 300 (= `rep[1]`)
+    /// and then at 299 (= `rep[0]` - 1) start series of their own, with no explicit candidate.
     pub fn rep_candidates_at_series_start() -> Vec<OptCase> {
         let p = 11000;
         let mut block = synth::random(117, BLOCK_SIZE);
@@ -1752,7 +1752,7 @@ pub mod cases {
         v
     }
 
-    /// Reps: a repcode match (offset == rep[1], offBase 2) is never dropped, however expensive;
+    /// Reps: a repcode match (offset == `rep[1]`, offBase 2) is never dropped, however expensive;
     /// an explicit 3-byte match (offset 800) that alone is cheaper than its literals is dropped
     /// because then its successor (offset 450) becomes repcode 1 (cheap) instead of repcode 2
     /// (expensive).
