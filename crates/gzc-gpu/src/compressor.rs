@@ -608,9 +608,8 @@ impl Kernels {
                 n_seg: (BLOCK_SIZE >> seg_log2) as u32,
             }
         });
-        // The optimal parse: K3opt's passes with the default build (wg16, the ring in workgroup
-        // memory when it fits): wg16 keeps a block's segments in one workgroup (wg % segments ==
-        // 0 at 16..64 KiB), which the Prior seed and the cheap passes' histograms need.
+        // The optimal parse: K3opt's passes, one workgroup of 16 lanes per block (a block's
+        // segments in one workgroup, which the Prior seed and the cheap passes' histograms need).
         let opt = if is_opt { Some(OptPasses::new(ctx, &m, K3OptConfig::default())?) } else { None };
         let (tab, consts) = k4_tables(max_seqs(&m));
         let huffman = params.emit_frames && params.huffman;

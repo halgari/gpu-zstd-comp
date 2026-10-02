@@ -271,11 +271,11 @@ impl Prepared {
             max_buffer_size: al.max_buffer_size,
             max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
             max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage,
-            // K3opt keeps its DP rings in workgroup memory when the adapter allows more than
-            // wgpu's 16 KiB default (M5; `k3opt::RingMem`). The raised limit also reaches
-            // `SortKernel::new` (sorted.rs), which picks its kernel by it: it builds a version only
-            // when `sorted::workgroup_bytes` fits, so a table that did not fit 16 KiB may now run
-            // sorted. The other kernels do not read the limit.
+            // The adapter's workgroup storage, where it is above wgpu's 16 KiB default:
+            // `SortKernel::new` (sorted.rs) picks its kernel by this limit (it builds a version
+            // only when `sorted::workgroup_bytes` fits, so a table that does not fit 16 KiB may
+            // still run sorted). K3opt's rings and tables fit the default (`k3opt::ring_for`); the
+            // other kernels do not read the limit.
             max_compute_workgroup_storage_size: al
                 .max_compute_workgroup_storage_size
                 .max(wgpu::Limits::default().max_compute_workgroup_storage_size),
