@@ -163,57 +163,6 @@ fn m6_variants_match_oracle_synthetic() {
     }
 }
 
-/// Up to `n` corpus blocks sampled uniformly over the whole corpus (`GZC_CORPUS`, default
-/// `data/corpus`, `.dds`/`.nif`): every k-th of all (file, block) pairs, files in sorted path
-/// order, k = total blocks / n (as `tests/k3opt.rs`). `None` (after a message) when the corpus
-/// directory does not exist.
-fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
-    use std::path::{Path, PathBuf};
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if matches!(ext.as_str(), "dds" | "nif") {
-                out.push(p);
-            }
-        }
-    }
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
-    if !Path::new(&root).is_dir() {
-        eprintln!("corpus directory {root} not found (set GZC_CORPUS): skipping");
-        return None;
-    }
-    let mut files = Vec::new();
-    walk(Path::new(&root), &mut files);
-    files.sort();
-    let counts: Vec<usize> =
-        files.iter().map(|f| (std::fs::metadata(f).unwrap().len() as usize).div_ceil(BLOCK_SIZE)).collect();
-    let total: usize = counts.iter().sum();
-    let step = (total / n.max(1)).max(1);
-    let mut blocks = Vec::new();
-    let mut first = 0usize;
-    for (f, &c) in files.iter().zip(&counts) {
-        if blocks.len() >= n {
-            break;
-        }
-        let picked: Vec<usize> = (first.div_ceil(step) * step..first + c).step_by(step).map(|g| g - first).collect();
-        if !picked.is_empty() {
-            let chunks = chunk_file(&std::fs::read(f).unwrap());
-            assert_eq!(chunks.len(), c, "{}", f.display());
-            for i in picked {
-                blocks.push(chunks[i].data.clone());
-            }
-        }
-        first += c;
-    }
-    blocks.truncate(n);
-    eprintln!("{} corpus blocks (every {step}th of {total}) from {} files", blocks.len(), files.len());
-    Some(blocks)
-}
-
 /// Informal (reads the real corpus): `GZC_CORPUS_BLOCKS` (default 4000) uniform-stride corpus
 /// blocks, opt14, opt16 and opt16p1, through the pipeline in every mode (batch 256, a partial last batch):
 /// frames byte-identical to the oracle's.
@@ -223,7 +172,7 @@ fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
 fn opt_corpus_matches_oracle() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     for (name, m) in OPT_PRESETS {
         let t = std::time::Instant::now();
         let want = oracle(&blocks, m);

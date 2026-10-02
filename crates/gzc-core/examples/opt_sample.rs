@@ -32,24 +32,8 @@ struct Blk {
     real: usize,
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut ents: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
-    ents.sort();
-    for p in ents {
-        if p.is_dir() {
-            walk(&p, out);
-        } else if let Some(e) = p.extension().and_then(|e| e.to_str()) {
-            let e = e.to_ascii_lowercase();
-            if e == "dds" || e == "nif" {
-                out.push(p);
-            }
-        }
-    }
-}
-
 fn load(dir: &Path, every: usize, offset: usize) -> Vec<Blk> {
-    let mut files = Vec::new();
-    walk(dir, &mut files);
+    let files = gzc_core::testdata::corpus_files(dir);
     let mut out = Vec::new();
     let mut idx = 0usize;
     for f in files {

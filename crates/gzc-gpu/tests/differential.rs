@@ -1453,44 +1453,15 @@ fn stream_frames_match_cpu_non_lvl3_presets() {
 /// Informal (not in the normal suite; reads the real corpus): a few hundred real .dds/.nif blocks
 /// per preset, GPU frames against CPU frames.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test differential corpus_blocks -- --ignored --nocapture`
-/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks, spread over the files in sorted path order;
+/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks sampled uniformly over the corpus
+/// (`gzc_core::testdata::corpus_sample_named`; skips when it is absent);
 /// `GZC_CORPUS_PRESETS` (comma-separated) limits the presets.
 #[test]
 #[ignore]
 fn corpus_blocks_match_cpu_per_preset() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    use std::path::{Path, PathBuf};
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if matches!(ext.as_str(), "dds" | "nif") {
-                out.push(p);
-            }
-        }
-    }
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
     let want_blocks: usize = std::env::var("GZC_CORPUS_BLOCKS").map(|v| v.parse().unwrap()).unwrap_or(300);
-    let mut files = Vec::new();
-    walk(Path::new(&root), &mut files);
-    files.sort();
-    // Every k-th file, up to 4 blocks from each, so the sample spans the corpus.
-    let step = (files.len() / want_blocks).max(1);
-    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
-    for f in files.iter().step_by(step) {
-        if blocks.len() >= want_blocks {
-            break;
-        }
-        let bytes = std::fs::read(f).unwrap();
-        for (i, b) in chunk_file(&bytes).into_iter().take(4).enumerate() {
-            blocks.push((format!("{}[{i}]", f.display()), b.data));
-        }
-    }
-    blocks.truncate(want_blocks);
-    eprintln!("{} blocks from {} files", blocks.len(), files.len());
+    let Some(blocks) = gzc_core::testdata::corpus_sample_named(want_blocks) else { return };
     // `GZC_CORPUS_PRESETS=lvl9seg,...` limits the run to those presets.
     let only = std::env::var("GZC_CORPUS_PRESETS").ok();
     for (name, params) in GPU_PRESETS {

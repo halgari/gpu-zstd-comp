@@ -505,28 +505,15 @@ mod tests {
     #[test]
     #[ignore]
     fn corpus_ratio() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, only: Option<&str>, out: &mut Vec<PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                let e = ext(&p);
-                if p.is_dir() {
-                    walk(&p, only, out);
-                } else if matches!(e.as_str(), "dds" | "nif") && only.is_none_or(|o| o == e) {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         fn ext(p: &Path) -> String {
             p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
         }
-        let root = std::env::var("GZC_CORPUS")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+        let Some(root) = crate::testdata::corpus_dir() else { return };
         let limit: u64 = std::env::var("GZC_CORPUS_MB").map(|v| v.parse().unwrap()).unwrap_or(500) * 1_000_000;
-        let mut files = Vec::new();
         let only = std::env::var("GZC_CORPUS_EXT").ok();
-        walk(Path::new(&root), only.as_deref(), &mut files);
-        files.sort();
+        let files: Vec<_> =
+            crate::testdata::corpus_files(&root).into_iter().filter(|f| only.as_deref().is_none_or(|o| o == ext(f))).collect();
         let mut jobs: Vec<(String, std::sync::Arc<crate::block::Block>)> = Vec::new();
         let mut taken = 0u64;
         for f in files {
