@@ -1037,6 +1037,7 @@ pub fn gather_literals(block: &[u8], sequences: &[Sequence]) -> Vec<u8> {
 /// Splits `blocks` (each BLOCK_SIZE bytes) into batches that fit the device limits.
 /// wgpu validation and out-of-memory errors while recording/submitting become `Err`.
 pub fn compress_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<BlockOutput>> {
+    crate::pipeline::check_blocks(blocks)?;
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -1071,6 +1072,7 @@ pub fn compress_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> 
 /// Errors unless `kernels` was built with `emit_frames`.
 pub fn compress_frames(ctx: &GpuContext, kernels: &Kernels, blocks: &[&[u8]]) -> anyhow::Result<Vec<Vec<u8>>> {
     anyhow::ensure!(kernels.emits_frames(), "compress_frames needs Kernels built with emit_frames");
+    crate::pipeline::check_blocks(blocks)?;
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -1672,6 +1674,22 @@ mod tests {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let e = opt_kernels.record(&ctx, &mut enc, &non_opt_bufs, 4).unwrap_err();
         assert!(e.to_string().contains("opt"), "{e}");
+    }
+
+    /// The one-shot paths return an error, not a panic, on a block that is not BLOCK_SIZE bytes.
+    #[test]
+    fn one_shot_paths_reject_wrong_size_blocks() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let kernels = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: true, huffman: true }).unwrap();
+        let full = vec![0u8; BLOCK_SIZE];
+        for bad in [vec![0u8; 3], vec![0u8; BLOCK_SIZE + 1]] {
+            let blocks = [full.as_slice(), bad.as_slice()];
+            let e = compress_frames(&ctx, &kernels, &blocks).unwrap_err().to_string();
+            assert!(e.contains("block 1"), "{e}");
+            let e = compress_batch(&ctx, &kernels, &blocks).unwrap_err().to_string();
+            assert!(e.contains("block 1"), "{e}");
+        }
     }
 
     #[test]

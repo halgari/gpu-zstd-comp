@@ -1524,6 +1524,7 @@ impl<'p, 'a> FrameStream<'p, 'a> {
 /// Write it sequentially and never read it back. A decompressor reads its own recent output for
 /// its matches, so do not decode into the slot: decode into a cached buffer (or a streaming
 /// decoder's window) and copy the result in.
+#[must_use = "an upload slot is wasted unless submitted"]
 pub struct UploadSlot<'s, 'p, 'a> {
     stream: &'s mut FrameStream<'p, 'a>,
     slot: usize,
@@ -1644,6 +1645,7 @@ impl<'a> Region<'a> {
     /// would otherwise be compressed with it), and returns the blocks it occupies
     /// (`payload_blocks(len)`; `payload_real_lens(len)` gives their real lengths). Errors if they
     /// do not fit in the region.
+    #[must_use = "the returned block count is what to submit"]
     pub fn pad(&mut self, len: usize) -> anyhow::Result<usize> {
         let blocks = payload_blocks(len);
         let end = blocks * BLOCK_SIZE;
@@ -1675,7 +1677,7 @@ pub fn payload_real_lens(len: usize) -> impl ExactSizeIterator<Item = usize> {
 }
 
 /// Every block must be exactly BLOCK_SIZE bytes.
-fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
+pub(crate) fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
     if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
         anyhow::bail!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len());
     }
