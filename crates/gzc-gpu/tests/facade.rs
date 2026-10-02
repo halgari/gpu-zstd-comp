@@ -196,10 +196,14 @@ fn stream_rejects_bad_batches_and_passes_errors_through() {
             },
             |stream| {
                 let mut batch = stream.next_batch()?;
-                for bad in [&[0usize][..], &[10, 0], &[3 * BLOCK_SIZE + 1], &[BLOCK_SIZE, 2 * BLOCK_SIZE + 1]] {
+                // 65536 payloads of `usize::MAX` bytes: their block counts sum to 2^64, which wraps
+                // to 0 in unchecked arithmetic.
+                let wrapping = vec![usize::MAX; 1 << 16];
+                for bad in [&[0usize][..], &[10, 0], &[3 * BLOCK_SIZE + 1], &[BLOCK_SIZE, 2 * BLOCK_SIZE + 1], &wrapping] {
                     let e = batch.reserve(bad).err().expect("a bad reservation");
-                    assert!(matches!(e, Error::InvalidInput(_)), "{bad:?}: {e:?}");
-                    assert!(batch.is_empty(), "{bad:?} reserved something");
+                    let what = &bad[..bad.len().min(4)];
+                    assert!(matches!(e, Error::InvalidInput(_)), "{what:?}: {e:?}");
+                    assert!(batch.is_empty(), "{what:?} reserved something");
                 }
                 let e = batch.submit().unwrap_err();
                 assert!(matches!(&e, Error::InvalidInput(m) if m.contains("empty")), "{e:?}");

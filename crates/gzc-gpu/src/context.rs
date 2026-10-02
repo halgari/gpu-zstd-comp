@@ -175,8 +175,9 @@ impl GpuOptions {
     /// - `GZC_DIRECT_UPLOAD` takes `0` or `1`, `GZC_K3_MODE` takes `seq` or `coop`, and the
     ///   numeric variables take a number.
     ///
-    /// Any other value, for any variable, is [`Error::InvalidInput`] naming the variable. So is
-    /// a value that is not Unicode, and a combination [`GpuContext::new`] would refuse.
+    /// A variable set to the empty string counts as unset, for every variable. Any other value
+    /// a variable does not take is [`Error::InvalidInput`] naming the variable. So is a value
+    /// that is not Unicode, and a combination [`GpuContext::new`] would refuse.
     pub fn try_from_env() -> Result<Self, Error> {
         let bad = |key: &str, value: &str, want: &str| Error::InvalidInput(format!("{key}={value}: expected {want}"));
         // Off by default: on for any value but `0`.
@@ -221,7 +222,7 @@ impl GpuOptions {
             },
             poison: on("GZC_POISON")?,
             poison_seed: number("GZC_POISON_SEED")?,
-            dump_wgsl: std::env::var_os("GZC_DUMP_WGSL").map(Into::into),
+            dump_wgsl: std::env::var_os("GZC_DUMP_WGSL").filter(|v| !v.is_empty()).map(Into::into),
         };
         options.validate().map_err(Error::from_anyhow)?;
         Ok(options)
@@ -255,9 +256,10 @@ impl GpuOptions {
     }
 }
 
-/// An environment variable; `None` when unset. A value that is not Unicode is an error.
+/// An environment variable; `None` when unset or empty. A value that is not Unicode is an error.
 fn env_var(key: &str) -> Result<Option<String>, Error> {
     match std::env::var(key) {
+        Ok(v) if v.is_empty() => Ok(None),
         Ok(v) => Ok(Some(v)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidInput(format!("{key}: the value is not Unicode"))),

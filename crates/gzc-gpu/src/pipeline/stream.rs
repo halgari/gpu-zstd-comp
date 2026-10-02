@@ -206,12 +206,16 @@ impl UploadSlot<'_, '_> {
         if let Some(i) = lens.iter().position(|&l| l == 0) {
             return Err(invalid_input(format!("payload {i} is empty")));
         }
-        let (total, cap) = (lens.iter().map(|&l| payload_blocks(l)).sum::<usize>(), self.capacity());
-        if first + total > cap {
+        let cap = self.capacity();
+        // Checked: lengths near `usize::MAX` are refused, not wrapped into a total that fits.
+        let end = lens.iter().try_fold(first, |sum, &l| sum.checked_add(payload_blocks(l)));
+        let Some(end) = end.filter(|&end| end <= cap) else {
+            let blocks = lens.iter().fold(0usize, |sum, &l| sum.saturating_add(payload_blocks(l)));
             return Err(invalid_input(format!(
-                "payloads of {total} blocks do not fit: {first} of the batch's {cap} blocks are taken"
+                "payloads of {blocks} blocks do not fit: {first} of the batch's {cap} blocks are taken"
             )));
-        }
+        };
+        let total = end - first;
         let (start, end) = (first * BLOCK_SIZE, (first + total) * BLOCK_SIZE);
         let mut rest = Region { bytes: self.view.slice(start..end), lens: &mut self.lens[first..first + total] };
         let mut out = Vec::with_capacity(lens.len());

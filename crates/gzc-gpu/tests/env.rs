@@ -1,5 +1,6 @@
 //! `GpuOptions::try_from_env`: every `GZC_*` variable either takes its value or is refused by
-//! name. One test in its own binary, because it changes the process environment.
+//! name, and an empty value counts as unset. One test in its own binary, because it changes the
+//! process environment.
 use gzc_gpu::{CompressorOptions, Emulation, Error, GpuOptions, K3Kernel, Level};
 
 const VARS: [&str; 17] = [
@@ -75,6 +76,15 @@ fn try_from_env_takes_or_refuses_every_variable() {
     };
     assert_eq!(GpuOptions::try_from_env().unwrap(), want);
 
+    // An empty value is "unset", for every variable.
+    let empty: Vec<(&str, &str)> = VARS.iter().map(|&v| (v, "")).collect();
+    set(&empty);
+    assert_eq!(GpuOptions::try_from_env().unwrap(), GpuOptions::default());
+    for &var in &VARS {
+        set(&[(var, "")]);
+        assert_eq!(GpuOptions::try_from_env().unwrap(), GpuOptions::default(), "{var}=");
+    }
+
     // Switches: `0` is the other state, whichever the default.
     set(&[("GZC_NO_SUBGROUPS", "0"), ("GZC_TRANSFER_QUEUE", "1"), ("GZC_K3_FORCE_FALLBACK", "0"), ("GZC_DIRECT_UPLOAD", "1")]);
     assert_eq!(GpuOptions::try_from_env().unwrap(), GpuOptions { direct_upload: Some(true), ..GpuOptions::default() });
@@ -84,13 +94,11 @@ fn try_from_env_takes_or_refuses_every_variable() {
     // A value a variable does not take is refused, naming the variable. None is ignored.
     for (key, value) in [
         ("GZC_DIRECT_UPLOAD", "yes"),
-        ("GZC_DIRECT_UPLOAD", ""),
         ("GZC_UPLOAD_THREADS", "four"),
         ("GZC_UPLOAD_THREADS", "0"),
         ("GZC_K1_GROUPS", "-1"),
         ("GZC_K1_GROUPS", "0"),
         ("GZC_K3_MODE", "bogus"),
-        ("GZC_K3_MODE", ""),
         ("GZC_K3_W", "x"),
         ("GZC_K3_W", "7"),
         ("GZC_POISON_SEED", "1.5"),
