@@ -101,14 +101,11 @@ pub struct GpuParams {
     pub huffman: bool,
 }
 
-/// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes; greedy
-/// over the whole block; lazy and lazy2 in segments only, `segment_log2 > 0`: an unsegmented lazy
-/// parse is refused and runs on the CPU oracle alone; the M5 optimal parse, presets
-/// `opt14`/`opt16`, with K2opt and the K3opt passes since M5 T5), and the
-/// M6 opt options (preset `opt16p1`, M6 B4): the S3 prior tables, gap3, top-N pruning and the
-/// drop pass at every value `validate` allows (K3opt and `K3Drop` compile them in), and sparse
-/// chains of stride 4 or 8 (`chains::long_chains_supported`: K1 hashes word-aligned slots).
-/// Valid sparse chains of stride 1 or 2 are refused.
+/// Whether the GPU kernels implement `p`: every valid `MatchParams`, with two exceptions.
+/// - A lazy parse needs segments (`segment_log2 > 0`). Over the whole block it runs on the CPU
+///   oracle alone.
+/// - Sparse chains need stride 4 or 8, because K1 hashes word-aligned slots
+///   (`chains::long_chains_supported`).
 pub fn gpu_supports(p: &MatchParams) -> bool {
     p.validate().is_ok() && !unsegmented_lazy(p) && p.opt.is_none_or(|_| chains::long_chains_supported(p))
 }
@@ -195,7 +192,7 @@ pub struct OptScratch {
     pub scratch: wgpu::Buffer,
     /// Bytes of `scratch` per block (for the params it was sized for).
     pub scratch_per_block: u64,
-    /// The persistent passes' block schedule (`sizing::sched_bytes`, M6 A4).
+    /// The persistent passes' block schedule (`sizing::sched_bytes`).
     pub sched: wgpu::Buffer,
 }
 
@@ -306,7 +303,7 @@ pub struct Kernels {
     parse_seg: Option<SegParse>,
     /// How the unsegmented greedy K3 runs; None when K3 is `parse_seg` or `opt`.
     k3_mode: Option<K3Mode>,
-    /// The optimal parse (`MatchParams::opt`, M5): the K3opt passes (`k3opt::OptPasses`), run as
+    /// The optimal parse (`MatchParams::opt`): the K3opt passes (`k3opt::OptPasses`), run as
     /// K3 instead of every parse above, on the shared buffers (`OptBinds::of_batch`).
     opt: Option<OptPasses>,
     entropy: Option<EntropyKernel>,
@@ -338,8 +335,6 @@ const K3_SEG_WG: u32 = 32;
 /// 12-16 are slower).
 const K3_SEG_SCAN: u32 = 8;
 
-/// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
-/// comes from gzc_core, so the GPU mirrors the CPU tables exactly.
 /// Bytes of K4's constant table buffer.
 pub(crate) fn k4_tables_bytes() -> u64 {
     k4_tables(MAX_SEQS).0.len() as u64 * 4
@@ -348,7 +343,9 @@ pub(crate) fn k4_tables_bytes() -> u64 {
 /// Frame-header options: the header does not depend on `huffman`.
 const HEADER_OPTIONS: FrameOptions = FrameOptions { checksum: false, huffman: true };
 
-/// `max_seqs`: the `seqs` stride per block (`max_seqs(m)`), injected as K4/K5's `MAX_SEQS`.
+/// K4's `tab` buffer contents and the WGSL constants locating each table in it. Every value
+/// comes from gzc_core, so the GPU mirrors the CPU tables exactly. `max_seqs` is the `seqs`
+/// stride per block (`max_seqs(m)`), injected as K4/K5's `MAX_SEQS`.
 fn k4_tables(max_seqs: u32) -> (Vec<u32>, String) {
     let mut tab: Vec<u32> = Vec::new();
     let mut consts = String::new();
@@ -407,7 +404,8 @@ pub(crate) fn storage_layout(ctx: &GpuContext, label: &str, read_only: &[bool]) 
 }
 
 fn compute_pipeline(ctx: &GpuContext, label: &str, layout: &wgpu::BindGroupLayout, body: &str) -> wgpu::ComputePipeline {
-    // K2, K4 and K5: loops terminate and indices stay in bounds for any input (`shader_trusted`).
+    // K2, K4 and K5 are built without bounds checks and loop bounding. Each kernel's header
+    // holds the argument that this is safe (`GpuContext::shader_trusted`).
     pipeline_from_module(ctx, label, layout, &ctx.shader_trusted(label, body), "main")
 }
 
@@ -433,7 +431,7 @@ pub(crate) fn pipeline_from_module(
     })
 }
 
-/// How K3 runs the unsegmented greedy parse (speed phase S3).
+/// How K3 runs the unsegmented greedy parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum K3Mode {
     /// `k3_parse.wgsl`: one lane per block.
@@ -558,16 +556,11 @@ impl Kernels {
         // The unsegmented parse (greedy: `check_matching` refused an unsegmented lazy one).
         let unsegmented = !is_opt && m.segment_log2 == 0;
         let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}");
-        // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
-        // naga adds so the driver may not assume termination; it costs 33 % of the greedy K3's
-        // time on an RTX 5090). Every K3 loop provably ends, whatever best[] holds:
-        // - k3_coop.wgsl: each loop has a `// Terminates:` note (variant and bound); the only
-        //   subtraction that could wrap, push_lits' end - start, is guarded.
-        // - k3_parse.wgsl: the parse loop advances p below PARSE_END (a store by >= 1 byte, a
-        //   skip by step >= 1); match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE);
-        //   push_lits has no loop.
-        // Bounds checks stay on. A new K3 loop must come with the same argument, or use
-        // `ctx.shader` instead.
+        // Both K3 modules are built without naga's forced loop bounding: a per-iteration counter
+        // naga adds so the driver may not assume termination, which costs 33 % of the greedy
+        // K3's time on an RTX 5090. Every K3 loop ends whatever best[] holds; k3_parse.wgsl's
+        // header and k3_coop.wgsl's `// Terminates:` notes hold the argument. Bounds checks stay
+        // on. A new K3 loop needs the same argument, or `ctx.shader`.
         let parse = unsegmented.then(|| {
             pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main")
         });
@@ -592,11 +585,8 @@ impl Kernels {
                 Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
             }
         };
-        // Segmented parse, also without the forced loop bounding: its parse loops advance ip
-        // below the segment's lim (a store by >= 1 byte, a skip by exactly 1, the deferral by
-        // 1-2, the immediate loop by ml >= 4); match_len's n grows to max <= lim - p; the
-        // catch-up's start falls toward anchor; the fixup loops count up to NSEG and to the
-        // segments' sequence counts.
+        // The segmented parse is built the same way. k3_seg.wgsl's and k3_fixup.wgsl's headers
+        // hold the argument.
         let parse_seg = (m.segment_log2 > 0 && !is_opt).then(|| {
             let seg_log2 = m.segment_log2;
             let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
@@ -640,17 +630,10 @@ impl Kernels {
         let chains = ChainsKernel::new(ctx, &m)?;
         let sorted = SortKernel::new(ctx, &m)?.map(|k1| {
             let body = format!("{}const BEST_OFF_BITS: u32 = {BEST_OFF_BITS}u;\n{K2_WGSL}\n{K2_WINDOW_WGSL}", finder_wgsl(&m));
-            // Loops: the staging loop steps by 256 below WIN, the walk is j <= DEPTH, and
-            // match_len_capped is bounded by SEARCH_CAP; win/wkey indices DEPTH + lid - j are in
-            // 0..WIN (see `GpuContext::shader_trusted` and the E3 report).
-            // Premise for the data-dependent indices: K1 (k1_sort / k1_sort_sg, run before this
-            // in the same submission) wrote each block's `pred` slots 0..HASHED_POSITIONS as a
-            // permutation of the positions 0..HASHED_POSITIONS (plus fingerprint bits above
-            // PRED_POS). So every p = w & PRED_POS is < HASHED_POSITIONS <= BLOCK_SIZE, and
-            // `best[sb + p]` and the byte loads at p and at q < p stay inside the block. The
-            // sorted K1's self-test (against `gzc_core::hash::bucket_sort`, a permutation) and the
-            // differential tests check it; a `pred` not written by the sorted K1 (e.g. chain-K1
-            // output) breaks it, so K2 window must only ever run right after the sorted K1.
+            // Built without bounds checks and loop bounding (`GpuContext::shader_trusted`);
+            // k2_window.wgsl's header holds the argument. Its premise is that `pred` holds the
+            // sorted K1's output, so the window K2 must only ever run right after the sorted K1.
+            // `record_best` records the two as a pair.
             let module = ctx.shader_trusted("k2_window", &body);
             (k1, pipeline_from_module(ctx, "k2_window", &best_layout, &module, "main_window"))
         });
@@ -1085,11 +1068,9 @@ pub(crate) fn k2_opt_pipeline(ctx: &GpuContext, m: &MatchParams, layout: &wgpu::
         layout_wgsl(m),
         gzc_core::reference::DEAD_BIT,
     );
-    // Loops: every iteration of the merged walk spends one step of at least one live chain (so
-    // at most the sum of the chains' depths, `reference::cand_depths`: h4, h3 and each sparse
-    // chain's, 32 for opt16 and 60 for opt16p1) and match_len_capped is
-    // bounded by SEARCH_CAP; indices as in K2 (pred words hold positions below HASHED_POSITIONS,
-    // sparse chains' slot positions below SPARSE_END, from K1 in the same submission).
+    // Built without bounds checks and loop bounding (`GpuContext::shader_trusted`);
+    // k2_opt.wgsl's header holds the argument. Its premise is that `pred` holds K1's chains for
+    // the same params, written earlier in the same submission.
     let module = ctx.shader_trusted("k2_opt", &body);
     pipeline_from_module(ctx, "k2_opt", layout, &module, "main_opt")
 }
@@ -1133,7 +1114,7 @@ mod tests {
                 assert!(max_seqs(&p) as usize * p.min_seq_len() as usize >= BLOCK_SIZE, "{name}");
                 check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
-            // Existing presets keep MAX_SEQS; only the optimal parse (min match 3) needs more.
+            // Only the optimal parse (min match 3) needs more than MAX_SEQS.
             assert_eq!(max_seqs(&p), if p.opt.is_some() { MAX_SEQS_OPT } else { MAX_SEQS }, "{name}");
             assert_eq!(seqs_bytes_for(7, &p), 7 * max_seqs(&p) as u64 * 12, "{name}");
         }
@@ -1144,7 +1125,7 @@ mod tests {
     fn gpu_supports_all_presets() {
         use gzc_core::params::{OPT16, OPT16P1, OptParams, PriorTables, Seed, SparseChain};
         for (name, p) in gzc_core::params::PRESETS {
-            // M5 T5: the optimal-parse presets too, and since M6 B4 opt16p1.
+            // Every preset, the optimal-parse ones included.
             assert!(gpu_supports(&p), "{name}");
             check_matching(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
@@ -1153,7 +1134,7 @@ mod tests {
         let sparse = |stride: u32| {
             with(OptParams { sparse_chains: [Some(SparseChain { width: 8, stride, depth: 16 }), None, None], ..p1 })
         };
-        // Each M6 option alone on opt16, and at other valid values: accepted.
+        // Each DP option alone on opt16, and at other valid values: accepted.
         let o16 = OPT16.opt.unwrap();
         for o in [
             OptParams { inner_gap: 3, ..o16 },
@@ -1173,7 +1154,7 @@ mod tests {
             assert!(m.validate().is_ok() && !gpu_supports(&m), "stride {stride}");
             assert!(check_matching(&m).unwrap_err().to_string().contains("not implemented"), "stride {stride}");
         }
-        // Invalid M6 values stay refused.
+        // Invalid option values stay refused.
         assert!(!gpu_supports(&with(OptParams { inner_gap: 4, ..p1 })));
         assert!(!gpu_supports(&with(OptParams { drop_max_len: 2, ..p1 })));
         assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "sparse prior without the Prior seed");
@@ -1265,7 +1246,7 @@ mod tests {
         assert!(n * 3 * MAX_SEQS_OPT as u64 <= 1 << 32, "seqs word index");
     }
 
-    /// M6 `opt16p1`: K1's pred buffer holds h4 and h3 at full length plus the three stride-4 sparse
+    /// `opt16p1`: K1's pred buffer holds h4 and h3 at full length plus the three stride-4 sparse
     /// chains compactly (11 B per position, against opt16's 8 B, which K3opt's trace also needs),
     /// counted by `pred_bytes_for` and so by `scratch_bytes` (`vram_bytes`) and `max_batch_blocks`.
     #[test]
@@ -1287,7 +1268,7 @@ mod tests {
             assert!(n > 0 && fits(n, &OPT16P1, limit) && !fits(n + 1, &OPT16P1, limit), "limit {limit}: n {n}");
         }
         // With 2 GiB storage bindings (an RTX 5090 under wgpu), the 704 KiB of pred per block
-        // bound the batch below the 6 GiB budget's 3125 (M6 B4: `--batch max` is 2978).
+        // bound the batch below the 6 GiB budget's 3125 (`--batch max` resolves to 2978).
         assert_eq!(max_batch_blocks(&limits(1 << 31, u64::MAX, 65535), &OPT16P1), 2978);
         let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16P1) as u64;
         assert!(n > 0 && n * 11 * BLOCK_SIZE as u64 / 4 <= 1 << 32, "pred word index");

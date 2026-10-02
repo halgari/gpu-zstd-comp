@@ -13,7 +13,7 @@
 // shares p's first 8 bytes, hence p's long hash, so it is on the long chain above best_q, i.e.
 // the long walk reached it before best_q, found len == SEARCH_CAP there and stopped at it:
 // best_q >= q', a contradiction. So the whole walk can stop at the first cap-length candidate.
-// Fingerprint skips (S8), also byte-identical. The result is the largest (len, q) over the
+// Fingerprint skips, also byte-identical. The result is the largest (len, q) over the
 // visited candidates (lexicographic: longer wins, a tie goes to the larger q), or none if that
 // len < MIN_MATCH; so a candidate can be skipped whenever its (len, q) is below the current
 // (best_len, best_q) or its len is below MIN_MATCH. The pred word loaded for a candidate q (to get
@@ -28,6 +28,16 @@
 // MIN_MATCH, SEARCH_CAP, DEPTH and N_HASHES come from the MatchParams the host injects per
 // Kernels (`context::params_wgsl`). pred layout (K1): [block][chain][pos], N_HASHES chains per
 // block, as pred words (predecessor | fingerprint, see common.wgsl).
+//
+// Built without naga's loop bounding and index clamps (GpuContext::shader_trusted). `pred` must
+// be K1's output for the same blocks: every pred word holds PRED_NONE or a position q below
+// the word's own position. A loop or index added here needs its own argument.
+// Terminates: `chain` counts to N_HASHES and `d` to DEPTH. match_len_capped's n rises by 4 from
+//   8 to max <= SEARCH_CAP <= 256.
+// Bounds: the kernel has no local or workgroup arrays. best[o] and pred[pb + p] belong to the
+//   dispatch's own (block, position). pred[pb + q] is loaded only for q != PRED_NONE: a position below p.
+//   The `data` reads end at word base + BLOCK_SIZE / 4 (see match_len_capped): the next block's
+//   first word, or the buffer's trailing zero word.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> pred: array<u32>;

@@ -2,7 +2,7 @@
 // walks (== gzc_core::reference::chains). A task is one chain t = b*N_HASHES + chain: with
 // N_HASHES == 2 (Dfast) chain 0 is hash_long and chain 1 hash_short; with OPT3 (Opt3 params)
 // chain 0 is hash_width(4) and chain 1 hash3, whose words carry pred_fp3 instead of pred_fp, and
-// chains N_FULL.. are the M6 sparse long chains (below); with N_HASHES == 1 (Single) chain 0 is
+// chains N_FULL.. are the sparse long chains (below); with N_HASHES == 1 (Single) chain 0 is
 // hash_width(MIN_MATCH). N_HASHES and MIN_MATCH come from the injected MatchParams
 // (`context::params_wgsl`); the chains link equal keys, the hash's top MatchParams::hash_bits bits
 // (hash >> KEY_SHIFT, `chains::finder_wgsl`). pred[b*PRED_PER_BLOCK + chain*BLOCK_SIZE + p] = most

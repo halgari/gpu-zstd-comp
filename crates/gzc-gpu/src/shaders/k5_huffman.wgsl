@@ -8,7 +8,7 @@
 // reads frame_len[b], writes the sequences section after the literals section and patches the
 // frame / block headers into the bytes below SEC (whatever K5 leaves there).
 //
-// Literals are gathered from the block (speed phase S4; K3 only writes seqs and counts): literal
+// Literals are gathered from the block (K3 only writes seqs and counts): literal
 // run j < n_seq is data[anchor_j .. anchor_j + ll_j), anchor_j = sum over i < j of ll_i + ml_i,
 // and run n_seq is data[anchor_n_seq .. BLOCK_SIZE). A workgroup prefix sum over G = ceil(n_seq /
 // 256) sequences per thread leaves in ix_lit / ix_src the literal index and block byte where each
@@ -31,6 +31,52 @@
 //
 // The host binds exactly n_blocks words of `frame_len`, so arrayLength(&frame_len) is the batch
 // size. Prepended by the host: HDR_LEN, FRAME_WORDS, MAX_SEQS, HUFFMAN (and K4's other constants).
+//
+// Built without naga's loop bounding and index clamps (GpuContext::shader_trusted), so the
+// kernel must terminate and stay in bounds for every input it can be given. It relies on K3's
+// output, which a harness that scripts a parse checks first (testing::frames_from_parses):
+// - n_seq <= MAX_SEQS, and the sequences' lit_len + match_len sum to at most BLOCK_SIZE;
+// - counts holds the literal count n those sequences leave, so n <= BLOCK_SIZE.
+// A loop or index added here needs its own argument.
+//
+// Terminates:
+// - seek: the binary search shrinks [lo, hi], then the walk raises cj to n_seq. next_byte
+//   raises cj to n_seq and prev_byte lowers it to 0.
+// - build_index and the stream scan double d up to WG.
+// - set_max_height: `while (tp[n] > tgt)` and the `while (tp[n] == tgt)` after it stop at
+//   n >= 0, because tp[0], the most frequent symbol's depth, is at most 8: a full binary tree of
+//   at most 256 leaves has a leaf that shallow, and depths do not fall as counts fall.
+//   `while (total_cost > 0)` lowers total_cost by 1 << (nb_dec - 1) >= 1 per pass, and
+//   `while (total_cost < 0)` raises it by 1. The nb_dec loops move nb_dec by 1 inside
+//   1..=HUF_MAX_BITS + 2.
+// - normalize and ncount: as fse_normalize and ncount in k4_seq_entropy.wgsl.
+// - dput removes 8 bits per pass. describe's `while (i > 0u)` lowers i by 2 from an even start.
+// - Every other loop is counted, to a constant, to np <= 256, or to a literal or word count.
+//
+// Bounds, workgroup and function arrays:
+// - hist, ctab, leaves [256]: a byte value, or a rank below the number of present symbols.
+// - tw, tp [512]: a node id below 2 * np - 1 <= 511.
+// - set_max_height indexes tp and rank_last [14] exactly as gzc_core::huffman::set_max_height
+//   does, statement for statement. nb_dec starts at most 8 (total_cost is below the number of
+//   clamped leaves) and ends at most HUF_MAX_BITS + 2 = 13. The remaining indices rest on the
+//   invariants of zstd's HUF_setMaxHeight, which both ports share: a symbol shorter than
+//   HUF_MAX_BITS exists while the cost is not zero, so rank_last[nb_dec] names a symbol when a
+//   code is lengthened, and n stays >= 0. The Rust port asserts the first and is bounds-checked,
+//   so an input that broke them would fail on the oracle.
+// - nb_per_rank, val_per_rank, wc, wnorm, wdfs, wdnb [12]: a code length or weight <= 11
+//   (set_max_height caps the lengths at HUF_MAX_BITS).
+// - wcumul [13]: a weight + 1. wst, wspread [64]: a cell of the weights' table, log <= 6.
+// - desc [40]: dbyte checks DESC_BYTES; the copy out reads bytes below L_DESC <= 128.
+// - ix_lit, ix_src [257]: lid + 1, or a search index <= WG.
+// - scan [WG]: lid, or lid - d inside the thread's own stream. lay [16]: constants <= 13.
+//
+// Bounds, storage buffers:
+// - data: the cursor stays on literal bytes, which lie inside the block (the facts above), and
+//   next_word / prev_word load 4 bytes only inside one run.
+// - frames: every section K5 writes is at most a Raw section, SEC + 3 + n bytes, which fits
+//   FRAME_WORDS.
+// - seqs, counts and frame_len are indexed inside block b's own words, and b is checked
+//   against the batch size.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read> seqs: array<u32>;

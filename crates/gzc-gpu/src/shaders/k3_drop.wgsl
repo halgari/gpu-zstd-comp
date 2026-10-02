@@ -1,4 +1,4 @@
-// K3drop (M6 B3): the drop pass of the optimal parse (gzc_core::opt::drop_pass, OptParams::
+// K3drop: the drop pass of the optimal parse (gzc_core::opt::drop_pass, OptParams::
 // drop_max_len), after K3opt's final pass and its fix-up (main_fixup, k3_fixup.wgsl), as in the
 // oracle: opt::parse applies drop_pass to the fixed-up output of the final DP pass. One workgroup
 // of DROP_WG lanes per block (main_drop):
@@ -39,6 +39,10 @@
 // Consts injected by the host: MIN_MATCH, SEARCH_CAP, ... (params), MAX_SEQS, SEG_LOG2,
 // DROP_MAX (OptParams::drop_max_len), DROP_PRICES_IN, LL_BITS / ML_BITS / ML_CODE (codes.rs).
 // k3_fixup.wgsl is appended for its rep helpers (its main_fixup entry is not built here).
+//
+// Built without naga's loop bounding (GpuContext::shader_unbounded_loops; bounds checks stay on):
+// every data-dependent loop carries a `// Terminates:` note, and the others count to a constant.
+// A loop added here needs one.
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;

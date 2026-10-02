@@ -1,8 +1,8 @@
-// K3 greedy parse, subgroup-cooperative (speed phase S3, design .superpowers/speed/s3-design.md).
-// Appended by the host after k3_reps.wgsl and k3_parse.wgsl (whose bindings, rep history, literal
-// count, off_base_for / apply_off_base and sequential greedy_parse it reuses), and
-// compiled (on a device with Features::SUBGROUP) with `const W: u32` (the workgroup size: the adapter's minimum
-// subgroup size, or GZC_K3_W) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
+// K3 greedy parse, subgroup-cooperative. Appended by the host after k3_reps.wgsl and
+// k3_parse.wgsl (whose bindings, rep history, literal count, off_base_for / apply_off_base and
+// sequential greedy_parse it reuses), and compiled on a device with Features::SUBGROUP with
+// `const W: u32` (the workgroup size: the adapter's minimum subgroup size, or
+// GpuOptions::k3_width) and W_MASK_X / W_MASK_Y (the ballot of W lanes). Entry point
 // `main_coop`, one block per workgroup of W lanes, which form one (possibly partial) subgroup.
 //
 // Every lane holds the same parse state (r0/r1/r2, ip, anchor, ...). Per-lane values reach
@@ -11,8 +11,9 @@
 // workgroup memory). Per-lane booleans combine with `&` / `|`, never `&&` / `||`: naga lowers
 // those to an `if` on the left operand, a lane-dependent branch right before the ballot that
 // would need the lanes reconverged after it (VK_KHR_shader_maximal_reconvergence is not
-// enabled; .superpowers/m6-research/subgroup-audit.md). The only per-lane branches are lane 0's
-// stores. Stores happen on lane 0 only, or on disjoint addresses per lane. Each
+// enabled). The only per-lane branches are lane 0's stores, which feed no subgroup operation.
+// Stores happen on lane 0 only, or on disjoint addresses per lane.
+// docs/design/m6/subgroup-audit.md lists every subgroup call with its argument. Each
 // cooperative primitive returns exactly what its sequential counterpart returns, for any W >= 1,
 // so the output never depends on W (see the equivalence notes per function).
 //

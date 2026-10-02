@@ -16,24 +16,27 @@ const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 /// frame pipeline at a time, and nothing else may submit to its queue from another thread while
 /// that pipeline runs.
 pub struct GpuContext {
-    /// A queue of a transfer-only family on the same `VkDevice` (speed-2 E3): frame-path
-    /// pipelines read their frames back through it, concurrently with the next batch's kernels
-    /// (`pipeline`). Vulkan adapters with such a family (NVIDIA: family 1; AMD: SDMA when the
-    /// driver exposes it) of Vulkan 1.2+ with timeline semaphores, unless
-    /// `GpuOptions::transfer_queue` is off. The queue and the wgpu device
-    /// share one `transfer::DeviceOwner`, which destroys the `VkDevice` after both are gone and
-    /// keeps the Vulkan instance alive until then, so the field order does not matter.
+    /// A queue of a transfer-only family on the same `VkDevice`. Frame-path pipelines read
+    /// their frames back through it, alongside the next batch's kernels (`pipeline`).
     ///
-    /// Single submitter: the transfer path stages timeline-semaphore waits/signals on `queue` for
-    /// its next submission (`TransferQueue::submit_wgpu`, under a lock that every submission of a
-    /// transfer-readback `Pipeline` takes). While such a pipeline exists, **nothing else may
-    /// submit to `queue` concurrently with it** (from another thread: `queue.submit`,
-    /// `write_buffer`, `read_buffer`, the one-shot `testing` functions, another pipeline's
-    /// `run`), or that submission could take the staged semaphores. Only one transfer-readback
-    /// `Pipeline` may exist per context: `Pipeline::new` errors on a second one while the first is
-    /// alive (it does not fall back to the main-queue readback, which would still submit to the
-    /// same queue). Other pipelines (parse path) and other work on the same thread
-    /// are fine. Open a context with `GpuOptions::transfer_queue` off for anything else.
+    /// It exists on a Vulkan 1.2+ adapter that has such a family (NVIDIA: family 1; AMD: SDMA
+    /// when the driver exposes it) and timeline semaphores, unless `GpuOptions::transfer_queue`
+    /// is off. The queue and the wgpu device share one `transfer::DeviceOwner`, which destroys
+    /// the `VkDevice` after both are gone and keeps the Vulkan instance alive until then, so the
+    /// field order does not matter.
+    ///
+    /// Single submitter: the transfer path stages timeline-semaphore waits and signals on
+    /// `queue` for its next submission (`TransferQueue::submit_wgpu`, under a lock that every
+    /// submission of a transfer-readback `Pipeline` takes). While such a pipeline exists,
+    /// **nothing else may submit to `queue` from another thread**: not `queue.submit`,
+    /// `write_buffer`, `read_buffer`, the one-shot `testing` functions or another pipeline's
+    /// `run`. Such a submission could take the staged semaphores.
+    ///
+    /// Only one transfer-readback `Pipeline` may exist per context. `Pipeline::new` returns an
+    /// error for a second one while the first is alive; it does not fall back to the main-queue
+    /// readback, which would submit to the same queue. Parse-path pipelines and other work on
+    /// the same thread are fine. For anything else, open a context with
+    /// `GpuOptions::transfer_queue` off.
     pub(crate) transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -51,11 +54,11 @@ pub struct GpuContext {
     /// (`k3_coop.wgsl`) if its lane probe passes (see `kernels::k3_mode`).
     pub(crate) subgroups: bool,
     /// The kernels read each batch straight from its slot's mapped upload buffer, with no upload
-    /// copy (speed-2 E8): the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS`
-    /// (mappable buffers may also be storage buffers; requested only for this) and the upload
-    /// buffers land in device-local memory (full ReBAR / SAM, see `rebar`), or
-    /// `GpuOptions::direct_upload` forced it (for measurements: without ReBAR the kernels would
-    /// read the batch over PCIe).
+    /// copy. True when the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS`
+    /// (mappable buffers may also be storage buffers; requested only for this) and either the
+    /// upload buffers land in device-local memory (full ReBAR / SAM, see `rebar`) or
+    /// `GpuOptions::direct_upload` forces it. Forcing it without ReBAR makes the kernels read
+    /// the batch over PCIe; that is for measurements.
     pub(crate) direct_upload: bool,
     /// The options the context was opened with (`subgroups`, `direct_upload` and `timestamps`
     /// above hold what the adapter then allowed).
@@ -420,10 +423,9 @@ impl Prepared {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             desc.backends = wgpu::Backends::METAL;
         }
-        // One thread at a time: the Vulkan loader's first ICD scan is not thread-safe. Two test
-        // threads opening contexts at once crashed in it (SIGSEGV, a null call inside
-        // libvulkan.so.1's vkEnumerateInstanceExtensionProperties while the other thread was in
-        // the NVIDIA ICD's vk_icdNegotiateLoaderICDInterfaceVersion).
+        // One thread at a time: the Vulkan loader's first ICD scan is not thread-safe. Two
+        // threads opening contexts at once can crash in it (a null call inside libvulkan's
+        // vkEnumerateInstanceExtensionProperties while the other thread negotiates with the ICD).
         static INSTANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let guard = INSTANCE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let instance = wgpu::Instance::new(desc);
@@ -488,10 +490,11 @@ impl GpuContext {
         self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
-    /// Wait for the GPU with non-blocking polls only (`PollType::Poll`), never `PollType::Wait`:
-    /// on Metal. wgpu-hal 30's Metal `Device::wait` can fail with a spurious `DeviceError::Lost`
-    /// (which loses the device) when it runs while another thread is inside `queue.submit` (see
-    /// `pipeline::Completion::poll_only`); a non-blocking poll never calls it.
+    /// True on Metal: wait for the GPU with non-blocking polls only (`PollType::Poll`), never
+    /// `PollType::Wait`. wgpu-hal 30's Metal `Device::wait` can fail with a spurious
+    /// `DeviceError::Lost`, which loses the device, when it runs while another thread is inside
+    /// `queue.submit` (see `pipeline::Completion::poll_only`). A non-blocking poll never calls
+    /// it.
     pub(crate) fn poll_only(&self) -> bool {
         self.adapter_info.backend == wgpu::Backend::Metal
     }
@@ -586,28 +589,34 @@ impl GpuContext {
         self.shader_with(label, body, wgpu::ShaderRuntimeChecks::checked())
     }
 
-    /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
-    /// must provably terminate (a loop that does not is undefined behaviour for the driver).
+    /// `shader` without naga's forced loop bounding; bounds checks stay on. Every loop in `body`
+    /// must terminate for every input: a loop that does not is undefined behaviour for the
+    /// driver. The K3 kernels use it (`k3_parse`, `k3_coop`, `k3_seg` with `k3_fixup`, `k3_opt`,
+    /// `k3_drop`). Each states its termination argument in its source, in the header or in
+    /// `// Terminates:` notes beside the loops, and a loop added to them needs one.
     pub(crate) fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
         self.shader_with(label, body, checks)
     }
 
-    /// `shader` without naga's forced loop bounding and without its index clamps (speed-2 E9):
-    /// indices into function-local and workgroup arrays are not clamped, and on backends without
+    /// `shader` without naga's forced loop bounding and without its index clamps. Indices into
+    /// function-local and workgroup arrays are not clamped, and on backends without
     /// hardware-robust buffer access neither are storage-buffer indices. Integer-division checks
-    /// stay on (turning them off measured nothing). The caller must guarantee, for every input
-    /// the kernel can be given, that
-    /// - every loop in `body` terminates, and
-    /// - every array index is in bounds (an out-of-bounds index is undefined behaviour, where the
-    ///   clamped module would have silently read/written a clamped element).
+    /// stay on; they cost nothing.
     ///
-    /// K2, K4 and K5 are built with this; their arguments are in `.superpowers/speed2/e3-report.md`
-    /// (E9). A loop or index added to them must come with the same argument. RTX 5090, lvl9,
-    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 %. K1 stays checked: its subgroup kernel got 7 %
-    /// slower; K3 keeps
-    /// `shader_unbounded_loops` (the index clamps cost it nothing).
-    /// `GpuOptions::checked_shaders` builds these modules fully checked instead (debugging aid).
+    /// The caller must guarantee, for every input the kernel can be given, that
+    /// - every loop in `body` terminates, and
+    /// - every array index is in bounds. An out-of-bounds index is undefined behaviour here,
+    ///   where the clamped module reads or writes a clamped element.
+    ///
+    /// K2 (`k2_best`, `k2_window`, `k2_opt`), K4 and K5 use it. On an RTX 5090 `k2_best`, K4
+    /// and K5 each run 7–18 % faster for it. Each kernel states its argument in its source
+    /// header, under "Built without naga's loop bounding and index clamps", with `Terminates:`
+    /// and `Bounds:` notes. A loop or index added to them needs the same argument.
+    ///
+    /// K1 stays fully checked, because its subgroup kernel is slower without the checks. K3
+    /// uses `shader_unbounded_loops`, because the index clamps cost it nothing.
+    /// `GpuOptions::checked_shaders` builds these modules fully checked instead, for debugging.
     pub(crate) fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let checks = if self.opts.checked_shaders {
             wgpu::ShaderRuntimeChecks::checked()
@@ -638,9 +647,9 @@ impl GpuContext {
             dump_wgsl(dir, label, &src);
         }
         // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
-        // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
-        // the K3 argument is at its call site in `Kernels::new`). Fully checked modules need no
-        // guarantee.
+        // bounds checks off that every index is in bounds (`shader_unbounded_loops`,
+        // `shader_trusted`). The arguments are in each kernel's WGSL source. Fully checked
+        // modules need no guarantee.
         unsafe {
             self.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src) },
