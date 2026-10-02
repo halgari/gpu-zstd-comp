@@ -12,6 +12,41 @@
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+mod oneshot;
+pub use oneshot::*;
+
+pub use crate::context::pack_blocks;
+pub use crate::kernels::{
+    BatchBuffers, GpuParams, K3Mode, Kernels, gather_literals, gpu_supports, max_seqs, probe_lanes,
+};
+
+/// K1 and its checks.
+pub mod chains {
+    pub use crate::chains::{
+        ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_span, expected_words, gpu_preds, gpu_preds_with,
+        pred_of_word, pred_words_per_block,
+    };
+}
+
+/// The bucket-sorted K1.
+pub mod sorted {
+    pub use crate::sorted::{SortKernel, sorted_words, workgroup_bytes};
+}
+
+/// The K3opt passes, their own buffers and the harnesses that run them alone.
+pub mod k3opt {
+    pub use crate::k3opt::{
+        K3Drop, K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
+        drops_from_parses, parses_from_cands, parses_from_passes, ring_bytes, ring_for, scratch_bytes_per_block,
+        time_passes, workgroup_bytes,
+    };
+}
+
+/// Buffer sizes.
+pub mod sizing {
+    pub use crate::sizing::{chain_pred_bytes, head_bytes};
+}
+
 use crate::context::{GpuContext, GpuOptions};
 
 /// A context opened with `GpuOptions::from_env()`. Panics without a GPU.

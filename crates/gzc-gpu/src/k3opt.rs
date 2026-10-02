@@ -52,7 +52,7 @@
 //! resident), and a batch beyond that has no second-wave cliff (the loop takes the remaining
 //! blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
 //! `vkstats` on every pass kernel after a change (`GpuOptions::dump_wgsl` writes the composed modules).
-use crate::compressor::{
+use crate::kernels::{
     BatchBuffers, K3_FIXUP_WGSL, decode_output,
 };
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
@@ -86,11 +86,11 @@ pub const WEIGHT_RUN: u32 = 8;
 pub const WEIGHT_STRIDE: u32 = 264;
 
 /// Sequences per block of the optimal parse (min match 3): `BLOCK_SIZE / 3 + 1`.
-pub use crate::compressor::MAX_SEQS_OPT;
+pub(crate) use crate::kernels::MAX_SEQS_OPT;
 
 /// Words of one block's price tables in the `prices` buffer: `opt::Prices` as lit[256], ll[36],
 /// ml[53], of[32].
-pub const PRICE_WORDS: usize = 256 + 36 + 53 + 32;
+pub(crate) const PRICE_WORDS: usize = 256 + 36 + 53 + 32;
 
 /// Largest batch `parses_from_cands` runs at once.
 const BATCH_CAP: usize = 256;
@@ -557,9 +557,9 @@ impl K3Drop {
             o.drop_max_len,
             tables_wgsl(o.prior),
         );
-        let layout = crate::compressor::storage_layout(ctx, "k3drop", &[true, false, false, false, true]);
+        let layout = crate::kernels::storage_layout(ctx, "k3drop", &[true, false, false, false, true]);
         let module = ctx.shader_unbounded_loops("k3_drop", &body);
-        let pipe = crate::compressor::pipeline_from_module(ctx, "k3_drop", &layout, &module, "main_drop");
+        let pipe = crate::kernels::pipeline_from_module(ctx, "k3_drop", &layout, &module, "main_drop");
         Ok(Self { pipe, layout, params: *m, prices_in })
     }
 
@@ -602,7 +602,7 @@ impl K3Drop {
 /// `INITIAL_REPS` (segment 0) or `[0, 0, 0]`, and its 6-word trailer at `SEG_META`), the parse's
 /// `seqs` words and its counts. For replaying a scripted drop input (`opt::cases::DropCase`).
 /// Every match must lie in one segment.
-pub fn final_pass_words(out: &BlockOutput, seg_log2: u32) -> (Vec<u32>, Vec<u32>, [u32; 2]) {
+pub(crate) fn final_pass_words(out: &BlockOutput, seg_log2: u32) -> (Vec<u32>, Vec<u32>, [u32; 2]) {
     use gzc_core::seq::{INITIAL_REPS, apply_off_base, off_base_for};
     let seg = 1usize << seg_log2;
     let seg_words = 2 * seg;
@@ -653,7 +653,7 @@ pub fn drops_from_parses(
     ensure!(blocks.len() == inputs.len() && !blocks.is_empty(), "one input per block");
     ensure!(prices.is_some() == d.prices_in, "price tables iff prices_in");
     let n = blocks.len() as u32;
-    crate::compressor::with_error_scopes(ctx, || {
+    crate::kernels::with_error_scopes(ctx, || {
         let bufs = OptBuffers::new(ctx, &d.params, n)?;
         ctx.queue.write_buffer(&bufs.data, 0, bytemuck::cast_slice(&pack_blocks(blocks)));
         let per = best_bytes_for(1, &d.params);
@@ -718,7 +718,7 @@ impl K3Opt {
             o.relax_lengths.unwrap_or(0),
             tables_wgsl(o.prior),
         );
-        let layout = crate::compressor::storage_layout(
+        let layout = crate::kernels::storage_layout(
             ctx,
             "k3opt",
             &[true, false, false, false, false, false, false, false],
@@ -728,17 +728,17 @@ impl K3Opt {
         } else {
             ctx.shader("k3_opt", &body)
         };
-        let main = crate::compressor::pipeline_from_module(ctx, "k3_opt", &layout, &module, "main_opt_persist");
+        let main = crate::kernels::pipeline_from_module(ctx, "k3_opt", &layout, &module, "main_opt_persist");
         let sched = {
             let body = format!(
                 "const SCHED_HDR: u32 = {SCHED_HDR}u;\nconst WEIGHT_RUN: u32 = {WEIGHT_RUN}u;\nconst WEIGHT_STRIDE: u32 = {WEIGHT_STRIDE}u;\n{K3_SCHED_WGSL}"
             );
-            let layout = crate::compressor::storage_layout(ctx, "k3opt_sched", &[true, true, false]);
+            let layout = crate::kernels::storage_layout(ctx, "k3opt_sched", &[true, true, false]);
             let module = ctx.shader("k3_sched", &body);
-            let pipe = |entry: &str| crate::compressor::pipeline_from_module(ctx, "k3_sched", &layout, &module, entry);
+            let pipe = |entry: &str| crate::kernels::pipeline_from_module(ctx, "k3_sched", &layout, &module, entry);
             Sched { weight: pipe("main_weight"), rank: pipe("main_rank"), scatter: pipe("main_scatter"), layout }
         };
-        let fixup = crate::compressor::pipeline_from_module(
+        let fixup = crate::kernels::pipeline_from_module(
             ctx,
             "k3_opt_fixup",
             &layout,
@@ -927,7 +927,7 @@ fn sched_binding<'a>(bufs: &OptBinds<'a>, n: u32) -> wgpu::BindingResource<'a> {
 }
 
 /// Reads the first `n` blocks' parses out of `bufs` (literals gathered from `blocks`).
-pub fn read_parses(
+pub(crate) fn read_parses(
     ctx: &GpuContext,
     bufs: &OptBuffers,
     blocks: &[&[u8]],
@@ -971,7 +971,7 @@ pub fn parses_from_cands(
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
-    crate::compressor::with_error_scopes(ctx, || {
+    crate::kernels::with_error_scopes(ctx, || {
         let bufs = OptBuffers::new(ctx, &k.params, blocks.len().min(BATCH_CAP) as u32)?;
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {
@@ -1171,7 +1171,7 @@ impl OptPasses {
 }
 
 /// Reads the first `n` blocks' histograms that a `hist_out` pass left in `bufs.prices`.
-pub fn read_hists(ctx: &GpuContext, bufs: &OptBuffers, n: usize) -> Vec<Hist> {
+pub(crate) fn read_hists(ctx: &GpuContext, bufs: &OptBuffers, n: usize) -> Vec<Hist> {
     let w: Vec<u32> = ctx.read_buffer(&bufs.prices, 0, n * PRICE_WORDS);
     w.chunks(PRICE_WORDS)
         .map(|c| Hist {
@@ -1199,7 +1199,7 @@ pub fn parses_from_passes(
     if blocks.is_empty() {
         return Ok((Vec::new(), hs));
     }
-    crate::compressor::with_error_scopes(ctx, || {
+    crate::kernels::with_error_scopes(ctx, || {
         let bufs = OptBuffers::new(ctx, p.params(), blocks.len().min(BATCH_CAP) as u32)?;
         let mut out = Vec::with_capacity(blocks.len());
         for (i, chunk) in blocks.chunks(BATCH_CAP).enumerate() {

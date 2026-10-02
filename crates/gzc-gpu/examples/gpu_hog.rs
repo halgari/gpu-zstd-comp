@@ -27,7 +27,16 @@ fn main() {
     let ctx = gzc_gpu::GpuContext::new(gzc_gpu::GpuOptions { transfer_queue: false, ..Default::default() }).expect("GPU");
     eprintln!("gpu_hog: {} — {gib} GiB, {seconds} s", ctx.describe());
     let chunk: u64 = 256 << 20;
-    let bufs: Vec<wgpu::Buffer> = (0..gib * 4).map(|_| ctx.storage_buffer("hog", chunk, false)).collect();
+    let bufs: Vec<wgpu::Buffer> = (0..gib * 4)
+        .map(|_| {
+            ctx.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hog"),
+                size: chunk,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
     let module = ctx.device().create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("hog"),
         source: wgpu::ShaderSource::Wgsl(SWEEP_WGSL.into()),

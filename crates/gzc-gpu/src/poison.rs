@@ -21,7 +21,7 @@ use crate::context::GpuContext;
 use std::sync::atomic::Ordering;
 
 /// Bytes every buffer gets past its logical size when poisoning.
-pub const POISON_PAD: u64 = 4096;
+pub(crate) const POISON_PAD: u64 = 4096;
 
 const FILL_WGSL: &str = r#"
 struct Params { start: u32, end: u32, seed: u32, mode: u32 }
@@ -120,10 +120,10 @@ impl Poisoner {
     fn new(ctx: &GpuContext) -> Self {
         let fill_layout = layout(ctx, "poison.fill");
         let module = ctx.wgsl_module("poison.fill", FILL_WGSL, wgpu::ShaderRuntimeChecks::checked());
-        let fill = crate::compressor::pipeline_from_module(ctx, "poison.fill", &fill_layout, &module, "main");
+        let fill = crate::kernels::pipeline_from_module(ctx, "poison.fill", &fill_layout, &module, "main");
         let dirty_layout = layout(ctx, "poison.dirty");
         let module = ctx.wgsl_module("poison.dirty", &dirty_wgsl(dirty_words(ctx)), wgpu::ShaderRuntimeChecks::checked());
-        let dirty = crate::compressor::pipeline_from_module(ctx, "poison.dirty", &dirty_layout, &module, "main");
+        let dirty = crate::kernels::pipeline_from_module(ctx, "poison.dirty", &dirty_layout, &module, "main");
         let sink = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("poison.sink"),
             size: 16,
@@ -151,18 +151,19 @@ fn uniform(ctx: &GpuContext, words: [u32; 4]) -> wgpu::Buffer {
 
 impl GpuContext {
     /// True when this context poisons memory (see the module docs).
+    #[doc(hidden)]
     pub fn poisoning(&self) -> bool {
         self.opts.poison
     }
 
     /// Every compute pipeline's compilation options: the defaults (workgroup memory zeroed at
     /// dispatch), but without the zeroing when poisoning.
-    pub fn compilation_options(&self) -> wgpu::PipelineCompilationOptions<'static> {
+    pub(crate) fn compilation_options(&self) -> wgpu::PipelineCompilationOptions<'static> {
         wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: !self.opts.poison, ..Default::default() }
     }
 
     /// Bytes to add to a buffer of logical size `size` (`POISON_PAD` when poisoning).
-    pub fn poison_pad(&self) -> u64 {
+    pub(crate) fn poison_pad(&self) -> u64 {
         if self.opts.poison { POISON_PAD } else { 0 }
     }
 
@@ -178,7 +179,7 @@ impl GpuContext {
 
     /// When poisoning: records a fill of `buf` from byte `from` (rounded up to a word) to its end
     /// with a fresh garbage pattern. `buf` needs STORAGE usage. No-op otherwise.
-    pub fn poison_from(&self, enc: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer, from: u64) {
+    pub(crate) fn poison_from(&self, enc: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer, from: u64) {
         if !self.opts.poison {
             return;
         }
@@ -208,7 +209,7 @@ impl GpuContext {
 
     /// When poisoning: records a kernel that leaves garbage in the workgroup memory of every SM.
     /// No-op otherwise.
-    pub fn poison_workgroup_memory(&self, enc: &mut wgpu::CommandEncoder) {
+    pub(crate) fn poison_workgroup_memory(&self, enc: &mut wgpu::CommandEncoder) {
         if !self.opts.poison {
             return;
         }

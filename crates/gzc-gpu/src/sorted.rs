@@ -27,10 +27,10 @@ const K1_SORT_SG_WGSL: &str = include_str!("shaders/k1_sort_sg.wgsl");
 
 /// Widest key the sorted K1 handles (2^13 counters: 16 KiB of workgroup memory, wgpu's default
 /// limit).
-pub const MAX_SORT_KEY_BITS: u32 = 13;
+pub(crate) const MAX_SORT_KEY_BITS: u32 = 13;
 
 /// Workgroup memory of the sorted K1's counters: 2^hash_bits of 16 bits.
-pub fn table_bytes(p: &MatchParams) -> u32 {
+pub(crate) fn table_bytes(p: &MatchParams) -> u32 {
     2 << p.hash_bits
 }
 
@@ -43,7 +43,7 @@ pub fn workgroup_bytes(p: &MatchParams, subgroups: bool) -> u32 {
 
 /// Whether `p` is a preset the sorted finder serves: a Single hash with a key of at most
 /// `MAX_SORT_KEY_BITS` bits.
-pub fn sorted_params(p: &MatchParams) -> bool {
+pub(crate) fn sorted_params(p: &MatchParams) -> bool {
     p.hashes == Hashes::Single && p.hash_bits <= MAX_SORT_KEY_BITS
 }
 
@@ -66,7 +66,7 @@ impl SortKernel {
         }
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;
         if ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 && workgroup_bytes(params, true) <= limit {
-            let built = crate::compressor::with_error_scopes(ctx, || {
+            let built = crate::kernels::with_error_scopes(ctx, || {
                 let k = Self::build(ctx, params, true);
                 k.self_test(ctx, params)?;
                 Ok(k)
@@ -79,7 +79,7 @@ impl SortKernel {
         if workgroup_bytes(params, false) > limit {
             return Ok(None);
         }
-        let built = crate::compressor::with_error_scopes(ctx, || {
+        let built = crate::kernels::with_error_scopes(ctx, || {
             let k = Self::build(ctx, params, false);
             k.self_test(ctx, params)?;
             Ok(k)

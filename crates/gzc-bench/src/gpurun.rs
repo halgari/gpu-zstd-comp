@@ -7,7 +7,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use gzc_core::config::BLOCK_SIZE;
-use gzc_gpu::compressor::GpuParams;
+use gzc_gpu::GpuParams;
 use gzc_gpu::GpuContext;
 use gzc_gpu::pipeline::{FrameSink, ParFrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 

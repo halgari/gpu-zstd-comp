@@ -104,7 +104,7 @@ pub(crate) struct RawDevice {
 impl RawDevice {
     /// Creates the device `p` describes (what wgpu's `open_with_callback` would create) with one
     /// extra queue, queue 0 of `family` (from `transfer_family`). Errors on a non-Vulkan adapter.
-    pub fn new(p: &Prepared, family: u32) -> anyhow::Result<Self> {
+    pub(crate) fn new(p: &Prepared, family: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(family != 0, "family 0 holds the main queue");
         // SAFETY: the hal adapter is only used while `p.adapter` lives.
         let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -129,7 +129,7 @@ impl RawDevice {
 
     /// The `GpuContext` whose wgpu device and queue are queue 0 of family 0 on this device (what
     /// `GpuContext::new` would give without the transfer queue).
-    pub fn context(&self, p: &Prepared) -> anyhow::Result<GpuContext> {
+    pub(crate) fn context(&self, p: &Prepared) -> anyhow::Result<GpuContext> {
         // SAFETY: as in `new`.
         let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
             .ok_or_else(|| anyhow!("the transfer queue needs the Vulkan backend"))?;
@@ -160,7 +160,7 @@ impl RawDevice {
 }
 
 /// The extra queue of a transfer-only family on the context's `VkDevice`.
-pub struct TransferQueue {
+pub(crate) struct TransferQueue {
     owner: Arc<DeviceOwner>,
     /// `vkQueueSubmit` / `vkQueueWaitIdle` need external synchronization of the queue.
     queue: Mutex<vk::Queue>,
@@ -499,7 +499,7 @@ impl TransferQueue {
     }
 
     /// Blocks until the transfer queue is idle.
-    pub fn idle(&self) {
+    pub(crate) fn idle(&self) {
         let queue = self.queue.lock().unwrap();
         // SAFETY: plain wait; the queue is externally synchronized by the lock.
         let _ = unsafe { self.device().queue_wait_idle(*queue) };
@@ -528,7 +528,7 @@ impl RawBuffer {
     /// Every GPU write to the buffer has completed (the caller waited for the submission that
     /// wrote it, e.g. its timeline value), and none is pending while the slice lives: the GPU may
     /// otherwise change bytes behind a shared reference.
-    pub unsafe fn mapped(&self) -> &[u8] {
+    pub(crate) unsafe fn mapped(&self) -> &[u8] {
         assert!(!self.ptr.is_null(), "not a host buffer");
         if !self.coherent {
             let range = vk::MappedMemoryRange::default().memory(self.memory).offset(0).size(vk::WHOLE_SIZE);
@@ -548,7 +548,7 @@ impl RawBuffer {
     ///   uses the buffer on queues of the families it was created for.
     /// - `self` outlives every GPU use of the returned buffer (drop it only after the device is
     ///   idle).
-    pub unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    pub(crate) unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         // SAFETY: the caller's contract; externally owned, so wgpu-hal never vkDestroyBuffers it
         // (`Buffer::from_raw` would).
         unsafe {

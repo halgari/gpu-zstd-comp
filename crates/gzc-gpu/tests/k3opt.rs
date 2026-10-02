@@ -10,9 +10,9 @@ use gzc_core::opt::{Engine, Hist, Prices, dp_pass_with, drop_pass, passes};
 use gzc_core::params::{LVL9SEG, MatchParams, OPT14, OPT16, OPT16P1, OptParams, PriorTables, Seed};
 use gzc_core::reference::{CandWords, chains, find_cands};
 use gzc_core::seq::BlockOutput;
-use gzc_gpu::compressor::{GpuParams, Kernels, OptCandKernel, cands_from_blocks, frames_from_parses};
-use gzc_gpu::context::GpuContext;
-use gzc_gpu::k3opt::{
+use gzc_gpu::testing::{GpuParams, Kernels, OptCandKernel, cands_from_blocks, frames_from_parses};
+use gzc_gpu::GpuContext;
+use gzc_gpu::testing::k3opt::{
     K3Drop, K3Opt, K3OptConfig, OptBuffers, OptPasses, PriceSrc, SCHED_HDR, WEIGHT_RUN, WEIGHT_STRIDE,
     drops_from_parses, parses_from_cands, parses_from_passes, ring_for, ring_bytes, scratch_bytes_per_block,
     time_passes, workgroup_bytes,

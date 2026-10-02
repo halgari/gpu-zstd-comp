@@ -15,7 +15,7 @@ use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_ca
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
-use gzc_gpu::compressor::{
+use gzc_gpu::testing::{
     GpuParams, K3Mode, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
     parses_from_best,
 };
@@ -1129,7 +1129,7 @@ fn literals_are_the_uncovered_block_bytes() {
     for (name, block) in all_blocks() {
         for (preset, params) in GPU_PRESETS {
             let parse = compress_block(&block, params);
-            let got = gzc_gpu::compressor::gather_literals(&block, &parse.sequences);
+            let got = gzc_gpu::testing::gather_literals(&block, &parse.sequences);
             assert!(got == parse.literals, "{name} {preset}: gathered literals differ");
         }
     }

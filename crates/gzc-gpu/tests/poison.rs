@@ -7,8 +7,8 @@ use gzc_core::block::chunk_file;
 use gzc_core::frame::write_frame;
 use gzc_core::params::{LVL3, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1};
 use gzc_core::reference::compress_block;
-use gzc_gpu::compressor::{GpuParams, Kernels, compress_frames};
-use gzc_gpu::context::{GpuContext, GpuOptions};
+use gzc_gpu::testing::{GpuParams, Kernels, compress_frames};
+use gzc_gpu::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
 
 fn blocks() -> Vec<Vec<u8>> {

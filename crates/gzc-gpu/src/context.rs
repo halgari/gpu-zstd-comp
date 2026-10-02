@@ -175,10 +175,7 @@ impl GpuOptions {
             timestamps: !env_on("GZC_NO_TIMESTAMPS"),
             sorted_finder: !env_off("GZC_SORTED"),
             upload_threads: env_number("GZC_UPLOAD_THREADS"),
-            k1_groups: env_number("GZC_K1_GROUPS").map(|g: u32| {
-                assert!(g > 0, "GZC_K1_GROUPS={g}: expected a positive number");
-                g
-            }),
+            k1_groups: env_number("GZC_K1_GROUPS"),
             k3_kernel: match std::env::var("GZC_K3_MODE").as_deref() {
                 Err(_) | Ok("") => None,
                 Ok("seq") => Some(K3Kernel::Seq),
@@ -323,7 +320,7 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub fn descriptor(&self) -> wgpu::DeviceDescriptor<'static> {
+    pub(crate) fn descriptor(&self) -> wgpu::DeviceDescriptor<'static> {
         wgpu::DeviceDescriptor {
             label: Some("gzc"),
             required_features: self.required_features,
@@ -332,7 +329,7 @@ impl Prepared {
         }
     }
 
-    pub fn context(&self, device: wgpu::Device, queue: wgpu::Queue) -> GpuContext {
+    pub(crate) fn context(&self, device: wgpu::Device, queue: wgpu::Queue) -> GpuContext {
         // wgpu-core reports a device loss only through this callback: errors of the lost type
         // (the hal error that lost the device, e.g. a Metal counter sample buffer that could not
         // be created, and every later `create_buffer` on it) reach no error scope and no
@@ -364,7 +361,7 @@ impl Prepared {
         }
     }
 
-    pub fn new(opts: GpuOptions) -> anyhow::Result<Self> {
+    pub(crate) fn new(opts: GpuOptions) -> anyhow::Result<Self> {
         let allow_subgroups = opts.subgroups;
         #[allow(unused_mut)]
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
@@ -536,7 +533,7 @@ impl GpuContext {
     }
 
     /// Compiles `body` with the block constants and `common.wgsl` prepended.
-    pub fn shader(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+    pub(crate) fn shader(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         self.shader_with(label, body, wgpu::ShaderRuntimeChecks::checked())
     }
 
@@ -604,7 +601,8 @@ impl GpuContext {
     }
 
     /// STORAGE | COPY_DST buffer, plus COPY_SRC when it will be read back or copied from. When
-    /// poisoning, `poison::POISON_PAD` bytes larger.
+    /// poisoning, `poison::POISON_PAD` bytes larger. Test support outside the crate.
+    #[doc(hidden)]
     pub fn storage_buffer(&self, label: &str, size: u64, copy_src: bool) -> wgpu::Buffer {
         let size = size + self.poison_pad();
         let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
@@ -620,7 +618,8 @@ impl GpuContext {
     }
 
     /// Copies `count` elements of `T` starting at byte `offset` of `buf` (which needs COPY_SRC)
-    /// into a staging buffer, waits for the GPU, and returns them.
+    /// into a staging buffer, waits for the GPU, and returns them. Test support outside the crate.
+    #[doc(hidden)]
     pub fn read_buffer<T: bytemuck::Pod>(&self, buf: &wgpu::Buffer, offset: u64, count: usize) -> Vec<T> {
         let bytes = (count * size_of::<T>()) as u64;
         let mut out = vec![T::zeroed(); count];
@@ -673,7 +672,7 @@ fn rebar(adapter: &wgpu::Adapter) -> bool {
 
 /// WGSL `const` declarations mirroring `gzc_core::config` (compile-time block constants,
 /// shared by every shader).
-pub fn constants_wgsl() -> String {
+pub(crate) fn constants_wgsl() -> String {
     format!(
         "const BLOCK_SIZE: u32 = {BLOCK_SIZE}u;\n\
          const LOG2_BLOCK: u32 = {LOG2_BLOCK}u;\n\
@@ -686,7 +685,7 @@ pub fn constants_wgsl() -> String {
 
 /// WGSL `const` declarations for one set of runtime `MatchParams`, prepended to the body of each
 /// params-dependent shader, so kernels built for different presets coexist in one process.
-pub fn params_wgsl(p: &MatchParams) -> String {
+pub(crate) fn params_wgsl(p: &MatchParams) -> String {
     format!(
         "const MIN_MATCH: u32 = {}u;\n\
          const SEARCH_CAP: u32 = {}u;\n\

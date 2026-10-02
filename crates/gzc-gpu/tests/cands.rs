@@ -7,8 +7,8 @@ use gzc_core::hash::hash_width;
 use gzc_core::params::{SparseChain, MatchParams, OPT14, OPT16, OPT16P1, OptParams};
 use gzc_core::reference::{CandWords, chains, find_cands, unpack_cands};
 use gzc_core::synth::test_cases;
-use gzc_gpu::compressor::{OptCandKernel, cands_from_blocks};
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::testing::{OptCandKernel, cands_from_blocks};
+use gzc_gpu::GpuContext;
 
 struct Rng(u64);
 impl Rng {
@@ -55,7 +55,7 @@ fn first_diff(got: &[CandWords], want: &[CandWords]) -> Option<String> {
 fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
     let kernel = OptCandKernel::new(ctx, params).expect("OptCandKernel::new");
     // The subgroup K1 passes its self-test (built for these chains) wherever it may run.
-    assert_eq!(kernel.uses_subgroups(), gzc_gpu::chains::ChainsKernel::subgroup_kernel_possible(ctx), "{params:?}");
+    assert_eq!(kernel.uses_subgroups(), gzc_gpu::testing::chains::ChainsKernel::subgroup_kernel_possible(ctx), "{params:?}");
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let got = cands_from_blocks(ctx, &kernel, &refs).expect("cands_from_blocks");
     assert_eq!(got.len(), blocks.len());

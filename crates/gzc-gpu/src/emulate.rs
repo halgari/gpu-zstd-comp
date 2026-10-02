@@ -36,10 +36,12 @@ pub struct Emulation {
 }
 
 impl Emulation {
+    /// Nothing emulated.
     pub const NONE: Self = Self { shift_mod32: false, vector_rmw: false, skew: false };
     /// Every other GPU's semantics (not the timing skew, which only slows things down).
     pub const ALL: Self = Self { shift_mod32: true, vector_rmw: true, skew: false };
 
+    /// True when any part is on.
     pub fn any(self) -> bool {
         self.shift_mod32 || self.vector_rmw || self.skew
     }
@@ -54,7 +56,7 @@ impl Emulation {
     }
 
     /// `src` (complete WGSL) rewritten as described on the fields.
-    pub fn rewrite(self, src: &str) -> anyhow::Result<String> {
+    pub(crate) fn rewrite(self, src: &str) -> anyhow::Result<String> {
         let module = naga::front::wgsl::parse_str(src).map_err(|e| anyhow!("{}", e.emit_to_string(src)))?;
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)

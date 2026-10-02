@@ -7,7 +7,7 @@ use gzc_core::params::LVL3;
 use gzc_core::reference::compress_block;
 use gzc_core::synth::test_cases;
 use gzc_gpu::GpuOptions;
-use gzc_gpu::compressor::{GpuParams, K3Mode, Kernels, compress_batch};
+use gzc_gpu::testing::{GpuParams, K3Mode, Kernels, compress_batch};
 
 #[test]
 fn forced_fallback_matches_cpu() {

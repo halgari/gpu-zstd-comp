@@ -9,12 +9,13 @@ use gzc_core::fixtures::RUNG1;
 use gzc_core::params::{Hashes, LVL3, LVL9SEG, SparseChain, MatchParams, OPT16, OPT16P1, OptParams};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
-use gzc_gpu::chains::{
+use gzc_gpu::testing::chains::{
     ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_span, expected_words, gpu_preds, gpu_preds_with,
     pred_of_word, pred_words_per_block,
 };
-use gzc_gpu::context::{GpuContext, pack_blocks};
-use gzc_gpu::sizing::{chain_pred_bytes, head_bytes};
+use gzc_gpu::GpuContext;
+use gzc_gpu::testing::pack_blocks;
+use gzc_gpu::testing::sizing::{chain_pred_bytes, head_bytes};
 
 /// Every test case chunked into padded blocks, labelled "name[i]", plus small-alphabet blocks
 /// (many distinct repeated hashes per tile: several equal-hash groups per subgroup tile).
@@ -329,7 +330,7 @@ fn k1_failed_self_test_falls_back() {
 #[test]
 fn pack_blocks_appends_zero_word() {
     let a = vec![1u8; gzc_core::config::BLOCK_SIZE];
-    let packed = gzc_gpu::context::pack_blocks(&[&a, &a]);
+    let packed = gzc_gpu::testing::pack_blocks(&[&a, &a]);
     assert_eq!(packed.len(), 2 * gzc_core::config::BLOCK_SIZE / 4 + 1);
     assert_eq!(packed[0], 0x0101_0101);
     assert_eq!(*packed.last().unwrap(), 0);
@@ -341,8 +342,8 @@ fn pack_blocks_appends_zero_word() {
 fn sorted_finder_kernel_names() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
     use gzc_core::params::LVL9S12SEG;
-    use gzc_gpu::compressor::{GpuParams, Kernels};
-    use gzc_gpu::sorted::workgroup_bytes;
+    use gzc_gpu::testing::{GpuParams, Kernels};
+    use gzc_gpu::testing::sorted::workgroup_bytes;
     for ctx in contexts() {
         let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
         let k = Kernels::new(&ctx, gp(LVL9S12SEG)).unwrap();
@@ -381,7 +382,7 @@ fn chains_over_short_keys() {
 fn sorted_k1_matches_bucket_sort() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
     use gzc_core::params::LVL9S12SEG;
-    use gzc_gpu::sorted::{SortKernel, sorted_words, workgroup_bytes};
+    use gzc_gpu::testing::sorted::{SortKernel, sorted_words, workgroup_bytes};
     let blocks = all_blocks();
     let ctx = gzc_gpu::testing::gpu();
     let fallback = gzc_gpu::testing::gpu_with(gzc_gpu::GpuOptions { subgroups: false, ..gzc_gpu::GpuOptions::from_env() });

@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use gzc_core::params::{MatchParams, PRESETS};
-use gzc_gpu::compressor::{GpuParams, gpu_supports};
-use gzc_gpu::sizing::max_batch_blocks;
+use gzc_gpu::{GpuParams, gpu_supports, max_batch_blocks};
 use gzc_gpu::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
 

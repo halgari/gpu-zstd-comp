@@ -10,8 +10,8 @@ use gzc_core::frame::write_frame;
 use gzc_core::params::{MatchParams, OPT14, OPT16, OPT16P1};
 use gzc_core::reference::compress_block;
 use gzc_core::seq::BlockOutput;
-use gzc_gpu::compressor::{GpuParams, Kernels, compress_batch, compress_frames, max_seqs};
-use gzc_gpu::context::{GpuContext, GpuOptions};
+use gzc_gpu::testing::{GpuParams, Kernels, compress_batch, compress_frames, max_seqs};
+use gzc_gpu::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
 const OPT_PRESETS: [(&str, MatchParams); 3] = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
@@ -125,7 +125,7 @@ fn opt_matches_oracle_synthetic() {
 #[test]
 fn m6_variants_match_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
-    use gzc_gpu::compressor::gpu_supports;
+    use gzc_gpu::testing::gpu_supports;
     let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
@@ -188,7 +188,7 @@ fn opt_corpus_matches_oracle() {
 #[test]
 fn m6_option_sweep_matches_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
-    use gzc_gpu::compressor::gpu_supports;
+    use gzc_gpu::testing::gpu_supports;
     let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();

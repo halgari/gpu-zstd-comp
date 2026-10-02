@@ -9,10 +9,10 @@ use gzc_core::fixtures::RUNG1;
 use gzc_core::params::{LVL3, MatchParams};
 use gzc_core::reference::{Match, compress_block, greedy_parse};
 use gzc_core::seq::BlockOutput;
-use gzc_gpu::compressor::{
+use gzc_gpu::testing::{
     GpuParams, K3Mode, Kernels, compress_batch, parses_from_best, parses_from_best_unchecked, probe_lanes,
 };
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::GpuContext;
 
 const WIDTHS: [usize; 3] = [8, 16, 32];
 const CAP: u32 = gzc_core::config::MATCH_SEARCH_CAP as u32;
