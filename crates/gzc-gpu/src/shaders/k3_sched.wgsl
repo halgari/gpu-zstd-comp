@@ -2,7 +2,7 @@
 // take their blocks heaviest first. Recorded once per batch, after K2opt and before the first pass,
 // on the candidate words K2opt left in `best` (no pass reads the schedule's words but K3opt).
 //
-// `sched` (k3opt::sched_bytes, bound to exactly SCHED_HDR + 3 n words for an n-block batch):
+// `sched` (sizing::sched_bytes, bound to exactly SCHED_HDR + 3 n words for an n-block batch):
 //   [0]                       the pass's block counter (cleared before every persistent pass);
 //   [1 .. SCHED_HDR)          unused;
 //   [SCHED_HDR + b]           block b's weight (main_weight);

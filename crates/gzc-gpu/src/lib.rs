@@ -5,6 +5,7 @@ pub mod emulate;
 pub mod chains;
 pub mod sorted;
 pub mod compressor;
+pub mod sizing;
 pub mod k3opt;
 pub mod pipeline;
 pub mod poison;

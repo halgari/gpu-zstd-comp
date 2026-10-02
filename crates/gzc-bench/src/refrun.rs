@@ -20,7 +20,7 @@ use crate::result::{per_kind, RunResult};
 /// every frame produced by the timed pass is decompressed with libzstd
 /// afterward and checked against the original (padded) block; any mismatch
 /// is an error.
-/// `params` must be `cpu_supports`ed (`compress_block` panics otherwise).
+/// `params` must be valid (`compress_block` panics otherwise).
 pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize, verify: bool) -> anyhow::Result<RunResult> {
     let opts = FrameOptions::default();
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;

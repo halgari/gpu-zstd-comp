@@ -7,13 +7,8 @@ use crate::config::{BLOCK_SIZE, HASH_BITS, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_sparse, hash_width, key};
 use crate::lazy::{lazy_parse, lazy_parse_segmented};
-use crate::params::{cpu_supports, Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
+use crate::params::{Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
 use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
-
-pub use crate::params::LVL3;
-
-/// The reference compressor's parameters are the shared `MatchParams`.
-pub type RefParams = MatchParams;
 
 /// A candidate match at some position: offset back from that position, and length.
 /// `len == 0` means no match was found (or none met `min_match`).
@@ -375,13 +370,12 @@ pub fn parse_cands(block: &[u8], cands: &[CandWords], p: &MatchParams) -> BlockO
 
 /// Compress one full-size block: compute the hash chains, find best matches (or the optimal
 /// parse's candidates), parse.
-/// Panics if `params` is invalid or not implemented on the CPU yet (`params::cpu_supports`).
+/// Panics if `params` is invalid (`MatchParams::validate`).
 pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     assert_eq!(block.len(), BLOCK_SIZE);
     if let Err(e) = params.validate() {
         panic!("reference::compress_block: invalid params {params:?}: {e}");
     }
-    assert!(cpu_supports(&params), "reference::compress_block: {params:?} is not implemented yet on cpu");
     let chains = chains(block, &params);
     if params.opt.is_some() {
         return parse_cands(block, &find_cands(block, &chains, &params), &params);
@@ -402,7 +396,7 @@ pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOpt
 mod tests {
     use super::*;
     use crate::block::chunk_file;
-    use crate::params::RUNG1;
+    use crate::params::{LVL3, RUNG1};
     use crate::seq::reconstruct;
     use crate::synth;
 

@@ -261,7 +261,8 @@ mod tests {
     use crate::config::BLOCK_SIZE;
     use crate::frame::testutil::scripted;
     use crate::frame::{FrameOptions, frame_header, write_frame, write_literals_raw};
-    use crate::reference::{LVL3, compress_block};
+    use crate::params::LVL3;
+    use crate::reference::compress_block;
     use crate::seq::{BlockOutput, reconstruct};
     use crate::synth;
 

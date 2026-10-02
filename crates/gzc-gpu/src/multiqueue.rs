@@ -535,7 +535,7 @@ mod tests {
         main.queue.submit([k12(main, &km, &a)]);
         wait(main);
         // The readback: frames_bytes(n) from device-local memory into a mappable buffer.
-        let size = crate::compressor::frames_bytes(n as u32);
+        let size = crate::sizing::frames_bytes(n as u32);
         let src = t.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,

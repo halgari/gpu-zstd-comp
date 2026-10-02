@@ -242,7 +242,7 @@ mod tests {
         let mut direct = 0;
         for (name, data) in synth::test_cases() {
             for (i, b) in crate::block::chunk_file(&data).into_iter().enumerate() {
-                let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                let out = crate::reference::compress_block(&b.data, crate::params::LVL3);
                 let frame = roundtrip(&b.data, &out, opts);
                 if matches!(name, "text" | "nif" | "exact_block") {
                     assert_eq!(literals_type(&frame, opts), COMPRESSED, "{name}#{i}: literals not Huffman-coded");
@@ -283,7 +283,7 @@ mod tests {
         let mut cases: Vec<(Vec<u8>, BlockOutput)> = Vec::new();
         for (_, data) in synth::test_cases() {
             for b in crate::block::chunk_file(&data) {
-                let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                let out = crate::reference::compress_block(&b.data, crate::params::LVL3);
                 cases.push((b.data, out));
             }
         }
@@ -549,7 +549,7 @@ mod tests {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((e, b)) = jobs.get(i) else { break };
-                        let out = crate::reference::compress_block(&b.data, crate::reference::LVL3);
+                        let out = crate::reference::compress_block(&b.data, crate::params::LVL3);
                         let on = write_frame(&b.data, &out, FrameOptions::default());
                         let off = write_frame(&b.data, &out, FrameOptions { huffman: false, ..Default::default() });
                         let dec = zstd::bulk::decompress(&on, BLOCK_SIZE).expect("libzstd rejected frame");

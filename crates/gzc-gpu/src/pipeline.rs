@@ -48,10 +48,9 @@ use anyhow::{Context as _, anyhow};
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::seq::BlockOutput;
 
-use crate::compressor::{
-    BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, counts_bytes, data_bytes, decode_output,
-    frame_len_bytes, frames_bytes, k4_tables_bytes, max_batch_blocks, max_seqs, scratch_bytes, seqs_bytes_for,
-    slot_bytes,
+use crate::compressor::{BatchBuffers, FRAME_STRIDE, GpuParams, KERNEL_QUERIES, Kernels, decode_output, k4_tables_bytes, max_seqs};
+use crate::sizing::{
+    counts_bytes, data_bytes, frame_len_bytes, frames_bytes, max_batch_blocks, scratch_bytes, seqs_bytes_for, slot_bytes,
 };
 use gzc_core::params::MatchParams;
 use crate::context::{ErrorScopes, GpuContext};
@@ -1750,33 +1749,10 @@ pub fn vram_bytes_with(cfg: &PipelineConfig, direct_upload: bool) -> u64 {
         + if frames { k4_tables_bytes() } else { 0 }
 }
 
-/// Builds a parse-path `Pipeline` for `cfg` (whose `emit_frames` must be false) and streams
-/// `blocks` through it (see `Pipeline::run`).
-pub fn compress_stream(
-    ctx: &GpuContext,
-    cfg: &PipelineConfig,
-    blocks: &[&[u8]],
-    sink: &mut (impl BlockSink + Send),
-) -> anyhow::Result<PipelineStats> {
-    Pipeline::new(ctx, cfg)?.run(blocks, sink)
-}
-
-/// Builds a frame-path `Pipeline` for `cfg` (`emit_frames` is forced on; `huffman` is kept) and
-/// streams `blocks` through it (see `Pipeline::run_frames`).
-pub fn compress_stream_frames(
-    ctx: &GpuContext,
-    cfg: &PipelineConfig,
-    blocks: &[&[u8]],
-    sink: &mut (impl FrameSink + Send),
-) -> anyhow::Result<PipelineStats> {
-    let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
-    Pipeline::new(ctx, &cfg)?.run_frames(blocks, sink)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chains::{head_bytes, pred_bytes};
+    use crate::sizing::{BufferSizes, chain_pred_bytes, head_bytes, pred_bytes_for};
     use gzc_core::block::chunk_file;
     use gzc_core::frame::write_frame;
     use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
@@ -1891,7 +1867,7 @@ mod tests {
         let blocks: Vec<&[u8]> = (0..1000).map(|i| distinct[i % distinct.len()].as_slice()).collect();
 
         let mut sink = Collect(vec![None; blocks.len()]);
-        let stats = compress_stream(&ctx, &cfg(64, 3), &blocks, &mut sink).expect("compress_stream");
+        let stats = Pipeline::new(&ctx, &cfg(64, 3)).and_then(|mut p| p.run(&blocks, &mut sink)).expect("run");
 
         for (i, got) in sink.0.iter().enumerate() {
             let got = got.as_ref().unwrap_or_else(|| panic!("index {i} never delivered"));
@@ -1933,11 +1909,12 @@ mod tests {
         let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let mut sink = Collect(Vec::new());
-        let stats = compress_stream(&ctx, &cfg(8, 2), &[], &mut sink).unwrap();
+        let mut run = |c: &PipelineConfig| Pipeline::new(&ctx, c).and_then(|mut p| p.run(&[], &mut sink));
+        let stats = run(&cfg(8, 2)).unwrap();
         assert_eq!(stats.batches, 0);
-        assert!(compress_stream(&ctx, &cfg(0, 2), &[], &mut sink).is_err());
-        assert!(compress_stream(&ctx, &cfg(8, 0), &[], &mut sink).is_err());
-        assert!(compress_stream(&ctx, &cfg(u32::MAX, 1), &[], &mut sink).is_err());
+        assert!(run(&cfg(0, 2)).is_err());
+        assert!(run(&cfg(8, 0)).is_err());
+        assert!(run(&cfg(u32::MAX, 1)).is_err());
         let bad = MatchParams { lazy: 3, ..LVL9 };
         let bad = PipelineConfig { params: GpuParams { matching: bad, ..cfg(8, 2).params }, ..cfg(8, 2) };
         let e = Pipeline::new(&ctx, &bad).err().expect("lazy 3 is invalid");
@@ -2058,18 +2035,16 @@ mod tests {
             })
         };
         // One chain instead of two: head and pred halve.
-        assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + pred_bytes(10, 1));
+        assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + chain_pred_bytes(10, &RUNG1));
         // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging
         // only on the parse path), K3opt's prices and scratch.
-        let opt_extra = crate::compressor::best_bytes(10)
-            + crate::compressor::seqs_bytes_for(10, &OPT16)
-            - crate::compressor::seqs_bytes(10)
-            + crate::compressor::opt_bytes(10, &OPT16);
+        let o = BufferSizes::new(10, &OPT16);
+        let opt_extra = crate::sizing::best_bytes(10) + o.seqs - seqs_bytes_for(10, &LVL3) + o.opt_prices + o.opt_scratch + o.opt_sched;
         assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
         assert_eq!(scratch(OPT14), scratch(OPT16));
         // opt16p1 (M6): three more head tables and sparse pred words; K3opt's buffers (and the
         // drop pass, which has none) are the same.
-        let p1_extra = crate::compressor::pred_bytes_for(10, &OPT16P1) - crate::compressor::pred_bytes_for(10, &OPT16)
+        let p1_extra = pred_bytes_for(10, &OPT16P1) - pred_bytes_for(10, &OPT16)
             + head_bytes(10, 5)
             - head_bytes(10, 2);
         assert_eq!(scratch(OPT16P1) - scratch(OPT16), p1_extra);
@@ -2130,8 +2105,8 @@ mod tests {
         let blocks: Vec<&[u8]> = (0..1000).map(|i| distinct[i % distinct.len()].as_slice()).collect();
 
         let mut sink = CollectFrames(vec![None; blocks.len()]);
-        // emit_frames: false in cfg is overridden by compress_stream_frames.
-        let stats = compress_stream_frames(&ctx, &cfg(64, 3), &blocks, &mut sink).expect("compress_stream_frames");
+        let c = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg(64, 3).params }, ..cfg(64, 3) };
+        let stats = Pipeline::new(&ctx, &c).and_then(|mut p| p.run_frames(&blocks, &mut sink)).expect("run_frames");
 
         for (i, got) in sink.0.iter().enumerate() {
             let got = got.as_ref().unwrap_or_else(|| panic!("index {i} never delivered"));

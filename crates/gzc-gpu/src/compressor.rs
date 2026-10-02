@@ -11,9 +11,13 @@
 //! K3 writes only the sequences and counts; the literals are the block bytes the sequences leave
 //! uncovered, so K5 gathers them from `data` and the parse path from the host's copy of the block
 //! (`decode_output`).
-use crate::chains::{self, ChainsKernel, chain_pred_bytes, finder_wgsl, head_bytes, layout_wgsl};
+use crate::chains::{self, ChainsKernel, finder_wgsl, layout_wgsl};
 use crate::k3opt::{K3OptConfig, OptBinds, OptPasses};
 use crate::context::{ErrorScopes, GpuContext, pack_blocks, params_wgsl};
+use crate::sizing::{
+    BufferSizes, best_bytes, best_bytes_for, chain_pred_bytes, counts_bytes, data_bytes, frame_len_bytes,
+    frames_bytes, head_bytes, max_batch_blocks, seqs_bytes_for,
+};
 use crate::sorted::SortKernel;
 use anyhow::{Context as _, anyhow};
 use gzc_core::codes::{
@@ -69,10 +73,8 @@ pub fn max_seqs(m: &MatchParams) -> u32 {
 }
 
 /// Largest batch `compress_batch`/`compress_frames` allocate buffers for, even when the device
-/// limits would allow more. Worst case (dfast's two hash chains, `emit_frames`:
-/// `data_bytes` + `chains::head_bytes`/`pred_bytes` + `best_bytes` + `seqs_bytes` +
-/// `counts_bytes` + `frames_bytes` + `frame_len_bytes`, with `head_bytes` capped at
-/// `chains::HEAD_TABLES` tables) is ~1.6 MiB per block, ~200 MiB at this cap. These one-shot
+/// limits would allow more. Worst case (dfast's two hash chains, `emit_frames`: every
+/// `sizing::BufferSizes` buffer, with `head` capped at `chains::HEAD_TABLES` tables) is ~1.6 MiB per block, ~200 MiB at this cap. These one-shot
 /// paths serve the tests, several of
 /// which run at once (each with its own device): 128 keeps their 300-block batches split into
 /// full and partial batches (as 256 did) at half the memory.
@@ -132,107 +134,11 @@ impl GpuParams {
     }
 }
 
-/// Bytes of the packed `data` buffer for `n_blocks` (blocks plus one trailing zero word).
-pub fn data_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * BLOCK_SIZE as u64 + 4
-}
-
 /// Low bits of a `best[]` word holding the match offset; the (capped) length sits above them.
 pub const BEST_OFF_BITS: u32 = 17;
 const _: () = assert!(BLOCK_SIZE <= 1 << BEST_OFF_BITS, "offsets must fit BEST_OFF_BITS");
 // MatchParams::validate bounds search_cap to 8..=256.
 const _: () = assert!(256 < 1u64 << (32 - BEST_OFF_BITS), "capped lengths must fit above the offset");
-
-/// Bytes of the `best` buffer: `[block][pos]` × one u32, `(capped len << BEST_OFF_BITS) | offset`
-/// (0 = no match).
-pub const fn best_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * BLOCK_SIZE as u64 * 4
-}
-
-/// u32 words per position of the `best` buffer under match params `m`: 1 (K2's best match), or 2
-/// for the optimal parse (`m.opt`: K2opt's two candidate words, `reference::CandWords`).
-pub fn best_words(m: &MatchParams) -> u32 {
-    if m.opt.is_some() { 2 } else { 1 }
-}
-
-/// Bytes of the `best` buffer under match params `m`: `best_bytes`, times `best_words(m)`.
-pub fn best_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
-    best_bytes(n_blocks) * best_words(m) as u64
-}
-
-/// Bytes of the `seqs` buffer: `[block][MAX_SEQS]` × (lit_len, match_len, off_base) u32.
-pub fn seqs_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * MAX_SEQS as u64 * 12
-}
-
-/// Bytes of the `seqs` buffer under match params `m`: `[block][max_seqs(m)]` × 3 u32.
-pub fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
-    n_blocks as u64 * max_seqs(m) as u64 * 12
-}
-
-/// Bytes of the `pred` buffer under match params `m`: K1's chains (`chains::chain_pred_bytes`),
-/// and for the optimal parse at least K3opt's DP trace, which reuses the buffer once K2opt has
-/// read the chains (`trace_bytes`). Opt3 has two full chains, so the two are equal; M6's sparse
-/// long chains add `BLOCK_SIZE / stride` words per block each (S3: 11 B per position).
-pub fn pred_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
-    let chains = chain_pred_bytes(n_blocks, m);
-    if m.opt.is_some() { chains.max(trace_bytes(n_blocks)) } else { chains }
-}
-
-/// Bytes of K3opt's DP trace for `n_blocks`: `[block][pos][2]` u32 (`tbase = 2 * b * BLOCK_SIZE`
-/// in `k3_opt.wgsl`), 8 B per position.
-pub fn trace_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * BLOCK_SIZE as u64 * 8
-}
-
-/// Bytes of K3opt's own buffers for `n_blocks` under match params `m` (0 without `opt`): the
-/// price tables / histograms (`k3opt::PRICE_WORDS` words per block), the DP nodes' payload
-/// scratch (`k3opt::scratch_bytes_per_block`) and the block schedule (`k3opt::sched_bytes`).
-pub fn opt_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
-    if m.opt.is_none() {
-        return 0;
-    }
-    n_blocks as u64 * (crate::k3opt::prices_bytes(1) + crate::k3opt::scratch_bytes_per_block(m))
-        + crate::k3opt::sched_bytes(n_blocks)
-}
-
-/// Bytes of the `counts` buffer: `[block]` × (n_seq, n_lit) u32.
-pub fn counts_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * 8
-}
-
-/// Bytes of the `frames` buffer: `[block][FRAME_STRIDE]` frame bytes.
-pub fn frames_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * FRAME_STRIDE as u64
-}
-
-/// Bytes of the `frame_len` buffer: `[block]` u32.
-pub fn frame_len_bytes(n_blocks: u32) -> u64 {
-    n_blocks as u64 * 4
-}
-
-/// Largest `n_blocks` one `Kernels::record` call (and one `BatchBuffers`) for match params `m`
-/// may take under `limits`: K1's bound (`chains::max_blocks_per_batch_for(limits, m)`: data, head
-/// and pred buffers, the pred words counting `m`'s sparse chains, the workgroups-per-dimension
-/// limit used by K1's x and K2's y dispatch, u32 head/pred indices) further limited so the best,
-/// pred (`pred_bytes_for`, which K3opt reuses as its trace), seqs, counts and frames buffers, and
-/// for opt params K3opt's prices, scratch and sched buffers, each fit one storage binding and one
-/// buffer, and their u32 word indices (at most BLOCK_SIZE words per block, in `best`, times
-/// `best_words(m)`; `seqs` has 3*MAX_SEQS < BLOCK_SIZE) cannot wrap. 0 if one block doesn't fit.
-pub fn max_batch_blocks(limits: &wgpu::Limits, m: &MatchParams) -> u32 {
-    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
-    let by_k1 = chains::max_blocks_per_batch_for(limits, m) as u64;
-    let mut per_block =
-        vec![best_bytes_for(1, m), pred_bytes_for(1, m), seqs_bytes_for(1, m), counts_bytes(1), frames_bytes(1)];
-    if m.opt.is_some() {
-        per_block.push(crate::k3opt::prices_bytes(1));
-        per_block.push(crate::k3opt::scratch_bytes_per_block(m));
-        per_block.push(crate::k3opt::sched_bytes(1));
-    }
-    let by_buffers = per_block.into_iter().map(|per_block| limit / per_block).min().unwrap();
-    let by_index = (1u64 << 32) / (BLOCK_SIZE as u64 * best_words(m) as u64);
-    by_k1.min(by_buffers).min(by_index) as u32
-}
 
 /// Per-batch buffers, allocated for `capacity` blocks and reused.
 pub struct BatchBuffers {
@@ -242,7 +148,7 @@ pub struct BatchBuffers {
     /// Packed blocks (`pack_blocks` layout); written by the caller.
     pub data: wgpu::Buffer,
     /// K1 scratch hash-head tables, `[table < chains::HEAD_TABLES][2^HASH_BITS]`
-    /// (`chains::head_bytes`: one table per chain, at most `HEAD_TABLES`).
+    /// (`sizing::head_bytes`: one table per chain, at most `HEAD_TABLES`).
     pub head: wgpu::Buffer,
     /// K1 predecessor chains, `[block][chain][pos]`.
     pub pred: wgpu::Buffer,
@@ -270,7 +176,7 @@ pub struct OptScratch {
     pub scratch: wgpu::Buffer,
     /// Bytes of `scratch` per block (for the params it was sized for).
     pub scratch_per_block: u64,
-    /// The persistent passes' block schedule (`k3opt::sched_bytes`, M6 A4).
+    /// The persistent passes' block schedule (`sizing::sched_bytes`, M6 A4).
     pub sched: wgpu::Buffer,
 }
 
@@ -298,43 +204,44 @@ impl BatchBuffers {
     ) -> anyhow::Result<Self> {
         let max = max_batch_blocks(&ctx.device.limits(), m);
         assert!(capacity >= 1 && capacity <= max, "BatchBuffers capacity {capacity} not in 1..={max}");
-        let bytes = scratch_bytes(capacity, m)
-            + if data.is_none() { data_bytes(capacity) } else { 0 }
-            + if frames && frame_bufs.is_none() { frames_bytes(capacity) + frame_len_bytes(capacity) } else { 0 };
+        let size = BufferSizes::new(capacity, m);
+        let bytes = size.scratch()
+            + if data.is_none() { size.data } else { 0 }
+            + if frames && frame_bufs.is_none() { size.frames + size.frame_len } else { 0 };
         let scopes = ErrorScopes::push(ctx);
         let n_hashes = m.n_hashes();
         let (frames, frame_len) = match (frames, frame_bufs) {
             (false, _) => (None, None),
             (true, Some((f, l))) => (Some(f), Some(l)),
             (true, None) => (
-                Some(ctx.storage_buffer("batch.frames", frames_bytes(capacity), true)),
-                Some(ctx.storage_buffer("batch.frame_len", frame_len_bytes(capacity), true)),
+                Some(ctx.storage_buffer("batch.frames", size.frames, true)),
+                Some(ctx.storage_buffer("batch.frame_len", size.frame_len, true)),
             ),
         };
         let opt = m.opt.is_some().then(|| {
             let scratch_per_block = crate::k3opt::scratch_bytes_per_block(m);
             OptScratch {
-                prices: ctx.storage_buffer("batch.opt_prices", crate::k3opt::prices_bytes(capacity), true),
-                scratch: ctx.storage_buffer("batch.opt_scratch", capacity as u64 * scratch_per_block, false),
+                prices: ctx.storage_buffer("batch.opt_prices", size.opt_prices, true),
+                scratch: ctx.storage_buffer("batch.opt_scratch", size.opt_scratch, false),
                 scratch_per_block,
-                sched: ctx.storage_buffer("batch.opt_sched", crate::k3opt::sched_bytes(capacity), false),
+                sched: ctx.storage_buffer("batch.opt_sched", size.opt_sched, false),
             }
         });
         // K3opt's `ld32` reads one word past a block's last word, so `data` keeps its trailing
         // zero word (`data_bytes` = n * BLOCK_SIZE + 4), also when the caller brings it (the
         // pipeline's direct-upload / zero-copy slots are `data_bytes(batch)` with that word
         // zeroed on every submit).
-        let data = data.unwrap_or_else(|| ctx.storage_buffer("batch.data", data_bytes(capacity), false));
-        assert!(data.size() >= data_bytes(capacity), "data buffer below data_bytes({capacity})");
+        let data = data.unwrap_or_else(|| ctx.storage_buffer("batch.data", size.data, false));
+        assert!(data.size() >= size.data, "data buffer below data_bytes({capacity})");
         let bufs = Self {
             capacity,
             n_hashes,
             data,
-            head: ctx.storage_buffer("batch.head", head_bytes(capacity, n_hashes), false),
-            pred: ctx.storage_buffer("batch.pred", pred_bytes_for(capacity, m), true),
-            best: ctx.storage_buffer("batch.best", best_bytes_for(capacity, m), true),
-            seqs: ctx.storage_buffer("batch.seqs", seqs_bytes_for(capacity, m), true),
-            counts: ctx.storage_buffer("batch.counts", counts_bytes(capacity), true),
+            head: ctx.storage_buffer("batch.head", size.head, false),
+            pred: ctx.storage_buffer("batch.pred", size.pred, true),
+            best: ctx.storage_buffer("batch.best", size.best, true),
+            seqs: ctx.storage_buffer("batch.seqs", size.seqs, true),
+            counts: ctx.storage_buffer("batch.counts", size.counts, true),
             frames,
             frame_len,
             opt,
@@ -342,24 +249,6 @@ impl BatchBuffers {
         scopes.pop_alloc(&format!("the batch buffers ({capacity} blocks)"), bytes)?;
         Ok(bufs)
     }
-}
-
-/// Bytes of the scratch buffers (head, pred, best, seqs, counts, and K3opt's prices and scratch
-/// for the optimal parse) for `n_blocks` under match params `m`: one head/pred chain per
-/// `m.n_hashes()` (`pred` at least the opt trace, `pred_bytes_for`), `seqs` of `max_seqs(m)`.
-pub fn scratch_bytes(n_blocks: u32, m: &MatchParams) -> u64 {
-    head_bytes(n_blocks, m.n_hashes())
-        + pred_bytes_for(n_blocks, m)
-        + best_bytes_for(n_blocks, m)
-        + seqs_bytes_for(n_blocks, m)
-        + counts_bytes(n_blocks)
-        + opt_bytes(n_blocks, m)
-}
-
-/// Bytes of the remaining `BatchBuffers` (data, plus frames and frame_len with `frames`) for
-/// `n_blocks`; the pipeline allocates them once, shared by all its slots.
-pub fn slot_bytes(n_blocks: u32, frames: bool) -> u64 {
-    data_bytes(n_blocks) + if frames { frames_bytes(n_blocks) + frame_len_bytes(n_blocks) } else { 0 }
 }
 
 /// K4 pipeline and its constant tables.
@@ -1492,7 +1381,7 @@ impl OptCandKernel {
     }
 
     /// Records K1 then K2opt for the first `n_blocks` blocks of `data`: K1 into `head`/`pred`
-    /// (`chains::head_bytes` for `m.n_hashes()` chains, `chain_pred_bytes`), the candidates into `cands` (at least
+    /// (`sizing::head_bytes` for `m.n_hashes()` chains, `chain_pred_bytes`), the candidates into `cands` (at least
     /// `best_bytes_for(n_blocks, m)`). `ts(0)` / `ts(1)` are K1's / K2opt's timestamp writes.
     /// `n_blocks <= max_batch_blocks(.., m)`.
     #[allow(clippy::too_many_arguments)]
@@ -1675,7 +1564,7 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chains::pred_bytes;
+    use crate::sizing::{best_words, pred_bytes_for, scratch_bytes, slot_bytes, trace_bytes};
     use gzc_core::params::{LVL3, LVL9, RUNG1, RUNG2};
 
     const MIB: u64 = 1 << 20;
@@ -1689,17 +1578,10 @@ mod tests {
         }
     }
 
-    /// Every batch buffer for `n` blocks with `nh` chains fits `limit`.
-    fn fits(n: u32, nh: u32, limit: u64) -> bool {
-        [
-            data_bytes(n),
-            head_bytes(n, nh),
-            pred_bytes(n, nh),
-            best_bytes(n),
-            seqs_bytes(n),
-            counts_bytes(n),
-            frames_bytes(n),
-        ]
+    /// Every batch buffer for `n` blocks of `m` fits `limit`.
+    fn fits(n: u32, m: &MatchParams, limit: u64) -> bool {
+        let s = BufferSizes::new(n, m);
+        [s.data, s.head, s.pred, s.best, s.seqs, s.counts, s.frames, s.opt_prices, s.opt_scratch, s.opt_sched]
         .iter()
         .all(|&b| b <= limit)
     }
@@ -1718,7 +1600,7 @@ mod tests {
             assert_eq!(max_seqs(&p), if p.opt.is_some() { MAX_SEQS_OPT } else { MAX_SEQS }, "{name}");
             assert_eq!(seqs_bytes_for(7, &p), 7 * max_seqs(&p) as u64 * 12, "{name}");
         }
-        assert_eq!(seqs_bytes_for(7, &LVL9), seqs_bytes(7));
+        assert_eq!(seqs_bytes_for(7, &LVL9), 7 * MAX_SEQS as u64 * 12);
     }
 
     #[test]
@@ -1791,10 +1673,9 @@ mod tests {
     #[test]
     fn batch_fits_every_buffer() {
         for m in [LVL3, RUNG1, RUNG2, LVL9] {
-            let nh = m.n_hashes();
             for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
                 let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &m);
-                assert!(n > 0 && fits(n, nh, limit) && !fits(n + 1, nh, limit), "{m:?} limit {limit}: n {n}");
+                assert!(n > 0 && fits(n, &m, limit) && !fits(n + 1, &m, limit), "{m:?} limit {limit}: n {n}");
                 // max_buffer_size is honoured the same way as the binding size.
                 assert_eq!(max_batch_blocks(&limits(u64::MAX, limit, 65535), &m), n);
             }
@@ -1813,27 +1694,25 @@ mod tests {
         assert_eq!(best_bytes_for(3, &OPT16), 3 * 8 * BLOCK_SIZE as u64);
         // Against lvl3 (also two chains): the second candidate word, the larger seqs, and K3opt's
         // prices (377 words) and scratch per block. The trace reuses pred (8 B per position).
-        let k3opt = crate::k3opt::prices_bytes(10)
+        let k3opt = crate::sizing::prices_bytes(10)
             + 10 * crate::k3opt::scratch_bytes_per_block(&OPT16)
-            + crate::k3opt::sched_bytes(10);
+            + crate::sizing::sched_bytes(10);
+        let opt_bytes = |m: &MatchParams| {
+            let s = BufferSizes::new(10, m);
+            s.opt_prices + s.opt_scratch + s.opt_sched
+        };
         assert_eq!(pred_bytes_for(10, &OPT16), trace_bytes(10));
-        assert_eq!(pred_bytes_for(10, &OPT16), pred_bytes(10, 2));
-        assert_eq!(opt_bytes(10, &OPT16), k3opt);
-        assert_eq!((opt_bytes(10, &LVL3), crate::k3opt::prices_bytes(1)), (0, 377 * 4));
+        assert_eq!(pred_bytes_for(10, &OPT16), chain_pred_bytes(10, &LVL3));
+        assert_eq!(opt_bytes(&OPT16), k3opt);
+        assert_eq!((opt_bytes(&LVL3), crate::sizing::prices_bytes(1)), (0, 377 * 4));
         assert_eq!(
             scratch_bytes(10, &OPT16) - scratch_bytes(10, &LVL3),
-            best_bytes(10) + seqs_bytes_for(10, &OPT16) - seqs_bytes(10) + k3opt
+            best_bytes(10) + seqs_bytes_for(10, &OPT16) - seqs_bytes_for(10, &LVL3) + k3opt
         );
         assert_eq!(crate::k3opt::scratch_bytes_per_block(&OPT16), 6336);
         for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
             let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &OPT16);
-            let fits = |n: u32| {
-                fits(n, 2, limit)
-                    && [best_bytes_for(n, &OPT16), seqs_bytes_for(n, &OPT16), opt_bytes(n, &OPT16)]
-                        .iter()
-                        .all(|&b| b <= limit)
-            };
-            assert!(n > 0 && fits(n) && !fits(n + 1), "limit {limit}: n {n}");
+            assert!(n > 0 && fits(n, &OPT16, limit) && !fits(n + 1, &OPT16, limit), "limit {limit}: n {n}");
         }
         let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &OPT16) as u64;
         assert!(n > 0 && n * 2 * BLOCK_SIZE as u64 <= 1 << 32, "cands / trace word index");
@@ -1859,20 +1738,7 @@ mod tests {
         );
         for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
             let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &OPT16P1);
-            let fits = |n: u32| {
-                [data_bytes(n), head_bytes(n, 5), pred_bytes_for(n, &OPT16P1), best_bytes_for(n, &OPT16P1)]
-                    .iter()
-                    .chain(&[seqs_bytes_for(n, &OPT16P1), opt_bytes(n, &OPT16P1), counts_bytes(n), frames_bytes(n)])
-                    .all(|&b| b <= limit)
-                    && [
-                        crate::k3opt::prices_bytes(n),
-                        n as u64 * crate::k3opt::scratch_bytes_per_block(&OPT16P1),
-                        crate::k3opt::sched_bytes(n),
-                    ]
-                        .iter()
-                        .all(|&b| b <= limit)
-            };
-            assert!(n > 0 && fits(n) && !fits(n + 1), "limit {limit}: n {n}");
+            assert!(n > 0 && fits(n, &OPT16P1, limit) && !fits(n + 1, &OPT16P1, limit), "limit {limit}: n {n}");
         }
         // With 2 GiB storage bindings (an RTX 5090 under wgpu), the 704 KiB of pred per block
         // bound the batch below the 6 GiB budget's 3125 (M6 B4: `--batch max` is 2978).

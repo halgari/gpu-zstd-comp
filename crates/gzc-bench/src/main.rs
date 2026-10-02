@@ -9,8 +9,9 @@ mod gpurun;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use gzc_core::params::{MatchParams, PRESETS, cpu_supports};
-use gzc_gpu::compressor::{GpuParams, gpu_supports, max_batch_blocks};
+use gzc_core::params::{MatchParams, PRESETS};
+use gzc_gpu::compressor::{GpuParams, gpu_supports};
+use gzc_gpu::sizing::max_batch_blocks;
 use gzc_gpu::context::GpuContext;
 use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
 
@@ -46,7 +47,7 @@ fn parse_preset(name: &str) -> Result<Preset, String> {
 /// GPU kernels) do not implement yet. Run before any work starts.
 fn check_presets(presets: &[Preset], cpu: bool, gpu: bool) -> anyhow::Result<()> {
     for p in presets {
-        anyhow::ensure!(!cpu || cpu_supports(&p.params), "preset '{}' is not implemented yet on cpu", p.name);
+        anyhow::ensure!(!cpu || p.params.validate().is_ok(), "preset '{}' is not implemented yet on cpu", p.name);
         anyhow::ensure!(!gpu || gpu_supports(&p.params), "preset '{}' is not implemented yet on gpu", p.name);
     }
     Ok(())
@@ -139,7 +140,7 @@ fn parse_batch_spec(s: &str) -> Result<BatchSpec, String> {
 }
 
 /// Resolves `BatchSpec::Max` to the largest batch that fits `budget_mb` at `inflight` for match
-/// params `m`, capped by `device_max` (`gzc_gpu::compressor::max_batch_blocks`). `vram_bytes` is
+/// params `m`, capped by `device_max` (`gzc_gpu::sizing::max_batch_blocks`). `vram_bytes` is
 /// non-decreasing in `batch` (every buffer it counts scales with `batch`, at fixed `inflight`), so
 /// this binary searches rather than scanning every batch size. `direct_upload`: the context reads
 /// batches from the upload buffers (`GpuContext::direct_upload`, no shared `data` buffer).

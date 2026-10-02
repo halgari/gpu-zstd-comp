@@ -353,14 +353,6 @@ pub fn preset(name: &str) -> Result<MatchParams, String> {
     })
 }
 
-/// Whether the CPU reference implements `p` (chains, best match and parse; M6: also the sparse
-/// chains, gap3, relaxation pruning and drop pass of `opt16p1`). Since Task 4
-/// (the lazy/lazy2 parse) it implements every preset and every valid `MatchParams`.
-pub fn cpu_supports(p: &MatchParams) -> bool {
-    // Now just `validate()`: kept as a separate hook for the CLI's per-engine preset check.
-    p.validate().is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,12 +504,12 @@ mod tests {
     }
 
     #[test]
-    fn cpu_supports_all_presets() {
+    fn every_preset_validates() {
         for (name, p) in PRESETS {
-            assert!(cpu_supports(&p), "{name}");
+            assert!(p.validate().is_ok(), "{name}");
         }
-        assert!(cpu_supports(&MatchParams { depth: 4, ..LVL3 }));
-        assert!(cpu_supports(&MatchParams { min_match: 6, lazy: 1, ..RUNG2 }));
-        assert!(!cpu_supports(&MatchParams { lazy: 3, ..LVL9 }));
+        assert!(MatchParams { depth: 4, ..LVL3 }.validate().is_ok());
+        assert!(MatchParams { min_match: 6, lazy: 1, ..RUNG2 }.validate().is_ok());
+        assert!(MatchParams { lazy: 3, ..LVL9 }.validate().is_err());
     }
 }

@@ -14,6 +14,7 @@
 //!
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
+use crate::sizing::{TABLE_BYTES, chain_pred_bytes, head_bytes, max_blocks_per_batch_for};
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, HASH_BITS, LOG2_BLOCK, NO_POS};
 use gzc_core::params::{Hashes, SparseChain, MatchParams};
 
@@ -165,12 +166,6 @@ pub fn pred_words_per_block(p: &MatchParams) -> u64 {
     off + len
 }
 
-/// Bytes of the `pred` buffer K1 writes for `n_blocks` under `p` (`pred_words_per_block`): equal
-/// to `pred_bytes(n_blocks, p.n_hashes())` without sparse long chains.
-pub fn chain_pred_bytes(n_blocks: u32, p: &MatchParams) -> u64 {
-    n_blocks as u64 * pred_words_per_block(p) * 4
-}
-
 /// Whether K1 can build `p`'s sparse long chains: their slots must be word aligned (stride 4 or
 /// 8), so a lane's key bytes are three whole data words.
 pub fn long_chains_supported(p: &MatchParams) -> bool {
@@ -224,49 +219,6 @@ pub fn expected_words(p: &MatchParams, block: &[u8]) -> Vec<u32> {
         }
     }
     out
-}
-
-/// Bytes of one head table (2^HASH_BITS u32 entries).
-const TABLE_BYTES: u64 = (1u64 << HASH_BITS) * 4;
-
-/// Bytes of the `head` buffer K1 needs for `n_blocks` with `n_hashes` chains per block
-/// (`MatchParams::n_hashes`): one table per chain, at most `HEAD_TABLES`.
-pub fn head_bytes(n_blocks: u32, n_hashes: u32) -> u64 {
-    (n_blocks as u64 * n_hashes as u64).min(HEAD_TABLES as u64) * TABLE_BYTES
-}
-
-/// Bytes of the `pred` buffer K1 writes for `n_blocks` with `n_hashes` chains per block.
-pub fn pred_bytes(n_blocks: u32, n_hashes: u32) -> u64 {
-    n_blocks as u64 * n_hashes as u64 * BLOCK_SIZE as u64 * 4
-}
-
-/// Largest `n_blocks` one `ChainsKernel::record` call may take under `limits` with `n_hashes`
-/// chains per block: the data (n*BLOCK_SIZE + 4 bytes), head and pred buffers each fit one
-/// storage binding and one buffer, and the kernels' u32 pred indices `(b*n_hashes+chain) *
-/// BLOCK_SIZE` cannot wrap (head indices `table << HASH_BITS` stay below 2^24). The block count is
-/// also kept within `max_compute_workgroups_per_dimension`, which K2 dispatches over. 0 if one
-/// block doesn't fit.
-pub fn max_blocks_per_batch(limits: &wgpu::Limits, n_hashes: u32) -> u32 {
-    max_blocks_inner(limits, n_hashes, n_hashes as u64 * BLOCK_SIZE as u64)
-}
-
-/// `max_blocks_per_batch` for the chains of `p`: `n_hashes` head tables per block and
-/// `pred_words_per_block` pred words (fewer than `n_hashes` full chains with sparse long chains).
-pub fn max_blocks_per_batch_for(limits: &wgpu::Limits, p: &MatchParams) -> u32 {
-    max_blocks_inner(limits, p.n_hashes(), pred_words_per_block(p))
-}
-
-fn max_blocks_inner(limits: &wgpu::Limits, n_hashes: u32, pred_words: u64) -> u32 {
-    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
-    let nh = n_hashes as u64;
-    let by_data = limit.saturating_sub(4) / BLOCK_SIZE as u64;
-    // head_bytes(n) <= limit: always once HEAD_TABLES tables fit, else n * nh tables must.
-    let by_head = if HEAD_TABLES as u64 * TABLE_BYTES <= limit { u64::MAX } else { limit / TABLE_BYTES / nh };
-    let by_buffers = by_data.min(by_head).min(limit / (pred_words * 4));
-    // The kernels' u32 pred word indices (b * PRED_PER_BLOCK + ..) cannot wrap; without sparse
-    // chains this is (b * n_hashes + chain) * BLOCK_SIZE.
-    let by_index = (1u64 << 32) / pred_words;
-    by_buffers.min(by_index).min(limits.max_compute_workgroups_per_dimension as u64) as u32
 }
 
 /// Computes the hash chains of `params` for BLOCK_SIZE blocks on the GPU, splitting into as many
@@ -590,69 +542,8 @@ impl ChainsKernel {
 mod tests {
     use super::*;
 
-    const MIB: u64 = 1 << 20;
-
-    fn limits(binding: u64, buffer: u64, wg: u32) -> wgpu::Limits {
-        wgpu::Limits {
-            max_storage_buffer_binding_size: binding,
-            max_buffer_size: buffer,
-            max_compute_workgroups_per_dimension: wg,
-            ..wgpu::Limits::default()
-        }
-    }
-
-    fn fits(n: u32, nh: u32, limit: u64) -> bool {
-        head_bytes(n, nh) <= limit && pred_bytes(n, nh) <= limit && n as u64 * BLOCK_SIZE as u64 + 4 <= limit
-    }
-
-    #[test]
-    fn batch_fits_every_buffer_at_default_limits() {
-        let n2 = max_blocks_per_batch(&limits(128 * MIB, 256 * MIB, 65535), 2);
-        let n1 = max_blocks_per_batch(&limits(128 * MIB, 256 * MIB, 65535), 1);
-        // pred-bound: 512 KiB per block (256 KiB with one chain); head is at most 64 MiB.
-        assert_eq!((n2, n1), (256, 512));
-        assert!(fits(n2, 2, 128 * MIB) && !fits(n2 + 1, 2, 128 * MIB));
-        assert!(fits(n1, 1, 128 * MIB) && !fits(n1 + 1, 1, 128 * MIB));
-    }
-
-    #[test]
-    fn batch_respects_buffer_size_and_workgroup_cap() {
-        for nh in [1, 2] {
-            assert_eq!(max_blocks_per_batch(&limits(128 * MIB, 128 * MIB, 3), nh), 3);
-            let n = max_blocks_per_batch(&limits(u64::MAX, 4 * MIB, 65535), nh);
-            assert!(n > 0 && fits(n, nh, 4 * MIB) && !fits(n + 1, nh, 4 * MIB));
-        }
-    }
-
-    #[test]
-    fn batch_keeps_u32_indices_in_range() {
-        // With unlimited buffers the cap keeps (b*n_hashes+chain) * BLOCK_SIZE in u32.
-        for nh in [1, 2] {
-            let n = max_blocks_per_batch(&limits(u64::MAX, u64::MAX, u32::MAX), nh);
-            assert_eq!(n as u64 * nh as u64, 1u64 << (32 - LOG2_BLOCK));
-        }
-        assert!((HEAD_TABLES as u64) << HASH_BITS <= 1 << 32);
-    }
-
-    #[test]
-    fn head_holds_one_table_per_chain_up_to_head_tables() {
-        assert_eq!(head_bytes(3, 2), 6 * TABLE_BYTES);
-        assert_eq!(head_bytes(HEAD_TABLES, 1), HEAD_TABLES as u64 * TABLE_BYTES);
-        assert_eq!(head_bytes(1638, 1), head_bytes(HEAD_TABLES, 1));
-        assert_eq!(head_bytes(1365, 2), head_bytes(HEAD_TABLES, 1));
-        // A limit below the full head bounds the chains to the tables that fit.
-        let n = max_blocks_per_batch(&limits(u64::MAX, 40 * TABLE_BYTES, 65535), 2);
-        assert!(fits(n, 2, 40 * TABLE_BYTES) && !fits(n + 1, 2, 40 * TABLE_BYTES));
-    }
-
     #[test]
     fn tags_fit_a_u32() {
         assert_eq!(MAX_TAG as u64 * (1u64 << LOG2_BLOCK) + (1u64 << LOG2_BLOCK) - 1, u32::MAX as u64);
-    }
-
-    #[test]
-    fn batch_is_zero_when_one_block_does_not_fit() {
-        assert_eq!(max_blocks_per_batch(&limits(256 * 1024, 256 * 1024, 65535), 2), 0);
-        assert_eq!(max_blocks_per_batch(&limits(BLOCK_SIZE as u64, BLOCK_SIZE as u64, 65535), 1), 0);
     }
 }
