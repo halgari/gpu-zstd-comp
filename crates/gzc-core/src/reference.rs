@@ -538,9 +538,10 @@ mod tests {
     /// the 16-bit one, at depths 4, 16 and 32 (shallow walks rarely reach other buckets).
     #[test]
     fn window_walk_equals_chain_walk() {
-        use crate::params::{LVL9, LVL9S12, LVL9S12D16SEG};
+        use crate::params::{LVL9, LVL9S12SEG};
         let s13 = MatchParams { hash_bits: 13, ..LVL9 };
-        for params in [LVL9S12, LVL9S12D16SEG, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
+        let d16 = MatchParams { depth: 16, ..LVL9S12SEG };
+        for params in [LVL9S12SEG, d16, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
                     let block = &blk.data;

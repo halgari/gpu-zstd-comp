@@ -1,6 +1,5 @@
-// K3: parse, one thread per block, sequential. LAZY == 0: the greedy parse below
-// (== gzc_core::reference::greedy_parse); LAZY 1/2: `lazy_parse` in k3_lazy.wgsl (appended by the
-// host; == gzc_core::lazy::lazy_parse). The injected LAZY constant selects the entry.
+// K3: the unsegmented greedy parse (== gzc_core::reference::greedy_parse), one thread per block,
+// sequential. Lazy parses are segmented (k3_seg.wgsl).
 // Dispatch (n_blocks, 1, 1) with workgroup size 1: each block gets its own subgroup, so the
 // long, data-dependent per-block loops never diverge against each other (2.5-6x faster than
 // 64-wide workgroups on an RTX 5090). The host binds exactly n_blocks * 2 words of `counts`,
@@ -12,7 +11,7 @@
 // uncovered (literal run i = block[anchor_i .. anchor_i + lit_len_i), anchor_i = the sum of
 // lit_len + match_len over the sequences before i, then block[anchor_n_seq .. BLOCK_SIZE)), and
 // K5 / the host gather them from there (speed phase S4).
-// MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come
+// MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH and SEARCH_CAP come
 // from the injected MatchParams. best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset
 // (K2's layout; 0 = no match).
 
@@ -46,13 +45,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     r2 = 8u;
     n_lit = 0u;
 
-    // Each parse counts every literal including the trailing ones and returns n_seq.
-    var n_seq: u32;
-    if (LAZY == 0u) {
-        n_seq = greedy_parse(base, sbase, bbase);
-    } else {
-        n_seq = lazy_parse(base, sbase, bbase);
-    }
+    // The parse counts every literal including the trailing ones and returns n_seq.
+    let n_seq = greedy_parse(base, sbase, bbase);
     counts[b * 2u] = n_seq;
     counts[b * 2u + 1u] = n_lit;
 }

@@ -1,5 +1,5 @@
 // The repeat-offset history and its helpers, shared by the sequential parse (k3_parse.wgsl, and
-// the k3_lazy / k3_coop code appended to it) and the segmented fix-up (k3_fixup.wgsl). The host
+// the k3_coop code appended to it) and the segmented fix-up (k3_fixup.wgsl). The host
 // prepends this to both (`K3_REPS_WGSL`, `K3_FIXUP_WGSL`).
 
 // Repeat-offset history (gzc_core::seq::Reps).

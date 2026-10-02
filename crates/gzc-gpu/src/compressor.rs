@@ -1,8 +1,8 @@
 //! Host side of the K2 (best match), K3 (parse), K5 (Huffman literals) and K4 (entropy + frame
 //! assembly) kernels; compress_batch / compress_frames entry points.
 //!
-//! K1 (hash chains) → K2 (`find_best`) → K3 (`reference::parse`: greedy, or `lazy::lazy_parse`
-//! when `MatchParams::lazy > 0`) reproduce
+//! K1 (hash chains) → K2 (`find_best`) → K3 (`reference::parse`: greedy, or
+//! `lazy::lazy_parse_segmented` when `MatchParams::lazy > 0`) reproduce
 //! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K5 writes each
 //! block's literals section into its frame and K4 completes the frame, byte-identical to
 //! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
@@ -37,7 +37,6 @@ const K2_OPT_WGSL: &str = include_str!("shaders/k2_opt.wgsl");
 /// sequential parse and the segmented fix-up.
 const K3_REPS_WGSL: &str = include_str!("shaders/k3_reps.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
-const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
 const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
 /// `main_fixup` and the rep helpers (`K3_REPS_WGSL`), shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
@@ -109,20 +108,31 @@ pub struct GpuParams {
     pub huffman: bool,
 }
 
-/// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes, greedy,
-/// lazy and lazy2 since M4 Task 5; the M5 optimal parse, presets `opt14`/`opt16`, with K2opt and
-/// the K3opt passes since M5 T5), and the
+/// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes; greedy
+/// over the whole block; lazy and lazy2 in segments only, `segment_log2 > 0`: an unsegmented lazy
+/// parse is refused and runs on the CPU oracle alone; the M5 optimal parse, presets
+/// `opt14`/`opt16`, with K2opt and the K3opt passes since M5 T5), and the
 /// M6 opt options (preset `opt16p1`, M6 B4): the S3 prior tables, gap3, top-N pruning and the
 /// drop pass at every value `validate` allows (K3opt and `K3Drop` compile them in), and sparse
 /// chains of stride 4 or 8 (`chains::long_chains_supported`: K1 hashes word-aligned slots).
 /// Valid sparse chains of stride 1 or 2 are refused.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.validate().is_ok() && p.opt.is_none_or(|_| chains::long_chains_supported(p))
+    p.validate().is_ok() && !unsegmented_lazy(p) && p.opt.is_none_or(|_| chains::long_chains_supported(p))
+}
+
+/// A lazy parse over the whole block: valid for the CPU oracle, not implemented on the GPU.
+fn unsegmented_lazy(p: &MatchParams) -> bool {
+    p.opt.is_none() && p.lazy > 0 && p.segment_log2 == 0
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
 pub fn check_matching(m: &MatchParams) -> anyhow::Result<()> {
     m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
+    anyhow::ensure!(
+        !unsegmented_lazy(m),
+        "match params {m:?} are not implemented on gpu: a lazy parse (lazy {}) needs segments (segment_log2 > 0)",
+        m.lazy
+    );
     anyhow::ensure!(gpu_supports(m), "match params {m:?} are not implemented yet on gpu");
     let max = max_seqs(m);
     anyhow::ensure!(
@@ -286,14 +296,16 @@ pub struct Kernels {
     /// K2: `k2_best.wgsl`'s `main`, or K2opt (`k2_opt.wgsl`) for the optimal parse.
     best: wgpu::ComputePipeline,
     best_layout: wgpu::BindGroupLayout,
-    /// The sequential K3 (None for the optimal parse, whose K3 is `opt`).
+    /// The sequential K3: the unsegmented greedy parse (None for the segmented and the optimal
+    /// parse, whose K3 is `parse_seg` / `opt`).
     parse: Option<wgpu::ComputePipeline>,
     parse_layout: wgpu::BindGroupLayout,
     /// The subgroup-cooperative K3 (`K3Mode::Coop`), used instead of `parse` when present.
     parse_coop: Option<wgpu::ComputePipeline>,
     /// The segmented K3 (`MatchParams::segment_log2 > 0`), used instead of both when present.
     parse_seg: Option<SegParse>,
-    k3_mode: K3Mode,
+    /// How the unsegmented greedy K3 runs; None when K3 is `parse_seg` or `opt`.
+    k3_mode: Option<K3Mode>,
     /// The optimal parse (`MatchParams::opt`, M5): the K3opt passes (`k3opt::OptPasses`), run as
     /// K3 instead of every parse above, on the shared buffers (`OptBinds::of_batch`).
     opt: Option<OptPasses>,
@@ -421,10 +433,10 @@ pub(crate) fn pipeline_from_module(
     })
 }
 
-/// How K3 runs the lazy / lazy2 parse (speed phase S3).
+/// How K3 runs the unsegmented greedy parse (speed phase S3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum K3Mode {
-    /// `k3_parse.wgsl` + `k3_lazy.wgsl`: one lane per block.
+    /// `k3_parse.wgsl`: one lane per block.
     Seq,
     /// `k3_coop.wgsl`: one subgroup of `w` lanes per block (needs `Features::SUBGROUP`), `bpw`
     /// blocks per workgroup.
@@ -553,28 +565,26 @@ impl Kernels {
             compute_pipeline(ctx, "k2_best", &best_layout, &format!("{best_consts}{K2_WGSL}"))
         };
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false]);
-        // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
-        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}\n{K3_LAZY_WGSL}");
+        // The unsegmented parse (greedy: `check_matching` refused an unsegmented lazy one).
+        let unsegmented = !is_opt && m.segment_log2 == 0;
+        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}");
         // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
-        // naga adds so the driver may not assume termination; it costs 4 % (lazy2, cooperative),
-        // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090). Every K3 loop
-        // provably ends, whatever best[] holds:
+        // naga adds so the driver may not assume termination; it costs 33 % of the greedy K3's
+        // time on an RTX 5090). Every K3 loop provably ends, whatever best[] holds:
         // - k3_coop.wgsl: each loop has a `// Terminates:` note (variant and bound); the only
         //   subtraction that could wrap, push_lits' end - start, is guarded.
-        // - k3_parse.wgsl / k3_lazy.wgsl: the parse loops advance p / ip below PARSE_END (a store
-        //   by >= 1 byte, a skip by step >= 1, the deferral by 1-2, the immediate loop by ml >= 4);
-        //   match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE); the catch-up's start
-        //   falls toward anchor; push_lits has no loop.
+        // - k3_parse.wgsl: the parse loop advances p below PARSE_END (a store by >= 1 byte, a
+        //   skip by step >= 1); match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE);
+        //   push_lits has no loop.
         // Bounds checks stay on. A new K3 loop must come with the same argument, or use
         // `ctx.shader` instead.
-        let parse = (!is_opt).then(|| {
+        let parse = unsegmented.then(|| {
             pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main")
         });
-        let k3_mode = k3_mode(ctx)?;
+        let k3_mode = if unsegmented { Some(k3_mode(ctx)?) } else { None };
         let parse_coop = match k3_mode {
-            K3Mode::Seq => None,
-            K3Mode::Coop { .. } if is_opt => None,
-            K3Mode::Coop { w, bpw } => {
+            None | Some(K3Mode::Seq) => None,
+            Some(K3Mode::Coop { w, bpw }) => {
                 let (mx, my) = lane_mask(w);
                 // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
                 let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
@@ -592,9 +602,11 @@ impl Kernels {
                 Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
             }
         };
-        // Segmented parse: loops as in k3_lazy.wgsl, bounded by the segment's lim instead of
-        // BLOCK_SIZE (match_len's n grows to max <= lim - p), the skip by exactly 1; the fixup
-        // loops count up to NSEG and to the segments' sequence counts.
+        // Segmented parse, also without the forced loop bounding: its parse loops advance ip
+        // below the segment's lim (a store by >= 1 byte, a skip by exactly 1, the deferral by
+        // 1-2, the immediate loop by ml >= 4); match_len's n grows to max <= lim - p; the
+        // catch-up's start falls toward anchor; the fixup loops count up to NSEG and to the
+        // segments' sequence counts.
         let parse_seg = (m.segment_log2 > 0 && !is_opt).then(|| {
             let seg_log2 = m.segment_log2;
             let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
@@ -691,8 +703,9 @@ impl Kernels {
         self.sorted.is_some()
     }
 
-    /// How K3 runs (see `k3_mode`).
-    pub fn k3_mode(&self) -> K3Mode {
+    /// How the unsegmented greedy K3 runs (see `k3_mode`); None when K3 is the segmented or the
+    /// optimal parse.
+    pub fn k3_mode(&self) -> Option<K3Mode> {
         self.k3_mode
     }
 
@@ -906,12 +919,12 @@ impl Kernels {
             ],
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
-        let seq = self.parse.as_ref().expect("the sequential K3 exists without opt");
+        let seq = self.parse.as_ref().expect("the sequential K3 exists for an unsegmented parse");
         pass.set_pipeline(self.parse_coop.as_ref().unwrap_or(seq));
         pass.set_bind_group(0, &k3, &[]);
         let per_workgroup = match self.k3_mode {
-            K3Mode::Coop { bpw, .. } => bpw,
-            K3Mode::Seq => 1,
+            Some(K3Mode::Coop { bpw, .. }) => bpw,
+            _ => 1,
         };
         pass.dispatch_workgroups(n_blocks.div_ceil(per_workgroup), 1, 1);
         Ok(())
@@ -1620,7 +1633,7 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
 mod tests {
     use super::*;
     use crate::sizing::{best_words, pred_bytes_for, scratch_bytes, slot_bytes, trace_bytes};
-    use gzc_core::params::{LVL3, LVL9, RUNG1, RUNG2};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, RUNG1, RUNG2};
 
     const MIB: u64 = 1 << 20;
 
@@ -1655,7 +1668,7 @@ mod tests {
             assert_eq!(max_seqs(&p), if p.opt.is_some() { MAX_SEQS_OPT } else { MAX_SEQS }, "{name}");
             assert_eq!(seqs_bytes_for(7, &p), 7 * max_seqs(&p) as u64 * 12, "{name}");
         }
-        assert_eq!(seqs_bytes_for(7, &LVL9), 7 * MAX_SEQS as u64 * 12);
+        assert_eq!(seqs_bytes_for(7, &LVL9SEG), 7 * MAX_SEQS as u64 * 12);
     }
 
     #[test]
@@ -1697,7 +1710,16 @@ mod tests {
         assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "S3 prior without the Prior seed");
         assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
-        assert!(gpu_supports(&MatchParams { min_match: 6, ..RUNG2 }));
+        // Lazy parses run on the GPU in segments only: the unsegmented ones (valid, and what the
+        // CPU oracle's hand-built lazy cases use) are refused.
+        for lazy in [RUNG2, LVL9, MatchParams { min_match: 6, ..RUNG2 }, MatchParams { hash_bits: 12, ..LVL9 }] {
+            assert!(lazy.validate().is_ok() && !gpu_supports(&lazy), "{lazy:?}");
+            let e = check_matching(&lazy).unwrap_err().to_string();
+            assert!(e.contains("not implemented") && e.contains("segment"), "{e}");
+            for segment_log2 in [10, 12, 16] {
+                assert!(gpu_supports(&MatchParams { segment_log2, ..lazy }), "{lazy:?} in 2^{segment_log2} segments");
+            }
+        }
         let bad = MatchParams { lazy: 3, ..LVL9 };
         assert!(!gpu_supports(&bad));
         assert!(check_matching(&bad).unwrap_err().to_string().contains("lazy 3"));
@@ -1743,7 +1765,7 @@ mod tests {
 
     #[test]
     fn batch_fits_every_buffer() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
                 let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &m);
                 assert!(n > 0 && fits(n, &m, limit) && !fits(n + 1, &m, limit), "{m:?} limit {limit}: n {n}");
@@ -1761,7 +1783,7 @@ mod tests {
     #[test]
     fn opt_batch_counts_two_candidate_words() {
         use gzc_core::params::{OPT14, OPT16};
-        assert_eq!((best_words(&LVL9), best_words(&OPT16), best_words(&OPT14)), (1, 2, 2));
+        assert_eq!((best_words(&LVL9SEG), best_words(&OPT16), best_words(&OPT14)), (1, 2, 2));
         assert_eq!(best_bytes_for(3, &OPT16), 3 * 8 * BLOCK_SIZE as u64);
         // Against lvl3 (also two chains): the second candidate word, the larger seqs, and K3opt's
         // prices (377 words) and scratch per block. The trace reuses pred (8 B per position).
@@ -1838,14 +1860,14 @@ mod tests {
 
     #[test]
     fn batch_respects_workgroup_cap() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 3), &m), 3);
         }
     }
 
     #[test]
     fn batch_keeps_u32_indices_in_range() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             let nh = m.n_hashes() as u64;
             let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &m) as u64;
             assert!(n > 0);
@@ -1859,7 +1881,7 @@ mod tests {
 
     #[test]
     fn batch_is_zero_when_one_block_does_not_fit() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             assert_eq!(max_batch_blocks(&limits(BLOCK_SIZE as u64, u64::MAX, 65535), &m), 0);
         }
     }

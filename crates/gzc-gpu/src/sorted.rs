@@ -1,8 +1,7 @@
 //! Host side of the bucket-sorted K1 (speed2 E2, `k1_sort_sg.wgsl`) and its window K2
 //! (`k2_window.wgsl`).
 //!
-//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s12`, `lvl9s12seg`,
-//! `lvl9s12d16seg`), K1 builds, per block, every hashed position ordered
+//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s12seg`), K1 builds, per block, every hashed position ordered
 //! by key and position (`gzc_core::hash::bucket_sort`) into the `pred` buffer: a counting sort in
 //! workgroup memory (one 32-lane subgroup per block) ranks the positions into `best` (scratch),
 //! then a block-major scatter places them. K2 then walks, for each slot, the entries just below

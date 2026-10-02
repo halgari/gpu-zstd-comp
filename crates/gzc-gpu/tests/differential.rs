@@ -9,8 +9,7 @@ use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases, segment_test_cases};
-use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL3, LVL9, LVL9S12, LVL9S12D16SEG, LVL9S12SEG, LVL9SEG, MatchParams, RUNG1, RUNG2};
+use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, MatchParams, RUNG1, RUNG2};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
@@ -59,16 +58,14 @@ fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
     (ctx, kernels)
 }
 
-/// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 8] = [
+/// The non-opt presets (the opt ones: `opt_pipeline.rs`), plus a single greedy chain and a
+/// segmented lazy1 parse, which no preset has. Each is checked by the differential tests below.
+const GPU_PRESETS: [(&str, MatchParams); 5] = [
     ("lvl3", LVL3),
-    ("rung1", RUNG1),
-    ("rung2", RUNG2),
-    ("lvl9", LVL9),
+    ("single-greedy", RUNG1),
+    ("lazy1-seg", MatchParams { segment_log2: 12, ..RUNG2 }),
     ("lvl9seg", LVL9SEG),
-    ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
-    ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
 /// LVL3 with a deeper chain walk.
@@ -224,17 +221,24 @@ fn kernels_per_params_coexist_and_reject_unsupported() {
     let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
     let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
     let rung1 = Kernels::new(&ctx, gp(RUNG1)).unwrap();
-    let rung2 = Kernels::new(&ctx, gp(RUNG2)).unwrap();
-    let lvl9 = Kernels::new(&ctx, gp(LVL9)).unwrap();
+    let lazy1 = MatchParams { segment_log2: 12, ..RUNG2 };
+    let rung2 = Kernels::new(&ctx, gp(lazy1)).unwrap();
+    let lvl9 = Kernels::new(&ctx, gp(LVL9SEG)).unwrap();
     let blocks = [("text".to_string(), text(12, BLOCK_SIZE))];
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     check_batch(&ctx, &depth4, &blocks, DEPTH4);
     check_batch(&ctx, &rung1, &blocks, RUNG1);
-    check_batch(&ctx, &lvl9, &blocks, LVL9);
-    check_batch(&ctx, &rung2, &blocks, RUNG2);
+    check_batch(&ctx, &lvl9, &blocks, LVL9SEG);
+    check_batch(&ctx, &rung2, &blocks, lazy1);
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     let e = Kernels::new(&ctx, gp(MatchParams { lazy: 3, ..LVL9 })).err().expect("lazy 3 rejected");
     assert!(e.to_string().contains("lazy 3"), "{e}");
+    // An unsegmented lazy parse is valid (the CPU oracle runs it) but not a GPU parse.
+    for m in [RUNG2, LVL9] {
+        assert!(m.validate().is_ok());
+        let e = Kernels::new(&ctx, gp(m)).err().expect("unsegmented lazy rejected");
+        assert!(e.to_string().contains("not implemented on gpu") && e.to_string().contains("segment"), "{e}");
+    }
     let e = Kernels::new(&ctx, gp(MatchParams { depth: 0, ..LVL3 })).err().expect("depth 0 rejected");
     assert!(e.to_string().contains("depth"), "{e}");
 }
@@ -503,7 +507,8 @@ fn gpu_frames_identical_without_subgroups() {
         assert!(!ctx.subgroups, "with_subgroups(false) must disable subgroups");
         let kernels =
             Kernels::new(&ctx, GpuParams { matching: params, emit_frames: true, huffman: true }).expect("Kernels::new");
-        assert_eq!(kernels.k3_mode(), K3Mode::Seq, "{name}: with_subgroups(false) must force the sequential K3");
+        let unsegmented = params.segment_log2 == 0;
+        assert_eq!(kernels.k3_mode(), unsegmented.then_some(K3Mode::Seq), "{name}: with_subgroups(false) must force the sequential K3");
         check_frames(&ctx, &kernels, &blocks);
     }
 }
@@ -1134,23 +1139,24 @@ fn literals_are_the_uncovered_block_bytes() {
 /// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
 /// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), a Single
 /// chain with a small cap, and short keys (the bucket-sorted finder, k1_sort_sg / k2_window) with
-/// deep walks and min_match > 4.
-const K2_VARIANTS: [MatchParams; 11] = [
+/// deep walks and min_match > 4. K2 does not depend on the parse: the lazy ones are segmented
+/// only because the GPU refuses an unsegmented lazy parse.
+const K2_VARIANTS: [MatchParams; 12] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 0, opt: None },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 12, opt: None },
     // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
     // skips only against a best of >= 4) and 6.
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 16, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16, segment_log2: 0, opt: None },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16, segment_log2: 12, opt: None },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 11, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13, segment_log2: 0, opt: None },
-    // The measured-and-dropped E2/E4 presets: a 13-bit sorted key (lvl9s13) and depth-16 chains
-    // (lvl9d16).
-    MatchParams { hash_bits: 13, ..LVL9 },
-    MatchParams { depth: 16, ..LVL9 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12, segment_log2: 12, opt: None },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13, segment_log2: 12, opt: None },
+    // A 13-bit sorted key, and depth-16 walks over the chains and over the 12-bit sorted key.
+    MatchParams { hash_bits: 13, ..LVL9SEG },
+    MatchParams { depth: 16, ..LVL9SEG },
+    MatchParams { depth: 16, ..LVL9S12SEG },
 ];
 
 /// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
@@ -1311,12 +1317,11 @@ fn k2_dfast_nearer_short_chain_candidate() {
 // ---- K3 lazy / lazy2 ----
 
 /// Lazy parses off the preset table: `min_match` above 4 (repcode matches may still be 4 bytes)
-/// and a small `search_cap`, so the parse extends many capped `best[]` entries.
-const LAZY_VARIANTS: [MatchParams; 4] = [
-    MatchParams { min_match: 6, ..RUNG2 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 0, opt: None },
-    // Segmented: 1 KiB lazy1 with min_match 6, and 2 KiB lazy2 extending many capped matches.
+/// and a small `search_cap`, so the parse extends many capped `best[]` entries: 1 KiB lazy1 with
+/// min_match 6, 2 KiB lazy2 extending many capped matches, and one segment per block.
+const LAZY_VARIANTS: [MatchParams; 3] = [
     MatchParams { min_match: 6, segment_log2: 10, ..RUNG2 },
+    MatchParams { min_match: 6, segment_log2: 16, ..RUNG2 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 11, opt: None },
 ];
 
@@ -1327,42 +1332,6 @@ fn gpu_matches_reference_lazy_variants() {
         eprintln!("{params:?}");
         let (ctx, kernels) = setup(params);
         check_batch(&ctx, &kernels, &all_blocks(), params);
-    }
-}
-
-/// Every hand-built lazy case (gain ties / wins by 1, `continue` after a win at step 1 and 2,
-/// catch-up bounds, the dedup-store rep rule, the immediate offset_2 loop, PARSE_END guards),
-/// run through K3 on its scripted `best[]` under both lazy presets. The K3 parse must equal
-/// `lazy_parse` (and the pinned sequences where the case lists them), and the frame must equal
-/// `write_frame` of it. The parse is compared directly because most of these mostly-random
-/// blocks become Raw frames, which would hide the sequences. Batched and one by one.
-#[test]
-fn k3_lazy_hand_built_best_matches_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let cases = lazy_test_cases();
-    assert_eq!(cases.len(), 21);
-    for params in [RUNG2, LVL9] {
-        let (ctx, kernels) = setup_frames_for(params, true);
-        let check = |cases: &[&LazyCase]| {
-            let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
-            let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
-            let parses = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("parses_from_best");
-            let frames = frames_from_best(&ctx, &kernels, &blocks, &bests).expect("frames_from_best");
-            for ((c, got), frame) in cases.iter().zip(&parses).zip(&frames) {
-                let want = lazy_parse(&c.block, &c.best, &params);
-                assert!(*got == want, "{} lazy {}: K3 != lazy_parse; {}", c.name, params.lazy, first_diff(got, &want));
-                if let Some((_, pinned)) = c.expect.iter().find(|(p, _)| *p == params) {
-                    assert_eq!(got.sequences, *pinned, "{} lazy {}: pinned sequences", c.name, params.lazy);
-                }
-                let want_frame = write_frame(&c.block, &want, kernels.frame_options());
-                assert!(*frame == want_frame, "{} lazy {}: frame; {}", c.name, params.lazy, first_byte_diff(frame, &want_frame));
-            }
-        };
-        let all: Vec<&LazyCase> = cases.iter().collect();
-        check(&all);
-        for c in &all {
-            check(std::slice::from_ref(c));
-        }
     }
 }
 

@@ -802,7 +802,7 @@ impl<'a> Pipeline<'a> {
     }
 
     /// How this pipeline's K3 runs (the mode its kernels were built with).
-    pub fn k3_mode(&self) -> crate::compressor::K3Mode {
+    pub fn k3_mode(&self) -> Option<crate::compressor::K3Mode> {
         self.kernels.k3_mode()
     }
 
@@ -1817,7 +1817,7 @@ mod tests {
     use super::*;
     use crate::sizing::{BufferSizes, chain_pred_bytes, head_bytes, pred_bytes_for};
     use gzc_core::block::chunk_file;
-    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
+    use gzc_core::params::{LVL3, LVL9SEG, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
@@ -1977,7 +1977,7 @@ mod tests {
         assert!(run(&cfg(0, 2)).is_err());
         assert!(run(&cfg(8, 0)).is_err());
         assert!(run(&cfg(u32::MAX, 1)).is_err());
-        let bad = MatchParams { lazy: 3, ..LVL9 };
+        let bad = MatchParams { lazy: 3, ..LVL9SEG };
         let bad = PipelineConfig { params: GpuParams { matching: bad, ..cfg(8, 2).params }, ..cfg(8, 2) };
         let e = Pipeline::new(&ctx, &bad).err().expect("lazy 3 is invalid");
         assert!(e.to_string().contains("lazy 3"), "{e}");
@@ -2139,7 +2139,7 @@ mod tests {
     fn vram_matches_params() {
         let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14, OPT16P1] {
+        for matching in [LVL3, RUNG1, LVL9SEG, OPT16, OPT14, OPT16P1] {
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg =
                     PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
@@ -2253,7 +2253,7 @@ mod tests {
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..300).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         for (huffman, batch, inflight) in [(true, 64, 3), (false, 7, 1), (true, 13, 2)] {
-            let params = GpuParams { matching: LVL9, emit_frames: true, huffman };
+            let params = GpuParams { matching: LVL9SEG, emit_frames: true, huffman };
             let pcfg = PipelineConfig { batch, inflight, params };
             let mut pipe = Pipeline::new(&ctx, &pcfg).unwrap();
             assert!(pipe.pack.is_some());
@@ -2292,7 +2292,7 @@ mod tests {
     }
 
     /// Every upload/readback mode delivers the CPU's frames, over partial batches and reuse, for
-    /// the chain finder (lvl9) and the bucket-sorted finder with the segmented parse (lvl9s12seg).
+    /// the chain finder (lvl9seg) and the bucket-sorted finder with the segmented parse (lvl9s12seg).
     #[test]
     fn stream_frames_every_mode_matches_cpu() {
         let _gpu = crate::test_support::gpu_test_slot();
@@ -2300,7 +2300,7 @@ mod tests {
         let blocks: Vec<&[u8]> = (0..200).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let modes = mode_contexts();
         assert!(modes.iter().any(|(_, c)| c.transfer.is_none() && !c.direct_upload), "the fallback mode always exists");
-        for matching in [LVL9, LVL9S12SEG] {
+        for matching in [LVL9SEG, LVL9S12SEG] {
             let params = GpuParams { matching, emit_frames: true, huffman: true };
             let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
             for (name, ctx) in &modes {
@@ -3000,7 +3000,7 @@ mod tests {
         }
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
         let distinct = distinct_blocks();
-        let params = GpuParams { matching: LVL9, emit_frames: true, huffman: true };
+        let params = GpuParams { matching: LVL9SEG, emit_frames: true, huffman: true };
         let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
         let blocks: Vec<&[u8]> = (0..150).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 32, inflight: 2, params }).unwrap();

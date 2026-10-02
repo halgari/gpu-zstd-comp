@@ -121,9 +121,8 @@ matches it byte for byte.
 | Preset | Ratio | Comparable to | Notes |
 |---|---:|---|---|
 | `lvl3` | 1.264 | zstd level 3 | greedy parse |
-| `rung1`, `rung2` | 1.330, 1.337 | zstd level 5–6 | greedy and lazy |
-| `lvl9`, `lvl9seg`, `lvl9s12`, `lvl9s12seg` | 1.3393 | zstd level 9 (1.3379) | `lvl9s12seg` is the fastest |
-| `lvl9s12d16seg` | 1.3386 | zstd level 9 | half the candidate depth |
+| `lvl9seg` | 1.33931 | zstd level 9 (1.33786) | lazy parse over hash chains; the faster level-9 preset on Apple GPUs |
+| `lvl9s12seg` | 1.33926 | zstd level 9 (1.33786) | lazy parse over the sorted finder; the fastest level-9 preset elsewhere |
 | `opt14` | 1.37064 | zstd level 14 (1.36827) | optimal parse, 2 passes |
 | `opt16` | 1.37144 | zstd level 16 (1.37100) | optimal parse, 4 passes |
 | `opt16p1` | 1.37229 | zstd level 16 (1.37100) | optimal parse, 1 pass; faster than `opt16` |

@@ -61,18 +61,15 @@ and errors on any mismatch against the original block.
 
 `--preset <list>` (on `ref`, `gpu` and `all`; default `lvl3`) picks the match
 parameters (`gzc_core::params::PRESETS`), one run per preset. Every preset runs on both `cpu-ref`
-and the GPU, byte for byte the same frames:
+and the GPU, byte for byte the same frames. (The GPU parses greedily over the whole block, or lazily
+and optimally in 4 KiB segments; a lazy parse over the whole block exists only in the CPU
+reference, and no preset uses it.)
 
 | Preset | What it is | Compare against |
 |---|---|---|
 | `lvl3` | dfast chains (8 B + 5 B), min match 5, depth 1, greedy | M3 output (byte-identical) / L3 |
-| `rung1` | single 4 B hash chain, depth 8, greedy | L5 |
-| `rung2` | `rung1` with a lazy parse | L6 |
-| `lvl9` | single 4 B hash chain, depth 32, lazy2 | L9 |
-| `lvl9seg` | `lvl9` with the parse split into independent 4 KiB segments (speed-2 E1) | L9 |
-| `lvl9s12` | `lvl9` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2) | L9 |
-| `lvl9s12seg` | `lvl9s12` + segmented parse: the fastest preset at L9 ratio | L9 |
-| `lvl9s12d16seg` | `lvl9s12seg` walking 16 candidates instead of 32 | L9 |
+| `lvl9seg` | single 4 B hash chain, depth 32, lazy2, the parse split into independent 4 KiB segments (speed-2 E1) | L9 |
+| `lvl9s12seg` | `lvl9seg` with a 12-bit hash key; the GPU finder bucket-sorts candidates per block (E2): the fastest preset at L9 ratio, except on Apple GPUs, where `lvl9seg` is faster | L9 |
 | `opt14` | M5 optimal parse (3-byte matches, priced DP per 4 KiB segment), prior seed + 1 re-pricing pass | L14 |
 | `opt16` | M5 optimal parse, block-init seed + 3 re-pricing passes | L16 |
 | `opt16p1` | M6: one optimal-parse pass over more candidates (three extra hash chains on every 4th position), a retrained prior seed, then short matches turned back into literals where cheaper | L16 |
@@ -81,11 +78,8 @@ Full-corpus ratios at 64 KiB (`gzc-bench ref`, which the GPU matches byte for by
 
 | Preset | Ratio | libzstd | libzstd ratio |
 |---|---:|---|---:|
-| `lvl9` | 1.33932 | L9 | 1.33786 |
 | `lvl9seg` | 1.33931 | L9 | 1.33786 |
-| `lvl9s12` | 1.33927 | L9 | 1.33786 |
 | `lvl9s12seg` | 1.33926 | L9 | 1.33786 |
-| `lvl9s12d16seg` | 1.33860 | L9 | 1.33786 |
 | `opt14` | 1.37064 | L14 | 1.36827 |
 | `opt16` | 1.37144 | L16 | 1.37100 |
 | `opt16p1` | 1.37229 | L16 | 1.37100 |
@@ -121,8 +115,8 @@ list is swept:
 - `--verify` decompresses every frame with libzstd after the timed pass.
 
 At the default 6144 MiB budget and 64 KiB blocks, `--batch max` resolves (RTX 5090, with the
-direct upload active) to b4095 for `lvl3` (the device's own limit) and b5403 for every
-single-hash preset (`rung1` … `lvl9s12d16seg`) at `--inflight 3`; at `--inflight 2` it's b4095
+direct upload active) to b4095 for `lvl3` (the device's own limit) and b5403 for the
+single-hash presets (`lvl9seg`, `lvl9s12seg`) at `--inflight 3`; at `--inflight 2` it's b4095
 and b6078. Without the direct upload (`GZC_DIRECT_UPLOAD=0`, or no full ReBAR) the pipeline keeps a
 shared `data` buffer and the single-hash presets resolve to b5118 at `--inflight 3`. These depend
 on the pipeline's VRAM footprint (`gzc_gpu::pipeline::vram_bytes_with`) and the
@@ -130,7 +124,7 @@ device, so re-derive them for your own card/build with e.g.:
 
 ```sh
 cargo run --release -p gzc-bench -- gpu --synthetic \
-  --preset lvl3,rung1,rung2,lvl9,lvl9seg,lvl9s12,lvl9s12seg,lvl9s12d16seg --batch max --inflight 3
+  --preset lvl3,lvl9seg,lvl9s12seg,opt14,opt16,opt16p1 --batch max --inflight 3
 ```
 
 ```sh
@@ -149,7 +143,7 @@ fails, the CPU results are still written.
 ```sh
 cargo run --release -p gzc-bench -- all \
   --input data/corpus --ext dds,nif --max-bytes 2000000000 \
-  --levels 1,2,3,4,5,6,9 --threads 1,8,16,32 --preset lvl3,lvl9,lvl9s12seg \
+  --levels 1,2,3,4,5,6,9 --threads 1,8,16,32 --preset lvl3,lvl9seg,lvl9s12seg \
   --batch max --inflight 3 --verify --out out
 ```
 
@@ -189,19 +183,20 @@ that is off by default is turned on by any value but `0`; one that is on by defa
 by `0` only.
 
 - `GZC_NO_SUBGROUPS` (anything but `0`): a device without subgroups, i.e. the portable kernels
-  every GPU can run. Chain presets use the fallback K1 (`k1_chains.wgsl`); the sorted presets
-  (`lvl9s12*`) use the workgroup-memory bucket sort (`k1_sort.wgsl`) instead of
+  every GPU can run. Chain presets use the fallback K1 (`k1_chains.wgsl`); the sorted preset
+  (`lvl9s12seg`) uses the workgroup-memory bucket sort (`k1_sort.wgsl`) instead of
   `k1_sort_sg.wgsl`, with the same window K2. K3 is the sequential kernel
-  (`k3_parse.wgsl`/`k3_lazy.wgsl`) for unsegmented presets; the segmented parse (`*seg`) never
+  (`k3_parse.wgsl`) for `lvl3`'s unsegmented greedy parse; the segmented parse (`*seg`) never
   uses subgroups. Output is byte-identical either way; `lvl9s12seg` does 8722 MB/s this way on the
   RTX 5090 (see `docs/results/2026-09-30-speed2.md`).
-- `GZC_SORTED=0`: the sorted presets use the hash-chain K1/K2 over the same 12-bit key instead of
+- `GZC_SORTED=0`: the sorted preset uses the hash-chain K1/K2 over the same 12-bit key instead of
   the bucket-sorted finder (byte-identical, slower); for comparisons.
 - `GZC_K1_GROUPS=N`: live head tables (persistent workgroups) the subgroup chain K1 keeps
   resident; default 128, sized for the ~32 MB L2 of 8 GB-class cards. 256 is about +7% on an RTX
   5090 (96 MB L2).
-- `GZC_K3_MODE=seq|coop`: forces the sequential or subgroup-cooperative K3 kernel
-  (`coop` errors if the device/probe can't support it); default: auto-detected.
+- `GZC_K3_MODE=seq|coop`: forces the sequential or subgroup-cooperative K3 kernel of the
+  unsegmented greedy parse (`lvl3`; `coop` errors if the device/probe can't support it);
+  default: auto-detected. The segmented and optimal parses have one K3 each.
 - `GZC_K3_W=4|8|16|32|64`: cooperative K3's lanes per block (at most the device's
   minimum subgroup size).
 - `GZC_K3_BPW=2`: two blocks per cooperative-K3 workgroup (needs min == max subgroup

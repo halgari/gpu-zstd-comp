@@ -7,7 +7,7 @@ use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
 use gzc_core::opt::cases::{opt_test_cases, run_case};
 use gzc_core::opt::{Engine, Hist, Prices, dp_pass_with, drop_pass, passes};
-use gzc_core::params::{LVL9, MatchParams, OPT14, OPT16, OPT16P1, OptParams, PriorTables, Seed};
+use gzc_core::params::{LVL9SEG, MatchParams, OPT14, OPT16, OPT16P1, OptParams, PriorTables, Seed};
 use gzc_core::reference::{CandWords, chains, find_cands};
 use gzc_core::seq::BlockOutput;
 use gzc_gpu::compressor::{GpuParams, Kernels, OptCandKernel, cands_from_blocks, frames_from_parses};
@@ -339,7 +339,7 @@ fn k3opt_matches_oracle_synthetic() {
     let kf = Kernels::new(
         &ctx,
         GpuParams {
-            matching: LVL9,
+            matching: LVL9SEG,
             emit_frames: true,
             huffman: true,
         },
@@ -389,7 +389,7 @@ fn k3opt_corpus() {
     let kf = Kernels::new(
         &ctx,
         GpuParams {
-            matching: LVL9,
+            matching: LVL9SEG,
             emit_frames: true,
             huffman: true,
         },
@@ -1022,7 +1022,7 @@ fn check_p1_frames(ctx: &GpuContext, kf: &Kernels, blocks: &[Vec<u8>], cands: &[
 
 /// The frames' kernels (K4/K5 only; the parse comes from the K3opt harness).
 fn frame_kernels(ctx: &GpuContext) -> Kernels {
-    Kernels::new(ctx, GpuParams { matching: LVL9, emit_frames: true, huffman: true }).unwrap()
+    Kernels::new(ctx, GpuParams { matching: LVL9SEG, emit_frames: true, huffman: true }).unwrap()
 }
 
 /// `opt::cases::m6_test_cases` (gap3, top-4 pruning) with their tables, at their level, on both
