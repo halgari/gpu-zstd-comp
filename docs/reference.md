@@ -246,7 +246,8 @@ lower the VRAM budget.
 `GpuOptions` says how the device is opened and which kernels are built. `GpuOptions::default()`
 reads nothing from the environment. `GpuOptions::from_env()` (and
 `CompressorOptions::from_env(level)`) applies the `GZC_*` variables below; `gzc-bench` and the
-tests use it. No option changes the compressed output.
+tests use it. No option changes the compressed output. wgpu's own `WGPU_BACKEND` variable picks
+the backend either way.
 
 ### The pipeline underneath (`gzc_gpu::pipeline`)
 

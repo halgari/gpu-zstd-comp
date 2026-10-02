@@ -225,6 +225,8 @@ impl Compressor {
     /// batch was delivered and dropped. An error from either closure stops the stream and is
     /// returned as it was. The compressor stays usable.
     ///
+    /// The compressor is busy until `stream` returns. Do not call it from inside the closures.
+    ///
     /// ```no_run
     /// use gzc_gpu::{Compressor, Error, Level};
     ///

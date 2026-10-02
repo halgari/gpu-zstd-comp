@@ -82,6 +82,9 @@ pub enum K3Kernel {
 /// [`GpuOptions::default`] turns on every fast path the adapter supports and reads nothing from
 /// the environment. [`GpuOptions::from_env`] applies the `GZC_*` variables on top; the benchmark
 /// and the tests use it. No option changes the compressed output.
+///
+/// The backend is wgpu's choice, which wgpu's own `WGPU_BACKEND` variable overrides whatever
+/// these options say.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
     /// Use subgroup operations when the adapter has them. `GZC_NO_SUBGROUPS` turns them off.

@@ -44,7 +44,7 @@
 //!
 //! Nothing here reads the environment unless asked. [`GpuOptions::from_env`] and
 //! [`CompressorOptions::from_env`] apply the `GZC_*` variables, which the benchmark and the
-//! tests use.
+//! tests use. The one exception is wgpu's own `WGPU_BACKEND`, which picks the backend.
 //!
 //! # The pipeline underneath
 //!
