@@ -1282,9 +1282,9 @@ fn k2_best_matches_find_best() {
 
 /// Dfast, the case the cross-chain early-out must get right: the long chain caps at a far
 /// candidate while the short chain holds a nearer (larger q) one. A nearer candidate shorter
-/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one of
-/// >= 8 bytes is on the long chain too, ahead of the far copy, and wins there (with search_cap
-/// 8 it caps first, and the far copy is never compared).
+/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one
+/// of at least 8 bytes is on the long chain too, ahead of the far copy, and wins there (with
+/// search_cap 8 it caps first, and the far copy is never compared).
 #[test]
 fn k2_dfast_nearer_short_chain_candidate() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();

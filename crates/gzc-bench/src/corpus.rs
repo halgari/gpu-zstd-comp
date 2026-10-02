@@ -99,10 +99,10 @@ pub fn load(opts: &LoadOpts) -> anyhow::Result<Corpus> {
             }
         }
 
-        if let Some(max) = opts.max_bytes {
-            if total >= max {
-                break;
-            }
+        if let Some(max) = opts.max_bytes
+            && total >= max
+        {
+            break;
         }
 
         let kind = path

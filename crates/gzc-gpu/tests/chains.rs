@@ -403,7 +403,7 @@ fn sorted_k1_matches_bucket_sort() {
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
         let sorted = ctx.storage_buffer("test.sorted", chain_pred_bytes(n, &RUNG1), true);
         let rank = ctx.storage_buffer("test.rank", chain_pred_bytes(n, &RUNG1), false);
-        let got = k1.run(&ctx, &data, &sorted, &rank, n);
+        let got = k1.run(ctx, &data, &sorted, &rank, n);
         for (b, (name, block)) in blocks.iter().enumerate() {
             let want = sorted_words(block, &params);
             let g = &got[b * BLOCK_SIZE..][..HASHED_POSITIONS];
@@ -416,7 +416,7 @@ fn sorted_k1_matches_bucket_sort() {
             let packed = pack_blocks(&[block.as_slice()]);
             let data = ctx.storage_buffer("test.data1", (packed.len() * 4) as u64, false);
             ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-            let got = k1.run(&ctx, &data, &sorted, &rank, 1);
+            let got = k1.run(ctx, &data, &sorted, &rank, 1);
             assert!(got[..HASHED_POSITIONS] == sorted_words(block, &params)[..HASHED_POSITIONS], "{params:?} {name} alone");
         }
     }

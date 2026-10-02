@@ -328,16 +328,16 @@ fn render_html(results: &[RunResult]) -> String {
     ));
 
     // Dashed projection line (drawn first, under the real series).
-    if let Some(proj) = &projection {
-        if proj.points.len() > 1 {
-            let pts: Vec<String> =
-                proj.points.iter().map(|&(x, y, _)| format!("{:.1},{:.1}", x_pos(x), y_pos(y))).collect();
-            svg.push_str(&format!(
-                r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2" stroke-dasharray="6 4" opacity="0.65"/>"#,
-                pts.join(" "),
-                series_color_var(proj.slot)
-            ));
-        }
+    if let Some(proj) = &projection
+        && proj.points.len() > 1
+    {
+        let pts: Vec<String> =
+            proj.points.iter().map(|&(x, y, _)| format!("{:.1},{:.1}", x_pos(x), y_pos(y))).collect();
+        svg.push_str(&format!(
+            r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2" stroke-dasharray="6 4" opacity="0.65"/>"#,
+            pts.join(" "),
+            series_color_var(proj.slot)
+        ));
     }
 
     // Thread-count series.

@@ -222,12 +222,12 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
         }
 
         // first search (depth 0)
-        if let Some((ml2, ob)) = search_max(block, best, ip, params, seg) {
-            if ml2 > match_length {
-                match_length = ml2;
-                start = ip;
-                off_base = ob;
-            }
+        if let Some((ml2, ob)) = search_max(block, best, ip, params, seg)
+            && ml2 > match_length
+        {
+            match_length = ml2;
+            start = ip;
+            off_base = ob;
         }
 
         if match_length < 4 {

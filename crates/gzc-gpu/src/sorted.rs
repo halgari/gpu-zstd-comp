@@ -190,6 +190,7 @@ impl SortKernel {
     /// words, layout `[block][slot]`), using `rank` (as large; `[block][pos]`, scratch: the
     /// pipeline passes `best`, which K2 overwrites) for each position's slot. Both dispatches
     /// run in one compute pass writing `timestamp_writes` (if any).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_timed(
         &self,
         ctx: &GpuContext,

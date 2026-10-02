@@ -25,7 +25,7 @@ pub fn run_cpu(corpus: &Corpus, level: i32, threads: usize) -> anyhow::Result<Ru
             .par_iter()
             .map_init(
                 || zstd::bulk::Compressor::new(level).expect("zstd compressor"),
-                |compressor, block| compress_block(compressor, block),
+                compress_block,
             )
             .collect::<anyhow::Result<Vec<u64>>>()?;
         Ok(())
@@ -38,7 +38,7 @@ pub fn run_cpu(corpus: &Corpus, level: i32, threads: usize) -> anyhow::Result<Ru
             .par_iter()
             .map_init(
                 || zstd::bulk::Compressor::new(level).expect("zstd compressor"),
-                |compressor, block| compress_block(compressor, block),
+                compress_block,
             )
             .collect::<anyhow::Result<Vec<u64>>>()
     })?;
