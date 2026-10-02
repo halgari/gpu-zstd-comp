@@ -52,6 +52,7 @@ pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize,
         })?;
     }
 
+    crate::result::log_frame_digest(corpus, frames.iter().map(Vec::as_slice));
     let sizes: Vec<u64> = frames.iter().map(|f| f.len() as u64).collect();
     let compressed_bytes: u64 = sizes.iter().sum();
     let real_bytes = corpus.real_bytes();

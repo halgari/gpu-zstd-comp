@@ -123,6 +123,7 @@ pub fn run_gpu(
             anyhow::ensure!(dec == block.data, "block {i} did not round-trip through the GPU frame");
             Ok(())
         })?;
+        crate::result::log_frame_digest(corpus, kept.iter().map(|f| f.get().expect("frame kept").as_slice()));
     }
 
     let real_bytes = corpus.real_bytes();
