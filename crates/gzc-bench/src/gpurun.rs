@@ -1,14 +1,14 @@
 //! GPU compressor benchmark runs (frame path: the GPU emits complete zstd frames).
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use rayon::prelude::*;
 
 use gzc_core::config::BLOCK_SIZE;
 use gzc_gpu::compressor::GpuParams;
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::GpuContext;
 use gzc_gpu::pipeline::{FrameSink, ParFrameSink, Pipeline, PipelineConfig, vram_bytes_with};
 
 use crate::corpus::Corpus;
@@ -83,7 +83,7 @@ impl FrameSink for Discard {
 /// breakdown is printed to stderr. `cfg.params.emit_frames` is forced on. `preset` names
 /// `cfg.params.matching` in the run's config label.
 pub fn run_gpu(
-    ctx: &GpuContext,
+    ctx: &Arc<GpuContext>,
     corpus: &Corpus,
     preset: &str,
     cfg: &PipelineConfig,
@@ -95,9 +95,9 @@ pub fn run_gpu(
     eprintln!(
         "  k3 mode: {}; direct upload: {}; transfer readback: {}; allocated {} MiB",
         pipe.k3_mode().map_or("segmented or optimal parse".to_string(), |m| format!("{m:?}")),
-        ctx.direct_upload,
+        ctx.direct_upload(),
         pipe.transfer_readback(),
-        vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)
+        vram_bytes_with(&cfg, ctx.direct_upload()).div_ceil(1 << 20)
     );
     let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.real()).collect();
 
@@ -184,7 +184,7 @@ mod tests {
             let opts = FrameOptions { checksum: false, huffman };
             corpus.blocks.iter().map(|b| compress_block_to_frame(b.real(), LVL3, opts).len() as u64).sum()
         };
-        let ctx = GpuContext::new().unwrap();
+        let ctx = Arc::new(GpuContext::new(gzc_gpu::GpuOptions::from_env()).unwrap());
         for (writers, huffman) in [(0, true), (2, true), (0, false)] {
             let params = GpuParams { matching: LVL3, emit_frames: false, huffman };
             let cfg = PipelineConfig { batch: 4, inflight: 2, params };

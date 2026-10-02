@@ -1,12 +1,19 @@
-//! GpuContext: device/queue setup, buffer helpers, shader templating.
+//! `GpuContext`: device and queue setup, `GpuOptions`, buffer helpers, shader templating.
 use anyhow::{Context as _, anyhow};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, NO_POS, PARSE_END};
 use gzc_core::params::MatchParams;
 
-pub use crate::emulate::Emulation;
+use crate::emulate::Emulation;
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
+/// An open GPU device and what it runs with. Create one with [`GpuContext::new`]; a
+/// [`crate::Compressor`] creates its own.
+///
+/// It is `Send + Sync`. Several pipelines may share one context, with one limit: a context
+/// that reads frames back through a transfer queue ([`GpuContext::transfer_readback`]) serves one
+/// frame pipeline at a time, and nothing else may submit to its queue from another thread while
+/// that pipeline runs.
 pub struct GpuContext {
     /// A queue of a transfer-only family on the same `VkDevice` (speed-2 E3): frame-path
     /// pipelines read their frames back through it, concurrently with the next batch's kernels
@@ -20,81 +27,142 @@ pub struct GpuContext {
     /// its next submission (`TransferQueue::submit_wgpu`, under a lock that every submission of a
     /// transfer-readback `Pipeline` takes). While such a pipeline exists, **nothing else may
     /// submit to `queue` concurrently with it** (from another thread: `queue.submit`,
-    /// `write_buffer`, `read_buffer`, the one-shot `compressor` functions, another pipeline's
+    /// `write_buffer`, `read_buffer`, the one-shot `testing` functions, another pipeline's
     /// `run`), or that submission could take the staged semaphores. Only one transfer-readback
     /// `Pipeline` may exist per context: `Pipeline::new` errors on a second one while the first is
     /// alive (it does not fall back to the main-queue readback, which would still submit to the
     /// same queue). Other pipelines (parse path) and other work on the same thread
     /// are fine. Open a context with `GpuOptions::transfer_queue` off for anything else.
-    pub transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub adapter_info: wgpu::AdapterInfo,
+    pub(crate) transfer: Option<std::sync::Arc<crate::transfer::TransferQueue>>,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) adapter_info: wgpu::AdapterInfo,
     /// True when the device was created with `Features::TIMESTAMP_QUERY`.
-    pub timestamps: bool,
+    pub(crate) timestamps: bool,
     /// The adapter can also write timestamps inside encoders
     /// (`Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`, not requested). Without it (Metal on Apple
     /// GPUs: counters sampled at stage boundaries only) the pipeline's timers are pass-boundary
     /// samples that the device may leave unwritten, see `PipelineStats::kernel_ms`.
-    pub timestamps_inside_encoders: bool,
+    pub(crate) timestamps_inside_encoders: bool,
     /// True when the device was created with `Features::SUBGROUP`. K1 then runs its subgroup
     /// kernel (`k1_chains_sg.wgsl`) if the subgroup sizes suit it and its self-test passes;
     /// otherwise the workgroup-sort fallback. K3 runs its cooperative kernel
-    /// (`k3_coop.wgsl`) if its lane probe passes (see `compressor::k3_mode`).
-    pub subgroups: bool,
+    /// (`k3_coop.wgsl`) if its lane probe passes (see `kernels::k3_mode`).
+    pub(crate) subgroups: bool,
     /// The kernels read each batch straight from its slot's mapped upload buffer, with no upload
     /// copy (speed-2 E8): the device was created with `Features::MAPPABLE_PRIMARY_BUFFERS`
     /// (mappable buffers may also be storage buffers; requested only for this) and the upload
-    /// buffers land in device-local memory (full ReBAR / SAM, see `rebar`). `GZC_DIRECT_UPLOAD=0` turns it off, `=1` forces it on
-    /// whenever `MAPPABLE_PRIMARY_BUFFERS` exists (for measurements: without ReBAR the kernels
-    /// would read the batch over PCIe).
-    pub direct_upload: bool,
-    /// Other GPUs' semantics emulated in every shader module (`GpuOptions::emulate`).
-    pub emulate: Emulation,
+    /// buffers land in device-local memory (full ReBAR / SAM, see `rebar`), or
+    /// `GpuOptions::direct_upload` forced it (for measurements: without ReBAR the kernels would
+    /// read the batch over PCIe).
+    pub(crate) direct_upload: bool,
+    /// The options the context was opened with (`subgroups`, `direct_upload` and `timestamps`
+    /// above hold what the adapter then allowed).
+    pub(crate) opts: GpuOptions,
     /// Set by the device-lost callback (`device_lost`).
     lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Memory poisoning (`GpuOptions::poison`, see `poison`).
-    pub(crate) poison: bool,
     pub(crate) poisoner: std::sync::OnceLock<crate::poison::Poisoner>,
     pub(crate) poison_seq: std::sync::atomic::AtomicU32,
     pub(crate) poison_base: u64,
 }
 
-/// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
-/// `GpuContext::new` uses; tests build it directly to cover every path whatever the environment.
+/// Which K3 kernel runs the greedy parse over the whole block ([`GpuOptions::k3_kernel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum K3Kernel {
+    /// One lane per block.
+    Seq,
+    /// One subgroup per block. Opening a pipeline fails where the device cannot run it.
+    Coop,
+}
+
+/// How a [`GpuContext`] sets up its device and builds its kernels.
+///
+/// [`GpuOptions::default`] turns on every fast path the adapter supports and reads nothing from
+/// the environment. [`GpuOptions::from_env`] applies the `GZC_*` variables on top; the benchmark
+/// and the tests use it. No option changes the compressed output.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// Enable subgroups when the adapter has them (`GZC_NO_SUBGROUPS` turns them off).
+    /// Use subgroup operations when the adapter has them. `GZC_NO_SUBGROUPS` turns them off.
     pub subgroups: bool,
-    /// The direct upload (E8): `None` = on with full ReBAR (`rebar`), `Some(b)` = forced (on only
-    /// where `MAPPABLE_PRIMARY_BUFFERS` exists). `GZC_DIRECT_UPLOAD=0/1`.
+    /// Let the kernels read each batch from the mapped upload buffer, with no upload copy.
+    /// `None` turns it on where upload buffers sit in device memory (full ReBAR). `Some(b)`
+    /// forces it on or off; on needs `MAPPABLE_PRIMARY_BUFFERS`. `GZC_DIRECT_UPLOAD=0/1`.
     pub direct_upload: Option<bool>,
-    /// The transfer-queue readback (E3) where the adapter supports it (`GZC_TRANSFER_QUEUE=0`
-    /// turns it off).
+    /// Read frames back through a transfer-only queue where the adapter has one.
+    /// `GZC_TRANSFER_QUEUE=0` turns it off.
     pub transfer_queue: bool,
-    /// Test aid: rewrite every shader to behave as it would on other GPUs (`Emulation`). The
-    /// `GZC_EMULATE_*` variables turn their part on for every context, whatever the options.
+    /// Time each kernel with timestamp queries when the adapter has them. `GZC_NO_TIMESTAMPS`
+    /// turns them off.
+    pub timestamps: bool,
+    /// Use the bucket-sorted match finder for the presets it serves (a single hash of at most 13
+    /// key bits, such as `lvl9s12seg`). `GZC_SORTED=0` turns it off.
+    pub sorted_finder: bool,
+    /// Threads that copy a batch into its upload buffer. `None` means 4. The pipeline never uses
+    /// more than the machine has. `GZC_UPLOAD_THREADS`.
+    pub upload_threads: Option<usize>,
+    /// Workgroups per K1 dispatch, which is the number of hash tables in use at once. `None`
+    /// picks 128 for the subgroup kernel and every table otherwise. `GZC_K1_GROUPS`.
+    pub k1_groups: Option<u32>,
+    /// Force one K3 kernel for the greedy parse over the whole block. `None` picks the
+    /// cooperative kernel where its probe passes. `GZC_K3_MODE=seq|coop`.
+    pub k3_kernel: Option<K3Kernel>,
+    /// Lanes of the cooperative K3: a power of two in 4..=64, at most the adapter's smallest
+    /// subgroup. `None` derives it from the adapter. `GZC_K3_W`.
+    pub k3_width: Option<u32>,
+    /// Test aid: every workgroup of the cooperative K3 takes its sequential fallback.
+    /// `GZC_K3_FORCE_FALLBACK=1`.
+    pub k3_force_fallback: bool,
+    /// Debugging aid: build every shader with bounds checks. `GZC_CHECKED_SHADERS`.
+    pub checked_shaders: bool,
+    /// Test aid: rewrite every shader to behave as it would on other GPUs (see [`Emulation`]).
+    /// `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW`, `GZC_EMULATE_SKEW`.
     pub emulate: Emulation,
-    /// Test aid: poison every buffer and workgroup memory before every batch (`crate::poison`).
-    /// `GZC_POISON` turns it on for every context, whatever the options.
+    /// Test aid: fill every buffer and workgroup memory with garbage before each batch.
+    /// `GZC_POISON`.
     pub poison: bool,
+    /// The first poison pattern's seed. `None` takes it from the clock. `GZC_POISON_SEED`.
+    pub poison_seed: Option<u64>,
+    /// Debugging aid: write every shader module's final source to this directory.
+    /// `GZC_DUMP_WGSL`.
+    pub dump_wgsl: Option<std::path::PathBuf>,
 }
 
 impl Default for GpuOptions {
-    /// Everything on where supported, ignoring the environment.
+    /// Every fast path on where the adapter supports it, every test aid off. Reads nothing from
+    /// the environment.
     fn default() -> Self {
         Self {
             subgroups: true,
             direct_upload: None,
             transfer_queue: true,
+            timestamps: true,
+            sorted_finder: true,
+            upload_threads: None,
+            k1_groups: None,
+            k3_kernel: None,
+            k3_width: None,
+            k3_force_fallback: false,
+            checked_shaders: false,
             emulate: Emulation::NONE,
             poison: false,
+            poison_seed: None,
+            dump_wgsl: None,
         }
     }
 }
 
 impl GpuOptions {
-    /// The defaults with the `GZC_*` environment overrides applied.
+    /// The defaults with the `GZC_*` environment variables applied. Each field's documentation
+    /// names its variable. This is the only place the crate reads them.
+    ///
+    /// A switch that is off by default (`GZC_NO_SUBGROUPS`, `GZC_POISON`, ...) is turned on by
+    /// any value but `0`. A switch that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is
+    /// turned off by `0` only.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a variable holds a value it cannot parse, naming the variable.
     pub fn from_env() -> Self {
         Self {
             subgroups: !env_on("GZC_NO_SUBGROUPS"),
@@ -104,64 +172,76 @@ impl GpuOptions {
                 _ => None,
             },
             transfer_queue: !env_off("GZC_TRANSFER_QUEUE"),
-            emulate: Emulation::from_env(),
+            timestamps: !env_on("GZC_NO_TIMESTAMPS"),
+            sorted_finder: !env_off("GZC_SORTED"),
+            upload_threads: env_number("GZC_UPLOAD_THREADS"),
+            k1_groups: env_number("GZC_K1_GROUPS").map(|g: u32| {
+                assert!(g > 0, "GZC_K1_GROUPS={g}: expected a positive number");
+                g
+            }),
+            k3_kernel: match std::env::var("GZC_K3_MODE").as_deref() {
+                Err(_) | Ok("") => None,
+                Ok("seq") => Some(K3Kernel::Seq),
+                Ok("coop") => Some(K3Kernel::Coop),
+                Ok(v) => panic!("GZC_K3_MODE={v}: expected seq or coop"),
+            },
+            k3_width: env_number("GZC_K3_W"),
+            k3_force_fallback: std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1"),
+            checked_shaders: env_on("GZC_CHECKED_SHADERS"),
+            emulate: Emulation {
+                shift_mod32: env_on("GZC_EMULATE_SHIFT_MOD32"),
+                vector_rmw: env_on("GZC_EMULATE_VEC_RMW"),
+                skew: env_on("GZC_EMULATE_SKEW"),
+            },
             poison: env_on("GZC_POISON"),
+            poison_seed: env_number("GZC_POISON_SEED"),
+            dump_wgsl: std::env::var_os("GZC_DUMP_WGSL").map(Into::into),
         }
     }
 }
 
-/// Boolean `GZC_*` knobs follow one convention: a knob that is off by default
-/// (`GZC_NO_SUBGROUPS`, `GZC_NO_TIMESTAMPS`, `GZC_CHECKED_SHADERS`) is turned on by any value but
-/// `0` (this function); one that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is turned
-/// off by `0` only (`env_off`). `GZC_DIRECT_UPLOAD` is tri-state (unset: auto).
-pub(crate) fn env_on(key: &str) -> bool {
+/// A switch that is off by default: on for any value but `0`.
+fn env_on(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v != "0")
 }
 
-/// `GZC_DUMP_WGSL=<dir>` (a dev aid): writes every module's final source (after emulation
-/// rewriting) to `<dir>/<label>.<n>.wgsl`, `n` counting modules in creation order, for offline
-/// register / shared-memory statistics (WGSL → SPIR-V → driver pipeline statistics).
-fn dump_wgsl(label: &str, src: &str) {
-    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Some(dir) = std::env::var_os("GZC_DUMP_WGSL") else { return };
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // The label becomes one file name inside `dir`: no path separators, no `..`.
-    let label = label.replace(['/', '\\'], "_").replace("..", "_");
-    let path = std::path::Path::new(&dir).join(format!("{label}.{n}.wgsl"));
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, src)) {
-        eprintln!("GZC_DUMP_WGSL: {}: {e}", path.display());
-    }
-}
-
-/// A default-on knob set to `0` (see `env_on`).
-pub(crate) fn env_off(key: &str) -> bool {
+/// A switch that is on by default: off for `0` only.
+fn env_off(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == "0")
 }
 
+/// A numeric variable; unset is `None`. Panics on a value that is not a number.
+fn env_number<T: std::str::FromStr>(key: &str) -> Option<T> {
+    let v = std::env::var(key).ok()?;
+    Some(v.parse().unwrap_or_else(|_| panic!("{key}={v}: not a number")))
+}
+
+/// Writes one module's final source (after emulation rewriting) to `<dir>/<label>.<n>.wgsl`
+/// (`GpuOptions::dump_wgsl`), `n` counting modules in creation order, for offline
+/// register / shared-memory statistics (WGSL → SPIR-V → driver pipeline statistics).
+fn dump_wgsl(dir: &std::path::Path, label: &str, src: &str) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The label becomes one file name inside `dir`: no path separators, no `..`.
+    let label = label.replace(['/', '\\'], "_").replace("..", "_");
+    let path = dir.join(format!("{label}.{n}.wgsl"));
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, src)) {
+        eprintln!("GpuOptions::dump_wgsl: {}: {e}", path.display());
+    }
+}
+
 impl GpuContext {
-    /// Opens the high-performance adapter with its full storage-buffer and dispatch limits,
-    /// enabling timestamp queries and subgroups when available (`GpuOptions::from_env`):
-    /// `GZC_NO_SUBGROUPS` leaves subgroups off, which selects K1's fallback kernel and, since
-    /// `compressor::k3_mode` also checks `ctx.subgroups`, the sequential K3; `GZC_DIRECT_UPLOAD`
-    /// and `GZC_TRANSFER_QUEUE` see `GpuOptions`.
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_gpu_options(GpuOptions::from_env())
-    }
-
-    /// `new`, with subgroups (and so K1's subgroup kernel) enabled only if `allow` and the adapter
-    /// supports them. `with_subgroups(false)` gives the context a device without subgroup support
-    /// gets; tests use it to cover K1's fallback kernel. The rest as in `new`.
-    pub fn with_subgroups(allow: bool) -> anyhow::Result<Self> {
-        Self::with_gpu_options(GpuOptions { subgroups: allow, ..GpuOptions::from_env() })
-    }
-
-    /// Opens the device as `opts` says. With `opts.transfer_queue` and a Vulkan
-    /// adapter that has a usable transfer-only family (`transfer::transfer_family`), the
-    /// `VkDevice` is created here with that extra queue (`transfer`); if that fails the context
-    /// falls back to wgpu's own device (with a warning), as it does everywhere else.
-    pub fn with_gpu_options(opts: GpuOptions) -> anyhow::Result<Self> {
-        let p = Prepared::new(opts)?;
-        let family = opts.transfer_queue.then(|| crate::transfer::transfer_family(&p.adapter)).flatten();
+    /// Opens the high-performance adapter with its full storage-buffer and dispatch limits, as
+    /// `options` says. Pass [`GpuOptions::default`], or [`GpuOptions::from_env`] to honour the
+    /// `GZC_*` variables.
+    ///
+    /// With `options.transfer_queue` and a Vulkan adapter that has a usable transfer-only family
+    /// (`transfer::transfer_family`), the `VkDevice` is created here with that extra queue
+    /// (`transfer`); if that fails the context falls back to wgpu's own device (with a warning),
+    /// as it does everywhere else.
+    pub fn new(options: GpuOptions) -> anyhow::Result<Self> {
+        let p = Prepared::new(options)?;
+        let family = p.opts.transfer_queue.then(|| crate::transfer::transfer_family(&p.adapter)).flatten();
         if let Some(family) = family {
             let with_transfer = || -> anyhow::Result<Self> {
                 let rd = crate::transfer::RawDevice::new(&p, family)?;
@@ -179,9 +259,56 @@ impl GpuContext {
             pollster::block_on(p.adapter.request_device(&p.descriptor())).context("request_device")?;
         Ok(p.context(device, queue))
     }
+
+    /// The wgpu device.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The wgpu queue. See the type's documentation before submitting to it from another thread.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The adapter the device was opened on.
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
+    }
+
+    /// The options the context was opened with.
+    pub fn options(&self) -> &GpuOptions {
+        &self.opts
+    }
+
+    /// True when the device has subgroup operations and the options allowed them.
+    pub fn subgroups(&self) -> bool {
+        self.subgroups
+    }
+
+    /// True when the device has timestamp queries and the options allowed them.
+    pub fn timestamps(&self) -> bool {
+        self.timestamps
+    }
+
+    /// True when the adapter can also write timestamps inside encoders. Without it the device
+    /// may leave a kernel's timer unwritten; that kernel is then missing from
+    /// `PipelineStats::kernel_ms`.
+    pub fn timestamps_inside_encoders(&self) -> bool {
+        self.timestamps_inside_encoders
+    }
+
+    /// True when the kernels read each batch straight from the mapped upload buffer.
+    pub fn direct_upload(&self) -> bool {
+        self.direct_upload
+    }
+
+    /// True when frame pipelines read their frames back through a transfer-only queue.
+    pub fn transfer_readback(&self) -> bool {
+        self.transfer.is_some()
+    }
 }
 
-/// The adapter and the device features/limits `GpuContext::with_gpu_options` settles on, before a
+/// The adapter and the device features/limits `GpuContext::new` settles on, before a
 /// device exists (shared with `transfer::RawDevice`, which creates the device itself).
 pub(crate) struct Prepared {
     pub adapter: wgpu::Adapter,
@@ -190,8 +317,7 @@ pub(crate) struct Prepared {
     pub timestamps_inside_encoders: bool,
     pub subgroups: bool,
     pub direct_upload: bool,
-    pub emulate: Emulation,
-    pub poison: bool,
+    pub opts: GpuOptions,
     pub required_features: wgpu::Features,
     pub required_limits: wgpu::Limits,
 }
@@ -228,14 +354,13 @@ impl Prepared {
             timestamps_inside_encoders: self.timestamps_inside_encoders,
             subgroups: self.subgroups,
             direct_upload: self.direct_upload,
-            emulate: self.emulate,
             transfer: None,
-            poison: self.poison,
             poisoner: std::sync::OnceLock::new(),
             poison_seq: std::sync::atomic::AtomicU32::new(0),
-            poison_base: std::env::var("GZC_POISON_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+            poison_base: self.opts.poison_seed.unwrap_or_else(|| {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
             }),
+            opts: self.opts.clone(),
         }
     }
 
@@ -281,9 +406,8 @@ impl Prepared {
                 .max(wgpu::Limits::default().max_compute_workgroup_storage_size),
             ..wgpu::Limits::default()
         };
-        // GZC_NO_TIMESTAMPS (anything but 0) leaves timestamp queries off, to time runs without them.
-        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
-            && !env_on("GZC_NO_TIMESTAMPS");
+        // `timestamps: false` leaves timestamp queries off, to time runs without them.
+        let timestamps = opts.timestamps && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let mut required_features = wgpu::Features::empty();
         if timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
@@ -305,8 +429,7 @@ impl Prepared {
             timestamps_inside_encoders,
             subgroups,
             direct_upload,
-            emulate: opts.emulate.or(Emulation::from_env()),
-            poison: opts.poison || env_on("GZC_POISON"),
+            opts,
             required_features,
             required_limits,
         })
@@ -403,10 +526,10 @@ impl GpuContext {
             on(self.transfer.is_some()),
             self.device.limits().max_compute_workgroup_storage_size,
         );
-        if self.emulate.any() {
-            line += &format!("; emulating {:?}", self.emulate);
+        if self.opts.emulate.any() {
+            line += &format!("; emulating {:?}", self.opts.emulate);
         }
-        if self.poison {
+        if self.opts.poison {
             line += "; poisoning memory";
         }
         line
@@ -438,9 +561,9 @@ impl GpuContext {
     /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 %. K1 stays checked: its subgroup kernel got 7 %
     /// slower; K3 keeps
     /// `shader_unbounded_loops` (the index clamps cost it nothing).
-    /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
+    /// `GpuOptions::checked_shaders` builds these modules fully checked instead (debugging aid).
     pub(crate) fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
-        let checks = if env_on("GZC_CHECKED_SHADERS") {
+        let checks = if self.opts.checked_shaders {
             wgpu::ShaderRuntimeChecks::checked()
         } else {
             wgpu::ShaderRuntimeChecks {
@@ -460,12 +583,14 @@ impl GpuContext {
     /// Creates a module from complete WGSL `src` (no templating) with `checks`, rewritten for
     /// `emulate` (a test aid). Every module of the crate goes through here.
     pub(crate) fn wgsl_module(&self, label: &str, src: &str, checks: wgpu::ShaderRuntimeChecks) -> wgpu::ShaderModule {
-        let src: std::borrow::Cow<str> = if self.emulate.any() {
-            self.emulate.rewrite(src).unwrap_or_else(|e| panic!("shader emulation: rewriting {label}: {e}")).into()
+        let src: std::borrow::Cow<str> = if self.opts.emulate.any() {
+            self.opts.emulate.rewrite(src).unwrap_or_else(|e| panic!("shader emulation: rewriting {label}: {e}")).into()
         } else {
             src.into()
         };
-        dump_wgsl(label, &src);
+        if let Some(dir) = &self.opts.dump_wgsl {
+            dump_wgsl(dir, label, &src);
+        }
         // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
         // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
         // the K3 argument is at its call site in `Kernels::new`). Fully checked modules need no

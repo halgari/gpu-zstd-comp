@@ -7,12 +7,13 @@ mod refrun;
 mod gpurun;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use gzc_core::params::{MatchParams, PRESETS};
 use gzc_gpu::compressor::{GpuParams, gpu_supports};
 use gzc_gpu::sizing::max_batch_blocks;
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::{GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
 
 use corpus::{Corpus, LoadOpts};
@@ -357,7 +358,7 @@ fn sweep_cfg(matching: MatchParams, batch: u32, inflight: u32) -> PipelineConfig
 /// `--inflight`, since a batch fitting the budget depends on both) and checks every resolved
 /// batch against the device's own limit and the VRAM budget again. Run before any timed work so a
 /// bad config or a missing adapter fails fast.
-fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
+fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Arc<GpuContext>> {
     check_presets(presets, false, true)?;
     anyhow::ensure!(sweep.inflight.iter().all(|&i| i >= 1), "--inflight must be at least 1");
     for p in presets {
@@ -369,19 +370,19 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
             }
         }
     }
-    let ctx = GpuContext::new()?;
+    let ctx = Arc::new(GpuContext::new(GpuOptions::from_env())?);
     eprintln!("{}", ctx.describe());
     for p in presets {
-        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
                 anyhow::ensure!(
                     batch >= 1 && batch <= max,
                     "--batch {batch} not in 1..={max} for preset '{}' on this device",
                     p.name
                 );
-                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, ctx.direct_upload)?;
+                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, ctx.direct_upload())?;
             }
         }
     }
@@ -393,7 +394,7 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
 /// no GPU dispatch) rather than threaded through from `gpu_preflight`, so the two stay in sync by
 /// construction.
 fn run_gpu_sweep(
-    ctx: &GpuContext,
+    ctx: &Arc<GpuContext>,
     corpus: &Corpus,
     presets: &[Preset],
     sweep: &GpuSweepArgs,
@@ -401,13 +402,13 @@ fn run_gpu_sweep(
     results: &mut Vec<result::RunResult>,
 ) -> anyhow::Result<()> {
     for p in presets {
-        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
                 for &writers in &sweep.writer_threads {
                     let cfg = sweep_cfg(p.params, batch, inflight);
-                    let mib = check_vram(&cfg, sweep.vram_budget_mb, ctx.direct_upload)?;
+                    let mib = check_vram(&cfg, sweep.vram_budget_mb, ctx.direct_upload())?;
                     eprintln!(
                         "running gpu {} b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})...",
                         p.name

@@ -1,3 +1,5 @@
+//! Test and benchmark support. Not part of the public API: anything here may change.
+//!
 //! Shared by the lib tests and the integration tests (each test binary is its own process).
 //!
 //! `gpu_test_slot`: tests that open a device of their own and build full-size pipelines or batch
@@ -8,7 +10,19 @@
 //! no slot and keep running beside them. Each test binary has its own slots (a runner that
 //! starts several binaries at once, such as nextest, can still put more on the GPU).
 
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+use crate::context::{GpuContext, GpuOptions};
+
+/// A context opened with `GpuOptions::from_env()`. Panics without a GPU.
+pub fn gpu() -> Arc<GpuContext> {
+    gpu_with(GpuOptions::from_env())
+}
+
+/// A context opened with `options`. Panics without a GPU.
+pub fn gpu_with(options: GpuOptions) -> Arc<GpuContext> {
+    Arc::new(GpuContext::new(options).expect("GPU required for gzc-gpu tests"))
+}
 
 static SLOTS: Mutex<Option<usize>> = Mutex::new(None);
 static FREED: Condvar = Condvar::new();

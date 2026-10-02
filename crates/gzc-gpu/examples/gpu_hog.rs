@@ -24,19 +24,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let gib: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(4);
     let seconds: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
-    let ctx = gzc_gpu::context::GpuContext::with_gpu_options(gzc_gpu::context::GpuOptions {
-        transfer_queue: false,
-        ..Default::default()
-    })
-    .expect("GPU");
+    let ctx = gzc_gpu::GpuContext::new(gzc_gpu::GpuOptions { transfer_queue: false, ..Default::default() }).expect("GPU");
     eprintln!("gpu_hog: {} — {gib} GiB, {seconds} s", ctx.describe());
     let chunk: u64 = 256 << 20;
     let bufs: Vec<wgpu::Buffer> = (0..gib * 4).map(|_| ctx.storage_buffer("hog", chunk, false)).collect();
-    let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let module = ctx.device().create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("hog"),
         source: wgpu::ShaderSource::Wgsl(SWEEP_WGSL.into()),
     });
-    let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = ctx.device().create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("hog"),
         layout: None,
         module: &module,
@@ -48,7 +44,7 @@ fn main() {
     let binds: Vec<wgpu::BindGroup> = bufs
         .iter()
         .map(|b| {
-            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hog"),
                 layout: &layout,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: b.as_entire_binding() }],
@@ -58,7 +54,7 @@ fn main() {
     let end = Instant::now() + Duration::from_secs(seconds);
     let mut sweeps = 0u64;
     while Instant::now() < end {
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let mut enc = ctx.device().create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
@@ -67,8 +63,8 @@ fn main() {
                 pass.dispatch_workgroups(8192, 1, 1);
             }
         }
-        ctx.queue.submit([enc.finish()]);
-        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        ctx.queue().submit([enc.finish()]);
+        ctx.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         sweeps += 1;
     }
     eprintln!("gpu_hog: {sweeps} sweeps of {gib} GiB");

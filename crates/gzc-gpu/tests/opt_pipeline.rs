@@ -42,17 +42,17 @@ fn oracle(blocks: &[Vec<u8>], m: MatchParams) -> Vec<(BlockOutput, Vec<u8>)> {
 
 /// Contexts for every upload/readback mode the adapter supports (copy / direct upload × main-queue
 /// / transfer-queue readback), with the environment's other knobs (`GZC_NO_SUBGROUPS`).
-fn mode_contexts() -> Vec<(String, GpuContext)> {
+fn mode_contexts() -> Vec<(String, std::sync::Arc<GpuContext>)> {
     let mut out = Vec::new();
     for transfer_queue in [false, true] {
         for direct in [false, true] {
             let opts = GpuOptions { direct_upload: Some(direct), transfer_queue, ..GpuOptions::from_env() };
-            let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
-            if ctx.direct_upload != direct || ctx.transfer.is_some() != transfer_queue {
+            let ctx = gzc_gpu::testing::gpu_with(opts);
+            if ctx.direct_upload() != direct || ctx.transfer_readback() != transfer_queue {
                 eprintln!("mode direct={direct} transfer={transfer_queue} unsupported here: skipped");
                 continue;
             }
-            out.push((format!("direct={direct} transfer={transfer_queue} subgroups={}", ctx.subgroups), ctx));
+            out.push((format!("direct={direct} transfer={transfer_queue} subgroups={}", ctx.subgroups()), ctx));
         }
     }
     out
@@ -75,7 +75,7 @@ fn check_modes(blocks: &[Vec<u8>], m: MatchParams, name: &str, want: &[(BlockOut
     for (mode, ctx) in &mode_contexts() {
         let cfg = PipelineConfig { batch, inflight: 3, params };
         let mut pipe = Pipeline::new(ctx, &cfg).expect("Pipeline::new");
-        let mib = vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20);
+        let mib = vram_bytes_with(&cfg, ctx.direct_upload()).div_ceil(1 << 20);
         for round in 0..2 {
             let mut sink = CollectFrames(vec![None; refs.len()]);
             pipe.run_frames(&refs, &mut sink).unwrap_or_else(|e| panic!("{name} {mode}: {e:#}"));
@@ -96,12 +96,12 @@ fn check_modes(blocks: &[Vec<u8>], m: MatchParams, name: &str, want: &[(BlockOut
 /// streaming pipeline in every mode) equal the oracle's; libzstd decodes every frame.
 #[test]
 fn opt_matches_oracle_synthetic() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     for (name, m) in OPT_PRESETS {
         let want = oracle(&blocks, m);
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let ctx = gzc_gpu::testing::gpu();
         let kp = Kernels::new(&ctx, GpuParams { matching: m, emit_frames: false, huffman: true }).unwrap();
         assert!(kp.is_opt());
         let parses = compress_batch(&ctx, &kp, &refs).unwrap();
@@ -126,7 +126,7 @@ fn opt_matches_oracle_synthetic() {
 fn m6_variants_match_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
     use gzc_gpu::compressor::gpu_supports;
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let p1 = OPT16P1.opt.unwrap();
@@ -151,7 +151,7 @@ fn m6_variants_match_oracle_synthetic() {
             },
         ),
     ];
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = gzc_gpu::testing::gpu();
     for (name, m) in variants {
         assert!(gpu_supports(&m), "{name}");
         let want = oracle(&blocks, m);
@@ -170,7 +170,7 @@ fn m6_variants_match_oracle_synthetic() {
 #[test]
 #[ignore]
 fn opt_corpus_matches_oracle() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
     let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     for (name, m) in OPT_PRESETS {
@@ -189,7 +189,7 @@ fn opt_corpus_matches_oracle() {
 fn m6_option_sweep_matches_oracle_synthetic() {
     use gzc_core::params::{OptParams, PriorTables, Seed, SparseChain};
     use gzc_gpu::compressor::gpu_supports;
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = synthetic_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let n: usize = std::env::var("GZC_SWEEP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
@@ -198,7 +198,7 @@ fn m6_option_sweep_matches_oracle_synthetic() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (x >> 33) % k
     };
-    let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+    let ctx = gzc_gpu::testing::gpu();
     let base = OPT16P1.opt.unwrap();
     let mut tested = 0;
     while tested < n {

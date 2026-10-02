@@ -230,8 +230,8 @@ fn k3opt_workgroup_memory() {
 /// pass prices), at the run's level.
 #[test]
 fn k3opt_matches_opt_cases() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     /// (name, block, candidate words, params with the pass level, prices, oracle output)
     type Run = (
         String,
@@ -294,8 +294,8 @@ fn k3opt_matches_opt_cases() {
 /// through K4/K5.
 #[test]
 fn k3opt_matches_oracle_synthetic() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let all = synthetic_blocks();
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
     let blocks: Vec<Vec<u8>> = all.into_iter().map(|(_, b)| b).collect();
@@ -326,8 +326,8 @@ fn k3opt_matches_oracle_synthetic() {
 #[test]
 #[ignore]
 fn k3opt_corpus() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -483,8 +483,8 @@ fn check_later_pass_tables(ctx: &GpuContext, names: &[String], blocks: &[Vec<u8>
 /// Every `opt::cases` block (with its scripted candidates) through every schedule.
 #[test]
 fn k3opt_passes_opt_cases() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let cases = opt_test_cases();
     let names: Vec<String> = cases.iter().map(|c| c.name.clone()).collect();
     let blocks: Vec<Vec<u8>> = cases.iter().map(|c| c.block.clone()).collect();
@@ -496,8 +496,8 @@ fn k3opt_passes_opt_cases() {
 /// and the later-pass Buffer-price configs.
 #[test]
 fn k3opt_passes_synthetic() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let all = synthetic_blocks();
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
     let blocks: Vec<Vec<u8>> = all.into_iter().map(|(_, b)| b).collect();
@@ -517,8 +517,8 @@ fn k3opt_passes_synthetic() {
 /// synthetic block several times (ties).
 #[test]
 fn k3opt_block_order() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let blocks: Vec<Vec<u8>> = synthetic_blocks().into_iter().map(|(_, b)| b).collect();
     let cands = cands_of(&blocks);
     let n = 600;
@@ -528,9 +528,9 @@ fn k3opt_block_order() {
     let k = K3Opt::new(&ctx, &OPT16, K3OptConfig::default()).expect("K3Opt::new");
     let bufs = OptBuffers::new(&ctx, &OPT16, n as u32).unwrap();
     bufs.upload(&ctx, &refs, &crefs, None).unwrap();
-    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    let mut enc = ctx.device().create_command_encoder(&Default::default());
     k.record_order(&ctx, &mut enc, &bufs.binds(), n as u32, None).unwrap();
-    ctx.queue.submit([enc.finish()]);
+    ctx.queue().submit([enc.finish()]);
     let got: Vec<u32> = ctx.read_buffer(&bufs.sched, 0, SCHED_HDR as usize + 3 * n);
     let weight = |c: &[CandWords]| -> u32 {
         c.iter()
@@ -643,8 +643,8 @@ fn memo_edge_witnesses(out: &BlockOutput) -> (usize, usize) {
 /// levels) and the opt16 / opt14 schedules, against the oracle.
 #[test]
 fn k3opt_memo_edges() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let offs: [&[usize]; 3] = [&[3, 4, 5], &[1, 2, 3, 4], &[3, 4, 5, 6, 8, 9, 12, 16]];
     let mut names = Vec::new();
     let mut blocks = Vec::new();
@@ -676,14 +676,14 @@ fn k3opt_memo_edges() {
 #[test]
 #[ignore]
 fn k3opt_passes_corpus() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4000);
     let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
-    let ctx = GpuContext::new().expect("GPU required");
-    eprintln!("subgroups: {}", ctx.subgroups);
+    let ctx = gzc_gpu::testing::gpu();
+    eprintln!("subgroups: {}", ctx.subgroups());
     let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();
     let cands = cands_of(&blocks);
     let live = check_passes(&ctx, &names, &blocks, &cands, &schedules(), K3OptConfig::default());
@@ -703,13 +703,13 @@ fn k3opt_passes_corpus() {
 #[test]
 #[ignore]
 fn k3opt_passes_timing() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2900);
     let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
-    let ctx = GpuContext::new().expect("GPU required");
+    let ctx = gzc_gpu::testing::gpu();
     let cands = cands_of(&blocks);
     let filter = std::env::var("GZC_TIMING_PRESETS").ok();
     let all = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
@@ -851,8 +851,8 @@ fn frame_kernels(ctx: &GpuContext) -> Kernels {
 /// `opt::cases::m6_test_cases` (gap3, top-4 pruning) with their tables, at their level; and every `opt::cases` block (with its scripted candidates) through the M6 schedules.
 #[test]
 fn k3opt_m6_opt_cases() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     for c in gzc_core::opt::cases::m6_test_cases() {
         for (i, (params, prices, want)) in c.expect.iter().enumerate() {
             let prices = prices.clone().expect("m6 cases carry their tables");
@@ -879,8 +879,8 @@ fn k3opt_m6_opt_cases() {
 /// and with the prices of the input's own histogram against `opt::drop_pass`.
 #[test]
 fn k3drop_matches_drop_cases() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let cases = gzc_core::opt::cases::drop_test_cases();
     let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
     let inputs: Vec<BlockOutput> = cases.iter().map(|c| c.input.clone()).collect();
@@ -906,8 +906,8 @@ fn k3drop_matches_drop_cases() {
 /// (the same frames), and the memo-edge blocks through the M6 passes (gap3 searches at lim 3..7).
 #[test]
 fn k3opt_m6_synthetic() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let all = synthetic_blocks();
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
     let blocks: Vec<Vec<u8>> = all.into_iter().map(|(_, b)| b).collect();
@@ -945,11 +945,11 @@ fn k3opt_m6_synthetic() {
 #[test]
 #[ignore]
 fn k3opt_m6_corpus() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
     let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
-    let ctx = GpuContext::new().expect("GPU required");
-    eprintln!("subgroups: {}", ctx.subgroups);
+    let ctx = gzc_gpu::testing::gpu();
+    eprintln!("subgroups: {}", ctx.subgroups());
     let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();
     let cands = cands_of_m(&blocks, &OPT16P1);
     check_m6_single(&ctx, &names, &blocks, &cands);

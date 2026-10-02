@@ -1,6 +1,6 @@
 //! Test aid: rewrite a shader so that, on the machine at hand (an NVIDIA card), it behaves as it
 //! would on another GPU wherever WGSL or its backends leave the behaviour to the implementation.
-//! `GpuOptions::emulate` / the `GZC_EMULATE_*` variables turn it on for a context; every module
+//! `GpuOptions::emulate` turns it on for a context (`GZC_EMULATE_*` through `GpuOptions::from_env`); every module
 //! then goes through `Emulation::rewrite` (`GpuContext::wgsl_module`).
 //!
 //! The rewrite works on naga's WGSL output: the source is parsed and validated by naga and written
@@ -39,15 +39,6 @@ impl Emulation {
     pub const NONE: Self = Self { shift_mod32: false, vector_rmw: false, skew: false };
     /// Every other GPU's semantics (not the timing skew, which only slows things down).
     pub const ALL: Self = Self { shift_mod32: true, vector_rmw: true, skew: false };
-
-    /// The parts the `GZC_EMULATE_*` variables turn on (any value but `0`).
-    pub fn from_env() -> Self {
-        Self {
-            shift_mod32: crate::context::env_on("GZC_EMULATE_SHIFT_MOD32"),
-            vector_rmw: crate::context::env_on("GZC_EMULATE_VEC_RMW"),
-            skew: crate::context::env_on("GZC_EMULATE_SKEW"),
-        }
-    }
 
     pub fn any(self) -> bool {
         self.shift_mod32 || self.vector_rmw || self.skew

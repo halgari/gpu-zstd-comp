@@ -51,7 +51,7 @@
 //! (cheap) registers (`vkstats`): 23 cheap-pass workgroups per SM on an RTX 5090 (3910 blocks
 //! resident), and a batch beyond that has no second-wave cliff (the loop takes the remaining
 //! blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
-//! `vkstats` on every pass kernel after a change (`GZC_DUMP_WGSL` writes the composed modules).
+//! `vkstats` on every pass kernel after a change (`GpuOptions::dump_wgsl` writes the composed modules).
 use crate::compressor::{
     BatchBuffers, K3_FIXUP_WGSL, decode_output,
 };
@@ -1320,14 +1320,14 @@ mod tests {
     /// panics (the kernel itself does no bounds checking on these buffers).
     #[test]
     fn check_rejects_bad_buffers() {
-        let _gpu = crate::test_support::gpu_test_slot();
+        let _gpu = crate::testing::gpu_test_slot();
         // Without poisoning: its padding would make the short buffers below long enough.
-        let opts = crate::context::GpuOptions { poison: false, ..crate::context::GpuOptions::default() };
-        if crate::context::env_on("GZC_POISON") {
+        let env = crate::context::GpuOptions::from_env();
+        if env.poison {
             eprintln!("skipped: poisoning pads every buffer");
             return;
         }
-        let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
+        let ctx = GpuContext::new(env).expect("GPU required for gzc-gpu tests");
         let n = 4u32;
         let bufs = OptBuffers::new(&ctx, &OPT16, n).unwrap();
         let binds = bufs.binds();

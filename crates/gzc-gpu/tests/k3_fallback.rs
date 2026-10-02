@@ -1,20 +1,18 @@
 //! The cooperative K3's in-kernel fallback: when the lane-layout guard fails, lane 0 of each block
-//! runs the sequential parse. `GZC_K3_FORCE_FALLBACK=1` (test-only) makes every workgroup take that
-//! branch; its output must still equal the CPU oracle. A separate test binary, because the
-//! variable is read by `Kernels::new` and must not leak into other tests.
+//! runs the sequential parse. `GpuOptions::k3_force_fallback` (test-only) makes every workgroup
+//! take that branch; its output must still equal the CPU oracle.
 use gzc_core::block::chunk_file;
 use gzc_core::fixtures::RUNG1;
 use gzc_core::params::LVL3;
 use gzc_core::reference::compress_block;
 use gzc_core::synth::test_cases;
+use gzc_gpu::GpuOptions;
 use gzc_gpu::compressor::{GpuParams, K3Mode, Kernels, compress_batch};
-use gzc_gpu::context::GpuContext;
 
 #[test]
 fn forced_fallback_matches_cpu() {
-    // SAFETY: the only test in this binary, so no other thread reads the environment.
-    unsafe { std::env::set_var("GZC_K3_FORCE_FALLBACK", "1") };
-    let ctx = GpuContext::new().expect("GPU required");
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu_with(GpuOptions { k3_force_fallback: true, ..GpuOptions::from_env() });
     let blocks: Vec<(String, Vec<u8>)> = test_cases()
         .into_iter()
         .flat_map(|(name, bytes)| {

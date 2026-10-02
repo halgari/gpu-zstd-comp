@@ -13,7 +13,7 @@
 //! (`decode_output`).
 use crate::chains::{self, ChainsKernel, finder_wgsl, layout_wgsl};
 use crate::k3opt::{K3OptConfig, OptBinds, OptPasses};
-use crate::context::{ErrorScopes, GpuContext, pack_blocks, params_wgsl};
+use crate::context::{ErrorScopes, GpuContext, K3Kernel, pack_blocks, params_wgsl};
 use crate::sizing::{
     BufferSizes, best_bytes, best_bytes_for, chain_pred_bytes, counts_bytes, data_bytes, frame_len_bytes,
     frames_bytes, head_bytes, max_batch_blocks, seqs_bytes_for,
@@ -459,40 +459,35 @@ fn lane_mask(w: u32) -> (u32, u32) {
 /// The K3 mode on `ctx`. Devices without subgroups use `Seq`.
 /// Otherwise `Coop` with W = the adapter's minimum subgroup size (clamped to 8..=64, a power of
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
-/// ids 0..W-1 (else `Seq`; `GZC_NO_SUBGROUPS` makes the context subgroup-less, see
-/// `GpuContext::new`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
-/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size). The output never depends on them.
+/// ids 0..W-1 (else `Seq`; `GpuOptions::subgroups` off makes the context subgroup-less).
+/// Overrides: `GpuOptions::k3_kernel` (`Coop` errors when unavailable) and
+/// `GpuOptions::k3_width` (4, 8, 16, 32 or 64, at most the minimum subgroup size). The output
+/// never depends on them.
 pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
-    let forced = std::env::var("GZC_K3_MODE").ok();
-    match forced.as_deref() {
-        None | Some("") | Some("coop") | Some("seq") => {}
-        Some(v) => anyhow::bail!("GZC_K3_MODE={v}: expected seq or coop"),
-    }
-    let force_coop = forced.as_deref() == Some("coop");
-    if forced.as_deref() == Some("seq") {
+    let force_coop = ctx.opts.k3_kernel == Some(K3Kernel::Coop);
+    if ctx.opts.k3_kernel == Some(K3Kernel::Seq) {
         return Ok(K3Mode::Seq);
     }
     let min = ctx.adapter_info.subgroup_min_size;
     if !ctx.subgroups {
-        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: the device has no subgroup support");
+        anyhow::ensure!(!force_coop, "k3_kernel Coop (GZC_K3_MODE=coop): the device has no subgroup support");
         return Ok(K3Mode::Seq);
     }
-    let w = match std::env::var("GZC_K3_W") {
-        Ok(v) => {
-            let w: u32 = v.parse().map_err(|_| anyhow!("GZC_K3_W={v}: not a number"))?;
+    let w = match ctx.opts.k3_width {
+        Some(w) => {
             anyhow::ensure!(
                 w.is_power_of_two() && (4..=64).contains(&w) && w <= min,
-                "GZC_K3_W={w}: expected a power of two in 4..=64 and at most the minimum subgroup size {min}"
+                "k3_width {w} (GZC_K3_W): expected a power of two in 4..=64 and at most the minimum subgroup size {min}"
             );
             w
         }
-        Err(_) => {
+        None => {
             let w = min.clamp(8, 64);
             1 << (31 - w.leading_zeros())
         }
     };
     if !probe_lanes(ctx, w)? {
-        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}");
+        anyhow::ensure!(!force_coop, "k3_kernel Coop (GZC_K3_MODE=coop): subgroup lane probe failed for W = {w}");
         eprintln!("gzc: subgroup lane probe failed for W = {w}; using the sequential K3");
         return Ok(K3Mode::Seq);
     }
@@ -578,9 +573,9 @@ impl Kernels {
                 let (mx, my) = lane_mask(w);
                 // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
                 let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
-                // Test-only: GZC_K3_FORCE_FALLBACK=1 makes every workgroup take the in-kernel
-                // sequential fallback (the path a failed lane-layout guard takes).
-                let force_fallback = std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1");
+                // Test-only: `GpuOptions::k3_force_fallback` makes every workgroup take the
+                // in-kernel sequential fallback (the path a failed lane-layout guard takes).
+                let force_fallback = ctx.opts.k3_force_fallback;
                 let body = format!(
                     "const W: u32 = {w}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
                      const REP_HI_MASK: u32 = {rep_hi}u;\nconst K3_FORCE_FALLBACK: bool = {force_fallback};\n\
@@ -1700,8 +1695,8 @@ mod tests {
     /// these `Kernels`' opt-ness, in both directions, before recording any dispatch.
     #[test]
     fn record_front_rejects_mismatched_opt_buffers() {
-        let _gpu = crate::test_support::gpu_test_slot();
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
         let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
         let opt16 = gzc_core::params::OPT16;
 
@@ -1721,8 +1716,8 @@ mod tests {
     /// The one-shot paths return an error, not a panic, on a block that is not BLOCK_SIZE bytes.
     #[test]
     fn one_shot_paths_reject_wrong_size_blocks() {
-        let _gpu = crate::test_support::gpu_test_slot();
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
         let kernels = Kernels::new(&ctx, GpuParams { matching: LVL3, emit_frames: true, huffman: true }).unwrap();
         let full = vec![0u8; BLOCK_SIZE];
         for bad in [vec![0u8; 3], vec![0u8; BLOCK_SIZE + 1]] {
@@ -1814,9 +1809,9 @@ mod tests {
     /// The batch buffers for `opt16p1` allocate exactly `scratch_bytes` + `slot_bytes`.
     #[test]
     fn opt16p1_batch_buffers_allocate_scratch_bytes() {
-        let _gpu = crate::test_support::gpu_test_slot();
+        let _gpu = crate::testing::gpu_test_slot();
         let m = gzc_core::params::OPT16P1;
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let ctx = crate::testing::gpu();
         let b = BatchBuffers::new(&ctx, 7, true, &m).unwrap();
         let o = b.opt.as_ref().unwrap();
         let frames = [b.frames.as_ref().unwrap(), b.frame_len.as_ref().unwrap(), b.lens.as_ref().unwrap()];

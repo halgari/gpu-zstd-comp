@@ -5,7 +5,7 @@
 //! the copy engine behind a transfer-only queue family runs that copy concurrently with the next
 //! batch's kernels at no measurable cost to them (measured: `docs/results/speed2-log.md`).
 //!
-//! `GpuContext::with_gpu_options` creates the `VkDevice` itself (with one extra queue of a
+//! `GpuContext::new` creates the `VkDevice` itself (with one extra queue of a
 //! transfer-only family) when the adapter is Vulkan 1.2 with timeline semaphores and has such a
 //! family, and wraps its queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
 //! `create_device_from_hal`); the extra queue is driven here with raw Vulkan (ash): a command
@@ -204,7 +204,7 @@ impl TransferQueue {
         anyhow::ensure!(
             self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
             "another transfer-readback Pipeline is alive on this GpuContext (one per context: drop it first, \
-             or open this context with GpuOptions::transfer_queue off / GZC_TRANSFER_QUEUE=0)"
+             or open this context with GpuOptions::transfer_queue off)"
         );
         Ok(StreamingGuard { tq: self.clone() })
     }
@@ -603,18 +603,16 @@ impl Drop for Commands {
 
 #[cfg(test)]
 mod tests {
-    use crate::context::GpuContext;
-
     /// A context with a transfer queue tears down cleanly (the VkDevice goes before the Vulkan
     /// instance), also when a clone of the queue outlives the context.
     #[test]
     fn context_with_transfer_queue_drops_cleanly() {
-        let _gpu = crate::test_support::gpu_test_slot();
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
         let tq = ctx.transfer.clone();
         drop(ctx);
         drop(tq);
-        let again = GpuContext::new().unwrap();
+        let again = crate::testing::gpu();
         drop(again);
     }
 }

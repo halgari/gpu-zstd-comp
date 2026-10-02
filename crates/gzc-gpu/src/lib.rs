@@ -11,7 +11,10 @@ pub mod pipeline;
 pub mod poison;
 pub mod transfer;
 #[doc(hidden)]
-pub mod test_support;
+pub mod testing;
+
+pub use context::{GpuContext, GpuOptions, K3Kernel};
+pub use emulate::Emulation;
 
 // Pins the thread-safety the streaming API relies on (`FrameBatch`es go to writer threads, a
 // `Pipeline` may move to another thread), so a dependency upgrade cannot drop it silently.
@@ -21,5 +24,5 @@ const _: () = {
     send_sync::<context::GpuContext>();
     send_sync::<compressor::Kernels>();
     send_sync::<pipeline::FrameBatch>();
-    send::<pipeline::Pipeline<'static>>();
+    send::<pipeline::Pipeline>();
 };

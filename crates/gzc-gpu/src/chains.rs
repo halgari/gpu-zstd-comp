@@ -30,7 +30,7 @@ pub const HEAD_TABLES: u32 = 256;
 
 /// Workgroups (live head tables) of the subgroup kernel by default: 128 x 256 KiB = 32 MiB, sized
 /// for the ~32 MB L2 of 8 GB-class target GPUs. The RTX 5090 (96 MB L2) is fastest at 224-256
-/// (`GZC_K1_GROUPS`).
+/// (`GpuOptions::k1_groups`).
 pub const DEFAULT_SG_GROUPS: u32 = 128;
 
 /// Predecessor bits of a K1 pred word (see `pred_fp`); `PRED_NONE` there means none.
@@ -252,7 +252,7 @@ pub fn gpu_preds_with(ctx: &GpuContext, kernel: &ChainsKernel, blocks: &[&[u8]])
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainsOptions {
     /// Workgroups (= live head tables) per dispatch, capped by the tables of the head buffer;
-    /// `None` = `GZC_K1_GROUPS` if set, else `DEFAULT_SG_GROUPS` for the subgroup kernel and all
+    /// `None` = `GpuOptions::k1_groups` if set, else `DEFAULT_SG_GROUPS` for the subgroup kernel and all
     /// tables for the fallback. Fewer live tables suit GPUs with a smaller L2.
     pub groups: Option<u32>,
     /// Pick each lane's ballot word at run time even for subgroups of at most 32 lanes (tests use
@@ -273,10 +273,8 @@ pub struct ChainsKernel {
     params: MatchParams,
     subgroups: bool,
     opts: ChainsOptions,
-    /// `GZC_K1_GROUPS`, parsed and validated once at construction (`build`), not per `record`
-    /// call: `None` if it's unset, else the workgroup count it named. A non-numeric or
-    /// non-positive value errors clearly here, the same way `GZC_K3_MODE`/`GZC_K3_W` do.
-    env_groups: Option<u32>,
+    /// The context's `GpuOptions::k1_groups`, checked at construction (`build`).
+    ctx_groups: Option<u32>,
 }
 
 impl ChainsKernel {
@@ -319,14 +317,8 @@ impl ChainsKernel {
     }
 
     fn build(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions, subgroups: bool) -> anyhow::Result<Self> {
-        let env_groups = match std::env::var("GZC_K1_GROUPS") {
-            Ok(v) => {
-                let g: u32 = v.parse().map_err(|_| anyhow::anyhow!("GZC_K1_GROUPS={v}: not a number"))?;
-                anyhow::ensure!(g > 0, "GZC_K1_GROUPS={v}: expected a positive number");
-                Some(g)
-            }
-            Err(_) => None,
-        };
+        let ctx_groups = ctx.opts.k1_groups;
+        anyhow::ensure!(ctx_groups != Some(0), "GpuOptions::k1_groups: expected a positive number");
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -367,7 +359,7 @@ impl ChainsKernel {
             compilation_options: ctx.compilation_options(),
             cache: None,
         });
-        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), params: *params, subgroups, opts, env_groups })
+        Ok(Self { pipeline, layout, n_hashes: params.n_hashes(), params: *params, subgroups, opts, ctx_groups })
     }
 
     /// Guards the subgroup kernel's assumptions (full, equally sized subgroups of >= 32 lanes
@@ -423,7 +415,7 @@ impl ChainsKernel {
             params: self.params,
             subgroups: self.subgroups,
             opts: self.opts,
-            env_groups: self.env_groups,
+            ctx_groups: self.ctx_groups,
         }
     }
 
@@ -510,7 +502,7 @@ impl ChainsKernel {
         let tables = (head.size() / TABLE_BYTES).min(HEAD_TABLES as u64) as u32;
         assert!(tables >= n_tasks.min(HEAD_TABLES), "head buffer smaller than head_bytes({n_blocks}, {})", self.n_hashes);
         let max_wg = ctx.device.limits().max_compute_workgroups_per_dimension;
-        let wanted = self.opts.groups.or(self.env_groups).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
+        let wanted = self.opts.groups.or(self.ctx_groups).unwrap_or(if self.subgroups { DEFAULT_SG_GROUPS } else { u32::MAX });
         // At most MAX_TAG chains per workgroup (the subgroup kernel's tags).
         let groups = wanted.max(n_tasks.div_ceil(MAX_TAG)).min(n_tasks).min(tables).min(max_wg);
         assert!(n_tasks.div_ceil(groups) <= MAX_TAG, "{n_tasks} chains over {groups} workgroups");

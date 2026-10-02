@@ -15,7 +15,7 @@
 //! self-test. Each needs its `workgroup_bytes` within the device's limit (the context keeps wgpu's
 //! default 16 KiB: a 12-bit key fits both versions; a 13-bit key fits only the subgroup
 //! version); otherwise (or
-//! with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the same chains over the
+//! with `GpuOptions::sorted_finder` off) `Kernels` runs the chain kernels, which build the same chains over the
 //! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
@@ -57,11 +57,11 @@ pub struct SortKernel {
 
 impl SortKernel {
     /// Builds and self-tests the kernel; `Ok(None)` when `params` or the device do not suit it
-    /// (see the module doc) or `GZC_SORTED=0`. The subgroup version runs when `ctx.subgroups`, the
+    /// (see the module doc) or `GpuOptions::sorted_finder` is off. The subgroup version runs when `ctx.subgroups`, the
     /// subgroups have at least 32 lanes and its self-test passes; otherwise the workgroup-memory
     /// version (whose failed build or self-test, reported on stderr, also gives `None`).
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
-        if !sorted_params(params) || crate::context::env_off("GZC_SORTED") {
+        if !sorted_params(params) || !ctx.opts.sorted_finder {
             return Ok(None);
         }
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;
