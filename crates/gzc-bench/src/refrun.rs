@@ -16,11 +16,12 @@ use crate::result::{per_kind, RunResult};
 /// pool pinned to `threads` threads. Runs one untimed warmup pass over the
 /// first `min(corpus.len(), 64)` blocks (to pay JIT/allocator/cache warmup
 /// cost outside the timed region), then times a full pass over every block;
-/// per-block frame sizes come from that timed pass. When `verify` is set,
+/// per-block frame sizes come from that timed pass. Each block is compressed as its real bytes
+/// (`Block::real_len`), so a file's last frame decodes to exactly its tail. When `verify` is set,
 /// every frame produced by the timed pass is decompressed with libzstd
-/// afterward and checked against the original (padded) block; any mismatch
+/// afterward and checked against the block's real bytes; any mismatch
 /// is an error.
-/// `params` must be `cpu_supports`ed (`compress_block` panics otherwise).
+/// `params` must be valid (`compress_block` panics otherwise).
 pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize, verify: bool) -> anyhow::Result<RunResult> {
     let opts = FrameOptions::default();
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
@@ -28,13 +29,13 @@ pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize,
     let warmup_n = corpus.blocks.len().min(64);
     pool.install(|| {
         corpus.blocks[..warmup_n].par_iter().for_each(|block| {
-            let _ = compress_block_to_frame(&block.data, params, opts);
+            let _ = compress_block_to_frame(block.real(), params, opts);
         });
     });
 
     let start = Instant::now();
     let frames: Vec<Vec<u8>> = pool.install(|| {
-        corpus.blocks.par_iter().map(|block| compress_block_to_frame(&block.data, params, opts)).collect()
+        corpus.blocks.par_iter().map(|block| compress_block_to_frame(block.real(), params, opts)).collect()
     });
     let seconds = start.elapsed().as_secs_f64();
 
@@ -43,7 +44,7 @@ pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize,
             corpus.blocks.par_iter().zip(frames.par_iter()).enumerate().try_for_each(
                 |(i, (block, frame))| -> anyhow::Result<()> {
                     let dec = zstd::bulk::decompress(frame, BLOCK_SIZE)?;
-                    if dec != block.data {
+                    if dec != block.real() {
                         anyhow::bail!("block {i} did not round-trip through the reference frame");
                     }
                     Ok(())
@@ -52,6 +53,7 @@ pub fn run_ref(corpus: &Corpus, name: &str, params: MatchParams, threads: usize,
         })?;
     }
 
+    crate::result::log_frame_digest(corpus, frames.iter().map(Vec::as_slice));
     let sizes: Vec<u64> = frames.iter().map(|f| f.len() as u64).collect();
     let compressed_bytes: u64 = sizes.iter().sum();
     let real_bytes = corpus.real_bytes();

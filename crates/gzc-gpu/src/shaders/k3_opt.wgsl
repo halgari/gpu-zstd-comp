@@ -255,7 +255,7 @@ var<private> mem: vec3<u32>;
 
 // load_u32_at without its alignment branch (M5 T3b: a per-lane branch diverges): both words
 // are loaded, the high one masked when aligned. data[w + 1] is in bounds because every `data`
-// binding ends with one zero word after the batch's last block (`compressor::data_bytes` =
+// binding ends with one zero word after the batch's last block (`sizing::data_bytes` =
 // n * BLOCK_SIZE + 4, asserted by `OptBinds::check`; the pipeline's copy, direct-upload and
 // zero-copy slots all keep and zero it).
 fn ld32(base: u32, byte_off: u32) -> u32 {

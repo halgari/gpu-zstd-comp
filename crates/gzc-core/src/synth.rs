@@ -55,7 +55,7 @@ pub fn text(seed: u64, len: usize) -> Vec<u8> {
         let idx = (rng.next_u64() % WORDS.len() as u64) as usize;
         out.extend_from_slice(WORDS[idx].as_bytes());
         word_count += 1;
-        if word_count % 12 == 0 {
+        if word_count.is_multiple_of(12) {
             out.push(b'\n');
         } else {
             out.push(b' ');

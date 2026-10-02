@@ -25,7 +25,7 @@
 //! `shaders/k3_drop.wgsl`, `opt::drop_pass`) after the final pass's fix-up.
 //!
 //! Buffers per block: data (BLOCK_SIZE, plus the batch's trailing zero word: `ld32` reads one word
-//! past a block), candidate words (`compressor::best_bytes_for`, 8 B per position; after the DP
+//! past a block), candidate words (`sizing::best_bytes_for`, 8 B per position; after the DP
 //! each segment's first words take its raw sequences, as `k3_seg.wgsl` does with `best`), trace
 //! (`compressor::trace_bytes`, 8 B per position: K1's `pred` in the pipeline), seqs
 //! (`MAX_SEQS_OPT` × 12 B; the DP's series log until the fix-up), counts, the price tables
@@ -54,9 +54,12 @@
 //! remaining blocks as slots free; measured +3 % on the cheap passes at 4095 blocks). Check
 //! `vkstats` on every pass kernel after a change (`GZC_DUMP_WGSL` writes the composed modules).
 use crate::compressor::{
-    BatchBuffers, K3_FIXUP_WGSL, best_bytes_for, counts_bytes, data_bytes, decode_output, seqs_bytes_for, trace_bytes,
+    BatchBuffers, K3_FIXUP_WGSL, decode_output,
 };
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
+use crate::sizing::{
+    best_bytes_for, counts_bytes, data_bytes, prices_bytes, sched_bytes, seqs_bytes_for, trace_bytes,
+};
 use anyhow::{anyhow, ensure};
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::opt::{Hist, Prices};
@@ -83,23 +86,12 @@ pub const SCHED_HDR: u32 = 4;
 pub const WEIGHT_RUN: u32 = 8;
 pub const WEIGHT_STRIDE: u32 = 264;
 
-/// Bytes of the `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight, the
-/// heavy-first block order and each block's rank in it (4 B per block each).
-pub fn sched_bytes(n: u32) -> u64 {
-    (SCHED_HDR as u64 + 3 * n as u64) * 4
-}
-
 /// Sequences per block of the optimal parse (min match 3): `BLOCK_SIZE / 3 + 1`.
 pub use crate::compressor::MAX_SEQS_OPT;
 
 /// Words of one block's price tables in the `prices` buffer: `opt::Prices` as lit[256], ll[36],
 /// ml[53], of[32].
 pub const PRICE_WORDS: usize = 256 + 36 + 53 + 32;
-
-/// Bytes of the `prices` buffer for `n` blocks (`PRICE_WORDS` words per block, read-write).
-pub fn prices_bytes(n: u32) -> u64 {
-    n as u64 * PRICE_WORDS as u64 * 4
-}
 
 /// Largest batch `parses_from_cands` runs at once.
 const BATCH_CAP: usize = 256;

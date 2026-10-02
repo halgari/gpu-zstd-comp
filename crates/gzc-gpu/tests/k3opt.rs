@@ -372,68 +372,6 @@ fn k3opt_matches_oracle_synthetic() {
     check_blocks(&ctx, &names, &blocks, &cfgs[1..], None);
 }
 
-/// Up to `n` corpus blocks sampled uniformly over the whole corpus (`GZC_CORPUS`, default
-/// `data/corpus`): every k-th of all (file, block) pairs, files in sorted path order,
-/// k = total blocks / n. `None` (after a message) when the corpus directory does not exist.
-fn corpus_blocks(n: usize) -> Option<Vec<Vec<u8>>> {
-    use std::path::{Path, PathBuf};
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            let ext = p
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if matches!(ext.as_str(), "dds" | "nif") {
-                out.push(p);
-            }
-        }
-    }
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
-    if !Path::new(&root).is_dir() {
-        eprintln!("corpus directory {root} not found (set GZC_CORPUS): skipping");
-        return None;
-    }
-    let mut files = Vec::new();
-    walk(Path::new(&root), &mut files);
-    files.sort();
-    let counts: Vec<usize> = files
-        .iter()
-        .map(|f| (std::fs::metadata(f).unwrap().len() as usize).div_ceil(BLOCK_SIZE))
-        .collect();
-    let total: usize = counts.iter().sum();
-    let step = (total / n.max(1)).max(1);
-    let mut blocks = Vec::new();
-    let mut first = 0usize;
-    for (f, &c) in files.iter().zip(&counts) {
-        if blocks.len() >= n {
-            break;
-        }
-        let picked: Vec<usize> = (first.div_ceil(step) * step..first + c)
-            .step_by(step)
-            .map(|g| g - first)
-            .collect();
-        if !picked.is_empty() {
-            let chunks = chunk_file(&std::fs::read(f).unwrap());
-            assert_eq!(chunks.len(), c, "{}", f.display());
-            for i in picked {
-                blocks.push(chunks[i].data.clone());
-            }
-        }
-        first += c;
-    }
-    blocks.truncate(n);
-    eprintln!(
-        "{} corpus blocks (every {step}th of {total}) from {} files",
-        blocks.len(),
-        files.len()
-    );
-    Some(blocks)
-}
-
 /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus`, block-init pass at
 /// optLevel 2 and 0 on the workgroup ring, level 2 on the private ring, frames via K4/K5.
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_corpus -- --ignored --nocapture`
@@ -446,7 +384,7 @@ fn k3opt_corpus() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4000);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();
     let kf = Kernels::new(
         &ctx,
@@ -491,7 +429,7 @@ fn k3opt_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     let cands = cands_of(&blocks);
     let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
     let crefs: Vec<&[CandWords]> = cands.iter().map(|c| c.as_slice()).collect();
@@ -910,7 +848,7 @@ fn k3opt_passes_corpus() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4000);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     let ctx = GpuContext::new().expect("GPU required");
     eprintln!("subgroups: {}", ctx.subgroups);
     let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();
@@ -941,7 +879,7 @@ fn k3opt_passes_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2900);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     let ctx = GpuContext::new().expect("GPU required");
     let cands = cands_of(&blocks);
     let filter = std::env::var("GZC_TIMING_PRESETS").ok();
@@ -1191,7 +1129,7 @@ fn k3opt_m6_synthetic() {
 fn k3opt_m6_corpus() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
     let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
-    let Some(blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = gzc_core::testdata::corpus_sample(n) else { return };
     let ctx = GpuContext::new().expect("GPU required");
     eprintln!("subgroups: {}", ctx.subgroups);
     let names: Vec<String> = (0..blocks.len()).map(|i| format!("corpus[{i}]")).collect();

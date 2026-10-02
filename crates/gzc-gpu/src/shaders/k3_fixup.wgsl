@@ -1,5 +1,5 @@
 // The per-block fix-up of a segmented parse (K3 of lvl9seg, k3_seg.wgsl, and of the optimal
-// parse, k3_opt.wgsl), plus the repeat-offset helpers both use. Appended to the kernel's body.
+// parse, k3_opt.wgsl). Appended to the kernel's body after k3_reps.wgsl (`K3_FIXUP_WGSL`).
 // The kernel defines SEG, NSEG, SEG_WORDS (the `best` words each segment keeps its raw
 // sequences and 6-word trailer in: block b's segment k at best[(b * NSEG + k) * SEG_WORDS ..],
 // trailer at SEG_META = SEG_WORDS - 6), RAW_REVERSED (the raw sequences are stored in order, or
@@ -20,48 +20,6 @@ const FIXUP_WG: u32 = 64u;
 // (RAW_REVERSED: the kernel stored them last first).
 fn raw_at(src: u32, n: u32, i: u32) -> u32 {
     return src + 3u * select(i, n - 1u - i, RAW_REVERSED);
-}
-
-// Repeat-offset history (gzc_core::seq::Reps).
-var<private> r0: u32;
-var<private> r1: u32;
-var<private> r2: u32;
-
-// == gzc_core::seq::off_base_for
-fn off_base_for(offset: u32, lit_len: u32) -> u32 {
-    if (lit_len > 0u) {
-        if (offset == r0) { return 1u; }
-        if (offset == r1) { return 2u; }
-        if (offset == r2) { return 3u; }
-    } else {
-        if (offset == r1) { return 1u; }
-        if (offset == r2) { return 2u; }
-        if (r0 > 1u && offset == r0 - 1u) { return 3u; }
-    }
-    return offset + 3u;
-}
-
-// == gzc_core::seq::apply_off_base (repeat-history update only).
-fn apply_off_base(off_base: u32, lit_len: u32) {
-    if (off_base > 3u) {
-        r2 = r1;
-        r1 = r0;
-        r0 = off_base - 3u;
-        return;
-    }
-    let idx = off_base - 1u + select(0u, 1u, lit_len == 0u);
-    var off: u32;
-    switch (idx) {
-        case 0u: { off = r0; }
-        case 1u: { off = r1; }
-        case 2u: { off = r2; }
-        default: { off = r0 - 1u; } // wrapping, as in the reference
-    }
-    if (idx > 0u) {
-        if (idx > 1u) { r2 = r1; }
-        r1 = r0;
-        r0 = off;
-    }
 }
 
 var<workgroup> seg_n: array<u32, NSEG>;

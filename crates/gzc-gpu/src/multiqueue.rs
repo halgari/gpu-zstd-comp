@@ -191,7 +191,6 @@ impl MultiQueue {
 mod tests {
     use super::*;
     use crate::compressor::{BatchBuffers, GpuParams, Kernels};
-    use gzc_core::block::chunk_file;
     use gzc_core::config::BLOCK_SIZE;
     use gzc_core::params::{LVL9, LVL9SEG, MatchParams};
 
@@ -200,35 +199,6 @@ mod tests {
         if std::env::var("GZC_PROBE_PRESET").is_ok_and(|v| v == "lvl9seg") { LVL9SEG } else { LVL9 }
     }
     use std::time::Instant;
-
-    /// Blocks from every `stride`-th file (sorted paths) under `dir`, until `n` blocks.
-    fn corpus_blocks(dir: &std::path::Path, n: usize, stride: usize) -> Vec<Vec<u8>> {
-        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(d) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dds") || x.eq_ignore_ascii_case("nif"))
-                {
-                    out.push(p);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(dir, &mut files);
-        files.sort();
-        let mut out = Vec::new();
-        for f in files.iter().step_by(stride) {
-            out.extend(chunk_file(&std::fs::read(f).unwrap()).into_iter().map(|b| b.data));
-            if out.len() >= n {
-                break;
-            }
-        }
-        out.truncate(n);
-        assert_eq!(out.len(), n, "corpus too small");
-        out
-    }
 
     struct Set {
         bufs: BatchBuffers,
@@ -325,16 +295,14 @@ mod tests {
     /// against K1+K2 of set B on another queue (the async-compute family, a second family-0 queue),
     /// alone and concurrently, plus the single-queue variant (K3(A) and K1(B) recorded without a
     /// barrier between them). `GZC_PROBE_N` blocks per set (default 1280), corpus from
-    /// `GZC_PROBE_INPUT` (default data/corpus).
+    /// `GZC_CORPUS` (default data/corpus).
     #[test]
     #[ignore]
     fn overlap_probe() {
         let n: usize = std::env::var("GZC_PROBE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1280);
-        let dir = std::env::var("GZC_PROBE_INPUT").unwrap_or_else(|_| "../../../../data/corpus".into());
-        let dir = std::path::PathBuf::from(dir);
-        let dir = if dir.exists() { dir } else { "/home/tbaldrid/oss/gpu-zstd-comp/data/corpus".into() };
         let reps: usize = std::env::var("GZC_PROBE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
-        let blocks = corpus_blocks(&dir, 2 * n, 7);
+        let Some(blocks) = gzc_core::testdata::corpus_sample(2 * n) else { return };
+        assert_eq!(blocks.len(), 2 * n, "corpus too small");
         let (a_blocks, b_blocks) = blocks.split_at(n);
         let _ = BLOCK_SIZE;
 
@@ -516,8 +484,8 @@ mod tests {
     fn transfer_probe() {
         let n: usize = std::env::var("GZC_PROBE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1280);
         let reps: usize = std::env::var("GZC_PROBE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
-        let dir = std::path::PathBuf::from("/home/tbaldrid/oss/gpu-zstd-comp/data/corpus");
-        let blocks = corpus_blocks(&dir, 2 * n, 7);
+        let Some(blocks) = gzc_core::testdata::corpus_sample(2 * n) else { return };
+        assert_eq!(blocks.len(), 2 * n, "corpus too small");
         let (a_blocks, b_blocks) = blocks.split_at(n);
         let fam = {
             let mq = MultiQueue::open(true, false, &[]).unwrap();
@@ -535,7 +503,7 @@ mod tests {
         main.queue.submit([k12(main, &km, &a)]);
         wait(main);
         // The readback: frames_bytes(n) from device-local memory into a mappable buffer.
-        let size = crate::compressor::frames_bytes(n as u32);
+        let size = crate::sizing::frames_bytes(n as u32);
         let src = t.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,

@@ -24,50 +24,8 @@ fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }
 @group(0) @binding(2) var<storage, read_write> seqs: array<u32>;
 @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
 
-// Repeat-offset history (gzc_core::seq::Reps).
-var<private> r0: u32;
-var<private> r1: u32;
-var<private> r2: u32;
-
 // Literals of the parse so far.
 var<private> n_lit: u32;
-
-// == gzc_core::seq::off_base_for
-fn off_base_for(offset: u32, lit_len: u32) -> u32 {
-    if (lit_len > 0u) {
-        if (offset == r0) { return 1u; }
-        if (offset == r1) { return 2u; }
-        if (offset == r2) { return 3u; }
-    } else {
-        if (offset == r1) { return 1u; }
-        if (offset == r2) { return 2u; }
-        if (r0 > 1u && offset == r0 - 1u) { return 3u; }
-    }
-    return offset + 3u;
-}
-
-// == gzc_core::seq::apply_off_base (repeat-history update only).
-fn apply_off_base(off_base: u32, lit_len: u32) {
-    if (off_base > 3u) {
-        r2 = r1;
-        r1 = r0;
-        r0 = off_base - 3u;
-        return;
-    }
-    let idx = off_base - 1u + select(0u, 1u, lit_len == 0u);
-    var off: u32;
-    switch (idx) {
-        case 0u: { off = r0; }
-        case 1u: { off = r1; }
-        case 2u: { off = r2; }
-        default: { off = r0 - 1u; } // wrapping, as in the reference
-    }
-    if (idx > 0u) {
-        if (idx > 1u) { r2 = r1; }
-        r1 = r0;
-        r0 = off;
-    }
-}
 
 // Counts block bytes [start, end) as literals (none when start >= end: a final push from an
 // anchor past BLOCK_SIZE, only reachable with a best[] word that claims a match past the block end).

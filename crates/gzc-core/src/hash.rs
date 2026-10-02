@@ -121,9 +121,9 @@ pub fn compute_preds<F: Fn(&[u8], usize) -> u32>(block: &[u8], hash: F) -> Vec<u
     assert_eq!(block.len(), BLOCK_SIZE);
     let mut head = vec![NO_POS; 1 << HASH_BITS];
     let mut pred = vec![NO_POS; BLOCK_SIZE];
-    for p in 0..HASHED_POSITIONS {
+    for (p, pr) in pred.iter_mut().enumerate().take(HASHED_POSITIONS) {
         let h = hash(block, p) as usize;
-        pred[p] = head[h];
+        *pr = head[h];
         head[h] = p as u32;
     }
     pred
@@ -138,10 +138,10 @@ mod tests {
     fn preds_point_back_to_equal_hash() {
         let b = crate::synth::text(1, crate::config::BLOCK_SIZE);
         let pl = compute_preds(&b, hash_long);
-        for p in 0..HASHED_POSITIONS {
-            if pl[p] != NO_POS {
-                assert!((pl[p] as usize) < p);
-                assert_eq!(hash_long(&b, pl[p] as usize), hash_long(&b, p));
+        for (p, &q) in pl.iter().enumerate().take(HASHED_POSITIONS) {
+            if q != NO_POS {
+                assert!((q as usize) < p);
+                assert_eq!(hash_long(&b, q as usize), hash_long(&b, p));
             }
         }
         assert!(pl[HASHED_POSITIONS..].iter().all(|&x| x == NO_POS));
@@ -152,8 +152,8 @@ mod tests {
         let b = crate::synth::zeros(crate::config::BLOCK_SIZE);
         let ps = compute_preds(&b, hash_short);
         assert_eq!(ps[0], NO_POS);
-        for p in 1..HASHED_POSITIONS {
-            assert_eq!(ps[p], (p - 1) as u32);
+        for (p, &q) in ps.iter().enumerate().take(HASHED_POSITIONS).skip(1) {
+            assert_eq!(q, (p - 1) as u32);
         }
     }
 

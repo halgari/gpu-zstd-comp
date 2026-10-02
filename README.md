@@ -2,8 +2,8 @@
 
 A zstd compressor that runs on the GPU. It is written in Rust, with compute shaders in WGSL, on
 top of wgpu, which runs on Vulkan and Metal. The input is cut into independent 64 KiB blocks, and
-the GPU turns each block into one standard zstd frame. Every frame decodes with stock libzstd; no
-custom decoder is needed.
+the GPU turns each block into one standard zstd frame. A file's shorter last block gets a frame
+of its real length. Every frame decodes with stock libzstd; no custom decoder is needed.
 
 It was built to recompress Skyrim mod data, mostly DDS textures with some NIF meshes, while it
 downloads. The goal is to keep up with a 1–10 Gbit/s connection on a normal gaming PC and still

@@ -5,6 +5,7 @@ pub mod emulate;
 pub mod chains;
 pub mod sorted;
 pub mod compressor;
+pub mod sizing;
 pub mod k3opt;
 pub mod pipeline;
 pub mod poison;
@@ -12,3 +13,14 @@ pub mod multiqueue;
 pub mod transfer;
 #[doc(hidden)]
 pub mod test_support;
+
+// Pins the thread-safety the streaming API relies on (`FrameBatch`es go to writer threads, a
+// `Pipeline` may move to another thread), so a dependency upgrade cannot drop it silently.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    const fn send<T: Send>() {}
+    send_sync::<context::GpuContext>();
+    send_sync::<compressor::Kernels>();
+    send_sync::<pipeline::FrameBatch>();
+    send::<pipeline::Pipeline<'static>>();
+};

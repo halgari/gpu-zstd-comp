@@ -2085,39 +2085,11 @@ mod tests {
         }
     }
 
-    /// `GZC_CORPUS_BLOCKS` (default 4000) blocks spread uniformly over the corpus (every
-    /// `total / n`-th .dds/.nif block in path order, the `gzc-bench --ext dds,nif` order), or
-    /// `None` (with a message) when the corpus directory (`GZC_CORPUS`, default `data/corpus`) is
-    /// absent.
+    /// `GZC_CORPUS_BLOCKS` (default 4000) blocks spread uniformly over the corpus
+    /// (`testdata::corpus_sample`), or `None` (with a message) when the corpus is absent.
     fn corpus_sample() -> Option<Vec<Vec<u8>>> {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let mut ents: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
-            ents.sort();
-            for p in ents {
-                let e = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if e == "dds" || e == "nif" {
-                    out.push(p);
-                }
-            }
-        }
-        let root = std::env::var("GZC_CORPUS")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
-        if !Path::new(&root).is_dir() {
-            println!("skipped: no corpus at {root} (set GZC_CORPUS)");
-            return None;
-        }
-        let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
-        let mut blocks = Vec::new();
-        for f in files {
-            blocks.extend(chunk_file(&std::fs::read(&f).unwrap()).into_iter().map(|b| b.data));
-        }
         let n: usize = std::env::var("GZC_CORPUS_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000).max(1);
-        let stride = (blocks.len() / n).max(1);
-        Some(blocks.into_iter().step_by(stride).take(n).collect())
+        crate::testdata::corpus_sample(n)
     }
 
     /// Informal (reads the real corpus): 4000 blocks spread over `data/corpus` (`corpus_sample`;

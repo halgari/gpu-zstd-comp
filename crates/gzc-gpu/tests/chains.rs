@@ -9,10 +9,11 @@ use gzc_core::params::{Hashes, LVL3, LVL9, SparseChain, MatchParams, OPT16, OPT1
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
 use gzc_gpu::chains::{
-    ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_pred_bytes, chain_span, expected_words, gpu_preds,
-    gpu_preds_with, head_bytes, pred_bytes, pred_of_word, pred_words_per_block,
+    ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_span, expected_words, gpu_preds, gpu_preds_with,
+    pred_of_word, pred_words_per_block,
 };
 use gzc_gpu::context::{GpuContext, pack_blocks};
+use gzc_gpu::sizing::{chain_pred_bytes, head_bytes};
 
 /// Every test case chunked into padded blocks, labelled "name[i]", plus small-alphabet blocks
 /// (many distinct repeated hashes per tile: several equal-hash groups per subgroup tile).
@@ -205,7 +206,7 @@ fn k1_head_reuse_across_dispatches() {
     for ctx in contexts() {
         let cap = blocks.len() as u32;
         let head = ctx.storage_buffer("test.head", head_bytes(cap, 5), false);
-        let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(cap, &OPT16P1).max(pred_bytes(cap, 2)), true);
+        let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(cap, &OPT16P1).max(chain_pred_bytes(cap, &LVL3)), true);
         let opts = |groups, wide_masks| ChainsOptions { groups, wide_masks, ..ChainsOptions::default() };
         let kernels: Vec<(MatchParams, ChainsKernel)> = [
             (LVL3, opts(None, false)),
@@ -239,7 +240,7 @@ fn k1_two_contexts_interleaved() {
     let ctxs = [GpuContext::new().unwrap(), GpuContext::new().unwrap()];
     let bufs: Vec<(wgpu::Buffer, wgpu::Buffer)> = ctxs
         .iter()
-        .map(|c| (c.storage_buffer("head", head_bytes(4, 2), false), c.storage_buffer("pred", pred_bytes(4, 2), true)))
+        .map(|c| (c.storage_buffer("head", head_bytes(4, 2), false), c.storage_buffer("pred", chain_pred_bytes(4, &LVL3), true)))
         .collect();
     let kernels: Vec<ChainsKernel> = ctxs
         .iter()
@@ -400,9 +401,9 @@ fn sorted_k1_matches_bucket_sort() {
         let packed = pack_blocks(&refs);
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-        let sorted = ctx.storage_buffer("test.sorted", pred_bytes(n, 1), true);
-        let rank = ctx.storage_buffer("test.rank", pred_bytes(n, 1), false);
-        let got = k1.run(&ctx, &data, &sorted, &rank, n);
+        let sorted = ctx.storage_buffer("test.sorted", chain_pred_bytes(n, &RUNG1), true);
+        let rank = ctx.storage_buffer("test.rank", chain_pred_bytes(n, &RUNG1), false);
+        let got = k1.run(ctx, &data, &sorted, &rank, n);
         for (b, (name, block)) in blocks.iter().enumerate() {
             let want = sorted_words(block, &params);
             let g = &got[b * BLOCK_SIZE..][..HASHED_POSITIONS];
@@ -415,7 +416,7 @@ fn sorted_k1_matches_bucket_sort() {
             let packed = pack_blocks(&[block.as_slice()]);
             let data = ctx.storage_buffer("test.data1", (packed.len() * 4) as u64, false);
             ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-            let got = k1.run(&ctx, &data, &sorted, &rank, 1);
+            let got = k1.run(ctx, &data, &sorted, &rank, 1);
             assert!(got[..HASHED_POSITIONS] == sorted_words(block, &params)[..HASHED_POSITIONS], "{params:?} {name} alone");
         }
     }

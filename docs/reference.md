@@ -173,7 +173,7 @@ and hands them to the sink, so frame delivery overlaps the next uploads.
   either side abort the stream (returned); panics are re-raised; the pipeline stays usable.
 - `run_frames(&blocks, &mut FrameSink)` / `run_frames_par(&blocks, &ParFrameSink, threads)` /
   `run(&blocks, &mut BlockSink)`: the `&[&[u8]]` wrappers (the producer copies the blocks in,
-  `GZC_UPLOAD_THREADS` threads). **Sinks passed to `run`, `run_frames` and `compress_stream*`
+  `GZC_UPLOAD_THREADS` threads). **Sinks passed to `run` and `run_frames`
   must now be `Send`**: they are called on the completion thread.
 
 The upload slot is MAP_WRITE memory: write-combined device memory with the direct upload, and

@@ -453,7 +453,7 @@ impl GpuContext {
 
     /// `shader` without naga's forced loop bounding (bounds checks stay on). Every loop in `body`
     /// must provably terminate (a loop that does not is undefined behaviour for the driver).
-    pub fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+    pub(crate) fn shader_unbounded_loops(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
         self.shader_with(label, body, checks)
     }
@@ -473,7 +473,7 @@ impl GpuContext {
     /// slower; K3 keeps
     /// `shader_unbounded_loops` (the index clamps cost it nothing).
     /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
-    pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
+    pub(crate) fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
         let checks = if env_on("GZC_CHECKED_SHADERS") {
             wgpu::ShaderRuntimeChecks::checked()
         } else {
