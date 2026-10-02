@@ -33,12 +33,16 @@ use gzc_core::seq::{BlockOutput, Sequence};
 const K2_WGSL: &str = include_str!("shaders/k2_best.wgsl");
 const K2_WINDOW_WGSL: &str = include_str!("shaders/k2_window.wgsl");
 const K2_OPT_WGSL: &str = include_str!("shaders/k2_opt.wgsl");
+/// The repeat-offset history (`r0..r2`) and `off_base_for` / `apply_off_base`, shared by the
+/// sequential parse and the segmented fix-up.
+const K3_REPS_WGSL: &str = include_str!("shaders/k3_reps.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
 const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
 const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
-/// `main_fixup` and the rep helpers, shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
-pub(crate) const K3_FIXUP_WGSL: &str = include_str!("shaders/k3_fixup.wgsl");
+/// `main_fixup` and the rep helpers (`K3_REPS_WGSL`), shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
+pub(crate) const K3_FIXUP_WGSL: &str =
+    concat!(include_str!("shaders/k3_reps.wgsl"), "\n", include_str!("shaders/k3_fixup.wgsl"));
 const K4_WGSL: &str = include_str!("shaders/k4_seq_entropy.wgsl");
 const K5_WGSL: &str = include_str!("shaders/k5_huffman.wgsl");
 
@@ -538,7 +542,7 @@ impl Kernels {
         };
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false]);
         // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
-        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_WGSL}\n{K3_LAZY_WGSL}");
+        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}\n{K3_LAZY_WGSL}");
         // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
         // naga adds so the driver may not assume termination; it costs 4 % (lazy2, cooperative),
         // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090). Every K3 loop
