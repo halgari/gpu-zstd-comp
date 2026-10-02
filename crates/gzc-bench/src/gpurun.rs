@@ -93,8 +93,8 @@ pub fn run_gpu(
     let cfg = PipelineConfig { params: GpuParams { emit_frames: true, ..cfg.params }, ..*cfg };
     let mut pipe = Pipeline::new(ctx, &cfg)?;
     eprintln!(
-        "  k3 mode: {:?}; direct upload: {}; transfer readback: {}; allocated {} MiB",
-        pipe.k3_mode(),
+        "  k3 mode: {}; direct upload: {}; transfer readback: {}; allocated {} MiB",
+        pipe.k3_mode().map_or("segmented or optimal parse".to_string(), |m| format!("{m:?}")),
         ctx.direct_upload,
         pipe.transfer_readback(),
         vram_bytes_with(&cfg, ctx.direct_upload).div_ceil(1 << 20)

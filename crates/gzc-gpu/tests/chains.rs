@@ -5,7 +5,7 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS};
 use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
-use gzc_core::params::{Hashes, LVL3, LVL9, SparseChain, MatchParams, OPT16, OPT16P1, OptParams, RUNG1};
+use gzc_core::params::{Hashes, LVL3, LVL9SEG, SparseChain, MatchParams, OPT16, OPT16P1, OptParams, RUNG1};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
 use gzc_gpu::chains::{
@@ -178,7 +178,7 @@ fn k1_kernel_follows_context() {
     for ctx in contexts() {
         let i = &ctx.adapter_info;
         eprintln!("{}: subgroups {} (sizes {}..={})", i.name, ctx.subgroups, i.subgroup_min_size, i.subgroup_max_size);
-        assert_eq!(ChainsKernel::new(&ctx, &LVL9).unwrap().uses_subgroups(), ChainsKernel::subgroup_kernel_possible(&ctx));
+        assert_eq!(ChainsKernel::new(&ctx, &LVL9SEG).unwrap().uses_subgroups(), ChainsKernel::subgroup_kernel_possible(&ctx));
     }
 }
 
@@ -212,7 +212,7 @@ fn k1_head_reuse_across_dispatches() {
             (LVL3, opts(None, false)),
             (RUNG1, opts(Some(1), false)),
             (LVL3, opts(Some(3), true)),
-            (LVL9, opts(Some(1), false)),
+            (LVL9SEG, opts(Some(1), false)),
             (RUNG1, opts(None, true)),
             (LVL3, opts(Some(1), false)),
             (OPT16P1, opts(Some(3), false)),
@@ -267,7 +267,7 @@ fn k1_pred_words_carry_fingerprints() {
     for ctx in contexts() {
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-        for params in [LVL3, LVL9, OPT16, OPT16P1] {
+        for params in [LVL3, LVL9SEG, OPT16, OPT16P1] {
             let kernel = ChainsKernel::new(&ctx, &params).unwrap();
             let nh = kernel.n_hashes() as usize;
             let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);
@@ -312,16 +312,16 @@ fn k1_failed_self_test_falls_back() {
     if !ChainsKernel::subgroup_kernel_possible(&ctx) {
         return;
     }
-    let good = ChainsKernel::with_options(&ctx, &LVL9, ChainsOptions::default()).unwrap();
+    let good = ChainsKernel::with_options(&ctx, &LVL9SEG, ChainsOptions::default()).unwrap();
     assert!(good.uses_subgroups(), "self-test failed on this adapter");
     let opts = ChainsOptions { break_subgroup_kernel: true, ..ChainsOptions::default() };
-    let broken = ChainsKernel::with_options(&ctx, &LVL9, opts).unwrap();
+    let broken = ChainsKernel::with_options(&ctx, &LVL9SEG, opts).unwrap();
     assert!(!broken.uses_subgroups());
     let blocks = all_blocks();
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let preds = gpu_preds_with(&ctx, &broken, &refs).unwrap();
     for ((name, block), got) in blocks.iter().zip(&preds) {
-        compare(name, got, block, &LVL9);
+        compare(name, got, block, &LVL9SEG);
     }
 }
 
@@ -339,19 +339,19 @@ fn pack_blocks_appends_zero_word() {
 #[test]
 fn sorted_finder_kernel_names() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    use gzc_core::params::LVL9S12;
+    use gzc_core::params::LVL9S12SEG;
     use gzc_gpu::compressor::{GpuParams, Kernels};
     use gzc_gpu::sorted::workgroup_bytes;
     for ctx in contexts() {
         let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
-        let k = Kernels::new(&ctx, gp(LVL9S12)).unwrap();
+        let k = Kernels::new(&ctx, gp(LVL9S12SEG)).unwrap();
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;
         let sg = ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32;
-        let fits = (sg && workgroup_bytes(&LVL9S12, true) <= limit) || workgroup_bytes(&LVL9S12, false) <= limit;
+        let fits = (sg && workgroup_bytes(&LVL9S12SEG, true) <= limit) || workgroup_bytes(&LVL9S12SEG, false) <= limit;
         assert_eq!(k.uses_sorted_finder(), fits);
         let want = if fits { ["k1_sort", "k2_window", "k3_parse"] } else { ["k1_chains", "k2_best", "k3_parse"] };
         assert_eq!(k.names(), want);
-        assert!(!Kernels::new(&ctx, gp(LVL9)).unwrap().uses_sorted_finder());
+        assert!(!Kernels::new(&ctx, gp(LVL9SEG)).unwrap().uses_sorted_finder());
     }
 }
 
@@ -360,7 +360,7 @@ fn sorted_finder_kernel_names() {
 fn chains_over_short_keys() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
     for ctx in contexts() {
-        for params in [MatchParams { hash_bits: 13, ..LVL9 }, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }] {
+        for params in [MatchParams { hash_bits: 13, ..LVL9SEG }, MatchParams { hash_bits: 11, min_match: 6, ..LVL9SEG }] {
             let blocks = all_blocks();
             let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
             let preds = gpu_preds(&ctx, &refs, &params).unwrap();
@@ -379,13 +379,13 @@ fn chains_over_short_keys() {
 #[test]
 fn sorted_k1_matches_bucket_sort() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    use gzc_core::params::LVL9S12;
+    use gzc_core::params::LVL9S12SEG;
     use gzc_gpu::sorted::{SortKernel, sorted_words, workgroup_bytes};
     let blocks = all_blocks();
     let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
     let fallback = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
-    assert!(SortKernel::new(&ctx, &LVL9).unwrap().is_none(), "sorted K1 for a 16-bit key");
-    let variants = [MatchParams { hash_bits: 13, ..LVL9 }, LVL9S12, MatchParams { hash_bits: 11, min_match: 6, ..LVL9 }];
+    assert!(SortKernel::new(&ctx, &LVL9SEG).unwrap().is_none(), "sorted K1 for a 16-bit key");
+    let variants = [MatchParams { hash_bits: 13, ..LVL9SEG }, LVL9S12SEG, MatchParams { hash_bits: 11, min_match: 6, ..LVL9SEG }];
     for (ctx, params) in [&ctx, &fallback].into_iter().flat_map(|c| variants.map(|p| (c, p))) {
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;
         let sg_ok = ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 && workgroup_bytes(&params, true) <= limit;

@@ -108,7 +108,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -211,7 +211,7 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
@@ -229,7 +229,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -556,8 +556,8 @@ mod tests {
     fn resolve_max_batch_differs_per_preset() {
         let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
         let lvl3 = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, false).unwrap();
-        let rung1 = resolve_max_batch(gzc_core::params::RUNG1, inflight, budget_mb, device_max, false).unwrap();
-        assert!(lvl3 < rung1, "lvl3 {lvl3} should resolve smaller than rung1 {rung1} at the same budget");
+        let lvl9 = resolve_max_batch(gzc_core::params::LVL9SEG, inflight, budget_mb, device_max, false).unwrap();
+        assert!(lvl3 < lvl9, "lvl3 {lvl3} should resolve smaller than lvl9seg {lvl9} at the same budget");
         // The direct upload has no shared `data` buffer: a larger batch fits.
         let direct = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, true).unwrap();
         assert!(direct > lvl3, "direct upload {direct} vs copy upload {lvl3}");
@@ -577,15 +577,20 @@ mod tests {
             };
             let names = |extra: &[&str]| presets(extra).unwrap().iter().map(|p| p.name).collect::<Vec<_>>();
             assert_eq!(names(&[]), ["lvl3"], "{cmd}: default");
-            assert_eq!(names(&["--preset", "lvl3,lvl9"]), ["lvl3", "lvl9"], "{cmd}");
-            assert_eq!(presets(&["--preset", "rung1"]).unwrap()[0].params, gzc_core::params::RUNG1, "{cmd}");
+            assert_eq!(names(&["--preset", "lvl3,lvl9seg"]), ["lvl3", "lvl9seg"], "{cmd}");
+            assert_eq!(presets(&["--preset", "lvl9s12seg"]).unwrap()[0].params, gzc_core::params::LVL9S12SEG, "{cmd}");
             let err = presets(&["--preset", "lvl3,bogus"]).unwrap_err().to_string();
-            assert!(err.contains("bogus") && err.contains("lvl3") && err.contains("lvl9"), "{cmd}: {err}");
+            assert!(err.contains("bogus") && err.contains("lvl3") && err.contains("lvl9seg"), "{cmd}: {err}");
+            for removed in ["rung1", "rung2", "lvl9", "lvl9s12", "lvl9s12d16seg"] {
+                assert!(presets(&["--preset", removed]).is_err(), "{cmd}: {removed} is no longer a preset");
+            }
         }
-        let lvl9 = parse_preset("lvl9").unwrap();
         let lvl3 = parse_preset("lvl3").unwrap();
         assert!(check_presets(&[lvl3], true, true).is_ok());
-        assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
+        // An unsegmented lazy parse is CPU-only (no preset has one; the GPU refuses the params).
+        let cpu_only = Preset { name: "lazy2-unsegmented", params: gzc_core::params::LVL9 };
+        assert!(check_presets(&[cpu_only], true, false).is_ok());
+        assert!(check_presets(&[cpu_only], false, true).is_err());
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
         // M5 T5: the GPU implements the optimal parse too, and since M6 B4 the M6 options

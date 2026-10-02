@@ -123,11 +123,12 @@ pub struct MatchParams {
     /// Bytes compared per candidate; the parse extends matches that hit the cap.
     pub search_cap: u32,
     /// Bits of the match-finder hash key (`hash::key`: the 16-bit hash's top `hash_bits` bits).
-    /// 16 for the chain presets; 12 for the `lvl9s12*` presets, whose GPU finder bucket-sorts the
+    /// 16 for the chain presets; 12 for `lvl9s12seg`, whose GPU finder bucket-sorts the
     /// candidates by key with 2^hash_bits counters in workgroup memory (`gzc_gpu::sorted`).
     /// Candidates, and so `find_best`, are the hash chains over this key either way.
     pub hash_bits: u32,
-    /// 0: the lazy parse runs over the whole block. Otherwise log2 of the parse segment
+    /// 0: the parse runs over the whole block (a lazy parse then runs on the CPU oracle only: the
+    /// GPU parses lazy in segments). Otherwise log2 of the parse segment
     /// (`lazy::lazy_parse_segmented`): segments of `1 << segment_log2` bytes are parsed
     /// independently (empty rep state, matches clamped to the segment, no skip acceleration),
     /// then the offsets are re-encoded with the block's true rep history. Needs `lazy > 0`, or
@@ -233,36 +234,38 @@ fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
 /// Level-3 calibration (the M3 output, byte for byte): dfast chains, depth 1, greedy.
 pub const LVL3: MatchParams =
     MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
-/// Single 4-byte hash, depth 8, greedy (compare against libzstd L5).
-pub const RUNG1: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
-/// Rung 1 with a lazy parse (compare against libzstd L6).
-pub const RUNG2: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 1, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
-/// Single 4-byte hash, depth 32, lazy2 (compare against libzstd L9).
+
+/// Single 4-byte hash, depth 32, lazy2, with the parse split into independent 4 KiB segments
+/// (speed-2 E1): a parse that runs one GPU lane per segment. Validated >= libzstd L9.
 ///
 /// Full-corpus ratios (`gzc-bench ref`, byte-identical to the GPU; `--ext dds,nif`) against
-/// libzstd L9 on the same blocks, for this and the speed-2 presets below:
+/// libzstd L9 on the same blocks:
 ///
-/// | block | L9 | lvl9 | lvl9seg | lvl9s12 | lvl9s12seg | lvl9s12d16seg |
-/// |---|---|---|---|---|---|---|
-/// | 64 KiB | 1.33786 | 1.33932 | 1.33931 | 1.33927 | 1.33926 | 1.33860 |
-pub const LVL9: MatchParams =
-    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
-
-/// lvl9 with the parse split into independent 4 KiB segments (speed-2 E1): same match finder,
-/// a parse that runs one GPU lane per segment. Validated >= libzstd L9 (table at `LVL9`).
+/// | block | L9 | lvl9seg | lvl9s12seg |
+/// |---|---|---|---|
+/// | 64 KiB | 1.33786 | 1.33931 | 1.33926 |
 pub const LVL9SEG: MatchParams = MatchParams { segment_log2: 12, ..LVL9 };
 
-/// `lvl9` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
+/// `lvl9seg` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
 /// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
-/// instead of 16-bit hash chains. Validated >= libzstd L9 (table at `LVL9`).
-pub const LVL9S12: MatchParams = MatchParams { hash_bits: 12, ..LVL9 };
-/// `lvl9s12` with the segmented parse (E2 + E1). Validated >= libzstd L9 (table at `LVL9`).
+/// instead of 16-bit hash chains. Validated >= libzstd L9 (table at `LVL9SEG`).
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
-/// `lvl9s12seg` walking 16 candidates instead of 32 (E2 + E1 + E4). Validated >= libzstd L9
-/// (table at `LVL9`).
-pub const LVL9S12D16SEG: MatchParams = MatchParams { depth: 16, ..LVL9S12SEG };
+
+// Not presets: parameter sets the tests use as fixtures. `RUNG1` (a single greedy chain) runs on
+// the GPU like any valid greedy params; `RUNG2` and `LVL9` are unsegmented lazy parses, which
+// only the CPU oracle implements (`gzc_gpu::compressor::gpu_supports` refuses them). The
+// hand-built deferral cases of `lazy::cases` pin the lazy rules on them.
+/// Test fixture: single 4-byte hash, depth 8, greedy.
+#[doc(hidden)]
+pub const RUNG1: MatchParams =
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 8, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
+/// Test fixture (CPU only): `RUNG1` with an unsegmented lazy parse.
+#[doc(hidden)]
+pub const RUNG2: MatchParams = MatchParams { lazy: 1, ..RUNG1 };
+/// Test fixture (CPU only): `LVL9SEG`'s finder with an unsegmented lazy2 parse.
+#[doc(hidden)]
+pub const LVL9: MatchParams =
+    MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 
 /// Optimal parse aimed at libzstd L16 (btultra, M5): `Opt3` candidates (h4 chain 32 deep + h3
 /// chain 4 deep, two records per position), the zstd optimal-parse DP per 4 KiB segment with
@@ -331,15 +334,10 @@ pub const OPT16P1: MatchParams = MatchParams {
 };
 
 /// Every named preset, in CLI order.
-pub const PRESETS: [(&str, MatchParams); 11] = [
+pub const PRESETS: [(&str, MatchParams); 6] = [
     ("lvl3", LVL3),
-    ("rung1", RUNG1),
-    ("rung2", RUNG2),
-    ("lvl9", LVL9),
     ("lvl9seg", LVL9SEG),
-    ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
-    ("lvl9s12d16seg", LVL9S12D16SEG),
     ("opt14", OPT14),
     ("opt16", OPT16),
     ("opt16p1", OPT16P1),
@@ -365,13 +363,15 @@ mod tests {
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
         assert_eq!(RUNG2, m(Hashes::Single, 4, 8, 1));
         assert_eq!(LVL9, m(Hashes::Single, 4, 32, 2));
-        assert_eq!(LVL9S12, MatchParams { hash_bits: 12, ..m(Hashes::Single, 4, 32, 2) });
-        assert_eq!(LVL9S12D16SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..m(Hashes::Single, 4, 16, 2) });
         assert_eq!(LVL9SEG, MatchParams { segment_log2: 12, ..m(Hashes::Single, 4, 32, 2) });
         assert_eq!(LVL9S12SEG, MatchParams { hash_bits: 12, segment_log2: 12, ..LVL9 });
         for (name, p) in PRESETS {
             assert_eq!(p.validate(), Ok(()), "{name}");
             assert_eq!(preset(name), Ok(p), "{name}");
+        }
+        assert_eq!(PRESETS.map(|(n, _)| n), ["lvl3", "lvl9seg", "lvl9s12seg", "opt14", "opt16", "opt16p1"]);
+        for removed in ["rung1", "rung2", "lvl9", "lvl9s12", "lvl9s12d16seg"] {
+            assert!(preset(removed).is_err(), "{removed}");
         }
         let opt = OptParams {
             level: 2,

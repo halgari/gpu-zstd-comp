@@ -133,7 +133,7 @@ Branch: T2 worktree based on `m5` at d4d05e2. Machine: RTX 5090, subgroups on un
 
 ### Time: K1 + K2opt vs lvl9 K1 + K2, 64 KiB, full corpus (100754 blocks, batch 2048)
 
-`cargo run --release -p gzc-gpu --example k2opt_bench -- data/corpus 2048`. For each batch, the per-kernel timestamps are the median of 3 reps; the table sums them over the corpus. Three full runs (µs per block):
+`cargo run --release -p gzc-gpu --example k2opt_bench -- data/corpus 2048` (the example has since been removed). For each batch, the per-kernel timestamps are the median of 3 reps; the table sums them over the corpus. Three full runs (µs per block):
 
 | run | lvl9 K1 | lvl9 K2 | lvl9 sum | opt16 K1 | opt16 K2opt | opt16 sum | lvl3 K1 (2 chains) |
 |---|---:|---:|---:|---:|---:|---:|---:|

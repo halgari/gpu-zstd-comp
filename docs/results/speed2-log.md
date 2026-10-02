@@ -151,7 +151,7 @@ Ratio checks:
 
 - **Floor:** libzstd L9 at 64K is 1.3379, and every preset is above it. The smallest margin is lvl9s12d16seg at
   +0.05 %.
-- **Totals:** the GPU byte totals equal the oracle's, both from `gzc-bench ref` and from `examples/e2_ratio`. For
+- **Totals:** the GPU byte totals equal the oracle's, both from `gzc-bench ref` and from `examples/e2_ratio` (since removed). For
   example, lvl9s12seg is 4 848 823 883 bytes in both.
 - **Decoding:** `--verify` passed for all 7 new presets.
 - **Per frame:** `corpus_blocks_match_cpu_per_preset` compared 4000 real blocks and found every GPU frame equal to

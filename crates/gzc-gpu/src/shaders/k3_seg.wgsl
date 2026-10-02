@@ -2,7 +2,7 @@
 // == gzc_core::lazy::lazy_parse_segmented. Two entry points, dispatched back to back in K3's pass:
 //
 // main_seg (one invocation per segment of SEG = 1 << SEG_LOG2 bytes, NSEG per block): the
-//   sequential lazy parse of k3_lazy.wgsl (== lazy::lazy_core) over one lazy::Seg::segment:
+//   sequential lazy parse (== lazy::lazy_core) over one lazy::Seg::segment:
 //   segment 0 starts at ip 1 with INITIAL_REPS, segment k > 0 at ip = anchor = k*SEG with all-zero
 //   reps; matches are clamped to the segment end `lim` (best[] matches past it are cut, and
 //   dropped below MIN_MATCH); the loop runs while ip < pend (lim - 4, PARSE_END for the last

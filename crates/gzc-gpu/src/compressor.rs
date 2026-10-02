@@ -1,8 +1,8 @@
 //! Host side of the K2 (best match), K3 (parse), K5 (Huffman literals) and K4 (entropy + frame
 //! assembly) kernels; compress_batch / compress_frames entry points.
 //!
-//! K1 (hash chains) → K2 (`find_best`) → K3 (`reference::parse`: greedy, or `lazy::lazy_parse`
-//! when `MatchParams::lazy > 0`) reproduce
+//! K1 (hash chains) → K2 (`find_best`) → K3 (`reference::parse`: greedy, or
+//! `lazy::lazy_parse_segmented` when `MatchParams::lazy > 0`) reproduce
 //! `gzc_core::reference::compress_block` exactly, for a batch of BLOCK_SIZE blocks. K5 writes each
 //! block's literals section into its frame and K4 completes the frame, byte-identical to
 //! `gzc_core::frame::write_frame` with `GpuParams::frame_options()`: Huffman literals
@@ -37,7 +37,6 @@ const K2_OPT_WGSL: &str = include_str!("shaders/k2_opt.wgsl");
 /// sequential parse and the segmented fix-up.
 const K3_REPS_WGSL: &str = include_str!("shaders/k3_reps.wgsl");
 const K3_WGSL: &str = include_str!("shaders/k3_parse.wgsl");
-const K3_LAZY_WGSL: &str = include_str!("shaders/k3_lazy.wgsl");
 const K3_COOP_WGSL: &str = include_str!("shaders/k3_coop.wgsl");
 const K3_SEG_WGSL: &str = include_str!("shaders/k3_seg.wgsl");
 /// `main_fixup` and the rep helpers (`K3_REPS_WGSL`), shared by `k3_seg.wgsl` and `k3_opt.wgsl`.
@@ -97,6 +96,10 @@ pub const SORTED_KERNEL_NAMES: [&str; 5] = ["k1_sort", "k2_window", "k3_parse", 
 /// Timestamp queries `Kernels::record_timed` may write: a begin/end pair per kernel.
 pub const KERNEL_QUERIES: u32 = 2 * KERNEL_NAMES.len() as u32;
 
+/// K3t's name in timing breakdowns (`Kernels::record_truncate`). It is not one of `KERNEL_NAMES`:
+/// it runs only for a batch that holds a partial block, with timestamp writes its caller places.
+pub const TRUNC_KERNEL_NAME: &str = "k3_trunc";
+
 /// Parameters for the GPU path: the match finder / parse (`params::LVL3` etc., same meaning
 /// as for `reference::compress_block`) and which output stages run.
 #[derive(Clone, Copy, Debug)]
@@ -109,20 +112,31 @@ pub struct GpuParams {
     pub huffman: bool,
 }
 
-/// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes, greedy,
-/// lazy and lazy2 since M4 Task 5; the M5 optimal parse, presets `opt14`/`opt16`, with K2opt and
-/// the K3opt passes since M5 T5), and the
+/// Whether the GPU kernels implement `p`: every valid `MatchParams` (both hash modes; greedy
+/// over the whole block; lazy and lazy2 in segments only, `segment_log2 > 0`: an unsegmented lazy
+/// parse is refused and runs on the CPU oracle alone; the M5 optimal parse, presets
+/// `opt14`/`opt16`, with K2opt and the K3opt passes since M5 T5), and the
 /// M6 opt options (preset `opt16p1`, M6 B4): the S3 prior tables, gap3, top-N pruning and the
 /// drop pass at every value `validate` allows (K3opt and `K3Drop` compile them in), and sparse
 /// chains of stride 4 or 8 (`chains::long_chains_supported`: K1 hashes word-aligned slots).
 /// Valid sparse chains of stride 1 or 2 are refused.
 pub fn gpu_supports(p: &MatchParams) -> bool {
-    p.validate().is_ok() && p.opt.is_none_or(|_| chains::long_chains_supported(p))
+    p.validate().is_ok() && !unsegmented_lazy(p) && p.opt.is_none_or(|_| chains::long_chains_supported(p))
+}
+
+/// A lazy parse over the whole block: valid for the CPU oracle, not implemented on the GPU.
+fn unsegmented_lazy(p: &MatchParams) -> bool {
+    p.opt.is_none() && p.lazy > 0 && p.segment_log2 == 0
 }
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
 pub fn check_matching(m: &MatchParams) -> anyhow::Result<()> {
     m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
+    anyhow::ensure!(
+        !unsegmented_lazy(m),
+        "match params {m:?} are not implemented on gpu: a lazy parse (lazy {}) needs segments (segment_log2 > 0)",
+        m.lazy
+    );
     anyhow::ensure!(gpu_supports(m), "match params {m:?} are not implemented yet on gpu");
     let max = max_seqs(m);
     anyhow::ensure!(
@@ -286,14 +300,16 @@ pub struct Kernels {
     /// K2: `k2_best.wgsl`'s `main`, or K2opt (`k2_opt.wgsl`) for the optimal parse.
     best: wgpu::ComputePipeline,
     best_layout: wgpu::BindGroupLayout,
-    /// The sequential K3 (None for the optimal parse, whose K3 is `opt`).
+    /// The sequential K3: the unsegmented greedy parse (None for the segmented and the optimal
+    /// parse, whose K3 is `parse_seg` / `opt`).
     parse: Option<wgpu::ComputePipeline>,
     parse_layout: wgpu::BindGroupLayout,
     /// The subgroup-cooperative K3 (`K3Mode::Coop`), used instead of `parse` when present.
     parse_coop: Option<wgpu::ComputePipeline>,
     /// The segmented K3 (`MatchParams::segment_log2 > 0`), used instead of both when present.
     parse_seg: Option<SegParse>,
-    k3_mode: K3Mode,
+    /// How the unsegmented greedy K3 runs; None when K3 is `parse_seg` or `opt`.
+    k3_mode: Option<K3Mode>,
     /// The optimal parse (`MatchParams::opt`, M5): the K3opt passes (`k3opt::OptPasses`), run as
     /// K3 instead of every parse above, on the shared buffers (`OptBinds::of_batch`).
     opt: Option<OptPasses>,
@@ -421,14 +437,14 @@ pub(crate) fn pipeline_from_module(
     })
 }
 
-/// How K3 runs the lazy / lazy2 parse (speed phase S3).
+/// How K3 runs the unsegmented greedy parse (speed phase S3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum K3Mode {
-    /// `k3_parse.wgsl` + `k3_lazy.wgsl`: one lane per block.
+    /// `k3_parse.wgsl`: one lane per block.
     Seq,
-    /// `k3_coop.wgsl`: one subgroup of `w` lanes per block (needs `Features::SUBGROUP`), `bpw`
-    /// blocks per workgroup.
-    Coop { w: u32, bpw: u32 },
+    /// `k3_coop.wgsl`: one workgroup of `w` lanes, a single subgroup, per block (needs
+    /// `Features::SUBGROUP`).
+    Coop { w: u32 },
 }
 
 /// Ballot bits (x, y) of `w` active lanes 0..w.
@@ -445,8 +461,7 @@ fn lane_mask(w: u32) -> (u32, u32) {
 /// two), provided a one-time probe confirms that a workgroup of W lanes is one subgroup with lane
 /// ids 0..W-1 (else `Seq`; `GZC_NO_SUBGROUPS` makes the context subgroup-less, see
 /// `GpuContext::new`). Overrides: `GZC_K3_MODE=seq|coop` (coop errors when unavailable),
-/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size) and `GZC_K3_BPW=1|2` (blocks per
-/// workgroup; 2 needs minimum == maximum subgroup size == W). The output never depends on them.
+/// `GZC_K3_W=4|8|16|32|64` (at most the minimum subgroup size). The output never depends on them.
 pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
     let forced = std::env::var("GZC_K3_MODE").ok();
     match forced.as_deref() {
@@ -476,32 +491,22 @@ pub fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
             1 << (31 - w.leading_zeros())
         }
     };
-    let bpw = match std::env::var("GZC_K3_BPW").as_deref() {
-        Ok("2") => {
-            let max = ctx.adapter_info.subgroup_max_size;
-            anyhow::ensure!(min == max && w == min, "GZC_K3_BPW=2 needs W == min == max subgroup size ({w}, {min}, {max})");
-            2
-        }
-        Ok("1") | Err(_) => 1,
-        Ok(v) => anyhow::bail!("GZC_K3_BPW={v}: expected 1 or 2"),
-    };
-    if !probe_lanes(ctx, w, bpw)? {
-        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}, BPW = {bpw}");
-        eprintln!("gzc: subgroup lane probe failed for W = {w}, BPW = {bpw}; using the sequential K3");
+    if !probe_lanes(ctx, w)? {
+        anyhow::ensure!(!force_coop, "GZC_K3_MODE=coop: subgroup lane probe failed for W = {w}");
+        eprintln!("gzc: subgroup lane probe failed for W = {w}; using the sequential K3");
         return Ok(K3Mode::Seq);
     }
-    Ok(K3Mode::Coop { w, bpw })
+    Ok(K3Mode::Coop { w })
 }
 
-/// Dispatches one `@workgroup_size(w * bpw)` workgroup that records each lane's local index,
-/// subgroup lane id, subgroup size and `subgroupBallot(true)`; true when every group of `w`
-/// lanes is one subgroup with lane id == local index % w, size >= w (== w when bpw > 1) and
-/// exactly the w-lane ballot (what `k3_coop.wgsl` assumes).
-pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
-    let n = w * bpw;
+/// Dispatches one `@workgroup_size(w)` workgroup that records each lane's local index,
+/// subgroup lane id, subgroup size and `subgroupBallot(true)`; true when the `w` lanes are one
+/// subgroup with lane id == local index, size >= w and exactly the w-lane ballot (what
+/// `k3_coop.wgsl` assumes).
+pub fn probe_lanes(ctx: &GpuContext, w: u32) -> anyhow::Result<bool> {
     let src = format!(
         "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
-         @compute @workgroup_size({n})\n\
+         @compute @workgroup_size({w})\n\
          fn main(@builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) sid: u32,\n\
                  @builtin(subgroup_size) sz: u32) {{\n\
              let m = subgroupBallot(true);\n\
@@ -513,7 +518,7 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
         let module = ctx.wgsl_module("k3_probe", &src, wgpu::ShaderRuntimeChecks::checked());
         let layout = storage_layout(ctx, "k3_probe", &[false]);
         let pipeline = pipeline_from_module(ctx, "k3_probe", &layout, &module, "main");
-        let buf = ctx.storage_buffer("k3_probe", 5 * 4 * n as u64, true);
+        let buf = ctx.storage_buffer("k3_probe", 5 * 4 * w as u64, true);
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k3_probe"),
             layout: &layout,
@@ -528,12 +533,9 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
             pass.dispatch_workgroups(1, 1, 1);
         }
         ctx.queue.submit([enc.finish()]);
-        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * n as usize);
+        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * w as usize);
         let (mx, my) = lane_mask(w);
-        Ok(v.chunks(5).enumerate().all(|(i, l)| {
-            let size_ok = if bpw > 1 { l[2] == w } else { l[2] >= w };
-            l[0] == i as u32 && l[1] == i as u32 % w && size_ok && l[3] == mx && l[4] == my
-        }))
+        Ok(v.chunks(5).enumerate().all(|(i, l)| l[0] == i as u32 && l[1] == i as u32 && l[2] >= w && l[3] == mx && l[4] == my))
     })
 }
 
@@ -553,28 +555,26 @@ impl Kernels {
             compute_pipeline(ctx, "k2_best", &best_layout, &format!("{best_consts}{K2_WGSL}"))
         };
         let parse_layout = storage_layout(ctx, "k3", &[true, true, false, false]);
-        // The greedy (`LAZY == 0`) and lazy entry are selected by the injected LAZY constant.
-        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}\n{K3_LAZY_WGSL}");
+        // The unsegmented parse (greedy: `check_matching` refused an unsegmented lazy one).
+        let unsegmented = !is_opt && m.segment_log2 == 0;
+        let k3_body = format!("{best_consts}const MAX_SEQS: u32 = {MAX_SEQS}u;\n{K3_REPS_WGSL}\n{K3_WGSL}");
         // Both K3 modules are built without naga's forced loop bounding (a per-iteration counter
-        // naga adds so the driver may not assume termination; it costs 4 % (lazy2, cooperative),
-        // 4 % (lazy2, sequential) and 33 % (greedy) of K3 time on an RTX 5090). Every K3 loop
-        // provably ends, whatever best[] holds:
+        // naga adds so the driver may not assume termination; it costs 33 % of the greedy K3's
+        // time on an RTX 5090). Every K3 loop provably ends, whatever best[] holds:
         // - k3_coop.wgsl: each loop has a `// Terminates:` note (variant and bound); the only
         //   subtraction that could wrap, push_lits' end - start, is guarded.
-        // - k3_parse.wgsl / k3_lazy.wgsl: the parse loops advance p / ip below PARSE_END (a store
-        //   by >= 1 byte, a skip by step >= 1, the deferral by 1-2, the immediate loop by ml >= 4);
-        //   match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE); the catch-up's start
-        //   falls toward anchor; push_lits has no loop.
+        // - k3_parse.wgsl: the parse loop advances p below PARSE_END (a store by >= 1 byte, a
+        //   skip by step >= 1); match_len's n grows to max <= BLOCK_SIZE - p (p < BLOCK_SIZE);
+        //   push_lits has no loop.
         // Bounds checks stay on. A new K3 loop must come with the same argument, or use
         // `ctx.shader` instead.
-        let parse = (!is_opt).then(|| {
+        let parse = unsegmented.then(|| {
             pipeline_from_module(ctx, "k3_parse", &parse_layout, &ctx.shader_unbounded_loops("k3_parse", &k3_body), "main")
         });
-        let k3_mode = k3_mode(ctx)?;
+        let k3_mode = if unsegmented { Some(k3_mode(ctx)?) } else { None };
         let parse_coop = match k3_mode {
-            K3Mode::Seq => None,
-            K3Mode::Coop { .. } if is_opt => None,
-            K3Mode::Coop { w, bpw } => {
+            None | Some(K3Mode::Seq) => None,
+            Some(K3Mode::Coop { w }) => {
                 let (mx, my) = lane_mask(w);
                 // The greedy rep test's second word: its first min_match - 4 bytes (4..=8).
                 let rep_hi = ((1u64 << (8 * (m.min_match - 4))) - 1) as u32;
@@ -582,7 +582,7 @@ impl Kernels {
                 // sequential fallback (the path a failed lane-layout guard takes).
                 let force_fallback = std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1");
                 let body = format!(
-                    "const W: u32 = {w}u;\nconst BPW: u32 = {bpw}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
+                    "const W: u32 = {w}u;\nconst W_MASK_X: u32 = {mx}u;\nconst W_MASK_Y: u32 = {my}u;\n\
                      const REP_HI_MASK: u32 = {rep_hi}u;\nconst K3_FORCE_FALLBACK: bool = {force_fallback};\n\
                      {k3_body}\n{K3_COOP_WGSL}"
                 );
@@ -592,9 +592,11 @@ impl Kernels {
                 Some(pipeline_from_module(ctx, "k3_coop", &parse_layout, &module, "main_coop"))
             }
         };
-        // Segmented parse: loops as in k3_lazy.wgsl, bounded by the segment's lim instead of
-        // BLOCK_SIZE (match_len's n grows to max <= lim - p), the skip by exactly 1; the fixup
-        // loops count up to NSEG and to the segments' sequence counts.
+        // Segmented parse, also without the forced loop bounding: its parse loops advance ip
+        // below the segment's lim (a store by >= 1 byte, a skip by exactly 1, the deferral by
+        // 1-2, the immediate loop by ml >= 4); match_len's n grows to max <= lim - p; the
+        // catch-up's start falls toward anchor; the fixup loops count up to NSEG and to the
+        // segments' sequence counts.
         let parse_seg = (m.segment_log2 > 0 && !is_opt).then(|| {
             let seg_log2 = m.segment_log2;
             let layout = storage_layout(ctx, "k3_seg", &[true, false, false, false]);
@@ -610,9 +612,8 @@ impl Kernels {
                 n_seg: (BLOCK_SIZE >> seg_log2) as u32,
             }
         });
-        // The optimal parse: K3opt's passes with the default build (wg16, the ring in workgroup
-        // memory when it fits): wg16 keeps a block's segments in one workgroup (wg % segments ==
-        // 0 at 16..64 KiB), which the Prior seed and the cheap passes' histograms need.
+        // The optimal parse: K3opt's passes, one workgroup of 16 lanes per block (a block's
+        // segments in one workgroup, which the Prior seed and the cheap passes' histograms need).
         let opt = if is_opt { Some(OptPasses::new(ctx, &m, K3OptConfig::default())?) } else { None };
         let (tab, consts) = k4_tables(max_seqs(&m));
         let huffman = params.emit_frames && params.huffman;
@@ -691,8 +692,9 @@ impl Kernels {
         self.sorted.is_some()
     }
 
-    /// How K3 runs (see `k3_mode`).
-    pub fn k3_mode(&self) -> K3Mode {
+    /// How the unsegmented greedy K3 runs (see `k3_mode`); None when K3 is the segmented or the
+    /// optimal parse.
+    pub fn k3_mode(&self) -> Option<K3Mode> {
         self.k3_mode
     }
 
@@ -828,29 +830,6 @@ impl Kernels {
         pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n_blocks, 1);
     }
 
-    /// K1 alone, or K2 alone on the chains already in `bufs.pred` (the E3 overlap probe).
-    #[cfg(test)]
-    pub(crate) fn record_k1_or_k2(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n: u32, k2: bool) {
-        assert!(self.sorted.is_none(), "record_k1_or_k2 runs the hash-chain K1/K2 only, not the bucket-sorted finder");
-        if !k2 {
-            self.chains.record_timed(ctx, enc, &bufs.data, &bufs.head, &bufs.pred, n, None);
-            return;
-        }
-        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k2"),
-            layout: &self.best_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: bufs.data.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bufs.pred.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: bufs.best.as_entire_binding() },
-            ],
-        });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k2"), timestamp_writes: None });
-        pass.set_pipeline(&self.best);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups((BLOCK_SIZE / 256) as u32, n, 1);
-    }
-
     /// Records K3 alone on whatever blocks (`data`) and matches (`best`) `bufs` holds for its
     /// first `n_blocks` blocks. `n_blocks` is at least 1 and at most `bufs.capacity`. For the
     /// optimal parse K3 is the block order, every K3opt pass, the fix-up and (opt16p1) the drop
@@ -906,14 +885,10 @@ impl Kernels {
             ],
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3"), timestamp_writes });
-        let seq = self.parse.as_ref().expect("the sequential K3 exists without opt");
+        let seq = self.parse.as_ref().expect("the sequential K3 exists for an unsegmented parse");
         pass.set_pipeline(self.parse_coop.as_ref().unwrap_or(seq));
         pass.set_bind_group(0, &k3, &[]);
-        let per_workgroup = match self.k3_mode {
-            K3Mode::Coop { bpw, .. } => bpw,
-            K3Mode::Seq => 1,
-        };
-        pass.dispatch_workgroups(n_blocks.div_ceil(per_workgroup), 1, 1);
+        pass.dispatch_workgroups(n_blocks, 1, 1);
         Ok(())
     }
 
@@ -934,8 +909,16 @@ impl Kernels {
     /// K3t: cuts the parse of every partial block of the batch to its real length, from
     /// `bufs.lens` (one u32 per block, BLOCK_SIZE for a full block, written by the caller before
     /// this runs). Recorded between K3 (`record_front`) and `record_entropy`, and only for a batch
-    /// holding a partial block (it leaves full blocks alone). `1 <= n_blocks <= bufs.capacity`.
-    pub(crate) fn record_truncate(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, bufs: &BatchBuffers, n_blocks: u32) {
+    /// holding a partial block (it leaves full blocks alone), in its own compute pass with
+    /// `timestamp_writes`. `1 <= n_blocks <= bufs.capacity`.
+    pub(crate) fn record_truncate(
+        &self,
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &BatchBuffers,
+        n_blocks: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites>,
+    ) {
         let (pipeline, layout) = self.trunc.as_ref().expect("Kernels built without emit_frames");
         let lens = bufs.lens.as_ref().expect("BatchBuffers allocated without frames");
         assert!(n_blocks >= 1 && n_blocks <= bufs.capacity, "n_blocks {n_blocks} not in 1..={}", bufs.capacity);
@@ -956,7 +939,7 @@ impl Kernels {
                 wgpu::BindGroupEntry { binding: 3, resource: bufs.counts.as_entire_binding() },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3t"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("k3t"), timestamp_writes });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_blocks, 1, 1);
@@ -1620,7 +1603,7 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
 mod tests {
     use super::*;
     use crate::sizing::{best_words, pred_bytes_for, scratch_bytes, slot_bytes, trace_bytes};
-    use gzc_core::params::{LVL3, LVL9, RUNG1, RUNG2};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, RUNG1, RUNG2};
 
     const MIB: u64 = 1 << 20;
 
@@ -1655,7 +1638,7 @@ mod tests {
             assert_eq!(max_seqs(&p), if p.opt.is_some() { MAX_SEQS_OPT } else { MAX_SEQS }, "{name}");
             assert_eq!(seqs_bytes_for(7, &p), 7 * max_seqs(&p) as u64 * 12, "{name}");
         }
-        assert_eq!(seqs_bytes_for(7, &LVL9), 7 * MAX_SEQS as u64 * 12);
+        assert_eq!(seqs_bytes_for(7, &LVL9SEG), 7 * MAX_SEQS as u64 * 12);
     }
 
     #[test]
@@ -1697,7 +1680,16 @@ mod tests {
         assert!(!gpu_supports(&with(OptParams { seed: Seed::BlockInit, ..p1 })), "S3 prior without the Prior seed");
         assert!(gpu_supports(&MatchParams { depth: 4, ..LVL3 }));
         assert!(gpu_supports(&MatchParams { min_match: 8, depth: 64, ..RUNG1 }));
-        assert!(gpu_supports(&MatchParams { min_match: 6, ..RUNG2 }));
+        // Lazy parses run on the GPU in segments only: the unsegmented ones (valid, and what the
+        // CPU oracle's hand-built lazy cases use) are refused.
+        for lazy in [RUNG2, LVL9, MatchParams { min_match: 6, ..RUNG2 }, MatchParams { hash_bits: 12, ..LVL9 }] {
+            assert!(lazy.validate().is_ok() && !gpu_supports(&lazy), "{lazy:?}");
+            let e = check_matching(&lazy).unwrap_err().to_string();
+            assert!(e.contains("not implemented") && e.contains("segment"), "{e}");
+            for segment_log2 in [10, 12, 16] {
+                assert!(gpu_supports(&MatchParams { segment_log2, ..lazy }), "{lazy:?} in 2^{segment_log2} segments");
+            }
+        }
         let bad = MatchParams { lazy: 3, ..LVL9 };
         assert!(!gpu_supports(&bad));
         assert!(check_matching(&bad).unwrap_err().to_string().contains("lazy 3"));
@@ -1743,7 +1735,7 @@ mod tests {
 
     #[test]
     fn batch_fits_every_buffer() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             for limit in [4 * MIB, 128 * MIB, 1 << 31, (1 << 32) - 4] {
                 let n = max_batch_blocks(&limits(limit, u64::MAX, 65535), &m);
                 assert!(n > 0 && fits(n, &m, limit) && !fits(n + 1, &m, limit), "{m:?} limit {limit}: n {n}");
@@ -1761,7 +1753,7 @@ mod tests {
     #[test]
     fn opt_batch_counts_two_candidate_words() {
         use gzc_core::params::{OPT14, OPT16};
-        assert_eq!((best_words(&LVL9), best_words(&OPT16), best_words(&OPT14)), (1, 2, 2));
+        assert_eq!((best_words(&LVL9SEG), best_words(&OPT16), best_words(&OPT14)), (1, 2, 2));
         assert_eq!(best_bytes_for(3, &OPT16), 3 * 8 * BLOCK_SIZE as u64);
         // Against lvl3 (also two chains): the second candidate word, the larger seqs, and K3opt's
         // prices (377 words) and scratch per block. The trace reuses pred (8 B per position).
@@ -1838,14 +1830,14 @@ mod tests {
 
     #[test]
     fn batch_respects_workgroup_cap() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             assert_eq!(max_batch_blocks(&limits(128 * MIB, 128 * MIB, 3), &m), 3);
         }
     }
 
     #[test]
     fn batch_keeps_u32_indices_in_range() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             let nh = m.n_hashes() as u64;
             let n = max_batch_blocks(&limits(u64::MAX, u64::MAX, u32::MAX), &m) as u64;
             assert!(n > 0);
@@ -1859,7 +1851,7 @@ mod tests {
 
     #[test]
     fn batch_is_zero_when_one_block_does_not_fit() {
-        for m in [LVL3, RUNG1, RUNG2, LVL9] {
+        for m in [LVL3, RUNG1, LVL9SEG, LVL9S12SEG] {
             assert_eq!(max_batch_blocks(&limits(BLOCK_SIZE as u64, u64::MAX, 65535), &m), 0);
         }
     }

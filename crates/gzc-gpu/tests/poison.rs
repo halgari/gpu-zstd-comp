@@ -5,7 +5,7 @@
 //! write in the same batch. The full suite runs poisoned with `GZC_POISON=1`.
 use gzc_core::block::chunk_file;
 use gzc_core::frame::write_frame;
-use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1, RUNG2};
+use gzc_core::params::{LVL3, LVL9S12SEG, LVL9SEG, MatchParams, OPT14, OPT16P1};
 use gzc_core::reference::compress_block;
 use gzc_gpu::compressor::{GpuParams, Kernels, compress_frames};
 use gzc_gpu::context::{GpuContext, GpuOptions};
@@ -18,8 +18,6 @@ fn blocks() -> Vec<Vec<u8>> {
 fn presets() -> Vec<(&'static str, MatchParams)> {
     vec![
         ("lvl3", LVL3),
-        ("rung2", RUNG2),
-        ("lvl9", LVL9),
         ("lvl9seg", LVL9SEG),
         ("lvl9s12seg", LVL9S12SEG),
         ("opt14", OPT14),
@@ -72,7 +70,7 @@ fn poisoned_skewed_frames_match_cpu() {
     let blocks: Vec<Vec<u8>> = blocks().into_iter().step_by(4).collect();
     let emulate = gzc_gpu::context::Emulation { skew: true, ..gzc_gpu::context::Emulation::NONE };
     let ctx = poisoned(GpuOptions { emulate, ..GpuOptions::from_env() });
-    for (name, matching) in [("lvl3", LVL3), ("lvl9", LVL9), ("lvl9s12seg", LVL9S12SEG)] {
+    for (name, matching) in [("lvl3", LVL3), ("lvl9seg", LVL9SEG), ("lvl9s12seg", LVL9S12SEG)] {
         let params = GpuParams { matching, emit_frames: true, huffman: true };
         let kernels = Kernels::new(&ctx, params).expect("Kernels::new");
         let refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
