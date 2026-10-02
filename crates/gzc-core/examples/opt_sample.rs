@@ -1,10 +1,11 @@
-//! Optimal-parse sample runs on the corpus (M5 T1): ratios of the `opt*` presets on every
-//! `every`-th block, and the prior tables of `codes::OPT_PRIOR_*`.
+//! Optimal-parse sample runs on the corpus: ratios of the `opt*` presets on every `every`-th
+//! block, and the prior tables of `codes::OPT_PRIOR_*`.
 //!
 //! Blocks are numbered in corpus order: files under the corpus directory sorted recursively by
-//! path, extensions `dds` and `nif` only, each chunked by `block::chunk_file` (the order of
-//! `gzc-bench --ext dds,nif` and of the m5-opt-design prototype). Block `i` is in the sample
-//! when `i % every == offset`. The design's evaluation sample is `every 50, offset 0`.
+//! path, extensions `dds` and `nif` only, each chunked by `block::chunk_file`. This is the order
+//! of `gzc-bench --ext dds,nif`. Block `i` is in the sample when `i % every == offset`. The
+//! evaluation sample is `every 50, offset 0`; the prior tables are trained on `every 50,
+//! offset 25`.
 //!
 //! ```text
 //! cargo run --release -p gzc-core --example opt_sample -- eval  <corpus> <every> <offset> [zstd]
@@ -14,9 +15,10 @@
 //! `eval` prints the ratio (real bytes / frame bytes) of opt14 and opt16 (and libzstd L14/L16
 //! with `zstd`), and checks every opt frame with libzstd. `train` sums the LL/ML/OF code
 //! histograms of opt16's output over the sample and prints them scaled to 65536 per table
-//! (round to nearest): the `OPT_PRIOR_*` constants. `train-sparse` does the same for `sparse_train_params`
-//! (the opt16 schedule over opt16p1's candidates and segment ends): the `OPT_PRIOR_SPARSE_*`
-//! constants. `eval` also prints opt16p1. `THREADS` (default 16) sets the thread count.
+//! (round to nearest): the `OPT_PRIOR_*` constants. `train-sparse` does the same for
+//! `sparse_train_params` (the opt16 schedule over opt16p1's candidates and segment ends): the
+//! `OPT_PRIOR_SPARSE_*` constants. `eval` also prints opt16p1. `THREADS` (default 16) sets the
+//! thread count.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -99,8 +101,8 @@ fn eval(blocks: &[Blk], zstd: bool) {
     }
 }
 
-/// The parse the `OPT_PRIOR_SPARSE_*` tables are trained on (M6 B0): `OPT16P1`'s candidates (h4 8
-/// deep, h3, the S3 sparse chains) and gap3 segment ends, with `OPT16`'s schedule (`BlockInit`
+/// The parse the `OPT_PRIOR_SPARSE_*` tables are trained on: `OPT16P1`'s candidates (h4 8
+/// deep, h3, the sparse chains) and gap3 segment ends, with `OPT16`'s schedule (`BlockInit`
 /// seed, 3 cheap passes, the optLevel-2 final pass), no relaxation pruning and no drop pass.
 fn sparse_train_params() -> MatchParams {
     let o = OptParams { passes: 3, seed: Seed::BlockInit, prior: PriorTables::Base, relax_lengths: None, drop_max_len: 0, ..OPT16P1.opt.unwrap() };

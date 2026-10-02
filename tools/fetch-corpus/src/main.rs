@@ -1,8 +1,7 @@
 //! `fetch-corpus`: dev-only tool that downloads and unpacks a pinned Nexus
 //! Mods benchmark corpus (see `corpus.toml`) into `data/corpus/<name>/…`.
 //!
-//! Not part of the compression pipeline itself — nothing in the workspace
-//! depends on this crate.
+//! Nothing in the workspace depends on this crate.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -28,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// List files for a Nexus mod (used to pick which file_id to pin).
+    /// List files for a Nexus mod, to pick which file_id to pin.
     List {
         /// Nexus game domain, e.g. skyrimspecialedition
         game: String,
@@ -59,7 +58,7 @@ fn require_api_key() -> Result<String> {
         .context("NEXUS_API_KEY is not set in the environment; get one from https://next.nexusmods.com/settings/api-keys and export it before running fetch-corpus")
 }
 
-// --- Nexus API response shapes (only the fields we use) ---
+// --- Nexus API response shapes (only the fields used) ---
 
 #[derive(Debug, Deserialize)]
 struct FilesResponse {

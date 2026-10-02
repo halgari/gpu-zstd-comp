@@ -128,7 +128,7 @@ impl<'a> FseState<'a> {
         let nb = (dnb + (1 << 15)) >> 16;
         // No u32 underflow: dnb = (k << 16) - m with 0 < m <= 2 * size <= 2^13 (m = n << maxBitsOut for
         // n >= 2, m = size for n in {-1, 0, 1}), so nb rounds up to k and v = m. This needs
-        // 2 * size <= 2^15, i.e. table_log <= 14; we allow at most 12. RLE tables: dnb = 0, v = 0.
+        // 2 * size <= 2^15, i.e. table_log <= 14; at most 12 is allowed. RLE tables: dnb = 0, v = 0.
         let v = (nb << 16) - dnb;
         FseState { value: t.next_state(v, nb, symbol), table: t }
     }
@@ -149,7 +149,7 @@ impl<'a> FseState<'a> {
 
 /// Smallest table log a table description can carry (`FSE_MIN_TABLELOG`).
 pub const FSE_MIN_TABLE_LOG: u32 = 5;
-/// Largest table log we build (`FSE_MAX_TABLELOG`); sequence streams stop at 9 (LL/ML) and 8 (OF).
+/// Largest table log built (`FSE_MAX_TABLELOG`); sequence streams stop at 9 (LL/ML) and 8 (OF).
 pub const FSE_MAX_TABLE_LOG: u32 = 12;
 
 /// Floor log2 of a nonzero value.
@@ -189,7 +189,7 @@ fn log2_x256(x: u32) -> u32 {
 
 /// Integer-only normalization (GPU-portable). `counts`: histogram; `total` = its sum; returns `norm`
 /// (same length as `counts`) summing to `1 << table_log`, where every symbol with count > 0 gets
-/// norm >= 1 (never -1 in our encoder) and absent symbols get 0.
+/// norm >= 1 (never -1 in this encoder) and absent symbols get 0.
 ///
 /// `n = max(1, c * size / total)`, then the rounding error `size - sum(n)` is fixed up: a surplus goes
 /// to the symbol with the largest count (lowest index on ties); a deficit is taken 1 at a time from the

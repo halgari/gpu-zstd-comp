@@ -1,4 +1,8 @@
-//! Runtime match-finder / parse parameters and the named presets shared by CPU, GPU and CLI.
+//! Match-finder and parse parameters, and the named presets the CPU, the GPU and the CLI share.
+//!
+//! A [`MatchParams`] value fixes the compressed output: the CPU reference and every GPU produce
+//! the same bytes for it. Take one from [`preset`] or [`PRESETS`], or build one and check it
+//! with [`MatchParams::validate`]. `docs/reference.md` has each preset's ratio.
 use crate::config::{HASH_BITS, LOG2_BLOCK, MATCH_SEARCH_CAP};
 
 /// Which hash chains the match finder walks.
@@ -8,17 +12,16 @@ pub enum Hashes {
     Dfast,
     /// One chain over a hash of `min_match` bytes.
     Single,
-    /// The optimal-parse candidate chains (M5): a 4-byte hash chain (`hash_width(.., 4)`) walked
-    /// `depth` deep, and a 3-byte hash chain (`hash::hash3`) walked `OPT_H3_DEPTH` deep, plus the
-    /// M6 sparse chains of `OptParams::sparse_chains`, merged nearest-first
-    /// (`reference::find_cands`). Requires `opt`.
+    /// Optimal-parse candidates: a 4-byte hash chain walked `depth` deep, a 3-byte chain walked
+    /// `OPT_H3_DEPTH` deep, and any `OptParams::sparse_chains`, merged nearest-first by
+    /// `reference::find_cands`. Requires `opt`.
     Opt3,
 }
 
-/// Depth of the 3-byte hash chain walked by `Hashes::Opt3` (m5-opt-design §2.1).
+/// Depth of the 3-byte hash chain walked by `Hashes::Opt3`.
 pub const OPT_H3_DEPTH: u32 = 4;
 
-/// How the optimal parse prices its first pass (m5-opt-design §2.4).
+/// How the optimal parse prices its first pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seed {
     /// zstd's first-block statistics (`ZSTD_rescaleFreqs`): literal counts `(c > 0) + (c >> 8)`
@@ -29,8 +32,9 @@ pub enum Seed {
     Prior,
 }
 
-/// Optimal-parse settings (M5, `opt` module). The parse is `passes` cheap DP passes (optLevel-0
-/// control flow) each re-pricing the next from its own output, then one final pass at `level`.
+/// Optimal-parse settings (see the `opt` module). The parse is `passes` cheap DP passes with
+/// optLevel-0 control flow, each re-pricing the next from its own output, then one final pass at
+/// `level`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptParams {
     /// zstd optLevel of the final pass: 0 (btopt control flow) or 2 (btultra).
@@ -43,32 +47,29 @@ pub struct OptParams {
     pub seed: Seed,
     /// Candidate records per position from `find_cands` (only 2 is implemented: A and B).
     pub k: u8,
-    /// The LL/ML/OF tables of `Seed::Prior` (`opt::seed_prices`). Must be `M5` unless `seed` is
-    /// `Prior`.
+    /// The LL/ML/OF tables of `Seed::Prior` (`opt::seed_prices`). Must be `Base` unless `seed`
+    /// is `Prior`.
     pub prior: PriorTables,
-    /// Extra sparse candidate chains (M6, `SparseChain`), walked after `h4` and `h3` by
-    /// `reference::find_cands`, in this order. The `Some` entries come first. M5: none.
+    /// Extra sparse candidate chains, walked after `h4` and `h3` by `reference::find_cands`, in
+    /// this order. The `Some` entries come first.
     pub sparse_chains: [Option<SparseChain>; 3],
-    /// Segment-end gap (zstd's `ilimit = iend - gap`): inner segments, every segment but the
-    /// block's last, start matches only at positions `<= iend - inner_gap`; the last segment always
-    /// uses 8 (no match may start in the block's last 8 bytes, `PARSE_END`). 8 (M5) or 3 ("gap3",
-    /// M6 a05: a match may run to `iend` from 3 bytes before it).
+    /// Segment-end gap (zstd's `ilimit = iend - gap`): an inner segment starts matches only at
+    /// positions `<= iend - inner_gap`. The block's last segment always uses 8 (`PARSE_END`).
+    /// 8, or 3 ("gap3": a match may start 3 bytes before a segment end).
     pub inner_gap: u8,
-    /// Relaxation pruning (M6, r2 "top N"): `Some(n)` relaxes only the `n` longest lengths
-    /// `L, L-1, .., L-n+1` of each *explicit* record (offBase > 3; `L` its length, never below the
-    /// record's own start length), in every DP pass. The series-start seed writes the pruned
-    /// lengths as unreachable (`MAX_PRICE`) nodes. Rep records keep every length. `None`: every
-    /// length (M5). See `opt` module doc.
+    /// Relaxation pruning: `Some(n)` relaxes only the `n` longest lengths of each explicit
+    /// record (offBase > 3), in every DP pass. Rep records keep every length. `None` relaxes
+    /// every length. See the `opt` module doc.
     pub relax_lengths: Option<u8>,
-    /// Drop pass (M6, r4; `opt::drop_pass`): after the final DP pass, explicit matches of at most
+    /// Drop pass (`opt::drop_pass`): after the final DP pass, explicit matches of at most
     /// `drop_max_len` bytes become literals where that is cheaper at the parse's own prices.
-    /// 0: off (M5).
+    /// 0 turns it off.
     pub drop_max_len: u8,
 }
 
 impl OptParams {
-    /// True when every M6 field has its M5 value: the opt params the GPU K1/K2opt/K3opt kernels of
-    /// M5 implement (no sparse chains, M5 prior tables, gap 8, no pruning, no drop pass).
+    /// True when every optional DP feature is off: no sparse chains, the base prior tables,
+    /// gap 8, no relaxation pruning and no drop pass.
     pub fn is_baseline(&self) -> bool {
         self.prior == PriorTables::Base
             && self.sparse_chains == [None; 3]
@@ -81,18 +82,18 @@ impl OptParams {
 /// Which prior LL/ML/OF frequency tables `Seed::Prior` uses (`codes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriorTables {
-    /// `codes::OPT_PRIOR_{LL,ML,OF}`, trained on `opt16`'s output (M5; `opt14`).
+    /// `codes::OPT_PRIOR_{LL,ML,OF}`, trained on `opt16`'s output. `opt14` uses them.
     Base,
     /// `codes::OPT_PRIOR_SPARSE_{LL,ML,OF}`, trained on the opt16 schedule over `OPT16P1`'s
-    /// candidates and segment ends (M6; `opt16p1`).
+    /// candidates and segment ends. `opt16p1` uses them.
     Sparse,
 }
 
-/// A sparse candidate chain (M6; a06 §2, r3 "S3"). Only *sparse positions*
-/// `p % stride == 0 && p < SPARSE_END` (`reference::SPARSE_END = BLOCK_SIZE - 12`) are hashed
-/// and chained, on the 16-bit `hash::hash_sparse(block, p, width)`; every other position has no
-/// predecessor (`NO_POS`), so the chain is walked only from sparse positions. Walked `depth`
-/// entries deep. `reference::sparse_chain_preds` builds it.
+/// A sparse candidate chain. Only *sparse positions* `p % stride == 0 && p < SPARSE_END`
+/// (`reference::SPARSE_END`) are hashed and chained, on the 16-bit
+/// `hash::hash_sparse(block, p, width)`. Every other position has no predecessor (`NO_POS`), so
+/// the chain is walked only from sparse positions, `depth` entries deep.
+/// `reference::sparse_chain_preds` builds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SparseChain {
     /// Bytes hashed: 5..=12.
@@ -103,16 +104,17 @@ pub struct SparseChain {
     pub depth: u32,
 }
 
-/// r3's "S3" sparse chains (`OPT16P1`): 6-, 10- and 12-byte keys, every 4th position, 16 deep.
+/// The three sparse chains of `OPT16P1`: 6-, 10- and 12-byte keys at every 4th position, 16 deep.
 pub const SPARSE_CHAINS: [Option<SparseChain>; 3] = [
     Some(SparseChain { width: 6, stride: 4, depth: 16 }),
     Some(SparseChain { width: 10, stride: 4, depth: 16 }),
     Some(SparseChain { width: 12, stride: 4, depth: 16 }),
 ];
 
-/// Match-finder and parse tuning.
+/// Match-finder and parse parameters. The output is a function of these and the input alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchParams {
+    /// Which hash chains the match finder walks.
     pub hashes: Hashes,
     /// Shortest match the finder stores and the parse accepts.
     pub min_match: u32,
@@ -127,26 +129,29 @@ pub struct MatchParams {
     /// candidates by key with 2^hash_bits counters in workgroup memory (`gzc_gpu::sorted`).
     /// Candidates, and so `find_best`, are the hash chains over this key either way.
     pub hash_bits: u32,
-    /// 0: the parse runs over the whole block (a lazy parse then runs on the CPU oracle only: the
-    /// GPU parses lazy in segments). Otherwise log2 of the parse segment
+    /// 0: the parse runs over the whole block. A lazy parse then runs on the CPU oracle only:
+    /// the GPU parses lazy in segments. Otherwise log2 of the parse segment
     /// (`lazy::lazy_parse_segmented`): segments of `1 << segment_log2` bytes are parsed
     /// independently (empty rep state, matches clamped to the segment, no skip acceleration),
     /// then the offsets are re-encoded with the block's true rep history. Needs `lazy > 0`, or
-    /// `opt` (whose DP runs per segment the same way).
+    /// `opt`, whose DP runs per segment the same way.
     pub segment_log2: u32,
-    /// `Some`: the optimal parse (`opt::parse`) over `find_cands` candidates instead of
-    /// `find_best` + greedy/lazy. `None` for every pre-M5 preset.
+    /// `Some`: the optimal parse (`opt::parse`) over `find_cands` candidates. `None`:
+    /// `find_best` with a greedy or lazy parse.
     pub opt: Option<OptParams>,
 }
 
 impl MatchParams {
-    /// Ok when every field is in its supported range: min_match 4..=8, depth 1..=64,
-    /// lazy 0..=2, search_cap 8..=256, hash_bits 11..=16, and Dfast only with min_match 5.
-    /// With `opt` (and only then): hashes `Opt3`, min_match 3, lazy 0, search_cap 64, hash_bits
-    /// 16, segment_log2 12, level 0 or 2,
-    /// target_length 8..=32, passes 0..=7, k 2; prior tables other than M5 only with seed Prior;
-    /// sparse chains packed first, each width 5..=12, stride 1/2/4/8, depth 1..=64; inner_gap 8
-    /// or 3; relax_lengths None or 1..=32; drop_max_len 0 or 3..=32.
+    /// Ok when every field is in its supported range.
+    ///
+    /// Without `opt`: min_match 4..=8, depth 1..=64, lazy 0..=2, search_cap 8..=256, hash_bits
+    /// 11..=16, Dfast only with min_match 5, and segments (10..=16) only with a lazy parse.
+    ///
+    /// With `opt`: hashes `Opt3`, min_match 3, lazy 0, search_cap 64, hash_bits 16,
+    /// segment_log2 12, level 0 or 2, target_length 8..=32, passes 0..=7, k 2. Prior tables other
+    /// than `Base` need seed `Prior`. Sparse chains are packed first, each with width 5..=12,
+    /// stride 1/2/4/8 and depth 1..=64. inner_gap is 8 or 3, relax_lengths `None` or 1..=32,
+    /// drop_max_len 0 or 3..=32.
     pub fn validate(&self) -> Result<(), String> {
         let MatchParams { hashes, min_match, depth, lazy, search_cap, hash_bits, segment_log2, opt } = *self;
         if let Some(o) = opt {
@@ -202,10 +207,10 @@ impl MatchParams {
     }
 }
 
-/// `validate` for `opt` params (see there).
 // The opt parse packs offsets in 16 bits.
 const _: () = assert!(LOG2_BLOCK <= 16, "opt needs offsets that fit 16 bits");
 
+/// `validate` for `opt` params (see there).
 fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
     let want = |ok: bool, what: String| if ok { Ok(()) } else { Err(what) };
     want(p.hashes == Hashes::Opt3, format!("opt needs Opt3 hashes, got {:?}", p.hashes))?;
@@ -231,38 +236,25 @@ fn validate_opt(p: &MatchParams, o: &OptParams) -> Result<(), String> {
     want(o.drop_max_len == 0 || (3..=32).contains(&o.drop_max_len), format!("opt drop_max_len {} not 0 or 3..=32", o.drop_max_len))
 }
 
-/// Level-3 calibration (the M3 output, byte for byte): dfast chains, depth 1, greedy.
+/// `lvl3`: two hash chains (8 and 5 bytes, as zstd's dfast), depth 1, greedy parse. Compares
+/// with libzstd level 3.
 pub const LVL3: MatchParams =
     MatchParams { hashes: Hashes::Dfast, min_match: 5, depth: 1, lazy: 0, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 0, opt: None };
 
-/// Single 4-byte hash, depth 32, lazy2, with the parse split into independent 4 KiB segments
-/// (speed-2 E1): a parse that runs one GPU lane per segment. Validated >= libzstd L9.
-///
-/// Full-corpus ratios (`gzc-bench ref`, byte-identical to the GPU; `--ext dds,nif`) against
-/// libzstd L9 on the same blocks:
-///
-/// | block | L9 | lvl9seg | lvl9s12seg |
-/// |---|---|---|---|
-/// | 64 KiB | 1.33786 | 1.33931 | 1.33926 |
+/// `lvl9seg`: a single 4-byte hash, depth 32, lazy2, with the parse split into independent 4 KiB
+/// segments, so the GPU runs one lane per segment. Its ratio is above libzstd L9's.
 pub const LVL9SEG: MatchParams =
     MatchParams { hashes: Hashes::Single, min_match: 4, depth: 32, lazy: 2, search_cap: MATCH_SEARCH_CAP as u32, hash_bits: HASH_BITS, segment_log2: 12, opt: None };
 
-/// `lvl9seg` with a 12-bit hash key (speed2 E2): the GPU builds its candidates as a per-block
-/// bucket-sorted array (a counting sort over 2^12 keys in workgroup memory, `gzc_gpu::sorted`)
-/// instead of 16-bit hash chains. Validated >= libzstd L9 (table at `LVL9SEG`).
+/// `lvl9s12seg`: `lvl9seg` with a 12-bit hash key, so the GPU can bucket-sort the candidates in
+/// workgroup memory instead of building 16-bit hash chains (`gzc_gpu`'s sorted finder). Its
+/// ratio is above libzstd L9's.
 pub const LVL9S12SEG: MatchParams = MatchParams { hash_bits: 12, ..LVL9SEG };
 
-/// Optimal parse aimed at libzstd L16 (btultra, M5): `Opt3` candidates (h4 chain 32 deep + h3
-/// chain 4 deep, two records per position), the zstd optimal-parse DP per 4 KiB segment with
-/// exact rep history, prices seeded from zstd's block init, 3 cheap re-pricing passes, then an
-/// optLevel-2 final pass (m5-opt-design §3.1).
-///
-/// Full-corpus ratios (`gzc-bench ref`, `--ext dds,nif`) against libzstd L14 / L16 on the same
-/// blocks (docs/results/m5-log.md):
-///
-/// | block | L14 | L16 | opt14 | opt16 |
-/// |---|---|---|---|---|
-/// | 64 KiB | 1.36827 | 1.37100 | 1.37064 | 1.37144 |
+/// `opt16`: an optimal parse aimed at libzstd L16 (btultra). `Opt3` candidates (the h4 chain 32
+/// deep and the h3 chain 4 deep, two records per position), zstd's optimal-parse DP per 4 KiB
+/// segment with exact rep history, prices seeded from zstd's block init, 3 cheap re-pricing
+/// passes, then an optLevel-2 final pass. Its ratio is above libzstd L16's.
 pub const OPT16: MatchParams = MatchParams {
     hashes: Hashes::Opt3,
     min_match: 3,
@@ -284,25 +276,21 @@ pub const OPT16: MatchParams = MatchParams {
         drop_max_len: 0,
     }),
 };
-/// `opt16`'s candidates and DP aimed at libzstd L14: first pass priced from the corpus prior plus
-/// the block's cover literals, 1 cheap pass, then the optLevel-2 final pass.
+
+/// `opt14`: `opt16`'s candidates and DP aimed at libzstd L14. The first pass is priced from the
+/// corpus prior plus the block's cover literals; 1 cheap pass and the optLevel-2 final pass
+/// follow. Its ratio is above libzstd L14's.
 pub const OPT14: MatchParams = MatchParams { opt: Some(OptParams { passes: 1, seed: Seed::Prior, ..OPT16.opt.unwrap() }), ..OPT16 };
-/// An L16-class optimal parse with **one** DP pass (M6 B0/B1, "opt16-class, 1 pass"):
-/// - candidates: the h4 chain 8 deep, h3 4 deep, and the three `SPARSE_CHAINS` sparse chains (6-, 10-
-///   and 12-byte keys at every 4th position, 16 deep each), merged by `reference::find_cands`;
-/// - pass-0 prices: `Seed::Prior` with the `PriorTables::Sparse` tables plus the cover literals;
-/// - one optLevel-2 pass (`passes: 0`) with gap3 segment ends (`inner_gap: 3`) and top-4
-///   relaxation pruning (`relax_lengths: Some(4)`);
-/// - then the drop pass for explicit matches of at most 6 bytes (`opt::drop_pass`).
+
+/// `opt16p1`: an L16-class optimal parse with one DP pass.
+/// - Candidates: the h4 chain 8 deep, h3 4 deep and the three `SPARSE_CHAINS`, merged by
+///   `reference::find_cands`.
+/// - Pass-0 prices: `Seed::Prior` with the `PriorTables::Sparse` tables plus the cover literals.
+/// - One optLevel-2 pass (`passes: 0`) with gap3 segment ends (`inner_gap: 3`) and top-4
+///   relaxation pruning (`relax_lengths: Some(4)`).
+/// - Then the drop pass for explicit matches of at most 6 bytes (`opt::drop_pass`).
 ///
-/// Full corpus at 64 KiB (`gzc-bench ref --ext dds,nif`, every frame libzstd-verified; M6 B1):
-///
-/// | | bytes | ratio | vs libzstd L16 |
-/// |---|---|---|---|
-/// | libzstd L16 | 4,736,557,791 | 1.37100 | |
-/// | opt16 (4 passes) | 4,735,028,925 | 1.37144 | +0.032 % |
-/// | **opt16p1** | 4,732,108,641 | **1.37229** | **+0.094 %** |
-/// | opt16p1 without `relax_lengths` | 4,731,891,557 | 1.37235 | +0.099 % |
+/// Its ratio is above `opt16`'s, in one pass instead of four.
 pub const OPT16P1: MatchParams = MatchParams {
     depth: 8,
     opt: Some(OptParams {
@@ -343,7 +331,7 @@ mod tests {
 
     #[test]
     fn presets_validate() {
-        // The spec's preset table, verbatim.
+        // Every preset and fixture, field by field.
         let m = |hashes, min_match, depth, lazy| MatchParams { hashes, min_match, depth, lazy, search_cap: 64, hash_bits: 16, segment_log2: 0, opt: None };
         assert_eq!(LVL3, m(Hashes::Dfast, 5, 1, 0));
         assert_eq!(RUNG1, m(Hashes::Single, 4, 8, 0));
@@ -452,7 +440,7 @@ mod tests {
             MatchParams { opt: Some(OptParams { passes: 8, ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { k: 3, ..o }), ..OPT16 },
             MatchParams { opt: None, ..OPT16 },
-            // M6 fields
+            // The optional DP features
             MatchParams { opt: Some(OptParams { prior: PriorTables::Sparse, ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [None, SPARSE_CHAINS[0], None], ..o }), ..OPT16 },
             MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 4, stride: 4, depth: 16 }), None, None], ..o }), ..OPT16 },

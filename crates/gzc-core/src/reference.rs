@@ -1,8 +1,8 @@
-//! CPU reference compressor used as the correctness and quality baseline.
+//! The CPU reference compressor: the oracle the GPU kernels are tested against, byte for byte.
 //!
-//! This is the bit-exact oracle the GPU kernels are tested against: a hash-chain match
-//! finder and parse driven by runtime `MatchParams`, using integer arithmetic only so the
-//! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
+//! It is a hash-chain match finder and a parse, both driven by runtime `MatchParams` and
+//! written in integer arithmetic only, so the GPU can mirror them exactly. The greedy parse is
+//! here; the lazy parses are in `lazy` and the optimal parse in `opt`.
 use crate::config::{BLOCK_SIZE, HASH_BITS, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_sparse, hash_width, key};
@@ -103,7 +103,7 @@ pub struct Cand {
 /// (`find_cands`). All zero when there is no candidate, apart from `DEAD_BIT`.
 pub type CandWords = [u32; 2];
 
-/// `w[1]`'s flag of a dead position (M6 A3, see `find_cands`); offsets are below 2^16.
+/// `w[1]`'s flag of a dead position (see `find_cands`); offsets are below 2^16.
 pub const DEAD_BIT: u32 = 1 << 16;
 
 /// Whether a position's candidate words mark it dead (`find_cands`).
@@ -130,7 +130,7 @@ pub fn cand_depths(params: &MatchParams) -> Vec<u32> {
     d
 }
 
-/// K2opt (m5-opt-design §2.1; M6 sparse chains), the optimal parse's candidates.
+/// The optimal parse's candidates, two records per position: what K2opt computes on the GPU.
 ///
 /// For every `p < PARSE_END`, the *visit list* of `p` is the union, sorted by position
 /// descending (nearest first) with duplicates removed, of the first `depth_i` entries of each
@@ -160,7 +160,7 @@ pub fn cand_depths(params: &MatchParams) -> Vec<u32> {
 /// bytes differ too). The same holds for sparse-chain collisions: a sparse entry is a
 /// candidate like any other, whatever its hashed bytes.
 ///
-/// Dead positions (M6 A3, a09): `p` is *dead* when it has no record and its `h3` walk reached
+/// Dead positions: `p` is *dead* when it has no record and its `h3` walk reached
 /// the chain's end (`NO_POS`, within `OPT_H3_DEPTH` steps). Then no earlier position shares `p`'s
 /// first 3 bytes: every such position has `p`'s `hash3` key, so it is on `p`'s `h3` chain (which
 /// links every earlier position below `HASHED_POSITIONS` with that key), and the walk visited the
@@ -384,10 +384,12 @@ pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     parse(block, &best, &params)
 }
 
-/// Compress one block, given as its real bytes (`1..=BLOCK_SIZE`, `Block::real_len`), straight to
-/// a zstd frame that decodes to exactly those bytes: `compress_block` on the zero-padded block,
-/// `seq::truncate_output` to its real length, then `write_frame`. This is the CPU reference compressor's end-to-end entry point,
-/// used by `gzc-bench ref` and exercised by `all_synthetic_frames_roundtrip` below.
+/// Compresses one block, given as its real bytes (`1..=BLOCK_SIZE`, `Block::real()`), to a zstd
+/// frame that decodes to exactly those bytes.
+///
+/// It runs `compress_block` on the zero-padded block, `seq::truncate_output` to the real length,
+/// then `write_frame`. This is the reference compressor's end-to-end entry point; `gzc-bench ref`
+/// uses it. Panics if `params` is invalid or the block is empty or longer than `BLOCK_SIZE`.
 pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOptions) -> Vec<u8> {
     if block.len() == BLOCK_SIZE {
         return write_frame(block, &compress_block(block, params), opts);
@@ -789,16 +791,12 @@ mod tests {
         assert_eq!(with(2, 1), (a3, far));
     }
 
-    /// xxh64 of the concatenated lvl3 frames, first captured on the unmodified M3 code (ddeee75);
-/// re-captured when `synth::nif_like` switched to a platform-independent sine (the lvl3 code
-/// itself unchanged: the old anchors still passed on Linux immediately before the switch), and
-/// when a partial block's frame started declaring and holding only its real length (was
-/// 0xd3354ac3c8f4a5d2; the full-block frames are pinned unchanged by
-/// `lvl3_full_block_frames_match_anchor`).
+    /// xxh64 of the concatenated lvl3 frames of every synthetic test case, partial blocks
+    /// included.
     const LVL3_ANCHOR: u64 = 0x441bb7015bd4cc45;
 
-    /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
-    /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.
+    /// Pins the lvl3 output. Any byte change in the lvl3 CPU path, and so in the GPU path that
+    /// must match it, fails here.
     #[test]
     fn lvl3_frames_match_anchor() {
         let mut all = Vec::new();
@@ -810,11 +808,11 @@ mod tests {
         }
         let h = xxhash_rust::xxh64::xxh64(&all, 0);
         println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
-        assert_eq!(h, LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+        assert_eq!(h, LVL3_ANCHOR, "lvl3 frames changed");
     }
 
-    /// xxh64 of the concatenated lvl3 frames of the synthetic cases' full blocks only, captured
-    /// before frames of partial blocks started declaring their real length: unchanged by that.
+    /// xxh64 of the concatenated lvl3 frames of the synthetic cases' full blocks only. A change
+    /// to how partial blocks are framed does not move it.
     const LVL3_FULL_BLOCK_ANCHOR: u64 = 0xc4c446cbce783267;
 
     /// `lvl3_frames_match_anchor` restricted to full blocks (`real_len == BLOCK_SIZE`).

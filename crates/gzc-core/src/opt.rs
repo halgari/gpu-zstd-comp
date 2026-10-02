@@ -1,6 +1,6 @@
-//! Optimal parse for the M5 presets `opt14` / `opt16`: an integer port of libzstd 1.5.7
-//! `ZSTD_compressBlock_opt_generic` (`lib/compress/zstd_opt.c`, noDict, one block), design in
-//! `docs/design/m5/m5-opt-design.md` §1–§2.
+//! The optimal parse of the presets `opt14`, `opt16` and `opt16p1`: an integer port of libzstd
+//! 1.5.7 `ZSTD_compressBlock_opt_generic` (`lib/compress/zstd_opt.c`, noDict, one block). The
+//! design and its measurements are in `docs/design/m5/m5-opt-design.md` §1–§2.
 //!
 //! This is the normative oracle the GPU K3opt kernel mirrors bit-exactly: integer-only,
 //! deterministic, every tie rule explicit. The DP body follows the C function statement by
@@ -27,7 +27,7 @@
 //!   pass runs `OptParams::level`.
 //! - After a series whose last stretch ends in literals, the next series starts after those
 //!   literals (`ip = anchor + litlen`). zstd 1.5.7 intends this too, but its `} {` typo in the
-//!   store loop makes it restart at the anchor; the prototype measured the intended form.
+//!   store loop makes it restart at the anchor.
 //!
 //! Tie rules (pinned by `cases`): the literal extension replaces `opt[cur]` when its price is
 //! `<=`; a relaxation replaces `opt[pos]` only when `<` (or `pos > last_pos`); relaxation lengths
@@ -36,7 +36,7 @@
 //! when strictly longer than every earlier one; `ZSTD_newRep` updates a node's reps from its
 //! predecessor when the node ends a match.
 //!
-//! M6 options (`OptParams`; all off in `opt14`/`opt16`, on in `opt16p1`):
+//! Options (`OptParams`; all off in `opt14` and `opt16`, all on in `opt16p1`):
 //! - `inner_gap`: inner segments use `ilimit = iend - inner_gap` (3: "gap3"); the block's last
 //!   segment keeps `iend - 8` (`Seg::new`).
 //! - `relax_lengths: Some(n)`: an explicit record (offBase > 3) of length `L` and start length
@@ -967,7 +967,7 @@ pub fn parse_with(block: &[u8], cands: &[CandWords], params: &MatchParams, engin
     }
 }
 
-/// The drop pass (M6, r4; `OptParams::drop_max_len`): `drop_decisions` at the parse's own prices
+/// The drop pass (`OptParams::drop_max_len`): `drop_decisions` at the parse's own prices
 /// (`Prices::from_hist(&Hist::of_output(out))`, the histogram of the final DP pass's output),
 /// then `apply_drops`.
 pub fn drop_pass(block: &[u8], out: &BlockOutput, max_len: u32, seg_log2: u32) -> BlockOutput {
@@ -1072,10 +1072,10 @@ pub fn apply_drops(block: &[u8], out: &BlockOutput, dropped: &[bool]) -> BlockOu
 /// `params.opt.level` with the price tables `p` verbatim (the GPU loads them in place of its
 /// pass-0 prologue); with `prices: None`, the full `parse` of `params` (seed and passes).
 /// Every case fits the first four 4 KiB segments (`gap3_inner_segments_only` also uses the
-/// block's last segment), so it runs at 16, 32 and 64 KiB blocks.
+/// block's last segment).
 ///
-/// `opt_test_cases` are the M5 cases; `option_test_cases` the M6 DP options (gap3, relaxation
-/// pruning); `drop_test_cases` the drop pass (`DropCase`).
+/// `opt_test_cases` are the cases of the base DP, `option_test_cases` those of the DP options
+/// (gap3, relaxation pruning) and `drop_test_cases` those of the drop pass (`DropCase`).
 pub mod cases {
     use super::{dp_pass_with, parse_with, Engine, Prices, BITCOST_MULTIPLIER};
     use crate::config::BLOCK_SIZE;
@@ -1578,7 +1578,7 @@ pub mod cases {
         .collect()
     }
 
-    /// A single optLevel-2 pass with M6 options `gap` (`inner_gap`) and `relax`
+    /// A single optLevel-2 pass with the options `gap` (`inner_gap`) and `relax`
     /// (`relax_lengths`).
     fn option_pass(gap: u8, relax: Option<u8>) -> MatchParams {
         MatchParams { opt: Some(OptParams { inner_gap: gap, relax_lengths: relax, ..pass(2).opt.unwrap() }), ..OPT16 }
@@ -1684,8 +1684,7 @@ pub mod cases {
         vec![case("gap3_rep_capped_at_ilimit", block, cands, runs)]
     }
 
-    /// The M6 DP cases (gap3, relaxation pruning), in order. Kept apart from `opt_test_cases`,
-    /// which the M5 GPU kernel replays.
+    /// The DP option cases (gap3, relaxation pruning), in order.
     pub fn option_test_cases() -> Vec<OptCase> {
         [gap3_inner_segments_only, gap3_rep_capped_at_ilimit, relax_top4_explicit_records_only]
             .into_iter()
@@ -1864,8 +1863,8 @@ mod tests {
         v
     }
 
-    /// `opt16p1` and its M6 options one at a time: each on `opt16` (gap3, top-4 pruning also at
-    /// optLevel 0, drop pass, S3 prior), and `opt16p1` without pruning / drop / gap3, with a
+    /// `opt16p1` and its options one at a time: each on `opt16` (gap3, top-4 pruning also at
+    /// optLevel 0, drop pass, sparse prior), and `opt16p1` without pruning / drop / gap3, with a
     /// cheap pass.
     fn option_variants() -> Vec<MatchParams> {
         let (o16, p1) = (OPT16.opt.unwrap(), OPT16P1.opt.unwrap());
@@ -1885,7 +1884,7 @@ mod tests {
         ]
     }
 
-    /// Every synthetic block round-trips through libzstd for every M6 variant (no match crosses a
+    /// Every synthetic block round-trips through libzstd for every option variant (no match crosses a
     /// segment), and the ring engine gives the same output.
     #[test]
     fn option_variants_roundtrip_and_ring() {
