@@ -336,6 +336,7 @@ fn set_max_height(np: u32) {
     let last = np - 1u;
     let largest = tp[last];
     if (largest <= tgt) { return; }
+    // largest - tgt < 31: at most 65536 literals bound the tree depth to about 23.
     let base_cost = 1i << (largest - tgt);
     var total_cost = 0i;
     var n = i32(last);

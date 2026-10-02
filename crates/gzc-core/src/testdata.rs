@@ -7,12 +7,17 @@ use std::path::{Path, PathBuf};
 use crate::block::chunk_file;
 use crate::config::BLOCK_SIZE;
 
-/// The corpus directory: `GZC_CORPUS`, else `data/corpus` at the repository root. `None` (after
-/// a message on stderr) when it does not exist, so a corpus test can skip.
+/// The corpus directory: `GZC_CORPUS`, else `data/corpus` at the repository root. A relative
+/// `GZC_CORPUS` is tried against the current directory and then against the repository root
+/// (cargo runs each crate's tests from the crate directory). `None` (after a message on stderr)
+/// when it does not exist, so a corpus test can skip.
 pub fn corpus_dir() -> Option<PathBuf> {
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
-    let root = PathBuf::from(root);
+    let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let root = match std::env::var("GZC_CORPUS") {
+        Ok(v) if PathBuf::from(&v).is_dir() || PathBuf::from(&v).is_absolute() => PathBuf::from(v),
+        Ok(v) => repo.join(v),
+        Err(_) => repo.join("data/corpus"),
+    };
     if root.is_dir() {
         Some(root)
     } else {

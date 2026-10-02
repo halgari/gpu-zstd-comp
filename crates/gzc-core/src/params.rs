@@ -67,17 +67,6 @@ pub struct OptParams {
     pub drop_max_len: u8,
 }
 
-impl OptParams {
-    /// True when every optional DP feature is off: no sparse chains, the base prior tables,
-    /// gap 8, no relaxation pruning and no drop pass.
-    pub fn is_baseline(&self) -> bool {
-        self.prior == PriorTables::Base
-            && self.sparse_chains == [None; 3]
-            && self.inner_gap == 8
-            && self.relax_lengths.is_none()
-            && self.drop_max_len == 0
-    }
-}
 
 /// Which prior LL/ML/OF frequency tables `Seed::Prior` uses (`codes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,7 +363,6 @@ mod tests {
             ..opt
         };
         assert_eq!(OPT16P1, MatchParams { depth: 8, opt: Some(p1), ..o16 });
-        assert!(OPT14.opt.unwrap().is_baseline() && OPT16.opt.unwrap().is_baseline() && !p1.is_baseline());
         assert_eq!((OPT16.n_hashes(), OPT16.min_seq_len(), OPT14.min_seq_len()), (2, 3, 3));
         assert_eq!((OPT16P1.n_hashes(), OPT16P1.min_seq_len()), (5, 3));
         assert_eq!(LVL3.n_hashes(), 2);

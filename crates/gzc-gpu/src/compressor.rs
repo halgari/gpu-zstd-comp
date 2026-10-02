@@ -185,7 +185,7 @@ impl Compressor {
 
     /// Opens the default GPU as `options.gpu` says and builds a compressor on it.
     pub fn with_options(options: CompressorOptions) -> Result<Self, Error> {
-        let ctx = GpuContext::new(options.gpu.clone()).map_err(Error::from_anyhow)?;
+        let ctx = GpuContext::new(options.gpu.clone())?;
         Self::with_context(Arc::new(ctx), &options)
     }
 

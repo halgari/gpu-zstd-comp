@@ -289,7 +289,11 @@ impl GpuContext {
     /// (`transfer::transfer_family`), the `VkDevice` is created here with that extra queue
     /// (`transfer`); if that fails the context falls back to wgpu's own device (with a warning),
     /// as it does everywhere else.
-    pub fn new(options: GpuOptions) -> anyhow::Result<Self> {
+    pub fn new(options: GpuOptions) -> Result<Self, crate::Error> {
+        Self::open(options).map_err(crate::Error::from_anyhow)
+    }
+
+    fn open(options: GpuOptions) -> anyhow::Result<Self> {
         options.validate()?;
         let p = Prepared::new(options)?;
         let family = p.opts.transfer_queue.then(|| crate::transfer::transfer_family(&p.adapter)).flatten();

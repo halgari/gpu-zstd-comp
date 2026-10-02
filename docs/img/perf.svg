@@ -68,11 +68,9 @@
 <circle cx="444.0" cy="311.1" r="3.5" fill="#c49c94"/>
 <circle cx="555.4" cy="372.4" r="3.5" fill="#c49c94"/>
 <circle cx="566.6" cy="381.7" r="3.5" fill="#c49c94"/>
-<path d="M169.1,140.2 L414.3,120.8 L447.7,116.2 L565.3,207.1 L571.5,196.2" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<path d="M169.1,140.2 L447.7,116.2 L565.3,207.1 L571.5,196.2" fill="none" stroke="#1f77b4" stroke-width="2"/>
 <circle cx="169.1" cy="140.2" r="3.5" fill="#1f77b4"/>
 <text x="174.1" y="154.2" text-anchor="start" fill="#1f77b4" font-size="10">lvl3</text>
-<circle cx="414.3" cy="120.8" r="3.5" fill="#1f77b4"/>
-<text x="419.3" y="114.8" text-anchor="start" fill="#1f77b4" font-size="10">rung1</text>
 <circle cx="447.7" cy="116.2" r="3.5" fill="#1f77b4"/>
 <text x="452.7" y="110.2" text-anchor="start" fill="#1f77b4" font-size="10">lvl9s12seg</text>
 <circle cx="565.3" cy="207.1" r="3.5" fill="#1f77b4"/>

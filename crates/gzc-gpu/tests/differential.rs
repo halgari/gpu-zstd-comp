@@ -1147,7 +1147,7 @@ const K2_VARIANTS: [MatchParams; 12] = [
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 12, opt: None },
-    // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
+    // Deep Single walks over the fingerprint skips, with min_match 4 (a byte-4 mismatch
     // skips only against a best of >= 4) and 6.
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 16, segment_log2: 0, opt: None },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16, segment_log2: 12, opt: None },
@@ -1160,7 +1160,7 @@ const K2_VARIANTS: [MatchParams; 12] = [
     MatchParams { depth: 16, ..LVL9S12SEG },
 ];
 
-/// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
+/// Blocks for K2's fingerprint skips: candidates that share the hash but not the first 4
 /// bytes (hash collisions), candidates equal in 4 bytes that differ at byte 4 (the byte field),
 /// and ties of length 4 and 5 between candidates. `words-tail1`: 4-byte words from 12 values, each
 /// followed by one of 3 bytes (so a word recurs with a different fifth byte); `words-tail2`: the
