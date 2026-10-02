@@ -2,7 +2,7 @@
 
 Status: design only (nothing implemented, nothing benchmarked). Normative references: `crates/gzc-core/src/lazy.rs`
 (the oracle, including every `// deviation:` note), `crates/gzc-gpu/src/shaders/k3_lazy.wgsl` (the current
-single-lane mirror), plan `docs/superpowers/plans/2026-09-30-speed-phase.md` (constraints), ideas-fable §4/§5.
+single-lane mirror), plan `docs/design/plans/2026-09-30-speed-phase.md` (constraints), ideas-fable §4/§5.
 Facts about naga/wgpu below were checked against the vendored `naga-30.0.1` and `wgpu-types-30.0.1` sources.
 
 ## 0. Decisions in one screen

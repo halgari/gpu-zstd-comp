@@ -2,8 +2,8 @@
 
 Date: 2026-09-30 · Status: design approved in conversation ("looks good … continue with the next algorithm")
 Builds on: master `b356ee4` (speed2: 64 KiB default, `lvl9seg` segmented parse, sorted finder, transfer queue).
-Detailed design and evidence: `docs/superpowers/m5/m5-opt-design.md` (normative detail for kernels and tie
-rules), `docs/superpowers/m5/m5-ratio-drivers.md` (independent ratio measurements), `m5-rt-npu.md`
+Detailed design and evidence: `docs/design/m5/m5-opt-design.md` (normative detail for kernels and tie
+rules), `docs/design/m5/m5-ratio-drivers.md` (independent ratio measurements), `m5-rt-npu.md`
 (RT cores / NPUs / tensor cores: no-go).
 
 ## 1. Goal

@@ -56,5 +56,5 @@ matter more than ideas that only help a huge GPU.
 crates/gzc-gpu/src/{compressor.rs, pipeline.rs, chains.rs, context.rs},
 crates/gzc-gpu/src/shaders/{common.wgsl, k1_chains.wgsl, k2_best.wgsl, k3_parse.wgsl, k3_lazy.wgsl,
 k4_seq_entropy.wgsl, k5_huffman.wgsl}; CPU oracle crates/gzc-core/src/{reference.rs, lazy.rs, hash.rs,
-params.rs}. Spec: docs/superpowers/specs/2026-09-29-m4-lazy-lvl9-design.md. Results:
+params.rs}. Spec: docs/design/specs/2026-09-29-m4-lazy-lvl9-design.md. Results:
 docs/results/2026-09-29-m4.md.

@@ -1,6 +1,6 @@
 //! Optimal parse for the M5 presets `opt14` / `opt16`: an integer port of libzstd 1.5.7
 //! `ZSTD_compressBlock_opt_generic` (`lib/compress/zstd_opt.c`, noDict, one block), design in
-//! `docs/superpowers/m5/m5-opt-design.md` §1–§2.
+//! `docs/design/m5/m5-opt-design.md` §1–§2.
 //!
 //! This is the normative oracle the GPU K3opt kernel mirrors bit-exactly: integer-only,
 //! deterministic, every tie rule explicit. The DP body follows the C function statement by
