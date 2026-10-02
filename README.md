@@ -102,10 +102,10 @@ Details are in `docs/results/2026-09-30-m4pro.md`.
 - **Metal tuning:** two settings on the `metal-exp` branch (subgroup width 32, 32 K1
   workgroups) add 4–27 %. They are not on master yet.
 
-**GTX 1660 Super** (Windows 11, Vulkan, Ryzen 5 7600X), same corpus, two verified runs each
-(`docs/results/2026-10-01-gtx1660s.md`): `lvl9s12seg` 552 MB/s, `lvl9seg` 370, `opt14` 95,
-`opt16` 58. The parse is 80 % of `opt16`'s time on this card. The fastest preset clears 1 Gbit but
-not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
+**GTX 1660 Super** (Windows 11, Vulkan, Ryzen 5 7600X), same corpus, verified
+(`docs/results/2026-10-01-gtx1660s.md`). After M6: `lvl9s12seg` 562 MB/s, `opt16p1` 140, `opt14`
+127, `opt16` 86 (before M6: 552 / – / 95 / 58). `opt16p1` clears 1 Gbit at L16-class ratio; on
+this card its 5-chain K1 is now 48 % of GPU time. CPU baseline not measured yet.
 
 ## What has been tested
 
@@ -125,8 +125,7 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 
 - **AMD discrete cards** (RDNA 2/3) on Vulkan, Windows or Linux. AMD's Vulkan driver has not
   run this code at all.
-- **`opt16p1` and the M6 kernels on any GPU but the RTX 5090** (Metal, GTX 1660 Super, AMD).
-  Only the emulation test modes cover other GPUs' behaviour.
+- **`opt16p1` and the M6 kernels on Metal and AMD.** The GTX 1660 Super has run them (below).
 - **Intel Arc.**
 - **The common 8 GB NVIDIA cards** (RTX 3060, RTX 4060). Every number for them is a
   projection.
