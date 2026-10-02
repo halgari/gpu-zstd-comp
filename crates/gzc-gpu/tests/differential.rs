@@ -1445,7 +1445,8 @@ fn partial_blocks_frames_match_cpu() {
     let opt16p1 = ("opt16p1", gzc_core::params::OPT16P1);
     for (name, matching) in GPU_PRESETS.into_iter().chain([opt16p1]) {
         let params = GpuParams { matching, emit_frames: true, huffman: true };
-        // 15 blocks in batches of 4: three with partial blocks, the last one a single full block.
+        // 15 blocks in batches of 4 (the last holds 3): every batch has partial blocks, and the
+        // last two a full block beside them.
         let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 4, inflight: 2, params }).expect("Pipeline::new");
         let mut sink = CollectFrames(vec![None; real.len()]);
         pipe.run_frames(&real, &mut sink).expect("run_frames");
