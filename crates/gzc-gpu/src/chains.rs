@@ -13,6 +13,7 @@
 //!   (38 barriers).
 //!
 //! Neither keeps state across dispatches: `head` is pure per-dispatch scratch.
+use anyhow::Context as _;
 use crate::context::{GpuContext, pack_blocks, params_wgsl};
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS, HASH_BITS, LOG2_BLOCK, NO_POS};
 use gzc_core::params::{Hashes, SparseChain, MatchParams};
@@ -360,6 +361,8 @@ impl ChainsKernel {
             });
             match built {
                 Ok(k) => return Ok(k),
+                // A stuck GPU is no reason to fall back: report it.
+                Err(e) if crate::context::is_watchdog(&e) => return Err(e),
                 Err(e) => eprintln!("gzc-gpu: K1 subgroup kernel failed to build or its self-test ({e}); using the fallback K1"),
             }
         }
@@ -450,7 +453,7 @@ impl ChainsKernel {
         let one_group = Self { opts: ChainsOptions { groups: Some(1), ..self.opts }, ..self.shallow_clone() };
         let per_block = pred_words_per_block(params) as usize;
         for (round, k) in [self, self, &one_group].into_iter().enumerate() {
-            let raw = k.run_words(ctx, &data, &head, &pred, n);
+            let raw = k.try_run_words(ctx, &data, &head, &pred, n).context("k1 self-test")?;
             let got_words: Vec<Vec<u32>> = raw.chunks_exact(per_block).map(|block| block.to_vec()).collect();
             let got: Vec<Vec<Vec<u32>>> = got_words.iter().map(|block| expand_preds(params, block)).collect();
             if let Some(b) = (0..blocks.len()).find(|&b| got[b] != want[b]) {
@@ -511,10 +514,22 @@ impl ChainsKernel {
         pred: &wgpu::Buffer,
         n_blocks: u32,
     ) -> Vec<u32> {
+        self.try_run_words(ctx, data, head, pred, n_blocks).unwrap_or_else(|e| panic!("k1: {e:#}"))
+    }
+
+    /// `run_words`, erroring where it panics (a lost device, an expired GPU watchdog).
+    fn try_run_words(
+        &self,
+        ctx: &GpuContext,
+        data: &wgpu::Buffer,
+        head: &wgpu::Buffer,
+        pred: &wgpu::Buffer,
+        n_blocks: u32,
+    ) -> anyhow::Result<Vec<u32>> {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1") });
         self.record(ctx, &mut enc, data, head, pred, n_blocks);
         ctx.queue.submit([enc.finish()]);
-        ctx.read_buffer(pred, 0, pred_words_per_block(&self.params) as usize * n_blocks as usize)
+        ctx.try_read_buffer(pred, 0, pred_words_per_block(&self.params) as usize * n_blocks as usize)
     }
 
     /// data: packed blocks; head: at least `head_bytes(n_blocks, n_hashes)`, per-dispatch scratch

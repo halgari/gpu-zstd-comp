@@ -353,14 +353,17 @@ impl TransferQueue {
         Ok(index)
     }
 
-    /// Blocks until `t` reaches `value`.
-    pub(crate) fn wait(&self, t: &Timeline, value: u64) -> anyhow::Result<()> {
+    /// Blocks until `t` reaches `value`, giving up after `timeout` (`None`: never): false when it
+    /// did not reach it.
+    pub(crate) fn wait_timeout(&self, t: &Timeline, value: u64, timeout: Option<std::time::Duration>) -> anyhow::Result<bool> {
         let (sems, values) = ([t.sem], [value]);
+        let ns = timeout.map_or(u64::MAX, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         // SAFETY: plain wait on a live semaphore.
-        unsafe {
-            self.device().wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&values), u64::MAX)
+        match unsafe { self.device().wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&values), ns) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(e) => Err(e).context("vkWaitSemaphores"),
         }
-        .context("vkWaitSemaphores")
     }
 
     /// The current value of `t`.

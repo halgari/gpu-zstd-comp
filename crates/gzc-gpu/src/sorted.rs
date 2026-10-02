@@ -18,6 +18,7 @@
 //! version); otherwise (or
 //! with `GZC_SORTED=0`) `Kernels` runs the chain kernels, which build the same chains over the
 //! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
+use anyhow::Context as _;
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS};
@@ -74,6 +75,8 @@ impl SortKernel {
             });
             match built {
                 Ok(k) => return Ok(Some(k)),
+                // A stuck GPU is no reason to fall back: report it.
+                Err(e) if crate::context::is_watchdog(&e) => return Err(e),
                 Err(e) => eprintln!("gzc-gpu: sorted K1 subgroup kernel failed to build or its self-test ({e}); using the workgroup-memory one"),
             }
         }
@@ -87,6 +90,8 @@ impl SortKernel {
         });
         match built {
             Ok(k) => Ok(Some(k)),
+            // A stuck GPU is no reason to fall back: report it.
+            Err(e) if crate::context::is_watchdog(&e) => return Err(e),
             Err(e) => {
                 eprintln!("gzc-gpu: sorted K1 failed to build or its self-test ({e}); using the chain K1");
                 Ok(None)
@@ -168,7 +173,7 @@ impl SortKernel {
         let sorted = ctx.storage_buffer("k1_sort.selftest.sorted", n as u64 * BLOCK_SIZE as u64 * 4, true);
         let rank = ctx.storage_buffer("k1_sort.selftest.rank", n as u64 * BLOCK_SIZE as u64 * 4, false);
         for round in 0..2 {
-            let got = self.run(ctx, &data, &sorted, &rank, n);
+            let got = self.try_run(ctx, &data, &sorted, &rank, n).context("k1_sort self-test")?;
             for (b, block) in blocks.iter().enumerate() {
                 if got[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE][..HASHED_POSITIONS] != sorted_words(block, params)[..HASHED_POSITIONS] {
                     anyhow::bail!("sorted array of self-test block {b} differs from the CPU in round {round}");
@@ -180,10 +185,22 @@ impl SortKernel {
 
     /// Records K1, submits it and reads the sorted words of `n_blocks` blocks back.
     pub fn run(&self, ctx: &GpuContext, data: &wgpu::Buffer, sorted: &wgpu::Buffer, rank: &wgpu::Buffer, n_blocks: u32) -> Vec<u32> {
+        self.try_run(ctx, data, sorted, rank, n_blocks).unwrap_or_else(|e| panic!("k1_sort: {e:#}"))
+    }
+
+    /// `run`, erroring where it panics (a lost device, an expired GPU watchdog).
+    fn try_run(
+        &self,
+        ctx: &GpuContext,
+        data: &wgpu::Buffer,
+        sorted: &wgpu::Buffer,
+        rank: &wgpu::Buffer,
+        n_blocks: u32,
+    ) -> anyhow::Result<Vec<u32>> {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("k1_sort") });
         self.record_timed(ctx, &mut enc, data, sorted, rank, n_blocks, None);
         ctx.queue.submit([enc.finish()]);
-        ctx.read_buffer(sorted, 0, BLOCK_SIZE * n_blocks as usize)
+        ctx.try_read_buffer(sorted, 0, BLOCK_SIZE * n_blocks as usize)
     }
 
     /// Records K1 for `n_blocks` blocks of `data` into `sorted` (at least `n_blocks * BLOCK_SIZE`

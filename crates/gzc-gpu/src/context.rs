@@ -64,6 +64,11 @@ pub struct GpuContext {
     pub(crate) poisoner: std::sync::OnceLock<crate::poison::Poisoner>,
     pub(crate) poison_seq: std::sync::atomic::AtomicU32,
     pub(crate) poison_base: u64,
+    /// `GZC_FORCE_POLL_ONLY` (test/debug knob): wait as on Metal (`poll_only`) on any backend.
+    force_poll_only: bool,
+    /// How long a wait for the GPU or for a pipeline slot may go without progress before it errors
+    /// (`GZC_GPU_WATCHDOG_SECS`, default 60; `None`: never).
+    pub(crate) watchdog: Option<std::time::Duration>,
 }
 
 /// How `GpuContext::with_gpu_options` sets up the device. `GpuOptions::from_env` is what
@@ -124,6 +129,54 @@ impl GpuOptions {
 /// `GZC_NO_SUBGROUPS`, `GZC_NO_TIMESTAMPS`, `GZC_CHECKED_SHADERS`) is turned on by any value but
 /// `0` (this function); one that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is turned
 /// off by `0` only (`env_off`). `GZC_DIRECT_UPLOAD` is tri-state (unset: auto).
+/// A poll-only wait (`GpuContext::wait_callback_until`) waits this long on its channel after
+/// its first poll, doubling up to `POLL_BACKOFF_MAX` between polls.
+const POLL_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_micros(50);
+const POLL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(1);
+/// A poll-only wait without its callback for this long nudges the queue (`GpuContext::nudge`).
+const NUDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The error of an expired watchdog (`GpuContext::watchdog`, `GZC_GPU_WATCHDOG_SECS`): a wait for
+/// the GPU or for a pipeline slot saw no progress for that long. Its message names the wait and
+/// what it found (slot states, batch, preset). Find it in an `anyhow::Error` with `is_watchdog`.
+#[derive(Debug)]
+pub struct GpuWatchdogExpired(pub String);
+
+impl std::fmt::Display for GpuWatchdogExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GpuWatchdogExpired {}
+
+/// True when `e` (or an error it wraps) is an expired watchdog (`GpuWatchdogExpired`).
+pub fn is_watchdog(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<GpuWatchdogExpired>())
+}
+
+/// The error of an expired watchdog: `what` names the wait and its state.
+pub(crate) fn watchdog_error(what: &str, waited: std::time::Duration) -> anyhow::Error {
+    anyhow::Error::new(GpuWatchdogExpired(format!(
+        "GPU watchdog: no progress for {:.1}s waiting for {what} (GZC_GPU_WATCHDOG_SECS sets the limit, 0 turns it off)",
+        waited.as_secs_f64()
+    )))
+}
+
+/// `GZC_GPU_WATCHDOG_SECS=N`: how long a wait for the GPU or a pipeline slot may see no progress
+/// before it errors (`GpuContext::watchdog`); default 60, `0` turns the watchdog off.
+fn watchdog_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: f64 = 60.0;
+    let secs = match std::env::var("GZC_GPU_WATCHDOG_SECS") {
+        Ok(v) => v.trim().parse::<f64>().unwrap_or_else(|_| {
+            eprintln!("gzc: GZC_GPU_WATCHDOG_SECS={v}: not a number; using {DEFAULT_SECS}");
+            DEFAULT_SECS
+        }),
+        Err(_) => DEFAULT_SECS,
+    };
+    (secs > 0.0 && secs.is_finite()).then(|| std::time::Duration::from_secs_f64(secs))
+}
+
 pub(crate) fn env_on(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v != "0")
 }
@@ -264,6 +317,8 @@ impl Prepared {
             poison_base: std::env::var("GZC_POISON_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
             }),
+            force_poll_only: env_on("GZC_FORCE_POLL_ONLY"),
+            watchdog: watchdog_from_env(),
         }
     }
 
@@ -356,63 +411,139 @@ impl GpuContext {
     /// on Metal. wgpu-hal 30's Metal `Device::wait` can fail with a spurious `DeviceError::Lost`
     /// (which loses the device) when it runs while another thread is inside `queue.submit` (see
     /// `pipeline::Completion::poll_only`); a non-blocking poll never calls it.
+    /// `GZC_FORCE_POLL_ONLY` makes every backend wait this way (to exercise Metal's waits on Vulkan).
     pub(crate) fn poll_only(&self) -> bool {
-        self.adapter_info.backend == wgpu::Backend::Metal
+        self.force_poll_only || self.adapter_info.backend == wgpu::Backend::Metal
     }
 
     /// Waits for the callback behind `rx` (a buffer map or a submitted-work-done callback, which
-    /// fires once `submission` completes; `None`: all submitted work) and returns its value.
-    /// With `poll_only` it polls without blocking (every 200 µs) instead of `PollType::Wait`, and
-    /// gives up once the device is lost.
+    /// fires once `submission` completes; `None`: all submitted work) and returns its value, or
+    /// errors once the context's watchdog (`GZC_GPU_WATCHDOG_SECS`) expires; `what` names the
+    /// wait in that error. See `wait_callback_until`.
     pub(crate) fn wait_callback<T>(
         &self,
         rx: &std::sync::mpsc::Receiver<T>,
         submission: Option<wgpu::SubmissionIndex>,
         poll_only: bool,
+        what: &dyn Fn() -> String,
     ) -> anyhow::Result<T> {
+        let r = self.wait_callback_until(rx, submission, poll_only, self.watchdog, what, &|| false)?;
+        Ok(r.expect("never cancelled"))
+    }
+
+    /// Waits for the callback behind `rx`, as `wait_callback`, with an explicit `watchdog` and a
+    /// `cancel` check (`Ok(None)` once it returns true; only checked with `poll_only`).
+    ///
+    /// wgpu delivers callbacks only from inside `device.poll` (or `queue.submit`), on whichever
+    /// thread calls it, so a wait must keep polling until its own callback is in: polling once and
+    /// then blocking on the channel would hang for good if the work was not yet done at that one
+    /// poll. Without `poll_only` one `PollType::Wait` (bounded by the watchdog) does that. With it
+    /// (Metal, `GZC_FORCE_POLL_ONLY`) the loop calls `PollType::Poll` and waits on the channel
+    /// with a backoff from `POLL_BACKOFF_MIN` to `POLL_BACKOFF_MAX`, and gives up once the device
+    /// is lost. After `NUDGE_AFTER` without the callback it submits one empty command buffer (a
+    /// new fence signal; see `nudge`), once, and says so on stderr.
+    pub(crate) fn wait_callback_until<T>(
+        &self,
+        rx: &std::sync::mpsc::Receiver<T>,
+        submission: Option<wgpu::SubmissionIndex>,
+        poll_only: bool,
+        watchdog: Option<std::time::Duration>,
+        what: &dyn Fn() -> String,
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Option<T>> {
         use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Instant;
         if let Ok(r) = rx.try_recv() {
-            return Ok(r);
+            return Ok(Some(r));
         }
+        let start = Instant::now();
         if !poll_only {
-            let wait = match submission {
-                Some(s) => wgpu::PollType::Wait { submission_index: Some(s), timeout: None },
-                None => wgpu::PollType::wait_indefinitely(),
+            let wait = wgpu::PollType::Wait { submission_index: submission, timeout: watchdog };
+            match self.device.poll(wait) {
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => return Err(watchdog_error(&what(), start.elapsed())),
+                Err(e) => return Err(e).context("device poll"),
+            }
+            // The work is done, so the callback ran inside this poll or is running on another
+            // thread that polled meanwhile.
+            let r = match watchdog {
+                None => rx.recv().context("wgpu callback dropped")?,
+                Some(d) => rx.recv_timeout(d).map_err(|e| match e {
+                    RecvTimeoutError::Timeout => watchdog_error(&what(), start.elapsed()),
+                    RecvTimeoutError::Disconnected => anyhow!("wgpu callback dropped"),
+                })?,
             };
-            self.device.poll(wait).context("device poll")?;
-            return rx.recv().context("wgpu callback dropped");
+            return Ok(Some(r));
         }
+        let mut backoff = POLL_BACKOFF_MIN;
+        let mut nudged = false;
         loop {
             self.device.poll(wgpu::PollType::Poll).context("device poll")?;
-            match rx.recv_timeout(std::time::Duration::from_micros(200)) {
-                Ok(r) => return Ok(r),
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(why) = self.device_lost() {
-                        anyhow::bail!("GPU device lost: {why}");
+            match rx.recv_timeout(backoff) {
+                Ok(r) => {
+                    if nudged {
+                        eprintln!(
+                            "gzc: {} came in after the nudge ({:.1}s in all)",
+                            what(),
+                            start.elapsed().as_secs_f64()
+                        );
                     }
+                    return Ok(Some(r));
                 }
                 Err(RecvTimeoutError::Disconnected) => anyhow::bail!("wgpu callback dropped"),
+                Err(RecvTimeoutError::Timeout) => {}
             }
+            if cancel() {
+                return Ok(None);
+            }
+            if let Some(why) = self.device_lost() {
+                anyhow::bail!("GPU device lost: {why}");
+            }
+            let waited = start.elapsed();
+            if watchdog.is_some_and(|d| waited >= d) {
+                return Err(watchdog_error(&what(), waited));
+            }
+            if !nudged && waited >= NUDGE_AFTER {
+                nudged = true;
+                if self.nudge() {
+                    eprintln!(
+                        "gzc: no callback for {} after {:.1}s of polling; submitted an empty command buffer",
+                        what(),
+                        waited.as_secs_f64()
+                    );
+                }
+            }
+            backoff = (backoff * 2).min(POLL_BACKOFF_MAX);
         }
     }
 
-    /// Waits until all work submitted so far is done: `PollType::Wait`, or with `poll_only`
-    /// non-blocking polls until a submitted-work-done callback fires (`wait_callback`).
-    pub(crate) fn wait_idle(&self, poll_only: bool) -> anyhow::Result<()> {
-        if !poll_only {
-            self.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
-            return Ok(());
+    /// Submits an empty command buffer: one more fence signal, so a fence value that a backend
+    /// left behind (e.g. a lost or late completion handler) is caught up once it completes, and
+    /// the wait sees its callback. False (nothing submitted) when the context has a transfer
+    /// queue: nothing else may submit beside a transfer-readback pipeline (`transfer`).
+    fn nudge(&self) -> bool {
+        if self.transfer.is_some() {
+            return false;
         }
+        self.queue.submit(std::iter::empty());
+        true
+    }
+
+    /// Waits until all work submitted so far is done: `PollType::Wait`, or with `poll_only`
+    /// non-blocking polls until a submitted-work-done callback fires (`wait_callback`); errors
+    /// once the watchdog expires.
+    pub(crate) fn wait_idle(&self, poll_only: bool) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.queue.on_submitted_work_done(move || {
             let _ = tx.send(());
         });
-        self.wait_callback(&rx, None, true)?;
-        // Deliver the map callbacks of the work just completed, as `PollType::Wait` would have.
-        self.device.poll(wgpu::PollType::Poll).context("device poll")?;
+        self.wait_callback(&rx, None, poll_only, &|| "the GPU to go idle".into())?;
+        if poll_only {
+            // Deliver the map callbacks of the work just completed, as `PollType::Wait` would have.
+            self.device.poll(wgpu::PollType::Poll).context("device poll")?;
+        }
         Ok(())
     }
-
     /// One line naming the adapter and what the context runs with, e.g.
     /// `adapter: NVIDIA GeForce RTX 5090 (Vulkan, driver NVIDIA 610.57.04); subgroups: on (32..=32);
     /// timestamps: on; direct upload: on; transfer queue: on; pack: off; workgroup storage: 49152 B`.
@@ -529,12 +660,18 @@ impl GpuContext {
     }
 
     /// Copies `count` elements of `T` starting at byte `offset` of `buf` (which needs COPY_SRC)
-    /// into a staging buffer, waits for the GPU, and returns them.
+    /// into a staging buffer, waits for the GPU, and returns them. Panics where `try_read_buffer`
+    /// errors (a lost device, an expired watchdog).
     pub fn read_buffer<T: bytemuck::Pod>(&self, buf: &wgpu::Buffer, offset: u64, count: usize) -> Vec<T> {
+        self.try_read_buffer(buf, offset, count).unwrap_or_else(|e| panic!("read_buffer: {e:#}"))
+    }
+
+    /// `read_buffer`, erroring instead of panicking.
+    pub fn try_read_buffer<T: bytemuck::Pod>(&self, buf: &wgpu::Buffer, offset: u64, count: usize) -> anyhow::Result<Vec<T>> {
         let bytes = (count * size_of::<T>()) as u64;
         let mut out = vec![T::zeroed(); count];
         if bytes == 0 {
-            return out;
+            return Ok(out);
         }
         let padded = bytes.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -545,17 +682,23 @@ impl GpuContext {
         });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
         enc.copy_buffer_to_buffer(buf, offset, &staging, 0, padded);
-        self.queue.submit([enc.finish()]);
+        let submission = self.queue.submit([enc.finish()]);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        staging.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
-        self.wait_callback(&rx, None, self.poll_only()).expect("device poll").expect("map readback buffer");
+        staging.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let size = buf.size();
+        self.wait_callback(&rx, Some(submission), self.poll_only(), &|| {
+            format!("read_buffer's map ({bytes} bytes at {offset} of a {size}-byte buffer)")
+        })?
+        .context("map readback buffer")?;
         {
-            let view = staging.get_mapped_range(..).expect("mapped range");
+            let view = staging.get_mapped_range(..).context("mapped range")?;
             bytemuck::cast_slice_mut::<T, u8>(&mut out).copy_from_slice(&view[..bytes as usize]);
         }
         staging.unmap();
-        out
+        Ok(out)
     }
 }
 
@@ -684,5 +827,42 @@ impl<'c> ErrorScopes<'c> {
             .map(ScopeError::Validation)
             .or(oom.map(ScopeError::Oom))
             .or_else(|| ctx.device_lost().map(ScopeError::Lost))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A callback that never fires (what `read_buffer` and every other GPU wait would see if the
+    /// GPU never completed) ends the wait with the watchdog's error, with `PollType::Wait` and
+    /// with the poll-only loop; `cancel` ends the poll-only loop early; a fired one is returned.
+    #[test]
+    fn watchdog_ends_a_wait_that_never_completes() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        // No transfer queue, so the nudge submits.
+        let opts = GpuOptions { transfer_queue: false, ..GpuOptions::default() };
+        let ctx = GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests");
+        for poll_only in [false, true] {
+            // Poll-only: past `NUDGE_AFTER`, so the nudge (an empty submission) runs too.
+            let limit = if poll_only { NUDGE_AFTER + Duration::from_millis(500) } else { Duration::from_millis(300) };
+            let (_tx, rx) = std::sync::mpsc::channel::<()>();
+            let t = Instant::now();
+            let e = ctx
+                .wait_callback_until(&rx, None, poll_only, Some(limit), &|| "a test callback".into(), &|| false)
+                .unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(is_watchdog(&e), "poll_only={poll_only}: {msg}");
+            assert!(msg.contains("waiting for a test callback") && msg.contains("GZC_GPU_WATCHDOG_SECS"), "{msg}");
+            assert!(t.elapsed() >= limit && t.elapsed() < limit + Duration::from_secs(5), "poll_only={poll_only}: {:?}", t.elapsed());
+
+            let (tx, rx) = std::sync::mpsc::channel::<u32>();
+            tx.send(7).unwrap();
+            assert_eq!(ctx.wait_callback_until(&rx, None, poll_only, None, &String::new, &|| false).unwrap(), Some(7));
+        }
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let r = ctx.wait_callback_until(&rx, None, true, Some(Duration::from_secs(60)), &String::new, &|| true).unwrap();
+        assert!(r.is_none());
     }
 }

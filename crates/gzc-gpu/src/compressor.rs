@@ -623,7 +623,7 @@ pub fn probe_lanes(ctx: &GpuContext, w: u32, bpw: u32) -> anyhow::Result<bool> {
             pass.dispatch_workgroups(1, 1, 1);
         }
         ctx.queue.submit([enc.finish()]);
-        let v: Vec<u32> = ctx.read_buffer(&buf, 0, 5 * n as usize);
+        let v: Vec<u32> = ctx.try_read_buffer(&buf, 0, 5 * n as usize).context("k3 lane probe")?;
         let (mx, my) = lane_mask(w);
         Ok(v.chunks(5).enumerate().all(|(i, l)| {
             let size_ok = if bpw > 1 { l[2] == w } else { l[2] >= w };
@@ -1657,13 +1657,16 @@ fn read_regions(ctx: &GpuContext, regions: &[(&wgpu::Buffer, u64, u64)]) -> anyh
             dst += words * 4;
         }
     }
-    ctx.queue.submit([enc.finish()]);
+    let submission = ctx.queue.submit([enc.finish()]);
 
     let (tx, rx) = std::sync::mpsc::channel();
     staging.map_async(wgpu::MapMode::Read, .., move |r| {
         let _ = tx.send(r);
     });
-    ctx.wait_callback(&rx, None, ctx.poll_only())?.context("map readback buffer")?;
+    ctx.wait_callback(&rx, Some(submission), ctx.poll_only(), &|| {
+        format!("read_regions' map ({total} bytes from {} regions)", regions.len())
+    })?
+    .context("map readback buffer")?;
     let words = {
         let view = staging.get_mapped_range(..).context("mapped range")?;
         bytemuck::pod_collect_to_vec(&view[..])

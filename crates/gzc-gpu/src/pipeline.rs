@@ -42,7 +42,7 @@
 //!   into the same `frames` / `frame_len` buffers, so it adds no memory.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
 use gzc_core::config::BLOCK_SIZE;
@@ -54,7 +54,7 @@ use crate::compressor::{
     slot_bytes,
 };
 use gzc_core::params::MatchParams;
-use crate::context::{ErrorScopes, GpuContext};
+use crate::context::{ErrorScopes, GpuContext, watchdog_error};
 use crate::transfer::{Commands, RawBuffer, StreamingGuard, Timeline, TransferQueue};
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +190,8 @@ type Handler<'d> = dyn FnMut(Lease, usize, u32, u64) -> anyhow::Result<()> + Sen
 /// A submitted batch, sent to the completion thread.
 struct Job {
     slot: usize,
+    /// The stream's batch number (from 0), for errors.
+    batch: u32,
     first: usize,
     n: u32,
     /// `UploadSlot::submit_with`'s tag (0 for `submit`).
@@ -257,6 +259,11 @@ enum SlotState {
     Leased,
 }
 
+/// The producer's slot wait gets the watchdog plus this: a slot in flight comes free through the
+/// completion thread, whose own wait for that batch has the plain watchdog, so a stalled batch is
+/// reported by the wait that saw it (with its batch number) rather than by the producer.
+const SLOT_WAIT_GRACE: Duration = Duration::from_secs(1);
+
 /// Slot states shared by the producer (the thread in `run*` / `stream_frames`), the completion
 /// thread and the leases, which may be dropped on any thread.
 struct Shared {
@@ -268,6 +275,9 @@ struct Shared {
 
 struct SharedState {
     slots: Vec<SlotState>,
+    /// Bumped on every change (a slot's state, an abort): the slot waits' watchdog counts from
+    /// the last change.
+    generation: u64,
     /// Set when either side of a stream failed: the producer stops waiting for slots and the
     /// completion thread stops delivering.
     abort: bool,
@@ -276,7 +286,7 @@ struct SharedState {
 impl Shared {
     fn new(slots: usize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(SharedState { slots: vec![SlotState::Free; slots], abort: false }),
+            state: Mutex::new(SharedState { slots: vec![SlotState::Free; slots], generation: 0, abort: false }),
             cv: Condvar::new(),
             release_ns: AtomicU64::new(0),
         })
@@ -288,57 +298,107 @@ impl Shared {
     }
 
     fn set(&self, slot: usize, to: SlotState) {
-        self.lock().slots[slot] = to;
+        let mut g = self.lock();
+        g.slots[slot] = to;
+        g.generation += 1;
+        drop(g);
         self.cv.notify_all();
     }
 
     fn abort(&self) {
-        self.lock().abort = true;
+        let mut g = self.lock();
+        g.abort = true;
+        g.generation += 1;
+        drop(g);
         self.cv.notify_all();
+    }
+
+    /// The slots' states, e.g. `[0: in flight, 1: leased, 2: free]`.
+    fn describe(&self) -> String {
+        self.lock().describe()
     }
 
     fn aborted(&self) -> bool {
         self.lock().abort
     }
 
-    /// Blocks until `slot` is free; errors once the stream is aborted.
-    fn wait_free(&self, slot: usize) -> anyhow::Result<()> {
+    /// Blocks until `slot` is free; errors once the stream is aborted, or once `watchdog` passes
+    /// with no slot changing state (`what` names the wait for that error).
+    fn wait_free(&self, slot: usize, watchdog: Option<Duration>, what: &dyn Fn() -> String) -> anyhow::Result<()> {
+        self.wait_until(watchdog, "a free upload slot", true, &|s| s.slots[slot] == SlotState::Free, &|| {
+            format!("a free upload slot (slot {slot}) for {}", what())
+        })
+    }
+
+    /// Blocks until no slot is lent out; errors once `watchdog` passes with no slot changing state.
+    fn wait_released(&self, watchdog: Option<Duration>, what: &dyn Fn() -> String) -> anyhow::Result<()> {
+        self.wait_until(watchdog, "the stream's end", false, &|s| !s.slots.contains(&SlotState::Leased), &|| {
+            format!("the sink to release its batches at the stream's end ({})", what())
+        })
+    }
+
+    /// Blocks until `done` holds; errors once the stream is aborted (when `abortable`), or once
+    /// `watchdog` passes without a state change. Every `STALL_WARN` without one it logs how many
+    /// batches the sink still holds, so a leaked or over-held `FrameBatch` shows up early.
+    fn wait_until(
+        &self,
+        watchdog: Option<Duration>,
+        short: &str,
+        abortable: bool,
+        done: &dyn Fn(&SharedState) -> bool,
+        what: &dyn Fn() -> String,
+    ) -> anyhow::Result<()> {
+        const STALL_WARN: Duration = Duration::from_secs(10);
         let mut g = self.lock();
+        let (mut seen, mut since) = (g.generation, Instant::now());
         loop {
-            anyhow::ensure!(!g.abort, "stream aborted");
-            if g.slots[slot] == SlotState::Free {
+            anyhow::ensure!(!(abortable && g.abort), "stream aborted");
+            if done(&g) {
                 return Ok(());
             }
-            g = self.wait_logged(g, "a free upload slot");
+            if g.generation != seen {
+                (seen, since) = (g.generation, Instant::now());
+            }
+            let waited = since.elapsed();
+            let mut wait = STALL_WARN;
+            if let Some(d) = watchdog {
+                if waited >= d {
+                    let state = g.describe();
+                    drop(g);
+                    return Err(watchdog_error(&format!("{}; slots: {state}", what()), waited));
+                }
+                wait = wait.min(d - waited);
+            }
+            let timeout;
+            (g, timeout) = self.cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner());
+            if timeout.timed_out() && g.generation == seen && wait == STALL_WARN {
+                let held = g.slots.iter().filter(|&&s| s == SlotState::Leased).count();
+                eprintln!(
+                    "gzc: pipeline waiting {:.0}s+ for {short}: {held} FrameBatch(es) still held by the sink, {} batch(es) in flight",
+                    since.elapsed().as_secs_f64(),
+                    g.slots.iter().filter(|&&s| s == SlotState::InFlight).count()
+                );
+            }
         }
     }
+}
 
-    /// Blocks until no slot is lent out.
-    fn wait_released(&self) {
-        let mut g = self.lock();
-        while g.slots.contains(&SlotState::Leased) {
-            g = self.wait_logged(g, "the stream's end");
-        }
-    }
-
-    /// One condvar wait; a wait of `STALL_WARN` or longer logs how many batches the sink still
-    /// holds, so a leaked or over-held `FrameBatch` shows up instead of a silent hang.
-    fn wait_logged<'g>(
-        &self,
-        g: std::sync::MutexGuard<'g, SharedState>,
-        what: &str,
-    ) -> std::sync::MutexGuard<'g, SharedState> {
-        const STALL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
-        let (g, timeout) = self.cv.wait_timeout(g, STALL_WARN).unwrap_or_else(|e| e.into_inner());
-        if timeout.timed_out() {
-            let held = g.slots.iter().filter(|&&s| s == SlotState::Leased).count();
-            eprintln!(
-                "gzc: pipeline waiting {}s+ for {what}: {held} FrameBatch(es) still held by the sink, {} batch(es) in flight",
-                STALL_WARN.as_secs(),
-                g.slots.iter().filter(|&&s| s == SlotState::InFlight).count()
-            );
-        }
-        g
+impl SharedState {
+    fn describe(&self) -> String {
+        let states: Vec<String> = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let s = match s {
+                    SlotState::Free => "free",
+                    SlotState::InFlight => "in flight",
+                    SlotState::Leased => "leased",
+                };
+                format!("{i}: {s}")
+            })
+            .collect();
+        format!("[{}]{}", states.join(", "), if self.abort { " (aborted)" } else { "" })
     }
 }
 
@@ -533,13 +593,25 @@ pub struct Pipeline<'a> {
     /// backend.
     #[cfg(test)]
     poll_only: bool,
+    /// Test hook: the delivery after this many more waits for a callback that never comes, as a
+    /// lost completion would (then the hook clears); the watchdog must end the stream.
+    #[cfg(test)]
+    stall_deliveries_after: Option<u32>,
+    /// Set when `abandon` could not bring the pipeline back (the GPU never went idle, or the sink
+    /// kept its batches): every later stream errors with it.
+    broken: Option<String>,
 }
 
 impl Drop for Pipeline<'_> {
     fn drop(&mut self) {
         if let Some(x) = &self.xfer {
-            // The raw buffers, semaphores and command buffers must outlive every GPU use.
-            let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+            // The raw buffers, semaphores and command buffers must outlive every GPU use: leak
+            // them if the GPU does not go idle within the watchdog.
+            if let Err(e) = self.ctx.wait_idle(false) {
+                eprintln!("gzc: dropping a pipeline whose GPU work did not finish, leaking its transfer buffers: {e:#}");
+                std::mem::forget(self.xfer.take());
+                return;
+            }
             x.tq.idle();
         }
     }
@@ -785,6 +857,9 @@ impl<'a> Pipeline<'a> {
             fail_submits_after: None,
             #[cfg(test)]
             poll_only: false,
+            #[cfg(test)]
+            stall_deliveries_after: None,
+            broken: None,
         })
     }
 
@@ -935,6 +1010,9 @@ impl<'a> Pipeline<'a> {
     where
         P: FnOnce(&mut FrameStream<'_, 'a>) -> anyhow::Result<()>,
     {
+        if let Some(e) = &self.broken {
+            anyhow::bail!("pipeline unusable after an earlier stream failed: {e}");
+        }
         let scopes = ErrorScopes::push(self.ctx);
         let start = Instant::now();
         let names = self.kernels.names();
@@ -945,6 +1023,8 @@ impl<'a> Pipeline<'a> {
         let fail_after = self.fail_deliveries_after.take();
         #[cfg(not(test))]
         let fail_after = None;
+        #[cfg(test)]
+        let stall_after = self.stall_deliveries_after.take();
         let poll_only = self.poll_only();
         let completion = Completion {
             ctx: self.ctx,
@@ -956,6 +1036,10 @@ impl<'a> Pipeline<'a> {
             timed: self.ctx.timestamps,
             poll_only,
             fail_after,
+            watchdog: self.ctx.watchdog,
+            desc: self.describe(),
+            #[cfg(test)]
+            stall_after,
         };
         let shared = self.shared.clone();
         shared.release_ns.store(0, Ordering::Relaxed);
@@ -998,11 +1082,11 @@ impl<'a> Pipeline<'a> {
             self.fail_deliveries_after = cprof.fail_after;
         }
         // A completion-side error also explains the producer's "stream aborted".
-        let result = completed.and(produced);
+        let mut result = completed.and(produced);
         if result.is_err() {
             self.abandon();
         } else {
-            self.shared.wait_released();
+            result = self.shared.wait_released(self.ctx.watchdog, &|| self.describe()).and(result);
         }
         let end = Instant::now();
         let wall_s = (end - start).as_secs_f64();
@@ -1181,13 +1265,18 @@ impl<'a> Pipeline<'a> {
         slot.upload_mapped = Some(upload_mapped);
         slot.upload_unmapped = false;
         slot.upload_submission = Some(submission.clone());
-        Ok(Job { slot: i, first, n, tag, submission, mapped, seq, staging: slot.staging.clone() })
+        Ok(Job { slot: i, batch: 0, first, n, tag, submission, mapped, seq, staging: slot.staging.clone() })
     }
 
     /// After an error: wait for the GPU, unmap and free every slot still in flight so the
     /// pipeline stays usable, then wait for the sink to drop the batches it still holds.
     fn abandon(&mut self) {
-        let _ = self.ctx.wait_idle(self.poll_only());
+        if let Err(e) = self.ctx.wait_idle(self.poll_only()) {
+            // The GPU may still use the slots' buffers: free none of them, and refuse new streams.
+            eprintln!("gzc: pipeline ({}) left unusable: {e:#}", self.describe());
+            self.broken = Some(format!("{e:#}"));
+            return;
+        }
         if let Some(x) = &self.xfer {
             x.tq.idle();
             // A batch whose readback was never submitted leaves t_done behind (and one whose second
@@ -1216,8 +1305,27 @@ impl<'a> Pipeline<'a> {
             g.abort = false;
         }
         self.shared.cv.notify_all();
-        self.shared.wait_released();
+        if let Err(e) = self.shared.wait_released(self.ctx.watchdog, &|| self.describe()) {
+            eprintln!("gzc: pipeline ({}) left unusable: {e:#}", self.describe());
+            self.broken = Some(format!("{e:#}"));
+        }
     }
+
+    /// The pipeline's preset and shape, for errors, e.g. `preset opt16, 3458 blocks per batch,
+    /// 3 in flight`.
+    fn describe(&self) -> String {
+        format!(
+            "preset {}, {} blocks per batch, {} in flight",
+            preset_name(&self.cfg.params.matching),
+            self.cfg.batch,
+            self.slots.len()
+        )
+    }
+}
+
+/// `m`'s preset name (`gzc_core::params::PRESETS`), or "custom" when it is none of them.
+fn preset_name(m: &MatchParams) -> &'static str {
+    gzc_core::params::PRESETS.iter().find(|(_, p)| p == m).map_or("custom", |(n, _)| n)
 }
 
 /// The completion thread of a stream: waits for each batch in submission order, adds its
@@ -1245,6 +1353,13 @@ struct Completion<'c> {
     poll_only: bool,
     /// Test hook: the delivery after this many more fails (then the hook clears).
     fail_after: Option<u32>,
+    /// How long a batch's wait may take (`GpuContext::watchdog`).
+    watchdog: Option<Duration>,
+    /// The pipeline's `describe`, for the watchdog's error.
+    desc: String,
+    /// Test hook (`Pipeline::stall_deliveries_after`).
+    #[cfg(test)]
+    stall_after: Option<u32>,
 }
 
 /// The completion thread's share of `PipelineStats::transfer_ms` (GPU ticks, host seconds).
@@ -1307,31 +1422,48 @@ impl Completion<'_> {
                 break;
             }
             let t = Instant::now();
-            // The staging map's result, when the wait already took it.
+            #[cfg(test)]
+            let stall = self.stall_now().then(mpsc::channel::<Result<(), wgpu::BufferAsyncError>>);
+            let what = || {
+                format!(
+                    "batch {} (slot {}, {} blocks) to complete; slots: {}; {}",
+                    job.batch,
+                    job.slot,
+                    job.n,
+                    self.shared.describe(),
+                    self.desc
+                )
+            };
+            // The staging map's result (wgpu staging).
             let mut mapped = None;
             match (&self.xfer, &job.mapped) {
                 (Some((tq, t_done)), _) => {
-                    tq.wait(t_done, job.seq)?;
+                    if !tq.wait_timeout(t_done, job.seq, self.watchdog)? {
+                        return Err(watchdog_error(&what(), t.elapsed()));
+                    }
                     // Deliver the upload buffers' map callbacks of completed submissions.
                     self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
                 }
-                (None, Some(rx)) if self.poll_only => {
-                    // The map completes with the submission (the staging buffer's last use).
-                    mapped = Some(loop {
-                        self.ctx.device.poll(wgpu::PollType::Poll).context("device poll")?;
-                        match rx.recv_timeout(std::time::Duration::from_micros(200)) {
-                            Ok(r) => break r,
-                            // The producer failed: deliver nothing more, as above.
-                            Err(mpsc::RecvTimeoutError::Timeout) if self.shared.aborted() => return Ok(()),
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("staging map callback dropped"),
-                        }
-                    });
+                (None, Some(rx)) => {
+                    #[cfg(test)]
+                    let rx = stall.as_ref().map_or(rx, |(_, never)| never);
+                    // The map completes with the submission (the staging buffer's last use). With
+                    // `poll_only` the wait polls until it is in; it stops early once the producer
+                    // failed (deliver nothing more, as above).
+                    let aborted = || self.shared.aborted();
+                    match self.ctx.wait_callback_until(
+                        rx,
+                        Some(job.submission.clone()),
+                        self.poll_only,
+                        self.watchdog,
+                        &what,
+                        &aborted,
+                    )? {
+                        Some(r) => mapped = Some(r),
+                        None => return Ok(()),
+                    }
                 }
-                (None, _) => {
-                    let wait = wgpu::PollType::Wait { submission_index: Some(job.submission.clone()), timeout: None };
-                    self.ctx.device.poll(wait).context("device poll")?;
-                }
+                (None, None) => anyhow::bail!("wgpu staging without a map request"),
             }
             let done = Instant::now();
             prof.wait += (done - t).as_secs_f64();
@@ -1355,19 +1487,11 @@ impl Completion<'_> {
     }
 
     /// Lends out `job`'s staging bytes (its batch completed); `mapped`: the staging map's result
-    /// if the wait already received it.
+    /// (wgpu staging; the wait received it).
     fn lease(&self, job: &Job, mapped: Option<Result<(), wgpu::BufferAsyncError>>) -> anyhow::Result<Lease> {
         let (view, ptr, len) = match &*job.staging {
             Staging::Wgpu(staging) => {
-                let r = match mapped {
-                    Some(r) => r,
-                    None => {
-                        let rx = job.mapped.as_ref().context("wgpu staging without a map request")?;
-                        // The submission completed, so its map callback has run or is running
-                        // (on whichever thread polled: the producer polls too).
-                        rx.recv().context("staging map callback dropped")?
-                    }
-                };
+                let r = mapped.context("wgpu staging without a map result")?;
                 r.context("map staging buffer")?;
                 let view = staging.get_mapped_range(..).map_err(|e| anyhow!("mapped range: {e}"))?;
                 let (ptr, len) = (view.as_ptr(), view.len());
@@ -1382,6 +1506,22 @@ impl Completion<'_> {
         };
         self.shared.set(job.slot, SlotState::Leased);
         Ok(Lease { shared: self.shared.clone(), slot: job.slot, staging: job.staging.clone(), view, ptr, len })
+    }
+
+    /// Test hook: whether this delivery's wait stalls (`Pipeline::stall_deliveries_after`).
+    #[cfg(test)]
+    fn stall_now(&mut self) -> bool {
+        match &mut self.stall_after {
+            Some(0) => {
+                self.stall_after = None;
+                true
+            }
+            Some(k) => {
+                *k -= 1;
+                false
+            }
+            None => false,
+        }
     }
 
     fn add_timestamps(&self, view: &[u8], prof: &mut CompletionProfile) {
@@ -1443,8 +1583,11 @@ impl<'p, 'a> FrameStream<'p, 'a> {
     pub fn next_upload_slot(&mut self) -> anyhow::Result<UploadSlot<'_, 'p, 'a>> {
         let i = self.next_slot;
         let t = Instant::now();
-        self.pipe.shared.wait_free(i)?;
+        let batch = self.batches;
+        let desc = self.pipe.describe();
         let ctx = self.pipe.ctx;
+        let watchdog = ctx.watchdog.map(|d| d + SLOT_WAIT_GRACE);
+        self.pipe.shared.wait_free(i, watchdog, &|| format!("batch {batch}; {desc}"))?;
         let poll_only = self.pipe.poll_only();
         let slot = &mut self.pipe.slots[i];
         slot.staging_requested = false;
@@ -1462,9 +1605,15 @@ impl<'p, 'a> FrameStream<'p, 'a> {
             // Metal (`poll_only`) the wait polls without blocking, as the completion thread does:
             // a `PollType::Wait` here would run beside the completion thread's polls and, with a
             // shared context, other threads' submits.
-            let r = ctx
-                .wait_callback(&rx, slot.upload_submission.clone(), poll_only)
-                .context("waiting for the upload buffer's map")?;
+            let what = || format!("slot {i}'s upload buffer map for batch {batch}; {desc}");
+            let r = match ctx.wait_callback(&rx, slot.upload_submission.clone(), poll_only, &what) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Still pending: the next call waits for it again.
+                    slot.upload_mapped = Some(rx);
+                    return Err(e.context("waiting for the upload buffer's map"));
+                }
+            };
             if r.is_err() {
                 slot.upload_unmapped = true;
             }
@@ -1494,7 +1643,7 @@ impl<'p, 'a> FrameStream<'p, 'a> {
     fn submit(&mut self, i: usize, n: u32, tag: u64) -> anyhow::Result<()> {
         let t = Instant::now();
         let job = match self.pipe.submit(i, self.next_index, n, tag) {
-            Ok(job) => job,
+            Ok(job) => Job { batch: self.batches, ..job },
             Err(e) => {
                 self.pipe.shared.abort();
                 self.submit_error.get_or_insert_with(|| format!("{e:#}"));
@@ -2920,5 +3069,75 @@ mod tests {
             let used = sink.threads.lock().unwrap().len();
             assert!(if threads == 1 { used == 1 } else { used > 1 }, "threads {threads}: {used} delivery threads");
         }
+    }
+
+    /// A completion that never arrives (the test hook's wait on a callback nobody fires, as on the
+    /// M4 Pro's opt16 hang) ends the stream with the watchdog's error, naming the wait, the slot
+    /// states, the batch and the preset, both with `PollType::Wait` and with Metal's poll-only
+    /// waits; the pipeline then runs the next stream right.
+    #[test]
+    fn watchdog_ends_a_stalled_stream() {
+        let _gpu = crate::test_support::gpu_test_slot();
+        let distinct = distinct_blocks();
+        let blocks: Vec<&[u8]> = (0..120).map(|i| distinct[i % distinct.len()].as_slice()).collect();
+        let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
+        let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
+        // The hook stalls a wgpu staging map: contexts without the transfer readback.
+        for (name, mut ctx) in mode_contexts().into_iter().filter(|(_, c)| c.transfer.is_none()) {
+            ctx.watchdog = Some(Duration::from_millis(1500));
+            for poll_only in [false, true] {
+                let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 16, inflight: 3, params }).unwrap();
+                pipe.poll_only = poll_only;
+                pipe.stall_deliveries_after = Some(2);
+                let t = Instant::now();
+                let mut sink = CollectFrames(vec![None; blocks.len()]);
+                let e = pipe.run_frames(&blocks, &mut sink).expect_err("a stalled wait must end the stream");
+                let msg = format!("{e:#}");
+                eprintln!("{name} poll_only={poll_only}: {msg}");
+                assert!(crate::context::is_watchdog(&e), "{name} poll_only={poll_only}: {msg}");
+                for part in ["batch 2 (slot 2, 16 blocks) to complete", "slots: [0: ", "2: in flight", "preset lvl3", "16 blocks per batch, 3 in flight"] {
+                    assert!(msg.contains(part), "{name} poll_only={poll_only}: no '{part}' in {msg}");
+                }
+                assert!(t.elapsed() < Duration::from_secs(30), "{name} poll_only={poll_only}: took {:?}", t.elapsed());
+                assert!(pipe.stall_deliveries_after.is_none() && pipe.broken.is_none());
+                let mut sink = CollectFrames(vec![None; blocks.len()]);
+                pipe.run_frames(&blocks, &mut sink).unwrap();
+                for (i, got) in sink.0.into_iter().enumerate() {
+                    assert!(got.unwrap() == want[i % distinct.len()], "{name} poll_only={poll_only}: index {i}");
+                }
+            }
+        }
+    }
+
+    /// A slot that never comes free (the sink keeps its batch) ends the slot wait and the stream's
+    /// final wait with the watchdog's error, naming the slots; any state change restarts it.
+    #[test]
+    fn watchdog_ends_slot_waits() {
+        let shared = Shared::new(3);
+        shared.set(0, SlotState::Leased);
+        shared.set(1, SlotState::InFlight);
+        let t = Instant::now();
+        let e = shared.wait_free(0, Some(Duration::from_millis(300)), &|| "batch 7; preset opt16".into()).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(crate::context::is_watchdog(&e), "{msg}");
+        assert!(msg.contains("a free upload slot (slot 0) for batch 7; preset opt16"), "{msg}");
+        assert!(msg.contains("slots: [0: leased, 1: in flight, 2: free]"), "{msg}");
+        assert!(t.elapsed() >= Duration::from_millis(300) && t.elapsed() < Duration::from_secs(5));
+        let e = shared.wait_released(Some(Duration::from_millis(100)), &|| "preset opt16".into()).unwrap_err();
+        assert!(crate::context::is_watchdog(&e) && format!("{e:#}").contains("release its batches"), "{e:#}");
+        // Progress (slot 1 changing state every 100 ms) keeps a 300 ms watchdog from firing
+        // until it stops; slot 0 comes free at the end.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for k in 0..8 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    shared.set(1, if k % 2 == 0 { SlotState::Free } else { SlotState::InFlight });
+                }
+                shared.set(0, SlotState::Free);
+            });
+            shared.wait_free(0, Some(Duration::from_millis(300)), &|| "batch 8".into()).unwrap();
+        });
+        // No watchdog: never errors (here the slot is free).
+        shared.wait_free(0, None, &String::new).unwrap();
     }
 }
