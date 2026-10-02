@@ -34,7 +34,7 @@ pub const DEFAULT_SG_GROUPS: u32 = 128;
 
 /// Predecessor bits of a K1 pred word (see `pred_fp`); `PRED_NONE` there means none.
 pub const PRED_POS: u32 = 0x1_FFFF;
-const _: () = assert!(LOG2_BLOCK <= 17);
+const _: () = assert!(LOG2_BLOCK == 16);
 
 /// The predecessor a K1 pred word holds (`NO_POS` for none), without its fingerprint.
 pub fn pred_of_word(w: u32) -> u32 {

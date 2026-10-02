@@ -76,7 +76,7 @@ fn match_len(base: u32, p: u32, q: u32, cap: u32) -> u32 {
 const PRED_POS: u32 = 0x1FFFFu;
 const PRED_NONE: u32 = 0x1FFFFu;
 const PRED_FP_LO: u32 = 0x7Fu << 17u;
-const_assert LOG2_BLOCK <= 17u;
+const_assert LOG2_BLOCK == 16u;
 fn pred_fp(lo: u32, hi: u32) -> u32 {
     return (((lo * 0x85EBCA6Bu) >> 25u) << 17u) | ((hi & 0xFFu) << 24u);
 }

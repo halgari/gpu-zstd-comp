@@ -26,7 +26,7 @@ Each of these produces standard zstd. Every frame was decoded with libzstd, and 
 - the drop pass;
 - top-4 pruning.
 
-It scores 1.37235 (+0.098 %) with no change to the frame writer.
+It scores 1.37229 (+0.094 %) with no change to the frame writer (1.37235 without top-4 pruning).
 
 **Held in reserve:**
 - the frame split, worth +0.14–0.2 % on top;

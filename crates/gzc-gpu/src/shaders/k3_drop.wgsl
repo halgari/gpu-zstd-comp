@@ -121,8 +121,11 @@ fn seq_price(ll: u32, ml: u32, ob: u32) -> i32 {
 
 // Counts the literal bytes at [a, e) of the block at word base `db` whose position is sub mod LPS.
 fn count_lits(db: u32, a: u32, e: u32, sub: u32) {
-    // Terminates: q rises by LPS to e.
-    for (var q = a + (sub + LPS - a % LPS) % LPS; q < e; q += LPS) {
+    // Terminates: q rises by LPS to e, which is clamped to the block so a garbage `ll` (a bug
+    // upstream) cannot turn this into a ~2^30-trip loop. Output-neutral: valid runs end inside
+    // their segment.
+    let e_c = min(e, BLOCK_SIZE);
+    for (var q = a + (sub + LPS - a % LPS) % LPS; q < e_c; q += LPS) {
         atomicAdd(&d_hist[load_byte(db, q)], 1u);
     }
 }

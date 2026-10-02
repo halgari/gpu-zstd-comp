@@ -930,8 +930,8 @@ fn k3opt_passes_corpus() {
 
 /// Informal: GPU time of every pass of opt14, opt16 and opt16p1 (its single final pass and the
 /// drop pass, on its S3 candidates; `GZC_TIMING_PRESETS`, comma-separated names, picks presets),
-/// `GZC_CORPUS_BLOCKS`, default 2900 corpus blocks, one batch; wg16, the default ring;
-/// `GZC_K3OPT_SORT`: heavy-first block order (by opt16's candidates).
+/// `GZC_CORPUS_BLOCKS`, default 2900 corpus blocks, one batch; wg16, the default ring (the
+/// persistent kernel orders blocks heavy-first itself, `k3_sched.wgsl`).
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_passes_timing -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -941,26 +941,9 @@ fn k3opt_passes_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2900);
-    let Some(mut blocks) = corpus_blocks(n) else { return };
+    let Some(blocks) = corpus_blocks(n) else { return };
     let ctx = GpuContext::new().expect("GPU required");
-    let mut cands = cands_of(&blocks);
-    if std::env::var("GZC_K3OPT_SORT").is_ok() {
-        // Heavy-first order (the K3opt performance study's cost proxy): blocks by descending
-        // Σ (min(max(lenA, lenB), 32) - 2) over their candidate words with a match.
-        let cost = |c: &[CandWords]| -> u64 {
-            c.iter()
-                .map(|w| {
-                    let (a, b) = gzc_core::reference::unpack_cands(*w);
-                    (a.len.max(b.len).min(32) as u64).saturating_sub(2)
-                })
-                .sum()
-        };
-        let mut idx: Vec<usize> = (0..blocks.len()).collect();
-        idx.sort_by_key(|&i| std::cmp::Reverse(cost(&cands[i])));
-        blocks = idx.iter().map(|&i| blocks[i].clone()).collect();
-        cands = idx.iter().map(|&i| cands[i].clone()).collect();
-        eprintln!("blocks in heavy-first order");
-    }
+    let cands = cands_of(&blocks);
     let filter = std::env::var("GZC_TIMING_PRESETS").ok();
     let all = [("opt14", OPT14), ("opt16", OPT16), ("opt16p1", OPT16P1)];
     // In GZC_TIMING_PRESETS' order (for A/B runs that alternate the order).

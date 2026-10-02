@@ -20,7 +20,8 @@ no GPU decompression, and blocks never reference each other.
 - **Platforms:** Linux/Vulkan on NVIDIA is the main development platform. macOS/Metal works and
   was benchmarked on an M4 Pro. Windows/Vulkan works but has an open bug (see below).
   Windows/DX12 does not work.
-- **M6 (done):** kernel work made `opt14`/`opt16` 60–80 % faster with the same output
+- **M6 (done):** kernel work made `opt14`/`opt16` 60–80 % faster at `--batch max` (27–31 % at
+  batch 2900) with the same output
   (`docs/results/2026-10-01-m6-trackA.md`), and the new `opt16p1` preset does the level-16 job
   in one parse pass (`docs/results/2026-10-01-m6-opt16p1.md`).
 - **Next steps:** splitting each frame into several zstd blocks (+0.14 % ratio in research) and
@@ -71,8 +72,9 @@ How to read it:
   pass instead of four, over more candidates.
 - **Without subgroups:** `lvl9s12seg` runs at 8,569 MB/s with `GZC_NO_SUBGROUPS=1`, the
   portable kernels every GPU can run.
-- **Small cards:** an RTX 4060 has about 14 % of a 5090's compute. Projections, not
-  measurements, put `opt16` at about 150–215 MB/s and `opt14` at 250–365 MB/s on an RTX 4060.
+- **Small cards:** measured on a GTX 1660 Super before M6: `opt16` 58 MB/s, `opt14` 95 MB/s
+  (see Other hardware). No small card has run the M6 kernels or `opt16p1` yet; a simulated
+  RTX 4060 showed the M6 persistent parse kernel cutting parse time by 36 %.
 
 Ratios with five decimals come from `gzc-bench ref` (the CPU reference, which the GPU matches
 byte for byte); the others are rounded from the run output. Full write-ups:
@@ -84,7 +86,8 @@ byte for byte); the others are rounded from the run output. Full write-ups:
 **Apple M4 Pro** (16-core GPU, 12 CPU cores, 24 GB, macOS 15.1, Metal), on the same corpus.
 Details are in `docs/results/2026-09-30-m4pro.md`.
 
-- **Correctness:** every preset verified.
+- **Correctness:** every pre-M6 preset verified (master before M6; `opt16p1` and the M6
+  kernels have not run on Metal yet).
 - **The GPU loses to the CPU at every level on this machine:**
 
   | GPU preset | GPU MB/s | libzstd level | CPU MB/s, 12 threads |
@@ -112,8 +115,8 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
   - GPU vs CPU-reference differential tests on synthetic and corpus blocks;
   - extra test modes that make shaders behave like Apple and AMD GPUs, fill every buffer with
     garbage before each batch (`GZC_POISON`), and stall threads at random (`GZC_EMULATE_SKEW`).
-- **macOS, M4 Pro, Metal:** the full test suite and a verified full-corpus benchmark of every
-  preset.
+- **macOS, M4 Pro, Metal:** the full test suite and a verified full-corpus benchmark of the ten
+  pre-M6 presets.
 - **Windows, GTX 1660 Super, Vulkan:** build, the test suite (with the failure below), and the
   smoke test.
 - **Linux, AMD Ryzen iGPU, OpenGL backend:** one quick run, before the Metal-era fixes.
@@ -122,6 +125,8 @@ not 10 Gbit; `opt14`/`opt16` are below 1 Gbit. CPU baseline not measured yet.
 
 - **AMD discrete cards** (RDNA 2/3) on Vulkan, Windows or Linux. AMD's Vulkan driver has not
   run this code at all.
+- **`opt16p1` and the M6 kernels on any GPU but the RTX 5090** (Metal, GTX 1660 Super, AMD).
+  Only the emulation test modes cover other GPUs' behaviour.
 - **Intel Arc.**
 - **The common 8 GB NVIDIA cards** (RTX 3060, RTX 4060). Every number for them is a
   projection.
@@ -437,3 +442,6 @@ by `0` only.
 Vulkan. On Metal they are off: readback runs on the main queue and uploads are copied, unless
 `GZC_DIRECT_UPLOAD=1`. That gives correct output at lower speed. DX12 currently gives wrong
 output (see Known problems), so set `WGPU_BACKEND=vulkan` on Windows.
+
+**Library users:** the `block-16k`/`32k`/`64k`/`128k` Cargo features were removed in M6;
+the block size is always 64 KiB. Drop any `features = ["block-…"]` from dependent manifests.
