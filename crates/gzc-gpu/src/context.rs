@@ -179,17 +179,17 @@ impl GpuContext {
     }
 
     /// Opens the device as `opts` says. With `opts.transfer_queue`, no packing, and a Vulkan
-    /// adapter that has a usable transfer-only family (`multiqueue::transfer_family`), the
+    /// adapter that has a usable transfer-only family (`transfer::transfer_family`), the
     /// `VkDevice` is created here with that extra queue (`transfer`); if that fails the context
     /// falls back to wgpu's own device (with a warning), as it does everywhere else.
     pub fn with_gpu_options(opts: GpuOptions) -> anyhow::Result<Self> {
         let p = Prepared::new(opts)?;
         let family =
-            (opts.transfer_queue && !p.pack_frames).then(|| crate::multiqueue::transfer_family(&p.adapter)).flatten();
+            (opts.transfer_queue && !p.pack_frames).then(|| crate::transfer::transfer_family(&p.adapter)).flatten();
         if let Some(family) = family {
             let with_transfer = || -> anyhow::Result<Self> {
-                let rd = crate::multiqueue::RawDevice::new(&p, &[(family, 0)])?;
-                let mut ctx = rd.context(&p, 0, 0)?;
+                let rd = crate::transfer::RawDevice::new(&p, family)?;
+                let mut ctx = rd.context(&p)?;
                 let tq = crate::transfer::TransferQueue::new(rd.owner.clone(), family, rd.memory);
                 ctx.transfer = Some(std::sync::Arc::new(tq));
                 Ok(ctx)
@@ -206,7 +206,7 @@ impl GpuContext {
 }
 
 /// The adapter and the device features/limits `GpuContext::with_options` settles on, before a
-/// device exists (shared with `multiqueue`, which creates the device itself).
+/// device exists (shared with `transfer::RawDevice`, which creates the device itself).
 pub(crate) struct Prepared {
     pub adapter: wgpu::Adapter,
     pub info: wgpu::AdapterInfo,

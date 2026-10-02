@@ -9,7 +9,6 @@ pub mod sizing;
 pub mod k3opt;
 pub mod pipeline;
 pub mod poison;
-pub mod multiqueue;
 pub mod transfer;
 #[doc(hidden)]
 pub mod test_support;
