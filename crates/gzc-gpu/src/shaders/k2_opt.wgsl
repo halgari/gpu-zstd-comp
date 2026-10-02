@@ -1,10 +1,10 @@
-// K2opt: the optimal parse's two candidate records per position (== gzc_core::reference::find_cands,
-// m5-opt-design §2.1). Appended to k2_best.wgsl (whose bindings, `funnel` and `match_len_capped` it
-// uses); entry point main_opt, built only for Opt3 params (K1 wrote pred[b*PRED_PER_BLOCK ..] =
-// the h4 chain, with pred_fp fingerprints, pred[b*PRED_PER_BLOCK + BLOCK_SIZE ..] = the h3 chain,
-// with pred_fp3 fingerprints, and with M6 sparse long chains (N_SPARSE > 0, `chains::layout_wgsl`)
-// chain k compactly at pred[b*PRED_PER_BLOCK + SP_OFF{k} + p / SP_S{k}], with pred_fp
-// fingerprints).
+// K2opt: the optimal parse's two candidate records per position (==
+// gzc_core::reference::find_cands). Appended to k2_best.wgsl (whose bindings, `funnel` and
+// `match_len_capped` it uses); entry point main_opt, built only for Opt3 params. K1 wrote:
+// - pred[b*PRED_PER_BLOCK ..]: the h4 chain, with pred_fp fingerprints;
+// - pred[b*PRED_PER_BLOCK + BLOCK_SIZE ..]: the h3 chain, with pred_fp3 fingerprints;
+// - with sparse long chains (N_SPARSE > 0, `chains::layout_wgsl`): chain k compactly at
+//   pred[b*PRED_PER_BLOCK + SP_OFF{k} + p / SP_S{k}], with pred_fp fingerprints.
 // Dispatch (BLOCK_SIZE / 256, n_blocks, 1): one thread per (position, block). Output (the `best`
 // binding, 2 words per position): best[2*(b*BLOCK_SIZE + p) ..] = (offA | lenA << 16 | lenB << 24,
 // offB | DEAD_BIT at a dead position, below): all zero without a record or for p >= PARSE_END,
@@ -13,17 +13,17 @@
 // The walk: the h4 chain DEPTH deep and the h3 chain H3_DEPTH deep, plus each sparse long chain k
 // SP_D{k} deep when p is on its slots (p % SP_S{k} == 0; its head at p is PRED_NONE past its hashed
 // slots), merged nearest first (the largest live head; a position on several chains is visited
-// once and advances all of them). A visited q
-// with capped length c (match_len_capped, cap SEARCH_CAP) is a record when c > best (best starts
-// at 2); A = the first record, B = the last. The walk stops at a record with c == max.
+// once and advances all of them). A visited q with capped length c (match_len_capped, cap
+// SEARCH_CAP) is a record when c > best (best starts at 2); A = the first record, B = the last.
+// The walk stops at a record with c == max.
 // Fingerprint skips, byte-identical: a q is compared only if an upper bound on its length, taken
 // from the fingerprints in the pred words of q the walk loads anyway, exceeds best (otherwise c <=
 // best and q is no record). Bounds (both valid for any bytes, so a q on both chains takes the
 // smaller):
 // - h4 word (pred_fp: 7-bit hash of bytes 0..4, byte 4): hash field differs -> the first 4 bytes
-//   differ -> c <= 2; byte field differs -> c <= 4. The c <= 2 is where the spec's fingerprint
-//   caveat applies (an h4-chain entry whose first 4 bytes differ may still share 3 bytes, unless
-//   the first 3 bytes differ as well), and they always do here: q is on p's h4 chain, so
+//   differ -> c <= 2; byte field differs -> c <= 4. The c <= 2 needs the first 3 bytes to differ
+//   too (an entry whose first 4 bytes differ may still share 3), and they always do here: q is
+//   on p's h4 chain, so
 //   hash_width(q, 4) == hash_width(p, 4) (all 16 bits, hash_bits is 16 for opt), and that hash,
 //   mix(lo, 0) = (lo * 0x9E3779B1 * 0xC2B2AE3D) >> 16, is injective in byte 3 for fixed bytes
 //   0..3: byte 3 enters lo * K (K odd) only as (byte3 * K) << 24, a bijection of the top 8 bits,
@@ -35,9 +35,19 @@
 //   long chain): hash field differs -> c <= 3; byte field differs -> c <= 4.
 // A skipped q still counts toward its chain's depth, and never has c == max (>= 8), so the walk
 // and its early stop are unchanged.
-// Indices: pred words hold positions < HASHED_POSITIONS or PRED_NONE (K1's output, run before
-// this in the same submission), so pred[pb + q] and the byte loads stay in the block.
-// Dead positions (M6 A3, reference::find_cands): p is dead when the walk found no record and its
+//
+// Built without naga's loop bounding and index clamps (GpuContext::shader_trusted). `pred` must
+// be K1's output for the same blocks and params, written before this in the same submission.
+// Terminates: every iteration of the merged walk spends one step of at least one live chain, so
+//   it runs at most DEPTH + H3_DEPTH + SP_D0 + SP_D1 + SP_D2 times. match_len_capped is bounded
+//   by SEARCH_CAP.
+// Bounds: the kernel has no local or workgroup arrays. A pred word holds PRED_NONE or a position
+//   below HASHED_POSITIONS (on a sparse chain: a slot position below reference::SPARSE_END), so
+//   pred[pb + q], pred[pb + q / SP_S{k}] and the byte loads at q stay in the block. best[o] and
+//   best[o + 1] belong to the dispatch's own (block, position): the remap of p below is a
+//   bijection of each group's 256 positions.
+//
+// Dead positions (reference::find_cands): p is dead when the walk found no record and its
 // h3 head reached PRED_NONE (the whole h3 chain visited). Every visited q then had c <= 2 (a
 // fingerprint skip only drops a q with c <= 2 <= best), and every earlier position with p's
 // first 3 bytes has p's hash3 key, so it is on p's h3 chain: there is none. Its second word gets

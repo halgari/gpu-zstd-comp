@@ -2,8 +2,8 @@
 
 A zstd compressor that runs on the GPU. It is written in Rust, with compute shaders in WGSL, on
 top of wgpu, which runs on Vulkan and Metal. The input is cut into independent 64 KiB blocks, and
-the GPU turns each block into one standard zstd frame. Every frame decodes with stock libzstd; no
-custom decoder is needed.
+the GPU turns each block into one standard zstd frame. A file's shorter last block gets a frame
+of its real length. Every frame decodes with stock libzstd; no custom decoder is needed.
 
 It was built to recompress Skyrim mod data, mostly DDS textures with some NIF meshes, while it
 downloads. The goal is to keep up with a 1–10 Gbit/s connection on a normal gaming PC and still
@@ -53,7 +53,7 @@ At matching compression ratios, the GPU presets compare with libzstd on a Ryzen 
 
 - **Level 9 ratio:** `lvl9s12seg` on an RTX 5090 runs 6× faster than libzstd on all 32 threads,
   and 14× faster than 8 threads.
-- **Level 16 ratio:** `opt16p1` beats libzstd level 16's ratio (1.37229 against 1.37100). It runs
+- **Level 16 ratio:** `opt16p1` beats libzstd level 16's ratio (1.37232 against 1.37100). It runs
   6.8× faster than 32 threads and 18× faster than 8.
 - **On a GTX 1660 Super**, a common budget card, `opt16p1` still clears 1 Gbit/s at level-16
   ratio.
@@ -121,12 +121,11 @@ matches it byte for byte.
 | Preset | Ratio | Comparable to | Notes |
 |---|---:|---|---|
 | `lvl3` | 1.264 | zstd level 3 | greedy parse |
-| `rung1`, `rung2` | 1.330, 1.337 | zstd level 5–6 | greedy and lazy |
-| `lvl9`, `lvl9seg`, `lvl9s12`, `lvl9s12seg` | 1.3393 | zstd level 9 (1.3379) | `lvl9s12seg` is the fastest |
-| `lvl9s12d16seg` | 1.3386 | zstd level 9 | half the candidate depth |
-| `opt14` | 1.37064 | zstd level 14 (1.36827) | optimal parse, 2 passes |
-| `opt16` | 1.37144 | zstd level 16 (1.37100) | optimal parse, 4 passes |
-| `opt16p1` | 1.37229 | zstd level 16 (1.37100) | optimal parse, 1 pass; faster than `opt16` |
+| `lvl9seg` | 1.33934 | zstd level 9 (1.33786) | lazy parse over hash chains; the faster level-9 preset on Apple GPUs |
+| `lvl9s12seg` | 1.33929 | zstd level 9 (1.33786) | lazy parse over the sorted finder; the fastest level-9 preset elsewhere |
+| `opt14` | 1.37067 | zstd level 14 (1.36827) | optimal parse, 2 passes |
+| `opt16` | 1.37148 | zstd level 16 (1.37100) | optimal parse, 4 passes |
+| `opt16p1` | 1.37232 | zstd level 16 (1.37100) | optimal parse, 1 pass; faster than `opt16` |
 
 ## Status
 
@@ -165,17 +164,42 @@ cargo run --release -p gzc-bench -- gpu --input <dir> --ext dds,nif \
 cargo run --release -p gzc-bench -- cpu --input <dir> --levels 9,16 --threads 8
 ```
 
+## Library use
+
+The `gzc-gpu` crate is the library. Compressing a buffer takes five lines:
+
+```rust
+use gzc_gpu::{Compressor, Level};
+
+let compressor = Compressor::new(Level::Zstd16)?;
+let frames = compressor.compress(&data)?; // one zstd frame per 64 KiB block
+std::fs::write("out.zst", frames.as_bytes())?; // or frames.frame(i) for block i
+```
+
+- `Level::Zstd3`, `Zstd9`, `Zstd14` and `Zstd16` stand for the presets `lvl3`, `lvl9s12seg`,
+  `opt14` and `opt16p1`. The output for a level is the same on every GPU.
+- `compress_blocks` takes blocks that are already split; any of them may be shorter than 64 KiB.
+- `stream` compresses while data arrives: the caller writes straight into GPU upload memory and
+  gets finished batches of frames back, with no copy in between. `compress` holds all its
+  output in memory; use `stream` for large inputs.
+- `CompressorOptions` sets the GPU memory budget (6144 MiB by default, sized for an 8 GB card).
+- Errors are typed: no adapter, unsupported parameters, out of memory, device lost, bad input.
+
+Build one `Compressor` and reuse it. `cargo doc --no-deps -p gzc-gpu --open` has the full API.
+
 `docs/reference.md` covers the rest:
 - the full benchmark CLI;
 - the corpus download tool (it needs a Nexus Mods API key);
-- the streaming API for embedding the compressor in another program;
+- the library API, including streaming;
 - the tuning and test environment switches.
 
 ## Layout
 
 - `crates/gzc-core`: the CPU reference encoder, the frame writer, hashing, and the test data.
-- `crates/gzc-gpu`: the WGSL kernels and the GPU pipeline.
+- `crates/gzc-gpu`: the library: `Compressor`, the WGSL kernels and the GPU pipeline.
 - `crates/gzc-bench`: the benchmark CLI.
 - `tools/fetch-corpus`: downloads the test corpus.
+- `docs/reference.md`: the reference for the CLI, the library and the environment variables.
 - `docs/results/`: measured results per machine.
-- `docs/superpowers/`: design notes and research.
+- `docs/design/`: specs, plans and research notes, kept as written at the time.
+- `docs/README.md`: an index of the above.

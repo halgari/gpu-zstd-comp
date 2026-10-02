@@ -1,4 +1,4 @@
-// K1, bucket-sorted candidates (speed2 E2, option C; == gzc_core::hash::bucket_sort): per block,
+// K1, bucket-sorted candidates (== gzc_core::hash::bucket_sort): per block,
 // every hashed position p < HASHED_POSITIONS ordered by key (hash_width(p, MIN_MATCH) >> KEY_SHIFT,
 // KEY_BITS bits), ascending inside a key; slot s of block b holds the pred-style word
 // q | pred_fp(q) at sorted[b*BLOCK_SIZE + s] (slots HASHED_POSITIONS.. are not written). K2 walks
@@ -128,7 +128,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
 // Scatter (second dispatch of the K1 pass, (BLOCK_SIZE / 256, n_blocks) like K2, so only a few
 // blocks' output regions are live at a time and the L2 merges the scattered 4-byte writes;
-// scattering from `main` with ~1000 blocks in flight was DRAM-bound): rankw[p] holds p's
+// scattering from `main` with ~1000 blocks in flight is DRAM-bound): rankw[p] holds p's
 // slot | pred_fp(p) from `main`; sorted[slot] = p | pred_fp(p).
 @compute @workgroup_size(256)
 fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {

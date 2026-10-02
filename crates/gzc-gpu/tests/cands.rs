@@ -1,14 +1,14 @@
 //! K1 (Opt3 chains) + K2opt differential test: the GPU candidate words must equal
 //! `gzc_core::reference::find_cands` word for word. Every check runs with the subgroup K1 (when the
-//! adapter has subgroups) and the fallback K1 (`GpuContext::with_subgroups(false)`).
+//! adapter has subgroups) and the fallback K1 (`GpuOptions::subgroups` off).
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::hash::hash_width;
 use gzc_core::params::{SparseChain, MatchParams, OPT14, OPT16, OPT16P1, OptParams};
 use gzc_core::reference::{CandWords, chains, find_cands, unpack_cands};
 use gzc_core::synth::test_cases;
-use gzc_gpu::compressor::{OptCandKernel, cands_from_blocks};
-use gzc_gpu::context::GpuContext;
+use gzc_gpu::testing::{OptCandKernel, cands_from_blocks};
+use gzc_gpu::GpuContext;
 
 struct Rng(u64);
 impl Rng {
@@ -38,10 +38,10 @@ fn all_blocks() -> Vec<(String, Vec<u8>)> {
     out
 }
 
-fn contexts() -> Vec<GpuContext> {
-    let sg = GpuContext::new().expect("GPU required for gzc-gpu tests");
-    let fallback = GpuContext::with_subgroups(false).expect("GPU required for gzc-gpu tests");
-    if !sg.subgroups {
+fn contexts() -> Vec<std::sync::Arc<GpuContext>> {
+    let sg = gzc_gpu::testing::gpu();
+    let fallback = gzc_gpu::testing::gpu_with(gzc_gpu::GpuOptions { subgroups: false, ..gzc_gpu::GpuOptions::from_env() });
+    if !sg.subgroups() {
         eprintln!("adapter without subgroups (or GZC_NO_SUBGROUPS set): only the fallback K1 is tested");
     }
     vec![sg, fallback]
@@ -55,7 +55,7 @@ fn first_diff(got: &[CandWords], want: &[CandWords]) -> Option<String> {
 fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
     let kernel = OptCandKernel::new(ctx, params).expect("OptCandKernel::new");
     // The subgroup K1 passes its self-test (built for these chains) wherever it may run.
-    assert_eq!(kernel.uses_subgroups(), gzc_gpu::chains::ChainsKernel::subgroup_kernel_possible(ctx), "{params:?}");
+    assert_eq!(kernel.uses_subgroups(), gzc_gpu::testing::chains::ChainsKernel::subgroup_kernel_possible(ctx), "{params:?}");
     let refs: Vec<&[u8]> = blocks.iter().map(|(_, b)| b.as_slice()).collect();
     let got = cands_from_blocks(ctx, &kernel, &refs).expect("cands_from_blocks");
     assert_eq!(got.len(), blocks.len());
@@ -69,7 +69,7 @@ fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
 
 /// K2opt's h4 fingerprint skip (k2_opt.wgsl header): the 16-bit 4-byte hash is injective in
 /// byte 3 for fixed bytes 0..3, so an h4-chain entry whose first 4 bytes differ from p's shares
-/// fewer than 3 bytes with it (the spec's fingerprint caveat never applies). Exhaustive over byte 3
+/// fewer than 3 bytes with it (`find_cands`' fingerprint caveat never applies). Exhaustive over byte 3
 /// for random prefixes.
 #[test]
 fn h4_hash_is_injective_in_byte_3() {
@@ -87,7 +87,7 @@ fn h4_hash_is_injective_in_byte_3() {
 
 #[test]
 fn gpu_cands_match_cpu_opt16() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT16);
@@ -98,7 +98,7 @@ fn gpu_cands_match_cpu_opt16() {
 /// opt14 has the same candidates; other depths of the h4 walk (1: h3-dominated, 64: the maximum).
 #[test]
 fn gpu_cands_match_cpu_other_depths() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks = all_blocks();
     for ctx in contexts() {
         check(&ctx, &blocks, &OPT14);
@@ -108,12 +108,12 @@ fn gpu_cands_match_cpu_other_depths() {
     }
 }
 
-/// M6 `opt16p1` (S3 candidates): h4 depth 8, h3 depth 4 and the 6-, 10- and 12-byte sparse
+/// `opt16p1`'s candidates: h4 depth 8, h3 depth 4 and the 6-, 10- and 12-byte sparse
 /// chains on every 4th position, 16 deep, in one merged walk; and other long chain shapes (
 /// one, two or three chains, stride 8, depths 1 and 64, widths 5 to 12) and h4 depths.
 #[test]
 fn gpu_cands_match_cpu_opt16p1() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let lc = |width, stride, depth| Some(SparseChain { width, stride, depth });
     let with = |depth, sparse_chains| MatchParams {
         depth,
@@ -133,8 +133,8 @@ fn gpu_cands_match_cpu_opt16p1() {
 /// K1 builds sparse chains of word-aligned slots only (stride 4 or 8).
 #[test]
 fn opt_cand_kernel_rejects_unaligned_long_chains() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().unwrap();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
     let o = OPT16P1.opt.unwrap();
     let m = MatchParams { opt: Some(OptParams { sparse_chains: [Some(SparseChain { width: 10, stride: 2, depth: 16 }), None, None], ..o }), ..OPT16P1 };
     assert!(m.validate().is_ok());
@@ -143,9 +143,9 @@ fn opt_cand_kernel_rejects_unaligned_long_chains() {
 
 #[test]
 fn opt_cand_kernel_rejects_non_opt_params() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let ctx = GpuContext::new().unwrap();
-    assert!(OptCandKernel::new(&ctx, &gzc_core::params::LVL9).is_err());
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = gzc_gpu::testing::gpu();
+    assert!(OptCandKernel::new(&ctx, &gzc_core::fixtures::LVL9).is_err());
 }
 
 /// Informal (reads the real corpus): K1 + K2opt against `find_cands` on real .dds/.nif blocks.
@@ -157,58 +157,14 @@ fn opt_cand_kernel_rejects_non_opt_params() {
 #[test]
 #[ignore]
 fn corpus_cands_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    use std::path::{Path, PathBuf};
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if matches!(ext.as_str(), "dds" | "nif") {
-                out.push(p);
-            }
-        }
-    }
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
-    if !Path::new(&root).is_dir() {
-        eprintln!("corpus directory {root} not found (set GZC_CORPUS): skipping");
-        return;
-    }
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let want_blocks: usize = std::env::var("GZC_CORPUS_BLOCKS").map(|v| v.parse().unwrap()).unwrap_or(4000);
-    let mut files = Vec::new();
-    walk(Path::new(&root), &mut files);
-    files.sort();
-    // Blocks per file (chunk_file: ceil(len / BLOCK_SIZE)), from the file sizes.
-    let counts: Vec<usize> =
-        files.iter().map(|f| (std::fs::metadata(f).unwrap().len() as usize).div_ceil(BLOCK_SIZE)).collect();
-    let total: usize = counts.iter().sum();
-    let step = (total / want_blocks.max(1)).max(1);
-    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut first = 0usize; // global index of the file's first block
-    for (f, &n) in files.iter().zip(&counts) {
-        if blocks.len() >= want_blocks {
-            break;
-        }
-        // The file's blocks whose global index first + i is a multiple of step.
-        let picked: Vec<usize> = (first.div_ceil(step) * step..first + n).step_by(step).map(|g| g - first).collect();
-        if !picked.is_empty() {
-            let chunks = chunk_file(&std::fs::read(f).unwrap());
-            assert_eq!(chunks.len(), n, "{}", f.display());
-            for i in picked {
-                blocks.push((format!("{}[{i}]", f.display()), chunks[i].data.clone()));
-            }
-        }
-        first += n;
-    }
-    blocks.truncate(want_blocks);
-    eprintln!("{} blocks (every {step}th of {total}) from {} files", blocks.len(), files.len());
+    let Some(blocks) = gzc_core::testdata::corpus_sample_named(want_blocks) else { return };
     let names = std::env::var("GZC_CANDS_PRESET").unwrap_or_else(|_| "opt16,opt16p1".to_string());
-    let ctx = GpuContext::new().expect("GPU required");
+    let ctx = gzc_gpu::testing::gpu();
     for name in names.split(',') {
         let params = gzc_core::params::preset(name).unwrap();
-        eprintln!("{name}, subgroups: {}", ctx.subgroups);
+        eprintln!("{name}, subgroups: {}", ctx.subgroups());
         for chunk in blocks.chunks(500) {
             check(&ctx, chunk, &params);
         }

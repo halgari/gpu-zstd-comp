@@ -1,8 +1,8 @@
-// K3opt's block schedule (M6 A4, a07): the persistent K3opt passes (k3_opt.wgsl main_opt_persist)
-// take their blocks heaviest first. Recorded once per batch, after K2opt and before the first pass,
+// K3opt's block schedule: the persistent K3opt passes (k3_opt.wgsl main_opt_persist) take their
+// blocks heaviest first. Recorded once per batch, after K2opt and before the first pass,
 // on the candidate words K2opt left in `best` (no pass reads the schedule's words but K3opt).
 //
-// `sched` (k3opt::sched_bytes, bound to exactly SCHED_HDR + 3 n words for an n-block batch):
+// `sched` (sizing::sched_bytes, bound to exactly SCHED_HDR + 3 n words for an n-block batch):
 //   [0]                       the pass's block counter (cleared before every persistent pass);
 //   [1 .. SCHED_HDR)          unused;
 //   [SCHED_HDR + b]           block b's weight (main_weight);
@@ -10,12 +10,13 @@
 //                             equal weights by ascending block id;
 //   [SCHED_HDR + 2 n + b]     block b's place in that order (main_rank).
 //
-// Weight (a07's cost proxy, Spearman 0.925 against the block's K3opt time): the block's positions
+// Weight (a cost proxy: Spearman 0.925 against the block's K3opt time): the block's positions
 // whose longest candidate (max(lenA, lenB)) is 3..32. Longer matches are encoded at once and are
 // cheap; dead and match-free positions have lenA = lenB = 0. Only runs of WEIGHT_RUN positions,
 // one every WEIGHT_STRIDE positions, are read (see k3opt::WEIGHT_STRIDE: a full scan of the
-// candidate words cost about 1.4 % of opt16's K3 time). The order only steers timing: the passes' output is the same for any order (blocks are
-// independent), and the order itself is deterministic.
+// candidate words costs about 1.4 % of opt16's K3 time). The order only steers timing: the
+// passes' output is the same for any order (blocks are independent), and the order itself is
+// deterministic.
 //
 // Dispatches, in order (one compute pass): main_weight (n, 1, 1), main_rank (ceil(n / 256),
 // ceil(n / 256), 1), main_scatter (ceil(n / 256), 1, 1).

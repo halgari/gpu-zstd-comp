@@ -52,6 +52,7 @@ fn hash3(base: u32, p: u32) -> u32 { return ((load_u32_at(base, p) << 8u) * 5068
 // == match_len_capped with cap = SEARCH_CAP. Compares 4 bytes at a time only while
 // n + 4 <= max, so every load_u32_at stays inside the block (q + n + 4 <= p + n + 4
 // <= BLOCK_SIZE); the tail is compared byte by byte.
+// Terminates: callers pass p < BLOCK_SIZE, so max <= BLOCK_SIZE; n rises by 4, then by 1, to max.
 fn match_len(base: u32, p: u32, q: u32, cap: u32) -> u32 {
     let max = min(BLOCK_SIZE - p, cap);
     var n = 0u;

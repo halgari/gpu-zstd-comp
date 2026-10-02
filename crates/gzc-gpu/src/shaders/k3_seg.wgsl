@@ -2,7 +2,7 @@
 // == gzc_core::lazy::lazy_parse_segmented. Two entry points, dispatched back to back in K3's pass:
 //
 // main_seg (one invocation per segment of SEG = 1 << SEG_LOG2 bytes, NSEG per block): the
-//   sequential lazy parse of k3_lazy.wgsl (== lazy::lazy_core) over one lazy::Seg::segment:
+//   sequential lazy parse (== lazy::lazy_core) over one lazy::Seg::segment:
 //   segment 0 starts at ip 1 with INITIAL_REPS, segment k > 0 at ip = anchor = k*SEG with all-zero
 //   reps; matches are clamped to the segment end `lim` (best[] matches past it are cut, and
 //   dropped below MIN_MATCH); the loop runs while ip < pend (lim - 4, PARSE_END for the last
@@ -20,6 +20,19 @@
 //
 // No subgroup operations: this is also the no-subgroup path for the preset. Consts injected by
 // the host: MIN_MATCH, SEARCH_CAP, LAZY, BEST_OFF_BITS, MAX_SEQS, SEG_LOG2.
+//
+// Built without naga's loop bounding (GpuContext::shader_unbounded_loops; bounds checks stay on).
+// Terminates, whatever best[] holds:
+// - main_seg's parse loop raises ip on every pass and ends at ilimit: a scan without a hit adds
+//   SCAN_W, a position without a match adds 1, and a stored match moves ip to its end, at least
+//   4 bytes past the position the pass started at.
+// - The deferral loop raises ip by 1 or 2 before each `continue` and breaks at ilimit.
+// - The catch-up lowers `start` to `anchor`. The immediate-repcode loop raises ip by ml >= 4,
+//   to ilimit.
+// - match_len runs with p < lim <= BLOCK_SIZE and cap lim - p (common.wgsl). scan's loops are
+//   counted.
+// - main_fixup: see k3_fixup.wgsl.
+// A loop added here needs its own argument.
 
 const SEG: u32 = 1u << SEG_LOG2;
 const NSEG: u32 = BLOCK_SIZE >> SEG_LOG2;

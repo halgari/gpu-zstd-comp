@@ -41,6 +41,29 @@ impl RunResult {
     }
 }
 
+/// Logs a digest of a run's frames to stderr, split by block kind: full blocks (`real_len ==
+/// BLOCK_SIZE`) and partial last blocks. The xxh64 runs over the full-block frames concatenated in
+/// corpus order, so two runs whose full-block output is byte-identical print the same hash
+/// whatever happens to the partial blocks.
+pub fn log_frame_digest<'a>(corpus: &Corpus, frames: impl IntoIterator<Item = &'a [u8]>) {
+    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+    let (mut full_n, mut full_b, mut part_n, mut part_b) = (0u64, 0u64, 0u64, 0u64);
+    for (block, frame) in corpus.blocks.iter().zip(frames) {
+        if block.real_len == gzc_core::config::BLOCK_SIZE {
+            h.update(frame);
+            full_n += 1;
+            full_b += frame.len() as u64;
+        } else {
+            part_n += 1;
+            part_b += frame.len() as u64;
+        }
+    }
+    eprintln!(
+        "  frames: {full_n} full blocks -> {full_b} bytes (xxh64 {:016x}); {part_n} partial blocks -> {part_b} bytes",
+        h.digest()
+    );
+}
+
 /// Builds per-kind stats from per-block compressed sizes (`compressed_sizes[i]`
 /// is the compressed size of `corpus.blocks[i]`).
 pub fn per_kind(corpus: &Corpus, compressed_sizes: &[u64]) -> Vec<KindStat> {

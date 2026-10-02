@@ -7,13 +7,13 @@
 use crate::bits::BitWriter;
 use crate::fse::{FseCTable, FseState, choose_table_log, normalize, write_ncount};
 
-/// Longest code we emit (zstd's `LitHufLog`; the format allows at most 11).
+/// Longest code emitted (zstd's `LitHufLog`; the format allows at most 11).
 pub const HUF_MAX_BITS: u32 = 11;
 /// Largest table log for the FSE-compressed weights (`MAX_FSE_TABLELOG_FOR_HUFF_HEADER`).
 const WEIGHTS_MAX_LOG: u32 = 6;
 /// Weights are 0..=11 (a weight is at most `max_bits`), so 12 histogram cells.
 const WEIGHT_ALPHABET: usize = HUF_MAX_BITS as usize + 1;
-/// Below this many literals we never try Huffman.
+/// Below this many literals Huffman is never tried.
 pub const MIN_HUF_LITERALS: usize = 64;
 
 /// Huffman code for the literal alphabet.
@@ -48,7 +48,7 @@ impl HufTable {
 /// 3. the two-queue tree's depths are already non-increasing along that order (debug-asserted);
 ///    they are limited to 11 with a port of libzstd's `HUF_setMaxHeight` run on the reversed
 ///    (count-descending) order;
-/// 4. canonical codes per RFC 8878 (see [`from_lengths`]).
+/// 4. canonical codes per RFC 8878 (see `from_lengths`).
 pub fn build_table(counts: &[u32; 256]) -> Option<HufTable> {
     // 1. ascending (count, symbol)
     let mut leaves: Vec<(u32, u8)> = (0..256).filter(|&s| counts[s] > 0).map(|s| (counts[s], s as u8)).collect();

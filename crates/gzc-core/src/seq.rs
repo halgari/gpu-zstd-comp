@@ -1,19 +1,30 @@
 //! Sequence and repeat-offset model shared by CPU and GPU parsers.
 
+/// One zstd sequence: `lit_len` literals, then a match of `match_len` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Sequence {
+    /// Literal bytes before the match.
     pub lit_len: u32,
+    /// Match length in bytes, at least `ZSTD_MIN_MATCH`.
     pub match_len: u32,
+    /// zstd's offBase: 1..=3 are repeat codes, larger values are `offset + 3`
+    /// (`off_base_for`).
     pub off_base: u32,
 }
 
+/// A block's parse: its sequences, and every literal byte in order. The literals past the last
+/// sequence's are the block's trailing literals.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockOutput {
+    /// The sequences, in block order.
     pub sequences: Vec<Sequence>,
+    /// The literal bytes of every sequence, then the trailing literals.
     pub literals: Vec<u8>,
 }
 
+/// The repeat-offset history, most recent first.
 pub type Reps = [u32; 3];
+/// The history at the start of a frame (RFC 8878 §3.1.1.5).
 pub const INITIAL_REPS: Reps = [1, 4, 8];
 
 /// zstd offBase for a match at `offset` preceded by `lit_len` literals (RFC 8878 §3.1.1.5).
@@ -64,6 +75,41 @@ pub fn apply_off_base(reps: &mut Reps, off_base: u32, lit_len: u32) -> u32 {
         reps[0] = off;
     }
     off
+}
+
+/// zstd's shortest match (RFC 8878: Match_Length codes start at 3).
+pub const ZSTD_MIN_MATCH: u32 = 3;
+
+/// Cuts `out`, the parse of the zero-padded block `block` (BLOCK_SIZE bytes), to the parse of its
+/// first `len` bytes (`1..=BLOCK_SIZE`, `Block::real_len`), so the frame holds no byte past them.
+/// Sequences that end by `len` are kept; one whose match crosses `len` keeps its match cut to
+/// end there when at least `ZSTD_MIN_MATCH` bytes of it are left, else it is dropped with every
+/// later one; the bytes from the last kept sequence to `len` are the trailing literals. Offsets
+/// and repeat codes of kept sequences are unchanged (the history before them is). The identity
+/// at `len == BLOCK_SIZE`. K3t (`k3_trunc.wgsl`) is the GPU twin.
+pub fn truncate_output(out: &BlockOutput, block: &[u8], len: usize) -> BlockOutput {
+    assert!((1..=block.len()).contains(&len), "truncate_output: len {len} not in 1..={}", block.len());
+    let (mut pos, mut lits) = (0usize, 0usize);
+    let mut sequences = Vec::with_capacity(out.sequences.len());
+    for s in &out.sequences {
+        let start = pos + s.lit_len as usize;
+        let end = start + s.match_len as usize;
+        if end <= len {
+            sequences.push(*s);
+        } else if start + ZSTD_MIN_MATCH as usize <= len {
+            sequences.push(Sequence { match_len: (len - start) as u32, ..*s });
+        } else {
+            break;
+        }
+        lits += s.lit_len as usize;
+        pos = end.min(len);
+        if pos == len {
+            break;
+        }
+    }
+    let mut literals = out.literals[..lits].to_vec();
+    literals.extend_from_slice(&block[pos..len]);
+    BlockOutput { sequences, literals }
 }
 
 /// Decode a BlockOutput the way a zstd decoder would. Used as a test oracle.

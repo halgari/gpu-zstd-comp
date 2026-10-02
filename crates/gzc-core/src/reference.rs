@@ -1,25 +1,22 @@
-//! CPU reference compressor used as the correctness and quality baseline.
+//! The CPU reference compressor: the oracle the GPU kernels are tested against, byte for byte.
 //!
-//! This is the bit-exact oracle the GPU kernels are tested against: a hash-chain match
-//! finder and parse driven by runtime `MatchParams`, using integer arithmetic only so the
-//! GPU mirrors it exactly. The `LVL3` preset is the M3 level-3-style greedy parse.
+//! It is a hash-chain match finder and a parse, both driven by runtime `MatchParams` and
+//! written in integer arithmetic only, so the GPU can mirror them exactly. The greedy parse is
+//! here; the lazy parses are in `lazy` and the optimal parse in `opt`.
 use crate::config::{BLOCK_SIZE, HASH_BITS, NO_POS, PARSE_END};
 use crate::frame::{write_frame, FrameOptions};
 use crate::hash::{compute_preds, hash3, hash_long, hash_short, hash_sparse, hash_width, key};
 use crate::lazy::{lazy_parse, lazy_parse_segmented};
-use crate::params::{cpu_supports, Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
-use crate::seq::{apply_off_base, off_base_for, BlockOutput, Sequence, INITIAL_REPS};
-
-pub use crate::params::LVL3;
-
-/// The reference compressor's parameters are the shared `MatchParams`.
-pub type RefParams = MatchParams;
+use crate::params::{Hashes, MatchParams, SparseChain, OPT_H3_DEPTH};
+use crate::seq::{apply_off_base, off_base_for, truncate_output, BlockOutput, Sequence, INITIAL_REPS};
 
 /// A candidate match at some position: offset back from that position, and length.
 /// `len == 0` means no match was found (or none met `min_match`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Match {
+    /// Distance back to the match's source.
     pub offset: u32,
+    /// Match length, capped at `search_cap`; 0 for no match.
     pub len: u32,
 }
 
@@ -99,7 +96,9 @@ pub fn sparse_chain_preds(block: &[u8], c: &SparseChain) -> Vec<u32> {
 /// One `find_cands` record: offset back from the position and capped length (`len == 0`: none).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cand {
+    /// Distance back to the candidate's source.
     pub offset: u32,
+    /// Length, capped at `search_cap`; 0 for no record.
     pub len: u32,
 }
 
@@ -108,7 +107,7 @@ pub struct Cand {
 /// (`find_cands`). All zero when there is no candidate, apart from `DEAD_BIT`.
 pub type CandWords = [u32; 2];
 
-/// `w[1]`'s flag of a dead position (M6 A3, see `find_cands`); offsets are below 2^16.
+/// `w[1]`'s flag of a dead position (see `find_cands`); offsets are below 2^16.
 pub const DEAD_BIT: u32 = 1 << 16;
 
 /// Whether a position's candidate words mark it dead (`find_cands`).
@@ -135,7 +134,7 @@ pub fn cand_depths(params: &MatchParams) -> Vec<u32> {
     d
 }
 
-/// K2opt (m5-opt-design §2.1; M6 sparse chains), the optimal parse's candidates.
+/// The optimal parse's candidates, two records per position: what K2opt computes on the GPU.
 ///
 /// For every `p < PARSE_END`, the *visit list* of `p` is the union, sorted by position
 /// descending (nearest first) with duplicates removed, of the first `depth_i` entries of each
@@ -165,7 +164,7 @@ pub fn cand_depths(params: &MatchParams) -> Vec<u32> {
 /// bytes differ too). The same holds for sparse-chain collisions: a sparse entry is a
 /// candidate like any other, whatever its hashed bytes.
 ///
-/// Dead positions (M6 A3, a09): `p` is *dead* when it has no record and its `h3` walk reached
+/// Dead positions: `p` is *dead* when it has no record and its `h3` walk reached
 /// the chain's end (`NO_POS`, within `OPT_H3_DEPTH` steps). Then no earlier position shares `p`'s
 /// first 3 bytes: every such position has `p`'s `hash3` key, so it is on `p`'s `h3` chain (which
 /// links every earlier position below `HASHED_POSITIONS` with that key), and the walk visited the
@@ -375,13 +374,12 @@ pub fn parse_cands(block: &[u8], cands: &[CandWords], p: &MatchParams) -> BlockO
 
 /// Compress one full-size block: compute the hash chains, find best matches (or the optimal
 /// parse's candidates), parse.
-/// Panics if `params` is invalid or not implemented on the CPU yet (`params::cpu_supports`).
+/// Panics if `params` is invalid (`MatchParams::validate`).
 pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     assert_eq!(block.len(), BLOCK_SIZE);
     if let Err(e) = params.validate() {
         panic!("reference::compress_block: invalid params {params:?}: {e}");
     }
-    assert!(cpu_supports(&params), "reference::compress_block: {params:?} is not implemented yet on cpu");
     let chains = chains(block, &params);
     if params.opt.is_some() {
         return parse_cands(block, &find_cands(block, &chains, &params), &params);
@@ -390,11 +388,21 @@ pub fn compress_block(block: &[u8], params: MatchParams) -> BlockOutput {
     parse(block, &best, &params)
 }
 
-/// Compress one full-size block straight to a zstd frame: `compress_block` followed
-/// by `write_frame`. This is the CPU reference compressor's end-to-end entry point,
-/// used by `gzc-bench ref` and exercised by `all_synthetic_frames_roundtrip` below.
+/// Compresses one block, given as its real bytes (`1..=BLOCK_SIZE`, `Block::real()`), to a zstd
+/// frame that decodes to exactly those bytes.
+///
+/// It runs `compress_block` on the zero-padded block, `seq::truncate_output` to the real length,
+/// then `write_frame`. This is the reference compressor's end-to-end entry point; `gzc-bench ref`
+/// uses it. Panics if `params` is invalid or the block is empty or longer than `BLOCK_SIZE`.
 pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOptions) -> Vec<u8> {
-    let out = compress_block(block, params);
+    if block.len() == BLOCK_SIZE {
+        return write_frame(block, &compress_block(block, params), opts);
+    }
+    // A partial block: parse it zero-padded (as `chunk_file` pads it), cut the parse at its end.
+    assert!((1..BLOCK_SIZE).contains(&block.len()), "a block holds 1..=BLOCK_SIZE bytes, not {}", block.len());
+    let mut padded = block.to_vec();
+    padded.resize(BLOCK_SIZE, 0);
+    let out = truncate_output(&compress_block(&padded, params), &padded, block.len());
     write_frame(block, &out, opts)
 }
 
@@ -402,7 +410,8 @@ pub fn compress_block_to_frame(block: &[u8], params: MatchParams, opts: FrameOpt
 mod tests {
     use super::*;
     use crate::block::chunk_file;
-    use crate::params::RUNG1;
+    use crate::fixtures::RUNG1;
+    use crate::params::LVL3;
     use crate::seq::reconstruct;
     use crate::synth;
 
@@ -529,16 +538,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid params")]
     fn invalid_params_panic_clearly() {
-        compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::params::LVL9 });
+        compress_block(&synth::zeros(BLOCK_SIZE), MatchParams { lazy: 3, ..crate::fixtures::LVL9 });
     }
 
     /// The window walk over the bucket-sorted array equals the chain walk, for 11/12/13-bit keys and
     /// the 16-bit one, at depths 4, 16 and 32 (shallow walks rarely reach other buckets).
     #[test]
     fn window_walk_equals_chain_walk() {
-        use crate::params::{LVL9, LVL9S12, LVL9S12D16SEG};
+        use crate::fixtures::LVL9;
+        use crate::params::LVL9S12SEG;
         let s13 = MatchParams { hash_bits: 13, ..LVL9 };
-        for params in [LVL9S12, LVL9S12D16SEG, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
+        let d16 = MatchParams { depth: 16, ..LVL9S12SEG };
+        for params in [LVL9S12SEG, d16, s13, LVL9, MatchParams { depth: 4, ..s13 }, MatchParams { hash_bits: 11, ..LVL9 }] {
             for (name, bytes) in synth::test_cases() {
                 for (i, blk) in chunk_file(&bytes).into_iter().enumerate() {
                     let block = &blk.data;
@@ -685,10 +696,10 @@ mod tests {
     /// `sparse_chain_preds`: only sparse positions (`p % stride == 0`, `p < SPARSE_END`) are
     /// linked, each to the previous sparse position with the same `hash_sparse`; on all-zero
     /// data that is `p - stride`, the last sparse position is `SPARSE_END - stride` (for strides
-    /// dividing 12), and `chains` appends one such chain per `S3_CHAINS` entry.
+    /// dividing 12), and `chains` appends one such chain per `SPARSE_CHAINS` entry.
     #[test]
     fn sparse_chain_links_sparse_positions_only() {
-        use crate::params::{OPT16P1, S3_CHAINS};
+        use crate::params::{OPT16P1, SPARSE_CHAINS};
         let zeros = synth::zeros(BLOCK_SIZE);
         for stride in [1u32, 2, 4, 8] {
             let c = SparseChain { width: 10, stride, depth: 16 };
@@ -699,13 +710,13 @@ mod tests {
                 assert_eq!(q, want, "stride {stride} p={p}");
             }
         }
-        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 16], (BLOCK_SIZE - 20) as u32);
-        assert_eq!(sparse_chain_preds(&zeros, &S3_CHAINS[0].unwrap())[BLOCK_SIZE - 12], NO_POS);
+        assert_eq!(sparse_chain_preds(&zeros, &SPARSE_CHAINS[0].unwrap())[BLOCK_SIZE - 16], (BLOCK_SIZE - 20) as u32);
+        assert_eq!(sparse_chain_preds(&zeros, &SPARSE_CHAINS[0].unwrap())[BLOCK_SIZE - 12], NO_POS);
         let text = synth::text(3, BLOCK_SIZE);
         let ch = chains(&text, &OPT16P1);
         assert_eq!(ch.len(), 5);
         assert_eq!(cand_depths(&OPT16P1), [8, OPT_H3_DEPTH, 16, 16, 16]);
-        for (i, c) in S3_CHAINS.iter().flatten().enumerate() {
+        for (i, c) in SPARSE_CHAINS.iter().flatten().enumerate() {
             assert_eq!(ch[2 + i], sparse_chain_preds(&text, c));
             for (p, &q) in ch[2 + i].iter().enumerate() {
                 if q != NO_POS {
@@ -784,24 +795,119 @@ mod tests {
         assert_eq!(with(2, 1), (a3, far));
     }
 
-    /// xxh64 of the concatenated lvl3 frames, first captured on the unmodified M3 code (ddeee75);
-/// re-captured when `synth::nif_like` switched to a platform-independent sine (the lvl3 code
-/// itself unchanged: the old anchors still passed on Linux immediately before the switch).
-    const M3_LVL3_ANCHOR: u64 = 0xd3354ac3c8f4a5d2;
+    /// xxh64 of the concatenated lvl3 frames of every synthetic test case, partial blocks
+    /// included.
+    const LVL3_ANCHOR: u64 = 0x441bb7015bd4cc45;
 
-    /// Pins the M3 lvl3 output: xxh64 over every synthetic test case's frames, concatenated.
-    /// Any byte change in the lvl3 CPU path (and hence the GPU path, which must match it) fails here.
+    /// Pins the lvl3 output. Any byte change in the lvl3 CPU path, and so in the GPU path that
+    /// must match it, fails here.
     #[test]
-    fn lvl3_frames_match_m3_anchor() {
+    fn lvl3_frames_match_anchor() {
         let mut all = Vec::new();
         for (_, bytes) in synth::test_cases() {
             for blk in chunk_file(&bytes) {
-                all.extend_from_slice(&compress_block_to_frame(&blk.data, LVL3, FrameOptions::default()));
+                let real = &blk.data[..blk.real_len];
+                all.extend_from_slice(&compress_block_to_frame(real, LVL3, FrameOptions::default()));
             }
         }
         let h = xxhash_rust::xxh64::xxh64(&all, 0);
         println!("lvl3 anchor: {h:#018x} ({} bytes)", all.len());
-        assert_eq!(h, M3_LVL3_ANCHOR, "lvl3 frames changed from the M3 anchor");
+        assert_eq!(h, LVL3_ANCHOR, "lvl3 frames changed");
+    }
+
+    /// xxh64 of the concatenated lvl3 frames of the synthetic cases' full blocks only. A change
+    /// to how partial blocks are framed does not move it.
+    const LVL3_FULL_BLOCK_ANCHOR: u64 = 0xc4c446cbce783267;
+
+    /// `lvl3_frames_match_anchor` restricted to full blocks (`real_len == BLOCK_SIZE`).
+    #[test]
+    fn lvl3_full_block_frames_match_anchor() {
+        let mut all = Vec::new();
+        for (_, bytes) in synth::test_cases() {
+            for blk in chunk_file(&bytes).into_iter().filter(|b| b.real_len == BLOCK_SIZE) {
+                all.extend_from_slice(&compress_block_to_frame(&blk.data, LVL3, FrameOptions::default()));
+            }
+        }
+        let h = xxhash_rust::xxh64::xxh64(&all, 0);
+        println!("lvl3 full-block anchor: {h:#018x} ({} bytes)", all.len());
+        assert_eq!(h, LVL3_FULL_BLOCK_ANCHOR, "lvl3 full-block frames changed");
+    }
+
+    /// A file of `k` full blocks plus `r` bytes round-trips through libzstd to exactly its bytes
+    /// for every preset: each block's frame declares and holds only its real length, and a full
+    /// block's frame is the padded-parse frame it always was. `r` covers the shortest blocks (1,
+    /// 2, 3: below, at and above zstd's minimum match), both frame-header forms (255, 256, 257)
+    /// and a segment boundary (4095, 4096, 4097). The sources: text, an all-equal file, text
+    /// whose last bytes are zeros (the real bytes run on into the padding, so a match found on
+    /// the padded block crosses the real length and is cut) and an all-zero file.
+    #[test]
+    fn partial_last_block_roundtrips_every_preset() {
+        let file = synth::text(7, 2 * BLOCK_SIZE + BLOCK_SIZE / 2);
+        let rle = vec![9u8; BLOCK_SIZE + 300];
+        let zeros = vec![0u8; 3 * BLOCK_SIZE];
+        let lens = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 100),
+            (1, 255),
+            (1, 256),
+            (1, 257),
+            (0, 4095),
+            (1, 4096),
+            (0, 4097),
+            (2, 31_000),
+            (1, BLOCK_SIZE - 1),
+            (2, 0),
+        ];
+        for (name, p) in crate::params::PRESETS {
+            for (k, r) in lens {
+                for (s, src) in [&file, &rle, &file, &zeros].into_iter().enumerate() {
+                    let mut bytes = src[..(k * BLOCK_SIZE + r).min(src.len())].to_vec();
+                    if s == 2 {
+                        // Zero-tailed: the last two thirds of the last block's real bytes.
+                        let n = bytes.len();
+                        let tail = if r == 0 { BLOCK_SIZE } else { r };
+                        bytes[n - tail + tail / 3..].fill(0);
+                    }
+                    let bytes = &bytes[..];
+                    let mut dec = Vec::new();
+                    for blk in chunk_file(bytes) {
+                        let real = &blk.data[..blk.real_len];
+                        let frame = compress_block_to_frame(real, p, FrameOptions::default());
+                        let got = zstd::bulk::decompress(&frame, BLOCK_SIZE)
+                            .unwrap_or_else(|e| panic!("{name} k{k} r{r}: libzstd rejected frame: {e}"));
+                        assert_eq!(got.len(), blk.real_len, "{name} k{k} r{r}");
+                        assert_eq!(zstd::zstd_safe::get_frame_content_size(&frame).ok().flatten(), Some(blk.real_len as u64));
+                        if blk.real_len == BLOCK_SIZE {
+                            let padded = write_frame(&blk.data, &compress_block(&blk.data, p), FrameOptions::default());
+                            assert_eq!(frame, padded, "{name}: a full block's frame changed");
+                        }
+                        dec.extend_from_slice(&got);
+                    }
+                    assert!(dec == bytes, "{name} k{k} r{r}: file did not round-trip");
+                }
+            }
+        }
+    }
+
+    /// `truncate_output` is the identity at BLOCK_SIZE and otherwise covers exactly `len` bytes
+    /// with no match shorter than zstd's 3 bytes.
+    #[test]
+    fn truncate_output_cuts_at_len() {
+        use crate::seq::{truncate_output, ZSTD_MIN_MATCH};
+        for (_, bytes) in synth::test_cases() {
+            let blk = &chunk_file(&bytes)[0];
+            for p in [LVL3, crate::params::OPT16P1] {
+                let out = compress_block(&blk.data, p);
+                assert_eq!(truncate_output(&out, &blk.data, BLOCK_SIZE), out);
+                for len in [1, 2, 3, 255, 4096, 30_001, BLOCK_SIZE - 1] {
+                    let t = truncate_output(&out, &blk.data, len);
+                    assert!(t.sequences.iter().all(|s| s.match_len >= ZSTD_MIN_MATCH));
+                    assert_eq!(reconstruct(&t).unwrap(), blk.data[..len], "len {len}");
+                }
+            }
+        }
     }
 
     /// `rung1` (Single chain, min_match 4, greedy parse): every synthetic test case

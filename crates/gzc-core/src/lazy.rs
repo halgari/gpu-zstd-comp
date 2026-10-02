@@ -1,20 +1,20 @@
 //! Lazy / lazy2 parse: a port of libzstd 1.5.7 `ZSTD_compressBlock_lazy_generic`
-//! (`lib/compress/zstd_lazy.c`, `dictMode == ZSTD_noDict`, `depth = params.lazy`), spec §3.4.
+//! (`lib/compress/zstd_lazy.c`, `dictMode == ZSTD_noDict`, `depth = params.lazy`).
 //!
 //! This is the normative oracle the GPU K3 lazy kernel mirrors bit-exactly: integer-only,
 //! deterministic, no reads past `BLOCK_SIZE`. The structure follows the C function
 //! statement by statement; names in comments (`ip`, `anchor`, `start`, `offBase`,
 //! `matchLength`, `offset_1`, `offset_2`, `ilimit`) are zstd's.
 //!
-//! Substitutions (the "only change" allowed by the spec):
+//! Substitutions, the only departures from the C function:
 //! - `ZSTD_searchMax(ip)` is `best[ip]` (K2 output), extended to its true length with
 //!   `match_len` when it hit `search_cap`. `len < min_match` means "no match". An explicit
 //!   match has `offBase = OFFSET_TO_OFFBASE(offset) = offset + 3`.
 //! - `MEM_read32(a) == MEM_read32(b)` followed by `ZSTD_count(...) + 4` is the bounded
 //!   `match_len(block, a, b) >= 4` (see `rep_len`).
 //! - `ilimit = iend - 8` is `PARSE_END`.
-//! - Sequences are stored through the M3 `off_base_for` / `apply_off_base` bookkeeping, so
-//!   the frame writer is unchanged. `offset_1` / `offset_2` always equal the decoder's
+//! - Sequences are stored through `seq::off_base_for` / `seq::apply_off_base`, the same
+//!   bookkeeping the greedy parse uses. `offset_1` / `offset_2` always equal the decoder's
 //!   `reps[0]` / `reps[1]` (see the `// deviation:` notes for the one case where zstd's own
 //!   bookkeeping would differ).
 use crate::config::{BLOCK_SIZE, PARSE_END};
@@ -89,8 +89,11 @@ pub type RawSeq = (u32, u32, u32);
 /// `Seg::whole_block()`; `lazy_parse_segmented` uses `Seg::segment`.
 #[derive(Clone, Copy, Debug)]
 pub struct Seg {
+    /// Where the parse starts.
     pub ip0: usize,
+    /// Start of the parsed range: the first literal.
     pub anchor0: usize,
+    /// The rep history the parse starts with.
     pub reps0: Reps,
     /// End of the parsed range: match lengths are bounded by it.
     pub lim: usize,
@@ -134,7 +137,7 @@ fn store(out: &mut Vec<RawSeq>, reps: &mut Reps, lit_len: usize, offset: u32, ml
     out.push((ll, ml, offset));
 }
 
-/// Lazy / lazy2 parse over precomputed best[] (spec §3.4). params.lazy ∈ {1,2}.
+/// Lazy / lazy2 parse over precomputed best[]. params.lazy ∈ {1,2}.
 /// Whole-block parse: `lazy_core` over `Seg::whole_block()`, then `encode_raw`.
 pub fn lazy_parse(block: &[u8], best: &[Match], params: &MatchParams) -> BlockOutput {
     let mut raw = Vec::new();
@@ -222,12 +225,12 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
         }
 
         // first search (depth 0)
-        if let Some((ml2, ob)) = search_max(block, best, ip, params, seg) {
-            if ml2 > match_length {
-                match_length = ml2;
-                start = ip;
-                off_base = ob;
-            }
+        if let Some((ml2, ob)) = search_max(block, best, ip, params, seg)
+            && ml2 > match_length
+        {
+            match_length = ml2;
+            start = ip;
+            off_base = ob;
         }
 
         if match_length < 4 {
@@ -341,7 +344,7 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
         ip = anchor;
 
         // check immediate repcode: an offset_2 match at ip is stored as (ll 0, repcode 1),
-        // which the decoder resolves to reps[1] and swaps into reps[0] — zstd's swap.
+        // which the decoder resolves to reps[1] and swaps into reps[0]: zstd's swap.
         while ip <= ilimit && offset_2 > 0 {
             let ml = rep_len(block, ip, offset_2, lim);
             if ml == 0 {
@@ -365,7 +368,8 @@ pub fn lazy_core(block: &[u8], best: &[Match], params: &MatchParams, seg: &Seg, 
 #[doc(hidden)]
 pub mod cases {
     use crate::config::{BLOCK_SIZE, PARSE_END};
-    use crate::params::{MatchParams, LVL9, LVL9SEG, RUNG2};
+    use crate::fixtures::{LVL9, RUNG2};
+    use crate::params::{MatchParams, LVL9SEG};
     use crate::reference::{match_len, Match};
     use crate::seq::Sequence;
     use crate::synth;
@@ -637,7 +641,7 @@ pub mod cases {
         )]
     }
 
-    /// Deviation 3 changes output: the dedup store at 296 (offset 20 == reps[0]) leaves the
+    /// Deviation 3 changes output: the dedup store at 296 (offset 20 == `reps[0]`) leaves the
     /// decoder's reps at [20, 1, 4], so offset_2 = 1 (zstd: offset_2 = offset_1 = 20). An
     /// offset-1 run right after the match is then stored by the immediate loop as
     /// (ll 0, repcode 1); zstd would probe offset 20 there, which does not match.
@@ -770,8 +774,9 @@ pub mod cases {
     /// bytes at the block start (with no explicit match, `best[]` entirely empty) is still
     /// caught by the offset_1 = 1 repeat at ip+1: `match_length` 4 covering positions 2..6,
     /// `start` stays at ip+1 = 2 (the depth-0 first search at ip = 1 finds nothing, since
-    /// `best[1]` is empty and every other `best[]` entry too), so the store is `(ll 2, rep1, 4)`
-    /// — pinned by running the CPU oracle (`lazy_parse`) directly, not derived by hand.
+    /// `best[1]` is empty and every other `best[]` entry too), so the store is `(ll 2, rep1, 4)`.
+    /// The expected output comes from running the CPU oracle (`lazy_parse`), not from a hand
+    /// derivation.
     pub fn rung2_min_match6_byte_run_at_start() -> Vec<LazyCase> {
         let mut block = background(101);
         block[0..6].fill(0x77);
@@ -788,7 +793,7 @@ pub mod cases {
 
     /// A match running across the end of segment 0 is cut at the segment end (length 6 of 20);
     /// segment 1 then starts with the rest (ll 0), which the true reps store explicitly (offset
-    /// == reps[0] with ll 0 is not a repcode).
+    /// == `reps[0]` with ll 0 is not a repcode).
     pub fn seg_match_clamped_at_segment_end() -> Vec<LazyCase> {
         let mut block = background(31);
         plant(&mut block, SEG - 6, 100, 20);
@@ -845,8 +850,8 @@ pub mod cases {
     }
 
     /// Segment 1 parses with empty reps (its first match is explicit there), but the true
-    /// history makes it repcode 1 (ll > 0, offset == reps[0]); and a segment starting with a
-    /// match at its first byte (ll 0) at the true reps[1] becomes repcode 1 as well.
+    /// history makes it repcode 1 (ll > 0, offset == `reps[0]`); and a segment starting with a
+    /// match at its first byte (ll 0) at the true `reps[1]` becomes repcode 1 as well.
     pub fn seg_true_reps_across_segments() -> Vec<LazyCase> {
         let mut block = background(34);
         plant(&mut block, 100, 50, 10);
@@ -916,7 +921,8 @@ mod tests {
     use super::*;
     use crate::block::chunk_file;
     use crate::frame::{write_frame, FrameOptions};
-    use crate::params::{LVL9, LVL9SEG, RUNG1, RUNG2};
+    use crate::fixtures::{LVL9, RUNG1, RUNG2};
+    use crate::params::LVL9SEG;
     use crate::reference::{chains, compress_block, find_best};
     use crate::seq::reconstruct;
     use crate::synth;

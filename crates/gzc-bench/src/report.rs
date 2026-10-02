@@ -59,7 +59,7 @@ fn kind_name(kind: Kind) -> &'static str {
 
 /// Fixed categorical palette (light-mode hexes; dark-mode values are set via
 /// CSS custom properties, see `palette_style`), assigned to series in a
-/// fixed order — never cycled per re-render for the same input.
+/// fixed order, never cycled per re-render for the same input.
 const SERIES_SLOTS: usize = 8;
 
 fn series_color_var(slot: usize) -> String {
@@ -328,16 +328,16 @@ fn render_html(results: &[RunResult]) -> String {
     ));
 
     // Dashed projection line (drawn first, under the real series).
-    if let Some(proj) = &projection {
-        if proj.points.len() > 1 {
-            let pts: Vec<String> =
-                proj.points.iter().map(|&(x, y, _)| format!("{:.1},{:.1}", x_pos(x), y_pos(y))).collect();
-            svg.push_str(&format!(
-                r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2" stroke-dasharray="6 4" opacity="0.65"/>"#,
-                pts.join(" "),
-                series_color_var(proj.slot)
-            ));
-        }
+    if let Some(proj) = &projection
+        && proj.points.len() > 1
+    {
+        let pts: Vec<String> =
+            proj.points.iter().map(|&(x, y, _)| format!("{:.1},{:.1}", x_pos(x), y_pos(y))).collect();
+        svg.push_str(&format!(
+            r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2" stroke-dasharray="6 4" opacity="0.65"/>"#,
+            pts.join(" "),
+            series_color_var(proj.slot)
+        ));
     }
 
     // Thread-count series.

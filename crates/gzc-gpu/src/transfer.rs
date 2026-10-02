@@ -1,27 +1,30 @@
-//! A dedicated transfer queue next to wgpu's queue (speed-2 E3).
+//! A dedicated transfer queue next to wgpu's queue.
 //!
-//! wgpu runs every submission on one queue, strictly one after another, so the readback copy of
-//! batch i (frames -> host) used to sit between batch i's K4 and batch i+1's K1. On the RTX 5090
-//! the copy engine behind a transfer-only queue family runs that copy concurrently with the next
-//! batch's kernels at no measurable cost to them (`multiqueue::tests::transfer_probe`).
+//! wgpu runs every submission on one queue, strictly one after another, so a readback copy of
+//! batch i (frames to host) on that queue sits between batch i's K4 and batch i+1's K1. On a
+//! transfer-only queue family the copy runs on the copy engine, alongside the next batch's
+//! kernels and at no measurable cost to them (RTX 5090).
 //!
-//! `GpuContext::with_gpu_options` creates the `VkDevice` itself (with one extra queue of a
-//! transfer-only family) when the adapter is Vulkan 1.2 with timeline semaphores and has such a
-//! family, and wraps its queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
-//! `create_device_from_hal`); the extra queue is driven here with raw Vulkan (ash): a command
-//! pool, timeline semaphores and the buffers both queues touch, created `CONCURRENT` over the two
-//! families (so no queue-family ownership transfers are needed) and imported into wgpu with
-//! `create_buffer_from_hal`.
+//! `GpuContext::new` creates the `VkDevice` itself, with one extra queue of a transfer-only
+//! family, when the adapter is Vulkan 1.2 with timeline semaphores and has such a family. It
+//! wraps queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
+//! `create_device_from_hal`). The extra queue is driven here with raw Vulkan (ash): a command
+//! pool, timeline semaphores and the buffers both queues touch. Those buffers are created
+//! `CONCURRENT` over the two families, so no queue-family ownership transfers are needed, and
+//! imported into wgpu with `create_buffer_from_hal`.
 //!
 //! Lifetimes: every object here holds an `Arc<DeviceOwner>`, which destroys the `VkDevice` after
 //! the last of them (and the wgpu device) is gone and keeps the Vulkan instance alive until then.
 //! GPU-side lifetimes (a buffer or semaphore must outlive the submissions using it) are the
 //! caller's: the entry points that create such uses are `unsafe` or `pub(crate)`.
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, anyhow};
 use ash::vk;
+
+use crate::context::{GpuContext, Prepared};
 
 /// Destroys the `VkDevice` once the wgpu device and every user of this module are gone. Holds the
 /// adapter so the Vulkan instance outlives the device (a `VkDevice` destroyed after its instance
@@ -48,8 +51,129 @@ impl Drop for DeviceOwner {
     }
 }
 
+/// The queue family the transfer readback can use on `adapter`: Vulkan with a family that is
+/// transfer-only (neither compute nor graphics; never family 0, wgpu's) and has a queue,
+/// preferring one whose flags are exactly TRANSFER (ignoring SPARSE_BINDING and PROTECTED: a
+/// dedicated copy engine) over transfer families with extra capabilities (video, optical flow), on a
+/// device and instance of Vulkan 1.2 or later with `timelineSemaphore` (the pipeline orders the
+/// two queues with timeline semaphores through the 1.2 core entry points). None otherwise.
+pub(crate) fn transfer_family(adapter: &wgpu::Adapter) -> Option<u32> {
+    // SAFETY: plain property queries while `adapter` lives.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let instance = hal.shared_instance();
+    let phd = hal.raw_physical_device();
+    let v12 = vk::API_VERSION_1_2;
+    if instance.instance_api_version() < v12 || hal.physical_device_capabilities().properties().api_version < v12 {
+        return None;
+    }
+    let mut t = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut t);
+    // SAFETY: plain property query (Vulkan 1.1+, checked above).
+    unsafe { instance.raw_instance().get_physical_device_features2(phd, &mut f2) };
+    if t.timeline_semaphore != vk::TRUE {
+        return None;
+    }
+    use vk::QueueFlags as Q;
+    // SAFETY: plain property query.
+    let families = unsafe { instance.raw_instance().get_physical_device_queue_family_properties(phd) };
+    // (family index, flags) of the usable families.
+    let usable: Vec<(u32, Q)> = families
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i as u32, f.queue_flags, f.queue_count))
+        .filter(|&(i, flags, count)| {
+            i != 0 && flags.contains(Q::TRANSFER) && !flags.intersects(Q::COMPUTE | Q::GRAPHICS) && count > 0
+        })
+        .map(|(i, flags, _)| (i, flags))
+        .collect();
+    let pure = |f: &&(u32, Q)| (f.1 & !(Q::SPARSE_BINDING | Q::PROTECTED)) == Q::TRANSFER;
+    usable.iter().find(pure).or(usable.first()).map(|f| f.0)
+}
+
+/// A `VkDevice` created by hand with wgpu's queue (family 0, queue 0) plus queue 0 of a transfer
+/// family, before the wgpu device wraps it. wgpu 30 creates one queue per device and chains every
+/// submission behind the previous one, so nothing submitted through one `wgpu::Queue` ever
+/// overlaps; the extra queue is what lets the readback overlap the kernels.
+pub(crate) struct RawDevice {
+    raw: ash::Device,
+    pub owner: Arc<DeviceOwner>,
+    pub memory: vk::PhysicalDeviceMemoryProperties,
+    exts: Vec<&'static CStr>,
+}
+
+impl RawDevice {
+    /// Creates the device `p` describes (what wgpu's `open_with_callback` would create) with one
+    /// extra queue, queue 0 of `family` (from `transfer_family`). Errors on a non-Vulkan adapter.
+    pub(crate) fn new(p: &Prepared, family: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(family != 0, "family 0 holds the main queue");
+        // SAFETY: the hal adapter is only used while `p.adapter` lives.
+        let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or_else(|| anyhow!("the transfer queue needs the Vulkan backend"))?;
+        let instance = hal.shared_instance().raw_instance();
+        let phd = hal.raw_physical_device();
+        let exts = hal.required_device_extensions(p.required_features);
+        let mut phd_features = hal.physical_device_features(&exts, p.required_features);
+        let prio = [1.0f32];
+        let infos = [0, family].map(|f| vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
+        let ext_ptrs: Vec<*const std::ffi::c_char> = exts.iter().map(|e| e.as_ptr()).collect();
+        let info = phd_features.add_to_device_create(
+            vk::DeviceCreateInfo::default().queue_create_infos(&infos).enabled_extension_names(&ext_ptrs),
+        );
+        // SAFETY: the create info is what `open_with_callback` builds, plus the transfer queue.
+        let raw = unsafe { instance.create_device(phd, &info, None) }.context("vkCreateDevice")?;
+        // SAFETY: plain property query.
+        let memory = unsafe { instance.get_physical_device_memory_properties(phd) };
+        let owner = Arc::new(DeviceOwner::new(raw.clone(), p.adapter.clone()));
+        Ok(Self { raw, owner, memory, exts })
+    }
+
+    /// The `GpuContext` whose wgpu device and queue are queue 0 of family 0 on this device (what
+    /// `GpuContext::new` would give without the transfer queue).
+    pub(crate) fn context(&self, p: &Prepared) -> anyhow::Result<GpuContext> {
+        // SAFETY: as in `new`.
+        let hal = unsafe { p.adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or_else(|| anyhow!("the transfer queue needs the Vulkan backend"))?;
+        let guard = self.owner.clone();
+        let hints = wgpu::MemoryHints::default();
+        // SAFETY: `raw` was created from this adapter with `exts` and these features, and has
+        // this queue; it stays valid until the last owner reference drops (DeviceOwner).
+        let dev = unsafe {
+            hal.device_from_raw(
+                self.raw.clone(),
+                Some(Box::new(move || drop(guard))),
+                &self.exts,
+                p.required_features,
+                &p.required_limits,
+                &hints,
+                0,
+                0,
+            )
+        }
+        .map_err(|e| anyhow!("device_from_raw: {e}"))?;
+        drop(hal);
+        // SAFETY: `dev` was opened from `p.adapter`'s hal adapter with `p.descriptor()`'s features
+        // and limits.
+        let (device, queue) =
+            unsafe { p.adapter.create_device_from_hal(dev, &p.descriptor()) }.context("create_device_from_hal")?;
+        Ok(p.context(device, queue))
+    }
+}
+
+/// The error of a failed buffer or memory allocation of `size` bytes: `OutOfMemory` when Vulkan
+/// says so, with what to try next.
+fn alloc_error(call: &str, size: u64, e: vk::Result) -> anyhow::Error {
+    let mib = size.div_ceil(1 << 20);
+    if matches!(e, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY) {
+        let hint = crate::error::OOM_HINT;
+        let msg = format!("GPU allocation of {mib} MiB for a transfer-queue buffer failed: out of memory ({hint}): {call}: {e}");
+        crate::error::tagged(crate::error::Kind::OutOfMemory, msg)
+    } else {
+        anyhow!("{call} ({size} bytes): {e}")
+    }
+}
+
 /// The extra queue of a transfer-only family on the context's `VkDevice`.
-pub struct TransferQueue {
+pub(crate) struct TransferQueue {
     owner: Arc<DeviceOwner>,
     /// `vkQueueSubmit` / `vkQueueWaitIdle` need external synchronization of the queue.
     queue: Mutex<vk::Queue>,
@@ -90,11 +214,13 @@ impl TransferQueue {
     /// context is still alive: its staged semaphores and timelines assume it is the only one
     /// submitting.
     pub(crate) fn begin_streaming(self: &Arc<Self>) -> anyhow::Result<StreamingGuard> {
-        anyhow::ensure!(
-            self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
-            "another transfer-readback Pipeline is alive on this GpuContext (one per context: drop it first, \
-             or open this context with GpuOptions::transfer_queue off / GZC_TRANSFER_QUEUE=0)"
-        );
+        if self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return Err(crate::error::invalid_input(
+                "this GpuContext reads frames back through its transfer queue, which serves one Compressor (one \
+                 frame Pipeline) at a time, and another one is alive: drop that one first, or open the context \
+                 with GpuOptions::transfer_queue off",
+            ));
+        }
         Ok(StreamingGuard { tq: self.clone() })
     }
 
@@ -134,7 +260,7 @@ impl TransferQueue {
         // SAFETY: plain object creation on a live device; every object is destroyed by RawBuffer
         // (or here on failure).
         unsafe {
-            let buffer = d.create_buffer(&info, None).context("vkCreateBuffer")?;
+            let buffer = d.create_buffer(&info, None).map_err(|e| alloc_error("vkCreateBuffer", size, e))?;
             let req = d.get_buffer_memory_requirements(buffer);
             let pick = if host {
                 self.memory_type(
@@ -162,11 +288,19 @@ impl TransferQueue {
                 .allocation_size(req.size)
                 .memory_type_index(type_index)
                 .push_next(&mut dedicated);
-            let memory = match d.allocate_memory(&alloc, None) {
+            #[cfg(test)]
+            let allocated = if tests::fail_allocation() {
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            } else {
+                d.allocate_memory(&alloc, None)
+            };
+            #[cfg(not(test))]
+            let allocated = d.allocate_memory(&alloc, None);
+            let memory = match allocated {
                 Ok(m) => m,
                 Err(e) => {
                     d.destroy_buffer(buffer, None);
-                    return Err(anyhow!("vkAllocateMemory({size} bytes): {e}"));
+                    return Err(alloc_error("vkAllocateMemory", size, e));
                 }
             };
             let mut raw =
@@ -308,7 +442,7 @@ impl TransferQueue {
     ) -> anyhow::Result<wgpu::SubmissionIndex> {
         let _guard = self.wgpu_submit.lock().unwrap_or_else(|e| e.into_inner());
         {
-            // SAFETY: see the contract; the hal queue is only used to stage the semaphores.
+            // SAFETY: see the contract; the hal queue only stages the semaphores here.
             let hal = unsafe { wgpu_queue.as_hal::<wgpu::hal::api::Vulkan>() }
                 .ok_or_else(|| anyhow!("not a Vulkan queue"))?;
             if let Some((t, v)) = wait {
@@ -331,7 +465,7 @@ impl TransferQueue {
                 if wait.is_none() && signal.is_none() {
                     return false;
                 }
-                // SAFETY: only used to unstage semaphores this call staged.
+                // SAFETY: this only unstages semaphores this call staged.
                 let Some(hal) = (unsafe { self.queue.as_hal::<wgpu::hal::api::Vulkan>() }) else { return false };
                 let w = wait.is_some_and(|s| hal.remove_wait_semaphore(s));
                 let s = signal.is_some_and(|s| hal.remove_signal_semaphore(s));
@@ -388,7 +522,7 @@ impl TransferQueue {
     }
 
     /// Blocks until the transfer queue is idle.
-    pub fn idle(&self) {
+    pub(crate) fn idle(&self) {
         let queue = self.queue.lock().unwrap();
         // SAFETY: plain wait; the queue is externally synchronized by the lock.
         let _ = unsafe { self.device().queue_wait_idle(*queue) };
@@ -417,7 +551,7 @@ impl RawBuffer {
     /// Every GPU write to the buffer has completed (the caller waited for the submission that
     /// wrote it, e.g. its timeline value), and none is pending while the slice lives: the GPU may
     /// otherwise change bytes behind a shared reference.
-    pub unsafe fn mapped(&self) -> &[u8] {
+    pub(crate) unsafe fn mapped(&self) -> &[u8] {
         assert!(!self.ptr.is_null(), "not a host buffer");
         if !self.coherent {
             let range = vk::MappedMemoryRange::default().memory(self.memory).offset(0).size(vk::WHOLE_SIZE);
@@ -437,7 +571,7 @@ impl RawBuffer {
     ///   uses the buffer on queues of the families it was created for.
     /// - `self` outlives every GPU use of the returned buffer (drop it only after the device is
     ///   idle).
-    pub unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    pub(crate) unsafe fn import(&self, device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         // SAFETY: the caller's contract; externally owned, so wgpu-hal never vkDestroyBuffers it
         // (`Buffer::from_raw` would).
         unsafe {
@@ -491,19 +625,38 @@ impl Drop for Commands {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::context::GpuContext;
+pub(crate) mod tests {
+    std::thread_local! {
+        /// Test hook: the transfer-queue allocation after this many more on this thread fails as
+        /// if the device were out of memory (then the hook clears).
+        pub(crate) static FAIL_ALLOCATION_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Counts the hook down; true for the allocation that must fail.
+    pub(super) fn fail_allocation() -> bool {
+        match FAIL_ALLOCATION_AFTER.get() {
+            Some(0) => {
+                FAIL_ALLOCATION_AFTER.set(None);
+                true
+            }
+            Some(k) => {
+                FAIL_ALLOCATION_AFTER.set(Some(k - 1));
+                false
+            }
+            None => false,
+        }
+    }
 
     /// A context with a transfer queue tears down cleanly (the VkDevice goes before the Vulkan
     /// instance), also when a clone of the queue outlives the context.
     #[test]
     fn context_with_transfer_queue_drops_cleanly() {
-        let _gpu = crate::test_support::gpu_test_slot();
-        let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
         let tq = ctx.transfer.clone();
         drop(ctx);
         drop(tq);
-        let again = GpuContext::new().unwrap();
+        let again = crate::testing::gpu();
         drop(again);
     }
 }

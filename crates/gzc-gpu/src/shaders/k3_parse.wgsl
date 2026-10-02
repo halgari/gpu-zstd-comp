@@ -1,6 +1,5 @@
-// K3: parse, one thread per block, sequential. LAZY == 0: the greedy parse below
-// (== gzc_core::reference::greedy_parse); LAZY 1/2: `lazy_parse` in k3_lazy.wgsl (appended by the
-// host; == gzc_core::lazy::lazy_parse). The injected LAZY constant selects the entry.
+// K3: the unsegmented greedy parse (== gzc_core::reference::greedy_parse), one thread per block,
+// sequential. Lazy parses are segmented (k3_seg.wgsl).
 // Dispatch (n_blocks, 1, 1) with workgroup size 1: each block gets its own subgroup, so the
 // long, data-dependent per-block loops never diverge against each other (2.5-6x faster than
 // 64-wide workgroups on an RTX 5090). The host binds exactly n_blocks * 2 words of `counts`,
@@ -11,10 +10,17 @@
 // The literals themselves are not written: they are the block bytes the sequences leave
 // uncovered (literal run i = block[anchor_i .. anchor_i + lit_len_i), anchor_i = the sum of
 // lit_len + match_len over the sequences before i, then block[anchor_n_seq .. BLOCK_SIZE)), and
-// K5 / the host gather them from there (speed phase S4).
-// MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH, SEARCH_CAP and LAZY come
+// K5 / the host gather them from there.
+// MAX_SEQS and BEST_OFF_BITS are prepended by the host; MIN_MATCH and SEARCH_CAP come
 // from the injected MatchParams. best[b*BLOCK_SIZE + p] = (capped len << BEST_OFF_BITS) | offset
 // (K2's layout; 0 = no match).
+//
+// Built without naga's loop bounding (GpuContext::shader_unbounded_loops; bounds checks stay on).
+// Terminates, whatever best[] holds: greedy_parse's loop raises p on every pass and ends at
+// PARSE_END. A skip adds at least 1. A stored match adds its length, which is at least 1 (a
+// capped entry that extends to nothing is skipped) and below 2^15 or within the block, so p
+// cannot wrap. match_len runs with p < PARSE_END (common.wgsl). A loop added here needs its own
+// argument.
 
 fn best_len_of(w: u32) -> u32 { return w >> BEST_OFF_BITS; }
 fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }
@@ -24,50 +30,8 @@ fn best_off_of(w: u32) -> u32 { return w & ((1u << BEST_OFF_BITS) - 1u); }
 @group(0) @binding(2) var<storage, read_write> seqs: array<u32>;
 @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
 
-// Repeat-offset history (gzc_core::seq::Reps).
-var<private> r0: u32;
-var<private> r1: u32;
-var<private> r2: u32;
-
 // Literals of the parse so far.
 var<private> n_lit: u32;
-
-// == gzc_core::seq::off_base_for
-fn off_base_for(offset: u32, lit_len: u32) -> u32 {
-    if (lit_len > 0u) {
-        if (offset == r0) { return 1u; }
-        if (offset == r1) { return 2u; }
-        if (offset == r2) { return 3u; }
-    } else {
-        if (offset == r1) { return 1u; }
-        if (offset == r2) { return 2u; }
-        if (r0 > 1u && offset == r0 - 1u) { return 3u; }
-    }
-    return offset + 3u;
-}
-
-// == gzc_core::seq::apply_off_base (repeat-history update only).
-fn apply_off_base(off_base: u32, lit_len: u32) {
-    if (off_base > 3u) {
-        r2 = r1;
-        r1 = r0;
-        r0 = off_base - 3u;
-        return;
-    }
-    let idx = off_base - 1u + select(0u, 1u, lit_len == 0u);
-    var off: u32;
-    switch (idx) {
-        case 0u: { off = r0; }
-        case 1u: { off = r1; }
-        case 2u: { off = r2; }
-        default: { off = r0 - 1u; } // wrapping, as in the reference
-    }
-    if (idx > 0u) {
-        if (idx > 1u) { r2 = r1; }
-        r1 = r0;
-        r0 = off;
-    }
-}
 
 // Counts block bytes [start, end) as literals (none when start >= end: a final push from an
 // anchor past BLOCK_SIZE, only reachable with a best[] word that claims a match past the block end).
@@ -88,13 +52,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     r2 = 8u;
     n_lit = 0u;
 
-    // Each parse counts every literal including the trailing ones and returns n_seq.
-    var n_seq: u32;
-    if (LAZY == 0u) {
-        n_seq = greedy_parse(base, sbase, bbase);
-    } else {
-        n_seq = lazy_parse(base, sbase, bbase);
-    }
+    // The parse counts every literal including the trailing ones and returns n_seq.
+    let n_seq = greedy_parse(base, sbase, bbase);
     counts[b * 2u] = n_seq;
     counts[b * 2u + 1u] = n_lit;
 }

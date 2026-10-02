@@ -6,7 +6,7 @@
 // fingerprint (common.wgsl `pred_word`; the tail p >= HASHED_POSITIONS holds PRED_NONE). pred is
 // bound to exactly this dispatch's chains, so n_tasks = arrayLength(pred) / PRED_PER_BLOCK *
 // N_HASHES.
-// M6 sparse long chains (Opt3 chains N_FULL.., `chains::layout_wgsl`): chain N_FULL + k hashes
+// Sparse long chains (Opt3 chains N_FULL.., `chains::layout_wgsl`): chain N_FULL + k hashes
 // only the slots i < SP_N{k}, position p = i * SP_S{k} (stride 4 or 8, so the key's words are
 // word aligned), on `long_hash` (== gzc_core::reference::sparse_chain_preds), stored compactly at
 // pred[b*PRED_PER_BLOCK + SP_OFF{k} + i] (the slots from SP_N{k} on hold PRED_NONE), with
@@ -15,12 +15,12 @@
 //
 // Persistent grid. A task is one chain t = b*N_HASHES + chain; workgroup w of the G dispatched
 // builds tasks w, w + G, w + 2G, .. in order, all in its own head table head[w << HASH_BITS ..].
-// G is kept small enough for the G live tables (256 KiB each) to stay in L2: with one table per
-// block (1638 x 256 KiB live) K1 was DRAM-bound. Each workgroup clears its table once at the start
+// G is kept small enough for the G live tables (256 KiB each) to stay in L2: one table per
+// block (1638 x 256 KiB live) makes K1 DRAM-bound. Each workgroup clears its table once at the start
 // of the dispatch; its j-th task stamps entries (tag << LOG2_BLOCK) | (pos + 1) with tag = j + 1,
 // and only entries of the current tag count (pos + 1 <= HASHED_POSITIONS < BLOCK_SIZE fits
 // LOG2_BLOCK bits). So the table is not cleared between the workgroup's tasks, and no tag state
-// outlives the dispatch (the host ensures a workgroup has at most MAX_TAG tasks).
+// outlives the dispatch (the host gives a workgroup at most MAX_TAG tasks).
 //
 // A task walks its block in tiles of T = 256 positions, one per invocation. The tile-local index
 // li = subgroup_id * subgroup_size + subgroup_invocation_id (position t0 + li) splits the tile
@@ -45,8 +45,8 @@
 // Every subgroup operation runs in subgroup-uniform control flow, and no operand comes straight
 // out of a lane-dependent branch: the hash is computed before a barrier (see `h` below) and
 // chunk_first uses `&` (naga lowers `&&` to an `if`), so nothing relies on the lanes reconverging
-// after divergence (VK_KHR_shader_maximal_reconvergence is not enabled;
-// .superpowers/m6-research/subgroup-audit.md).
+// after divergence (VK_KHR_shader_maximal_reconvergence is not enabled).
+// docs/design/m6/subgroup-audit.md lists every subgroup call with its argument.
 
 @group(0) @binding(0) var<storage, read> data: array<u32>;
 @group(0) @binding(1) var<storage, read_write> head: array<atomic<u32>>;
@@ -86,7 +86,7 @@ fn chain_hash_words(w: vec3<u32>, p: u32, chain: u32) -> u32 {
         } else if (k < 4u) {
             // `& 31u`: a no-op for k < 4, but this dead branch is still const-evaluated where
             // MIN_MATCH < 4 (Opt3, k wraps) once naga folds k, as the GZC_EMULATE_* rewrite of
-            // naga's output does, and a shift by >= 32 there failed the module.
+            // naga's output does, and a shift by >= 32 there fails the module.
             mask = (1u << ((8u * k) & 31u)) - 1u;
         }
         return mix(lo, hi & mask) >> KEY_SHIFT;
@@ -123,12 +123,13 @@ fn load_words(base: u32, i: u32, stride: u32, n_idx: u32) -> vec3<u32> {
     return w;
 }
 
-// Ballot of bit i of h over this lane's chunk (ballot word `word`; K1_BALLOT_WORD is `.x` for
-// subgroups of at most 32 lanes, else `[word]`, host-generated), published by the chunk's lane i
-// at bal[at ..]; returns the lanes whose bit i equals this lane's. One lane stores one component
-// per call, the calls in order: safe where a component store is a read-modify-write of the whole
-// vec4 (Metal; `GZC_EMULATE_VEC_RMW`), unlike several lanes storing components at once (K4's old
-// wg_scan). Storing whole vec4s from one lane instead cost this kernel 7 % (RTX 5090, lvl9).
+// Ballot of bit i of h over this lane's chunk (ballot word `word`: the host substitutes the
+// component access after the ballot, `.x` for subgroups of at most 32 lanes, else `[word]`),
+// published by the chunk's lane i at bal[at ..]; returns the lanes whose bit i equals this
+// lane's. One lane stores one component per call, the calls in order. That is safe where a
+// component store is a read-modify-write of the whole vec4 (Metal; `GZC_EMULATE_VEC_RMW`);
+// several lanes storing components of one vec4 at once is not. Storing whole vec4s from one
+// lane instead costs this kernel 7 % (RTX 5090).
 fn publish_bit(h: u32, i: u32, word: u32, cl: u32, at: u32) -> u32 {
     let bit = (h >> i) & 1u;
     let m = subgroupBallot(bit != 0u)K1_BALLOT_WORD;
@@ -137,7 +138,7 @@ fn publish_bit(h: u32, i: u32, word: u32, cl: u32, at: u32) -> u32 {
 }
 
 // Publishes this chunk's ballots at bal[at ..] and returns its live lanes holding hash h. Written
-// out: naga's loop bounding keeps a loop over the bits rolled, which made the ballots several
+// out: naga's loop bounding keeps a loop over the bits rolled, which makes the ballots several
 // times slower.
 fn publish(h: u32, live: bool, word: u32, cl: u32, at: u32) -> u32 {
     let lv = subgroupBallot(live)K1_BALLOT_WORD;
@@ -194,10 +195,9 @@ fn main(
         var stride = 1u;
         var n_idx = HASHED_POSITIONS;
         var n_len = BLOCK_SIZE;
-        // Without sparse chains PRED_PER_BLOCK == N_HASHES * BLOCK_SIZE, so pb == t * BLOCK_SIZE,
-        // written so: `b * PRED_PER_BLOCK + chain * BLOCK_SIZE` there made the driver's code for
-        // the full chains ~5 % slower, this form ~10 % faster than before M6 (RTX 5090, opt16
-        // and lvl3, B2 report).
+        // Without sparse chains PRED_PER_BLOCK == N_HASHES * BLOCK_SIZE, so pb == t * BLOCK_SIZE.
+        // It is written in that form: the general `b * PRED_PER_BLOCK + chain * BLOCK_SIZE`
+        // compiles about 10 % slower for the full chains (RTX 5090).
         var pb = t * BLOCK_SIZE;
         if (N_SPARSE > 0u) { pb = b * PRED_PER_BLOCK + chain * BLOCK_SIZE; }
         if (N_SPARSE > 0u && chain >= N_FULL) {

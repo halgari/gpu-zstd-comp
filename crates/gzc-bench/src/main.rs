@@ -7,12 +7,13 @@ mod refrun;
 mod gpurun;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use gzc_core::params::{MatchParams, PRESETS, cpu_supports};
-use gzc_gpu::compressor::{GpuParams, gpu_supports, max_batch_blocks};
-use gzc_gpu::context::GpuContext;
-use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
+use gzc_core::params::{MatchParams, PRESETS};
+use gzc_gpu::{GpuParams, gpu_supports, max_batch_blocks};
+use gzc_gpu::{GpuContext, GpuOptions};
+use gzc_gpu::pipeline::{PipelineConfig, max_batch_within, vram_bytes_with};
 
 use corpus::{Corpus, LoadOpts};
 
@@ -46,7 +47,7 @@ fn parse_preset(name: &str) -> Result<Preset, String> {
 /// GPU kernels) do not implement yet. Run before any work starts.
 fn check_presets(presets: &[Preset], cpu: bool, gpu: bool) -> anyhow::Result<()> {
     for p in presets {
-        anyhow::ensure!(!cpu || cpu_supports(&p.params), "preset '{}' is not implemented yet on cpu", p.name);
+        anyhow::ensure!(!cpu || p.params.validate().is_ok(), "preset '{}' is not implemented yet on cpu", p.name);
         anyhow::ensure!(!gpu || gpu_supports(&p.params), "preset '{}' is not implemented yet on gpu", p.name);
     }
     Ok(())
@@ -107,7 +108,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -139,10 +140,10 @@ fn parse_batch_spec(s: &str) -> Result<BatchSpec, String> {
 }
 
 /// Resolves `BatchSpec::Max` to the largest batch that fits `budget_mb` at `inflight` for match
-/// params `m`, capped by `device_max` (`gzc_gpu::compressor::max_batch_blocks`). `vram_bytes` is
-/// non-decreasing in `batch` (every buffer it counts scales with `batch`, at fixed `inflight`), so
-/// this binary searches rather than scanning every batch size. `direct_upload`: the context reads
-/// batches from the upload buffers (`GpuContext::direct_upload`, no shared `data` buffer).
+/// params `m`, capped by `device_max` (`gzc_gpu::max_batch_blocks`): the library's search
+/// (`gzc_gpu::pipeline::max_batch_within`), which a `Compressor` without an explicit batch also
+/// runs. `direct_upload`: the context reads batches from the upload buffers
+/// (`GpuContext::direct_upload`, no shared `data` buffer).
 fn resolve_max_batch(
     m: MatchParams,
     inflight: u32,
@@ -150,22 +151,9 @@ fn resolve_max_batch(
     device_max: u32,
     direct_upload: bool,
 ) -> anyhow::Result<u32> {
-    let fits =
-        |batch: u32| vram_bytes_with(&sweep_cfg(m, batch, inflight), direct_upload).div_ceil(1 << 20) <= vram_budget_mb;
-    anyhow::ensure!(
-        device_max >= 1 && fits(1),
-        "--batch max: even batch 1 at inflight {inflight} does not fit {vram_budget_mb} MiB (--vram-budget-mb) \
-         or this device's limits"
-    );
-    if fits(device_max) {
-        return Ok(device_max);
-    }
-    let (mut lo, mut hi) = (1u32, device_max); // fits(lo) held, fits(hi) does not.
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if fits(mid) { lo = mid } else { hi = mid }
-    }
-    Ok(lo)
+    use anyhow::Context as _;
+    max_batch_within(sweep_cfg(m, 1, inflight).params, inflight, vram_budget_mb, device_max, direct_upload)
+        .context("--batch max (see --vram-budget-mb)")
 }
 
 /// `spec` as an exact batch count: `N` as is, `Max` resolved via `resolve_max_batch`.
@@ -210,11 +198,15 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
     sweep: GpuSweepArgs,
+    /// Run through the library's `Compressor` API (`compress_blocks`, which returns every frame
+    /// in one buffer) instead of the bench's own pipeline calls. `--writer-threads` is not used.
+    #[arg(long)]
+    facade: bool,
     /// Decompress every produced frame with libzstd after the timed pass and
     /// error on any mismatch against the original block.
     #[arg(long)]
@@ -228,7 +220,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, lvl9seg, lvl9s12seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -356,7 +348,7 @@ fn sweep_cfg(matching: MatchParams, batch: u32, inflight: u32) -> PipelineConfig
 /// `--inflight`, since a batch fitting the budget depends on both) and checks every resolved
 /// batch against the device's own limit and the VRAM budget again. Run before any timed work so a
 /// bad config or a missing adapter fails fast.
-fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<GpuContext> {
+fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Arc<GpuContext>> {
     check_presets(presets, false, true)?;
     anyhow::ensure!(sweep.inflight.iter().all(|&i| i >= 1), "--inflight must be at least 1");
     for p in presets {
@@ -368,19 +360,19 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
             }
         }
     }
-    let ctx = GpuContext::new()?;
+    let ctx = Arc::new(GpuContext::new(GpuOptions::try_from_env()?)?);
     eprintln!("{}", ctx.describe());
     for p in presets {
-        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
                 anyhow::ensure!(
                     batch >= 1 && batch <= max,
                     "--batch {batch} not in 1..={max} for preset '{}' on this device",
                     p.name
                 );
-                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, ctx.direct_upload)?;
+                check_vram(&sweep_cfg(p.params, batch, inflight), sweep.vram_budget_mb, ctx.direct_upload())?;
             }
         }
     }
@@ -392,7 +384,7 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Gpu
 /// no GPU dispatch) rather than threaded through from `gpu_preflight`, so the two stay in sync by
 /// construction.
 fn run_gpu_sweep(
-    ctx: &GpuContext,
+    ctx: &Arc<GpuContext>,
     corpus: &Corpus,
     presets: &[Preset],
     sweep: &GpuSweepArgs,
@@ -400,13 +392,13 @@ fn run_gpu_sweep(
     results: &mut Vec<result::RunResult>,
 ) -> anyhow::Result<()> {
     for p in presets {
-        let max = max_batch_blocks(&ctx.device.limits(), &p.params);
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
         for &spec in &sweep.batch {
             for &inflight in &sweep.inflight {
-                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload)?;
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
                 for &writers in &sweep.writer_threads {
                     let cfg = sweep_cfg(p.params, batch, inflight);
-                    let mib = check_vram(&cfg, sweep.vram_budget_mb, ctx.direct_upload)?;
+                    let mib = check_vram(&cfg, sweep.vram_budget_mb, ctx.direct_upload())?;
                     eprintln!(
                         "running gpu {} b{batch} i{inflight} ({mib} MiB GPU memory) @ {writers} writer threads (verify={verify})...",
                         p.name
@@ -425,9 +417,43 @@ fn run_gpu_cmd(args: GpuArgs) -> anyhow::Result<()> {
     log_corpus(&corpus);
 
     let mut results = Vec::new();
-    run_gpu_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    if args.facade {
+        run_facade_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    } else {
+        run_gpu_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    }
 
     write_reports(&results, &args.out)
+}
+
+/// `run_gpu_sweep` through `gzc_gpu::Compressor`. A `max` batch is left to the compressor's own
+/// sizing, which must come to what the bench resolved.
+fn run_facade_sweep(
+    ctx: &Arc<GpuContext>,
+    corpus: &Corpus,
+    presets: &[Preset],
+    sweep: &GpuSweepArgs,
+    verify: bool,
+    results: &mut Vec<result::RunResult>,
+) -> anyhow::Result<()> {
+    for p in presets {
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
+        for &spec in &sweep.batch {
+            for &inflight in &sweep.inflight {
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
+                let options = gzc_gpu::CompressorOptions {
+                    preset: p.params,
+                    vram_budget_mib: sweep.vram_budget_mb,
+                    batch_blocks: (spec != BatchSpec::Max).then_some(batch),
+                    inflight,
+                    gpu: ctx.options().clone(),
+                };
+                eprintln!("running gpu-facade {} b{batch} i{inflight} (verify={verify})...", p.name);
+                results.push(gpurun::run_facade(ctx, corpus, p.name, &options, batch, verify)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
@@ -537,7 +563,7 @@ mod tests {
     #[test]
     fn resolve_max_batch_errors_when_even_batch_1_does_not_fit() {
         let m = gzc_core::params::LVL3;
-        let err = resolve_max_batch(m, 1, 0, 4096, false).unwrap_err().to_string();
+        let err = format!("{:#}", resolve_max_batch(m, 1, 0, 4096, false).unwrap_err());
         assert!(err.contains("--batch max") && err.contains("--vram-budget-mb"), "{err}");
     }
 
@@ -555,8 +581,8 @@ mod tests {
     fn resolve_max_batch_differs_per_preset() {
         let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
         let lvl3 = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, false).unwrap();
-        let rung1 = resolve_max_batch(gzc_core::params::RUNG1, inflight, budget_mb, device_max, false).unwrap();
-        assert!(lvl3 < rung1, "lvl3 {lvl3} should resolve smaller than rung1 {rung1} at the same budget");
+        let lvl9 = resolve_max_batch(gzc_core::params::LVL9SEG, inflight, budget_mb, device_max, false).unwrap();
+        assert!(lvl3 < lvl9, "lvl3 {lvl3} should resolve smaller than lvl9seg {lvl9} at the same budget");
         // The direct upload has no shared `data` buffer: a larger batch fits.
         let direct = resolve_max_batch(gzc_core::params::LVL3, inflight, budget_mb, device_max, true).unwrap();
         assert!(direct > lvl3, "direct upload {direct} vs copy upload {lvl3}");
@@ -576,19 +602,23 @@ mod tests {
             };
             let names = |extra: &[&str]| presets(extra).unwrap().iter().map(|p| p.name).collect::<Vec<_>>();
             assert_eq!(names(&[]), ["lvl3"], "{cmd}: default");
-            assert_eq!(names(&["--preset", "lvl3,lvl9"]), ["lvl3", "lvl9"], "{cmd}");
-            assert_eq!(presets(&["--preset", "rung1"]).unwrap()[0].params, gzc_core::params::RUNG1, "{cmd}");
+            assert_eq!(names(&["--preset", "lvl3,lvl9seg"]), ["lvl3", "lvl9seg"], "{cmd}");
+            assert_eq!(presets(&["--preset", "lvl9s12seg"]).unwrap()[0].params, gzc_core::params::LVL9S12SEG, "{cmd}");
             let err = presets(&["--preset", "lvl3,bogus"]).unwrap_err().to_string();
-            assert!(err.contains("bogus") && err.contains("lvl3") && err.contains("lvl9"), "{cmd}: {err}");
+            assert!(err.contains("bogus") && err.contains("lvl3") && err.contains("lvl9seg"), "{cmd}: {err}");
+            for removed in ["rung1", "rung2", "lvl9", "lvl9s12", "lvl9s12d16seg"] {
+                assert!(presets(&["--preset", removed]).is_err(), "{cmd}: {removed} is no longer a preset");
+            }
         }
-        let lvl9 = parse_preset("lvl9").unwrap();
         let lvl3 = parse_preset("lvl3").unwrap();
         assert!(check_presets(&[lvl3], true, true).is_ok());
-        assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
+        // An unsegmented lazy parse is CPU-only (no preset has one; the GPU refuses the params).
+        let cpu_only = Preset { name: "lazy2-unsegmented", params: gzc_core::fixtures::LVL9 };
+        assert!(check_presets(&[cpu_only], true, false).is_ok());
+        assert!(check_presets(&[cpu_only], false, true).is_err());
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
         assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
-        // M5 T5: the GPU implements the optimal parse too, and since M6 B4 the M6 options
-        // (opt16p1).
+        // The GPU implements every preset, opt16p1 included.
         assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
         let p1 = parse_preset("opt16p1").unwrap();
         assert!(check_presets(&[p1], true, true).is_ok(), "cpu and gpu implement opt16p1");
@@ -616,7 +646,7 @@ mod tests {
         let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
         assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
         assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
-        // M6 opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB),
+        // opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB),
         // so the budget allows fewer: 3125 blocks. On a device whose storage
         // bindings stop at 2 GiB (an RTX 5090 under wgpu) `device_max` is lower still: the pred
         // buffer, 704 KiB per block, caps the batch at 2978 (`max_batch_blocks`).

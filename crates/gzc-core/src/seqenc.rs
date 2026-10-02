@@ -16,9 +16,11 @@ static OF_TABLE: LazyLock<FseCTable> = LazyLock::new(|| FseCTable::from_normaliz
 /// Symbol compression mode of one stream (RFC 8878 §3.1.1.3.2.2). Repeat_Mode is never used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeqMode {
+    /// zstd's predefined distribution; no table description.
     Predefined,
     /// Every sequence uses this one code.
     Rle(u8),
+    /// A computed FSE table, described by an NCount header.
     Compressed,
 }
 
@@ -36,8 +38,11 @@ impl SeqMode {
 /// The three sequence streams, in table-description order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamKind {
+    /// Literal-length codes.
     LiteralLength,
+    /// Offset codes.
     Offset,
+    /// Match-length codes.
     MatchLength,
 }
 
@@ -80,8 +85,11 @@ impl StreamKind {
 /// description written after the modes byte (empty / 1 RLE byte / NCount header).
 #[derive(Clone, Debug)]
 pub struct StreamTable {
+    /// The stream's symbol compression mode.
     pub mode: SeqMode,
+    /// The FSE table the encoder uses.
     pub table: Cow<'static, FseCTable>,
+    /// The table description bytes written after the modes byte.
     pub description: Vec<u8>,
 }
 
@@ -261,7 +269,8 @@ mod tests {
     use crate::config::BLOCK_SIZE;
     use crate::frame::testutil::scripted;
     use crate::frame::{FrameOptions, frame_header, write_frame, write_literals_raw};
-    use crate::reference::{LVL3, compress_block};
+    use crate::params::LVL3;
+    use crate::reference::compress_block;
     use crate::seq::{BlockOutput, reconstruct};
     use crate::synth;
 

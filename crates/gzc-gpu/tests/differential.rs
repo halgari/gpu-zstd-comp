@@ -9,17 +9,17 @@ use gzc_core::fse::{choose_table_log, cost_x256, normalize, write_ncount};
 use gzc_core::huffman::HufTable;
 use gzc_core::huffman::{HUF_MAX_BITS, MIN_HUF_LITERALS, build_table, compressed_section, table_description};
 use gzc_core::lazy::cases::{LazyCase, lazy_test_cases, segment_test_cases};
-use gzc_core::lazy::lazy_parse;
-use gzc_core::params::{LVL3, LVL9, LVL9S12, LVL9S12D16SEG, LVL9S12SEG, LVL9SEG, MatchParams, RUNG1, RUNG2};
+use gzc_core::fixtures::{LVL9, RUNG1, RUNG2};
+use gzc_core::params::{LVL3, LVL9S12SEG, LVL9SEG, MatchParams};
 use gzc_core::reference::{Match, chains, compress_block, find_best, match_len_capped};
 use gzc_core::seq::{BlockOutput, INITIAL_REPS, Sequence, apply_off_base, off_base_for, reconstruct};
 use gzc_core::seqenc::{SeqMode, StreamKind, StreamTable, histograms, write_sequences_section_auto};
 use gzc_core::synth::{random, test_cases, text, zeros};
-use gzc_gpu::compressor::{
+use gzc_gpu::testing::{
     GpuParams, K3Mode, Kernels, best_from_blocks, compress_batch, compress_frames, frames_from_best, frames_from_parses,
     parses_from_best,
 };
-use gzc_gpu::context::{Emulation, GpuContext, GpuOptions};
+use gzc_gpu::{Emulation, GpuContext, GpuOptions};
 use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
 
 /// The foreign GPU semantics every context of this suite emulates: none when this file is its own
@@ -28,12 +28,12 @@ use gzc_gpu::pipeline::{FrameSink, Pipeline, PipelineConfig};
 #[allow(dead_code)]
 const EMULATION: Emulation = Emulation::NONE;
 
-/// `GpuContext::new()`, or `with_subgroups(false)` for `subgroups: false`, emulating
-/// `crate::EMULATION`.
-fn context(subgroups: bool) -> GpuContext {
+/// A context from the environment's options, without subgroups for `subgroups: false`,
+/// emulating `crate::EMULATION`.
+fn context(subgroups: bool) -> std::sync::Arc<GpuContext> {
     let env = GpuOptions::from_env();
-    let opts = GpuOptions { subgroups: subgroups && env.subgroups, emulate: crate::EMULATION, ..env };
-    GpuContext::with_gpu_options(opts).expect("GPU required for gzc-gpu tests")
+    let opts = GpuOptions { subgroups: subgroups && env.subgroups, emulate: crate::EMULATION.or(env.emulate), ..env };
+    gzc_gpu::testing::gpu_with(opts)
 }
 
 /// Every test case chunked into padded blocks, labelled "name[i]".
@@ -53,22 +53,20 @@ fn case(name: &str) -> Vec<u8> {
     test_cases().into_iter().find(|(n, _)| *n == name).unwrap().1
 }
 
-fn setup(matching: MatchParams) -> (GpuContext, Kernels) {
+fn setup(matching: MatchParams) -> (std::sync::Arc<GpuContext>, Kernels) {
     let ctx = context(true);
     let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: false, huffman: false }).expect("Kernels::new");
     (ctx, kernels)
 }
 
-/// The presets the GPU implements, each checked by the differential tests below.
-const GPU_PRESETS: [(&str, MatchParams); 8] = [
+/// The non-opt presets (the opt ones: `opt_pipeline.rs`), plus a single greedy chain and a
+/// segmented lazy1 parse, which no preset has. Each is checked by the differential tests below.
+const GPU_PRESETS: [(&str, MatchParams); 5] = [
     ("lvl3", LVL3),
-    ("rung1", RUNG1),
-    ("rung2", RUNG2),
-    ("lvl9", LVL9),
+    ("single-greedy", RUNG1),
+    ("lazy1-seg", MatchParams { segment_log2: 12, ..RUNG2 }),
     ("lvl9seg", LVL9SEG),
-    ("lvl9s12", LVL9S12),
     ("lvl9s12seg", LVL9S12SEG),
-    ("lvl9s12d16seg", LVL9S12D16SEG),
 ];
 
 /// LVL3 with a deeper chain walk.
@@ -111,7 +109,7 @@ fn check_batch(ctx: &GpuContext, kernels: &Kernels, blocks: &[(String, Vec<u8>)]
 
 #[test]
 fn gpu_matches_reference() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup(params);
@@ -126,7 +124,7 @@ fn gpu_matches_reference() {
 
 #[test]
 fn gpu_matches_reference_depth4() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup(DEPTH4);
     let blocks: Vec<_> = all_blocks().into_iter().step_by(2).collect();
     check_batch(&ctx, &kernels, &blocks, DEPTH4);
@@ -137,7 +135,7 @@ fn gpu_matches_reference_depth4() {
 /// and the parse extends that match to its full 80 bytes.
 #[test]
 fn capped_search_prefers_closer_candidate() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup(DEPTH4);
     let mut block = random(20, BLOCK_SIZE);
     let s = random(21, 200);
@@ -158,7 +156,7 @@ fn capped_search_prefers_closer_candidate() {
 /// past the end would see a mismatch).
 #[test]
 fn block_ends_with_adjacent_neighbours() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let period3 = case("period3");
     // period3 continued across the boundary: its phase at BLOCK_SIZE.
     let mut period3_cont = period3.clone();
@@ -189,7 +187,7 @@ fn block_ends_with_adjacent_neighbours() {
 
 #[test]
 fn gpu_frames_roundtrip() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (preset, params) in GPU_PRESETS {
         let (ctx, kernels) = setup(params);
         let blocks = all_blocks();
@@ -205,7 +203,7 @@ fn gpu_frames_roundtrip() {
 
 #[test]
 fn batch_of_300_mixed() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup(params);
@@ -218,30 +216,37 @@ fn batch_of_300_mixed() {
 /// params are errors, not panics.
 #[test]
 fn kernels_per_params_coexist_and_reject_unsupported() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let ctx = context(true);
     let gp = |matching| GpuParams { matching, emit_frames: false, huffman: false };
     let lvl3 = Kernels::new(&ctx, gp(LVL3)).unwrap();
     let depth4 = Kernels::new(&ctx, gp(DEPTH4)).unwrap();
     let rung1 = Kernels::new(&ctx, gp(RUNG1)).unwrap();
-    let rung2 = Kernels::new(&ctx, gp(RUNG2)).unwrap();
-    let lvl9 = Kernels::new(&ctx, gp(LVL9)).unwrap();
+    let lazy1 = MatchParams { segment_log2: 12, ..RUNG2 };
+    let rung2 = Kernels::new(&ctx, gp(lazy1)).unwrap();
+    let lvl9 = Kernels::new(&ctx, gp(LVL9SEG)).unwrap();
     let blocks = [("text".to_string(), text(12, BLOCK_SIZE))];
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     check_batch(&ctx, &depth4, &blocks, DEPTH4);
     check_batch(&ctx, &rung1, &blocks, RUNG1);
-    check_batch(&ctx, &lvl9, &blocks, LVL9);
-    check_batch(&ctx, &rung2, &blocks, RUNG2);
+    check_batch(&ctx, &lvl9, &blocks, LVL9SEG);
+    check_batch(&ctx, &rung2, &blocks, lazy1);
     check_batch(&ctx, &lvl3, &blocks, LVL3);
     let e = Kernels::new(&ctx, gp(MatchParams { lazy: 3, ..LVL9 })).err().expect("lazy 3 rejected");
     assert!(e.to_string().contains("lazy 3"), "{e}");
+    // An unsegmented lazy parse is valid (the CPU oracle runs it) but not a GPU parse.
+    for m in [RUNG2, LVL9] {
+        assert!(m.validate().is_ok());
+        let e = Kernels::new(&ctx, gp(m)).err().expect("unsegmented lazy rejected");
+        assert!(e.to_string().contains("not implemented on gpu") && e.to_string().contains("segment"), "{e}");
+    }
     let e = Kernels::new(&ctx, gp(MatchParams { depth: 0, ..LVL3 })).err().expect("depth 0 rejected");
     assert!(e.to_string().contains("depth"), "{e}");
 }
 
 #[test]
 fn empty_batch_is_empty() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup(LVL3);
     assert!(compress_batch(&ctx, &kernels, &[]).unwrap().is_empty());
 }
@@ -252,12 +257,12 @@ fn empty_batch_is_empty() {
 const NO_HUFFMAN: FrameOptions = FrameOptions { checksum: false, huffman: false };
 
 /// LVL3 frame kernels; `huffman` adds K5 (Huffman literals), matching `FrameOptions::default()`.
-fn setup_frames(huffman: bool) -> (GpuContext, Kernels) {
+fn setup_frames(huffman: bool) -> (std::sync::Arc<GpuContext>, Kernels) {
     setup_frames_for(LVL3, huffman)
 }
 
 /// `setup_frames` for any match params.
-fn setup_frames_for(matching: MatchParams, huffman: bool) -> (GpuContext, Kernels) {
+fn setup_frames_for(matching: MatchParams, huffman: bool) -> (std::sync::Arc<GpuContext>, Kernels) {
     let ctx = context(true);
     let kernels = Kernels::new(&ctx, GpuParams { matching, emit_frames: true, huffman }).expect("Kernels::new");
     assert_eq!(kernels.frame_options().huffman, huffman);
@@ -447,7 +452,7 @@ fn frame_blocks_cover_every_mode() {
 
 #[test]
 fn gpu_frames_identical_no_huffman() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup_frames_for(params, false);
@@ -462,7 +467,7 @@ fn gpu_frames_identical_no_huffman() {
 
 #[test]
 fn gpu_frames_identical_huffman() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup_frames_for(params, true);
@@ -477,7 +482,7 @@ fn gpu_frames_identical_huffman() {
 
 #[test]
 fn gpu_frames_batch_of_300_mixed() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let (ctx, kernels) = setup_frames_for(params, true);
@@ -486,31 +491,32 @@ fn gpu_frames_batch_of_300_mixed() {
     }
 }
 
-/// With subgroups off (`GpuContext::with_subgroups(false)`), K1 builds only its fallback kernel
-/// (`ChainsKernel::with_options` only attempts the subgroup kernel when `ctx.subgroups`) and
-/// `compressor::k3_mode` (which also checks `ctx.subgroups`) picks the sequential K3 instead of
-/// the cooperative one — the code path a GPU without subgroup support runs everywhere. Runs the
+/// With subgroups off (`GpuOptions::subgroups`), K1 builds only its fallback kernel
+/// (`ChainsKernel::with_options` only attempts the subgroup kernel when `ctx.subgroups()`) and
+/// `kernels::k3_mode` (which also checks `ctx.subgroups()`) picks the sequential K3 instead of
+/// the cooperative one: the code path a GPU without subgroup support runs everywhere. Runs the
 /// full frame pipeline for every preset on a few synthetic blocks, so plain `cargo test` covers
 /// fallback K1 and sequential K3 together, without needing such hardware.
 #[test]
 fn gpu_frames_identical_without_subgroups() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let blocks: Vec<_> = frame_blocks().into_iter().step_by(4).collect();
     assert!(blocks.len() >= 3, "expected a handful of synthetic blocks, got {}", blocks.len());
     for (name, params) in GPU_PRESETS {
         eprintln!("preset {name}");
         let ctx = context(false);
-        assert!(!ctx.subgroups, "with_subgroups(false) must disable subgroups");
+        assert!(!ctx.subgroups(), "subgroups: false must disable subgroups");
         let kernels =
             Kernels::new(&ctx, GpuParams { matching: params, emit_frames: true, huffman: true }).expect("Kernels::new");
-        assert_eq!(kernels.k3_mode(), K3Mode::Seq, "{name}: with_subgroups(false) must force the sequential K3");
+        let unsegmented = params.segment_log2 == 0;
+        assert_eq!(kernels.k3_mode(), unsegmented.then_some(K3Mode::Seq), "{name}: subgroups: false must force the sequential K3");
         check_frames(&ctx, &kernels, &blocks);
     }
 }
 
 #[test]
 fn compress_frames_needs_emit_frames() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup(LVL3);
     let block = zeros(BLOCK_SIZE);
     assert!(compress_frames(&ctx, &kernels, &[&block]).is_err());
@@ -522,7 +528,7 @@ fn compress_frames_needs_emit_frames() {
 /// instead of handing them to the GPU.
 #[test]
 fn frames_from_parses_rejects_invalid_sequences() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let ctx = context(true);
     let params = GpuParams { matching: LVL3, emit_frames: true, huffman: true };
     let kernels = Kernels::new(&ctx, params).unwrap();
@@ -610,7 +616,7 @@ fn check_scripted(ctx: &GpuContext, kernels: &Kernels, cases: &[(String, Vec<u8>
 /// predefined-vs-computed cost, one- and two-sequence streams, RLE streams, repeat offsets.
 #[test]
 fn k4_random_scripts_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup_frames(false);
     let mut r = Lcg(0x4b4);
     let mut cases = Vec::new();
@@ -645,7 +651,7 @@ fn k4_random_scripts_match_cpu() {
 /// 16-bit literal-length, match-length and offset extra fields next to each other.
 #[test]
 fn k4_chunk_boundaries_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let mut r = Lcg(0xc4c);
     let mut cases = Vec::new();
     for (i, &n_seq) in [1usize, 2, 4, 5, 255, 256, 257, 259, 511, 512, 513, 1000, 1024, 1025].iter().enumerate() {
@@ -675,7 +681,7 @@ fn k4_chunk_boundaries_match_cpu() {
 /// Hand-built cases pinning each decision boundary of the mode choice and the block type.
 #[test]
 fn k4_decision_boundaries_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup_frames(false);
     let mut cases = Vec::new();
     let mut push = |name: &str, script: &[(u32, u32, u32)]| {
@@ -1012,7 +1018,7 @@ fn literal_cases_cover_every_path() {
 
 #[test]
 fn k5_literal_cases_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup_frames(true);
     let cases = literal_cases();
     check_scripted(&ctx, &kernels, &cases);
@@ -1026,7 +1032,7 @@ fn k5_literal_cases_match_cpu() {
 /// literals sections of every type and many lengths, spliced by K4 at every byte alignment.
 #[test]
 fn k5_random_scripts_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let (ctx, kernels) = setup_frames(true);
     let mut r = Lcg(0x4b5);
     let mut cases = Vec::new();
@@ -1065,14 +1071,14 @@ fn k5_random_scripts_match_cpu() {
 }
 
 /// K5 gathers the literals from the block through a per-thread index over groups of
-/// G = ceil(n_seq / 256) sequences (speed phase S4). Scripts with hundreds to thousands of
+/// G = ceil(n_seq / 256) sequences. Scripts with hundreds to thousands of
 /// sequences (G > 1), mostly empty literal runs (so group starts and seeks land on runs of
 /// length 0) with a few long ones (runs across group and thread boundaries), trailing literals of
 /// every size including none; Raw and Huffman (1 and 4 streams) sections; K5 with and without
 /// Huffman. Only these cases reach a seek that walks more than one run.
 #[test]
 fn k5_gather_many_sequences_match_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let mut r = Lcg(0x5a4);
     let mut cases = Vec::new();
     let most = BLOCK_SIZE as u32 / 8;
@@ -1123,7 +1129,7 @@ fn literals_are_the_uncovered_block_bytes() {
     for (name, block) in all_blocks() {
         for (preset, params) in GPU_PRESETS {
             let parse = compress_block(&block, params);
-            let got = gzc_gpu::compressor::gather_literals(&block, &parse.sequences);
+            let got = gzc_gpu::testing::gather_literals(&block, &parse.sequences);
             assert!(got == parse.literals, "{name} {preset}: gathered literals differ");
         }
     }
@@ -1134,26 +1140,27 @@ fn literals_are_the_uncovered_block_bytes() {
 /// K2 params beyond the presets: deeper Dfast walks and the smallest search_cap (8 = the long
 /// hash width, the edge of the cross-chain early-out argument in k2_best.wgsl), a Single
 /// chain with a small cap, and short keys (the bucket-sorted finder, k1_sort_sg / k2_window) with
-/// deep walks and min_match > 4.
-const K2_VARIANTS: [MatchParams; 11] = [
+/// deep walks and min_match > 4. K2 does not depend on the parse: the lazy ones are segmented
+/// only because the GPU refuses an unsegmented lazy parse.
+const K2_VARIANTS: [MatchParams; 12] = [
     MatchParams { depth: 4, ..LVL3 },
     MatchParams { depth: 16, search_cap: 8, ..LVL3 },
     MatchParams { depth: 8, search_cap: 16, ..LVL3 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 0, opt: None },
-    // Deep Single walks over the fingerprint skips (S8), with min_match 4 (a byte-4 mismatch
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 12, opt: None },
+    // Deep Single walks over the fingerprint skips, with min_match 4 (a byte-4 mismatch
     // skips only against a best of >= 4) and 6.
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 16, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16, segment_log2: 0, opt: None },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 64, lazy: 2, search_cap: 64, hash_bits: 16, segment_log2: 12, opt: None },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 4, depth: 64, lazy: 0, search_cap: 16, hash_bits: 11, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12, segment_log2: 0, opt: None },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13, segment_log2: 0, opt: None },
-    // The measured-and-dropped E2/E4 presets: a 13-bit sorted key (lvl9s13) and depth-16 chains
-    // (lvl9d16).
-    MatchParams { hash_bits: 13, ..LVL9 },
-    MatchParams { depth: 16, ..LVL9 },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 6, depth: 8, lazy: 2, search_cap: 8, hash_bits: 12, segment_log2: 12, opt: None },
+    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 8, depth: 1, lazy: 1, search_cap: 64, hash_bits: 13, segment_log2: 12, opt: None },
+    // A 13-bit sorted key, and depth-16 walks over the chains and over the 12-bit sorted key.
+    MatchParams { hash_bits: 13, ..LVL9SEG },
+    MatchParams { depth: 16, ..LVL9SEG },
+    MatchParams { depth: 16, ..LVL9S12SEG },
 ];
 
-/// Blocks for K2's fingerprint skips (S8): candidates that share the hash but not the first 4
+/// Blocks for K2's fingerprint skips: candidates that share the hash but not the first 4
 /// bytes (hash collisions), candidates equal in 4 bytes that differ at byte 4 (the byte field),
 /// and ties of length 4 and 5 between candidates. `words-tail1`: 4-byte words from 12 values, each
 /// followed by one of 3 bytes (so a word recurs with a different fifth byte); `words-tail2`: the
@@ -1263,7 +1270,7 @@ fn k2_cap_early_out_matches_find_best_cpu() {
 /// K2's best[] equals `find_best` exactly, for every preset and K2 variant.
 #[test]
 fn k2_best_matches_find_best() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let mut blocks = all_blocks();
     blocks.extend(k2_chain_blocks());
     blocks.extend(k2_fp_blocks());
@@ -1282,12 +1289,12 @@ fn k2_best_matches_find_best() {
 
 /// Dfast, the case the cross-chain early-out must get right: the long chain caps at a far
 /// candidate while the short chain holds a nearer (larger q) one. A nearer candidate shorter
-/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one of
-/// >= 8 bytes is on the long chain too, ahead of the far copy, and wins there (with search_cap
-/// 8 it caps first, and the far copy is never compared).
+/// than 8 bytes is only on the short chain and loses on length (the early-out skips it); one
+/// of at least 8 bytes is on the long chain too, ahead of the far copy, and wins there (with
+/// search_cap 8 it caps first, and the far copy is never compared).
 #[test]
 fn k2_dfast_nearer_short_chain_candidate() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for params in [LVL3, MatchParams { search_cap: 8, ..LVL3 }] {
         let (ctx, kernels) = setup(params);
         let blocks = k2_chain_blocks();
@@ -1311,58 +1318,21 @@ fn k2_dfast_nearer_short_chain_candidate() {
 // ---- K3 lazy / lazy2 ----
 
 /// Lazy parses off the preset table: `min_match` above 4 (repcode matches may still be 4 bytes)
-/// and a small `search_cap`, so the parse extends many capped `best[]` entries.
-const LAZY_VARIANTS: [MatchParams; 4] = [
-    MatchParams { min_match: 6, ..RUNG2 },
-    MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 0, opt: None },
-    // Segmented: 1 KiB lazy1 with min_match 6, and 2 KiB lazy2 extending many capped matches.
+/// and a small `search_cap`, so the parse extends many capped `best[]` entries: 1 KiB lazy1 with
+/// min_match 6, 2 KiB lazy2 extending many capped matches, and one segment per block.
+const LAZY_VARIANTS: [MatchParams; 3] = [
     MatchParams { min_match: 6, segment_log2: 10, ..RUNG2 },
+    MatchParams { min_match: 6, segment_log2: 16, ..RUNG2 },
     MatchParams { hashes: gzc_core::params::Hashes::Single, min_match: 5, depth: 4, lazy: 2, search_cap: 8, hash_bits: 16, segment_log2: 11, opt: None },
 ];
 
 #[test]
 fn gpu_matches_reference_lazy_variants() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     for params in LAZY_VARIANTS {
         eprintln!("{params:?}");
         let (ctx, kernels) = setup(params);
         check_batch(&ctx, &kernels, &all_blocks(), params);
-    }
-}
-
-/// Every hand-built lazy case (gain ties / wins by 1, `continue` after a win at step 1 and 2,
-/// catch-up bounds, the dedup-store rep rule, the immediate offset_2 loop, PARSE_END guards),
-/// run through K3 on its scripted `best[]` under both lazy presets. The K3 parse must equal
-/// `lazy_parse` (and the pinned sequences where the case lists them), and the frame must equal
-/// `write_frame` of it. The parse is compared directly because most of these mostly-random
-/// blocks become Raw frames, which would hide the sequences. Batched and one by one.
-#[test]
-fn k3_lazy_hand_built_best_matches_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    let cases = lazy_test_cases();
-    assert_eq!(cases.len(), 21);
-    for params in [RUNG2, LVL9] {
-        let (ctx, kernels) = setup_frames_for(params, true);
-        let check = |cases: &[&LazyCase]| {
-            let blocks: Vec<&[u8]> = cases.iter().map(|c| c.block.as_slice()).collect();
-            let bests: Vec<Vec<Match>> = cases.iter().map(|c| c.best.clone()).collect();
-            let parses = parses_from_best(&ctx, &kernels, &blocks, &bests).expect("parses_from_best");
-            let frames = frames_from_best(&ctx, &kernels, &blocks, &bests).expect("frames_from_best");
-            for ((c, got), frame) in cases.iter().zip(&parses).zip(&frames) {
-                let want = lazy_parse(&c.block, &c.best, &params);
-                assert!(*got == want, "{} lazy {}: K3 != lazy_parse; {}", c.name, params.lazy, first_diff(got, &want));
-                if let Some((_, pinned)) = c.expect.iter().find(|(p, _)| *p == params) {
-                    assert_eq!(got.sequences, *pinned, "{} lazy {}: pinned sequences", c.name, params.lazy);
-                }
-                let want_frame = write_frame(&c.block, &want, kernels.frame_options());
-                assert!(*frame == want_frame, "{} lazy {}: frame; {}", c.name, params.lazy, first_byte_diff(frame, &want_frame));
-            }
-        };
-        let all: Vec<&LazyCase> = cases.iter().collect();
-        check(&all);
-        for c in &all {
-            check(std::slice::from_ref(c));
-        }
     }
 }
 
@@ -1372,7 +1342,7 @@ fn k3_lazy_hand_built_best_matches_cpu() {
 /// Batched and one by one.
 #[test]
 fn k3_seg_hand_built_best_matches_cpu() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let seg_cases = segment_test_cases();
     let lazy_cases = lazy_test_cases();
     let mut runs: Vec<(MatchParams, Vec<&LazyCase>)> = Vec::new();
@@ -1426,7 +1396,7 @@ impl FrameSink for CollectFrames {
 /// stale blocks, the pipeline reused for a second run) for every non-lvl3 preset.
 #[test]
 fn stream_frames_match_cpu_non_lvl3_presets() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let ctx = context(true);
     let distinct = frame_blocks();
     for (name, matching) in GPU_PRESETS.into_iter().filter(|(n, _)| *n != "lvl3") {
@@ -1450,47 +1420,65 @@ fn stream_frames_match_cpu_non_lvl3_presets() {
     }
 }
 
+/// Partial blocks (a file's last block, given as its real bytes) through the streaming pipeline:
+/// frames equal the CPU oracle's, declare exactly the block's length (K4's content size ==
+/// `lens`) and decode to the block's bytes. Lengths around zstd's minimum match (1, 2, 3), both
+/// frame-header forms (255, 256, 257), a segment boundary (4095, 4096, 4097) and zero-tailed
+/// blocks, mixed with full blocks. Part of the emulated suite too (`differential_emulated.rs`):
+/// K3t and K4's real-length paths under the other GPUs' semantics.
+#[test]
+fn partial_blocks_frames_match_cpu() {
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
+    let ctx = context(true);
+    let source: Vec<u8> = test_cases().into_iter().flat_map(|(_, bytes)| bytes).collect();
+    let mut blocks: Vec<Vec<u8>> = [1, 2, 3, 255, 256, 257, 4095, 4096, 4097, 31_000, BLOCK_SIZE - 1, BLOCK_SIZE]
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| source[i * 5003..][..n].to_vec())
+        .collect();
+    // Zero-tailed: the real bytes end in zeros, like the padding after them.
+    let mut tailed = source[70_000..][..9000].to_vec();
+    tailed[4000..].fill(0);
+    blocks.push(tailed);
+    blocks.push(vec![0u8; 5000]);
+    blocks.push(source[2 * BLOCK_SIZE..3 * BLOCK_SIZE].to_vec());
+    let real: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+    let opt16p1 = ("opt16p1", gzc_core::params::OPT16P1);
+    for (name, matching) in GPU_PRESETS.into_iter().chain([opt16p1]) {
+        let params = GpuParams { matching, emit_frames: true, huffman: true };
+        // 15 blocks in batches of 4 (the last holds 3): every batch has partial blocks, and the
+        // last two a full block beside them.
+        let mut pipe = Pipeline::new(&ctx, &PipelineConfig { batch: 4, inflight: 2, params }).expect("Pipeline::new");
+        let mut sink = CollectFrames(vec![None; real.len()]);
+        pipe.run_frames(&real, &mut sink).expect("run_frames");
+        for (i, got) in sink.0.iter().enumerate() {
+            let got = got.as_ref().unwrap_or_else(|| panic!("{name}: block {i} never delivered"));
+            let want = gzc_core::reference::compress_block_to_frame(real[i], matching, params.frame_options());
+            let len = real[i].len();
+            assert!(*got == want, "{name}: block {i} ({len} bytes): {}", first_byte_diff(got, &want));
+            assert_eq!(
+                zstd::zstd_safe::get_frame_content_size(got).ok().flatten(),
+                Some(len as u64),
+                "{name}: block {i}: declared content size"
+            );
+            let back = zstd::bulk::decompress(got, BLOCK_SIZE).unwrap_or_else(|e| panic!("{name}: block {i}: libzstd: {e}"));
+            assert!(back == real[i], "{name}: block {i} ({len} bytes) did not round-trip");
+        }
+    }
+}
+
 /// Informal (not in the normal suite; reads the real corpus): a few hundred real .dds/.nif blocks
 /// per preset, GPU frames against CPU frames.
 /// `GZC_CORPUS=/path/to/data/corpus cargo test --release -p gzc-gpu --test differential corpus_blocks -- --ignored --nocapture`
-/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks, spread over the files in sorted path order;
+/// Takes up to `GZC_CORPUS_BLOCKS` (default 300) blocks sampled uniformly over the corpus
+/// (`gzc_core::testdata::corpus_sample_named`; skips when it is absent);
 /// `GZC_CORPUS_PRESETS` (comma-separated) limits the presets.
 #[test]
 #[ignore]
 fn corpus_blocks_match_cpu_per_preset() {
-    let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    use std::path::{Path, PathBuf};
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if matches!(ext.as_str(), "dds" | "nif") {
-                out.push(p);
-            }
-        }
-    }
-    let root = std::env::var("GZC_CORPUS")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus").to_string());
+    let _gpu = gzc_gpu::testing::gpu_test_slot();
     let want_blocks: usize = std::env::var("GZC_CORPUS_BLOCKS").map(|v| v.parse().unwrap()).unwrap_or(300);
-    let mut files = Vec::new();
-    walk(Path::new(&root), &mut files);
-    files.sort();
-    // Every k-th file, up to 4 blocks from each, so the sample spans the corpus.
-    let step = (files.len() / want_blocks).max(1);
-    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
-    for f in files.iter().step_by(step) {
-        if blocks.len() >= want_blocks {
-            break;
-        }
-        let bytes = std::fs::read(f).unwrap();
-        for (i, b) in chunk_file(&bytes).into_iter().take(4).enumerate() {
-            blocks.push((format!("{}[{i}]", f.display()), b.data));
-        }
-    }
-    blocks.truncate(want_blocks);
-    eprintln!("{} blocks from {} files", blocks.len(), files.len());
+    let Some(blocks) = gzc_core::testdata::corpus_sample_named(want_blocks) else { return };
     // `GZC_CORPUS_PRESETS=lvl9seg,...` limits the run to those presets.
     let only = std::env::var("GZC_CORPUS_PRESETS").ok();
     for (name, params) in GPU_PRESETS {

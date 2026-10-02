@@ -1,6 +1,6 @@
 # M5 log: optimal-parse presets `opt14` / `opt16`
 
-Plan: `docs/superpowers/plans/2026-09-30-m5-optimal-parse.md`. Design: `docs/superpowers/m5/m5-opt-design.md`.
+Plan: `docs/design/plans/2026-09-30-m5-optimal-parse.md`. Design: `docs/design/m5/m5-opt-design.md`.
 Corpus: `data/corpus --ext dds,nif` (3172 files, 6.49 GB). Ratios are real bytes / frame bytes and are
 deterministic (CPU oracle), so one run per row. CPU runs used 16 threads, with another agent's GPU benchmarks
 running at the same time; the MB/s columns are informational only.
@@ -133,7 +133,7 @@ Branch: T2 worktree based on `m5` at d4d05e2. Machine: RTX 5090, subgroups on un
 
 ### Time: K1 + K2opt vs lvl9 K1 + K2, 64 KiB, full corpus (100754 blocks, batch 2048)
 
-`cargo run --release -p gzc-gpu --example k2opt_bench -- data/corpus 2048`. For each batch, the per-kernel timestamps are the median of 3 reps; the table sums them over the corpus. Three full runs (µs per block):
+`cargo run --release -p gzc-gpu --example k2opt_bench -- data/corpus 2048` (the example has since been removed). For each batch, the per-kernel timestamps are the median of 3 reps; the table sums them over the corpus. Three full runs (µs per block):
 
 | run | lvl9 K1 | lvl9 K2 | lvl9 sum | opt16 K1 | opt16 K2opt | opt16 sum | lvl3 K1 (2 chains) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -410,7 +410,7 @@ Per 64 KiB of data, that is opt14 58.7 µs and opt16 108.2 µs, against 34.9 and
 
 ## T3b: K3opt speed port, branch `worktree-agent-ac3bc416894d39a90` (from `m5` d6a6700), 2026-09-30
 
-This task ports the K3opt performance study (`docs/superpowers/m5/k3opt-perf.md`) into the T4 kernel. T4's
+This task ports the K3opt performance study (`docs/design/m5/k3opt-perf.md`) into the T4 kernel. T4's
 prologue and epilogue, packed histogram, both seeds, cover literals and all pass schedules are unchanged.
 Output is byte-identical to the oracle for every schedule. `gzc-core` was not changed.
 

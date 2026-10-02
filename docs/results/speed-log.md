@@ -1,6 +1,6 @@
 # Speed phase log
 
-Protocol: `docs/superpowers/plans/2026-09-30-speed-phase.md`. Full corpus (`--ext dds,nif`, 6.49 GB), `--batch max --inflight 3`,
+Protocol: `docs/design/plans/2026-09-30-speed-phase.md`. Full corpus (`--ext dds,nif`, 6.49 GB), `--batch max --inflight 3`,
 6144 MiB budget, RTX 5090, median of 3 runs. Output must stay byte-identical to the CPU oracle.
 
 ## S0 — Baseline (branch `speed` @ 4c029c2 = m4 8894816 + plan), 2026-09-30 00:05, load avg ~4 (two idle VMs, desktop)
