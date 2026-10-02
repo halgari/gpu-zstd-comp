@@ -168,6 +168,59 @@ pub fn run_gpu(
     })
 }
 
+/// Compresses every block of `corpus` through the library's `Compressor::compress_blocks`, which
+/// returns all frames in one buffer. One untimed warmup batch runs first. The compressor must
+/// come to `batch` blocks per batch. With `verify`, every frame is decompressed with libzstd and
+/// compared with the block's real bytes.
+pub fn run_facade(
+    ctx: &Arc<GpuContext>,
+    corpus: &Corpus,
+    preset: &str,
+    options: &gzc_gpu::CompressorOptions,
+    batch: u32,
+    verify: bool,
+) -> anyhow::Result<RunResult> {
+    let compressor = gzc_gpu::Compressor::with_context(ctx.clone(), options)?;
+    anyhow::ensure!(
+        compressor.batch_blocks() == batch as usize,
+        "the compressor sized its batch to {} blocks, the bench to {batch}",
+        compressor.batch_blocks()
+    );
+    let blocks: Vec<&[u8]> = corpus.blocks.iter().map(|b| b.real()).collect();
+    compressor.compress_blocks(&blocks[..blocks.len().min(batch as usize)])?;
+
+    let start = Instant::now();
+    let frames = compressor.compress_blocks(&blocks)?;
+    let seconds = start.elapsed().as_secs_f64();
+    anyhow::ensure!(frames.len() == blocks.len(), "{} frames for {} blocks", frames.len(), blocks.len());
+
+    if verify {
+        (0..frames.len()).into_par_iter().try_for_each(|i| {
+            let dec = zstd::bulk::decompress(frames.frame(i), BLOCK_SIZE)?;
+            anyhow::ensure!(dec == blocks[i], "block {i} did not round-trip through the GPU frame");
+            Ok(())
+        })?;
+        crate::result::log_frame_digest(corpus, frames.iter());
+    }
+    let sizes: Vec<u64> = frames.iter().map(|f| f.len() as u64).collect();
+    let real_bytes = corpus.real_bytes();
+    eprintln!(
+        "  gpu-facade {preset} b{batch} i{}: compress_blocks {seconds:.3}s ({:.1} MB/s)",
+        options.inflight,
+        real_bytes as f64 / 1e6 / seconds
+    );
+    Ok(RunResult {
+        engine: "gpu-facade".to_string(),
+        config: format!("{preset} b{batch} i{}", options.inflight),
+        threads: None,
+        real_bytes,
+        compressed_bytes: sizes.iter().sum(),
+        seconds,
+        per_kind: per_kind(corpus, &sizes),
+        kernel_ms: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +250,28 @@ mod tests {
             let kind_sum: u64 = r.per_kind.iter().map(|k| k.compressed_bytes).sum();
             assert_eq!(kind_sum, r.compressed_bytes);
             assert_eq!(r.compressed_bytes, cpu_bytes(huffman));
+        }
+        // The library API gives the same frames, with a fixed batch and with its own sizing.
+        let max = gzc_gpu::max_batch_blocks(&ctx.device().limits(), &LVL3);
+        let auto = gzc_gpu::pipeline::max_batch_for_budget(
+            &ctx,
+            GpuParams { matching: LVL3, emit_frames: true, huffman: true },
+            2,
+            64,
+        )
+        .unwrap();
+        assert!(auto >= 1 && auto < max);
+        for (batch_blocks, batch) in [(Some(4), 4), (None, auto)] {
+            let options = gzc_gpu::CompressorOptions {
+                batch_blocks,
+                inflight: 2,
+                vram_budget_mib: 64,
+                gpu: ctx.options().clone(),
+                ..gzc_gpu::CompressorOptions::new(gzc_gpu::Level::Zstd3)
+            };
+            let r = run_facade(&ctx, &corpus, "lvl3", &options, batch, true).unwrap();
+            assert_eq!((r.engine.as_str(), r.config.as_str()), ("gpu-facade", format!("lvl3 b{batch} i2").as_str()));
+            assert_eq!(r.compressed_bytes, cpu_bytes(true));
         }
     }
 }

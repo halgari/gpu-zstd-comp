@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use gzc_core::params::{MatchParams, PRESETS};
 use gzc_gpu::{GpuParams, gpu_supports, max_batch_blocks};
 use gzc_gpu::{GpuContext, GpuOptions};
-use gzc_gpu::pipeline::{PipelineConfig, vram_bytes_with};
+use gzc_gpu::pipeline::{PipelineConfig, max_batch_within, vram_bytes_with};
 
 use corpus::{Corpus, LoadOpts};
 
@@ -140,10 +140,10 @@ fn parse_batch_spec(s: &str) -> Result<BatchSpec, String> {
 }
 
 /// Resolves `BatchSpec::Max` to the largest batch that fits `budget_mb` at `inflight` for match
-/// params `m`, capped by `device_max` (`gzc_gpu::sizing::max_batch_blocks`). `vram_bytes` is
-/// non-decreasing in `batch` (every buffer it counts scales with `batch`, at fixed `inflight`), so
-/// this binary searches rather than scanning every batch size. `direct_upload`: the context reads
-/// batches from the upload buffers (`GpuContext::direct_upload`, no shared `data` buffer).
+/// params `m`, capped by `device_max` (`gzc_gpu::max_batch_blocks`): the library's search
+/// (`gzc_gpu::pipeline::max_batch_within`), which a `Compressor` without an explicit batch also
+/// runs. `direct_upload`: the context reads batches from the upload buffers
+/// (`GpuContext::direct_upload`, no shared `data` buffer).
 fn resolve_max_batch(
     m: MatchParams,
     inflight: u32,
@@ -151,22 +151,9 @@ fn resolve_max_batch(
     device_max: u32,
     direct_upload: bool,
 ) -> anyhow::Result<u32> {
-    let fits =
-        |batch: u32| vram_bytes_with(&sweep_cfg(m, batch, inflight), direct_upload).div_ceil(1 << 20) <= vram_budget_mb;
-    anyhow::ensure!(
-        device_max >= 1 && fits(1),
-        "--batch max: even batch 1 at inflight {inflight} does not fit {vram_budget_mb} MiB (--vram-budget-mb) \
-         or this device's limits"
-    );
-    if fits(device_max) {
-        return Ok(device_max);
-    }
-    let (mut lo, mut hi) = (1u32, device_max); // fits(lo) held, fits(hi) does not.
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if fits(mid) { lo = mid } else { hi = mid }
-    }
-    Ok(lo)
+    use anyhow::Context as _;
+    max_batch_within(sweep_cfg(m, 1, inflight).params, inflight, vram_budget_mb, device_max, direct_upload)
+        .context("--batch max (see --vram-budget-mb)")
 }
 
 /// `spec` as an exact batch count: `N` as is, `Max` resolved via `resolve_max_batch`.
@@ -216,6 +203,10 @@ struct GpuArgs {
     preset: Vec<Preset>,
     #[command(flatten)]
     sweep: GpuSweepArgs,
+    /// Run through the library's `Compressor` API (`compress_blocks`, which returns every frame
+    /// in one buffer) instead of the bench's own pipeline calls. `--writer-threads` is not used.
+    #[arg(long)]
+    facade: bool,
     /// Decompress every produced frame with libzstd after the timed pass and
     /// error on any mismatch against the original block.
     #[arg(long)]
@@ -426,9 +417,43 @@ fn run_gpu_cmd(args: GpuArgs) -> anyhow::Result<()> {
     log_corpus(&corpus);
 
     let mut results = Vec::new();
-    run_gpu_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    if args.facade {
+        run_facade_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    } else {
+        run_gpu_sweep(&ctx, &corpus, &args.preset, &args.sweep, args.verify, &mut results)?;
+    }
 
     write_reports(&results, &args.out)
+}
+
+/// `run_gpu_sweep` through `gzc_gpu::Compressor`. A `max` batch is left to the compressor's own
+/// sizing, which must come to what the bench resolved.
+fn run_facade_sweep(
+    ctx: &Arc<GpuContext>,
+    corpus: &Corpus,
+    presets: &[Preset],
+    sweep: &GpuSweepArgs,
+    verify: bool,
+    results: &mut Vec<result::RunResult>,
+) -> anyhow::Result<()> {
+    for p in presets {
+        let max = max_batch_blocks(&ctx.device().limits(), &p.params);
+        for &spec in &sweep.batch {
+            for &inflight in &sweep.inflight {
+                let batch = resolve_batch(spec, p.params, inflight, sweep.vram_budget_mb, max, ctx.direct_upload())?;
+                let options = gzc_gpu::CompressorOptions {
+                    preset: p.params,
+                    vram_budget_mib: sweep.vram_budget_mb,
+                    batch_blocks: (spec != BatchSpec::Max).then_some(batch),
+                    inflight,
+                    gpu: ctx.options().clone(),
+                };
+                eprintln!("running gpu-facade {} b{batch} i{inflight} (verify={verify})...", p.name);
+                results.push(gpurun::run_facade(ctx, corpus, p.name, &options, batch, verify)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_all_cmd(args: AllArgs) -> anyhow::Result<()> {
@@ -538,7 +563,7 @@ mod tests {
     #[test]
     fn resolve_max_batch_errors_when_even_batch_1_does_not_fit() {
         let m = gzc_core::params::LVL3;
-        let err = resolve_max_batch(m, 1, 0, 4096, false).unwrap_err().to_string();
+        let err = format!("{:#}", resolve_max_batch(m, 1, 0, 4096, false).unwrap_err());
         assert!(err.contains("--batch max") && err.contains("--vram-budget-mb"), "{err}");
     }
 

@@ -1,8 +1,10 @@
 //! wgpu-backed GPU compression pipeline: device context, chain-hash and
 //! best-match kernels, host-side compressor orchestration, and streaming pipeline.
 mod chains;
+mod compressor;
 mod context;
 mod emulate;
+mod error;
 mod k3opt;
 mod kernels;
 pub mod pipeline;
@@ -13,11 +15,14 @@ mod sorted;
 pub mod testing;
 mod transfer;
 
+pub use compressor::{Batch, Compressor, CompressorOptions, Frames, FramesIter, Level, Payload, Stream};
 pub use context::{GpuContext, GpuOptions, K3Kernel};
 pub use emulate::Emulation;
+pub use error::Error;
 pub use gzc_core::config::BLOCK_SIZE;
 pub use gzc_core::params::MatchParams;
 pub use kernels::{GpuParams, K3Mode, gpu_supports};
+pub use pipeline::{FrameBatch, PipelineStats};
 pub use sizing::max_batch_blocks;
 
 // Pins the thread-safety the streaming API relies on (`FrameBatch`es go to writer threads, a

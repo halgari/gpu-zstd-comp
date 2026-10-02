@@ -14,9 +14,9 @@
 use crate::chains::{self, ChainsKernel, finder_wgsl, layout_wgsl};
 use crate::k3opt::{K3OptConfig, OptBinds, OptPasses};
 use crate::context::{ErrorScopes, GpuContext, K3Kernel, params_wgsl};
+use crate::error::{Kind, invalid_input, tagged};
 use crate::sizing::{BufferSizes, best_bytes, counts_bytes, data_bytes, frame_len_bytes, max_batch_blocks};
 use crate::sorted::SortKernel;
-use anyhow::anyhow;
 use gzc_core::codes::{
     LL_BASE, LL_BITS, LL_DEFAULT_NORM, ML_BASE, ML_BITS, ML_DEFAULT_NORM, OF_DEFAULT_NORM, ll_code, ml_code,
 };
@@ -119,13 +119,19 @@ fn unsegmented_lazy(p: &MatchParams) -> bool {
 
 /// Ok when `m` is valid, implemented on the GPU and its sequences fit `max_seqs(m)`.
 pub(crate) fn check_matching(m: &MatchParams) -> anyhow::Result<()> {
-    m.validate().map_err(|e| anyhow!("invalid match params {m:?}: {e}"))?;
-    anyhow::ensure!(
-        !unsegmented_lazy(m),
-        "match params {m:?} are not implemented on gpu: a lazy parse (lazy {}) needs segments (segment_log2 > 0)",
-        m.lazy
-    );
-    anyhow::ensure!(gpu_supports(m), "match params {m:?} are not implemented yet on gpu");
+    m.validate().map_err(|e| invalid_input(format!("invalid match params {m:?}: {e}")))?;
+    if unsegmented_lazy(m) {
+        return Err(tagged(
+            Kind::Unsupported,
+            format!(
+                "match params {m:?} are not implemented on gpu: a lazy parse (lazy {}) needs segments (segment_log2 > 0)",
+                m.lazy
+            ),
+        ));
+    }
+    if !gpu_supports(m) {
+        return Err(tagged(Kind::Unsupported, format!("match params {m:?} are not implemented yet on gpu")));
+    }
     let max = max_seqs(m);
     anyhow::ensure!(
         max as usize * m.min_seq_len() as usize >= BLOCK_SIZE,

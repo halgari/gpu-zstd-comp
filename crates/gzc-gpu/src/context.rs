@@ -4,6 +4,7 @@ use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, NO_P
 use gzc_core::params::MatchParams;
 
 use crate::emulate::Emulation;
+use crate::error::{Kind, tagged};
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
@@ -98,8 +99,9 @@ pub struct GpuOptions {
     /// Use the bucket-sorted match finder for the presets it serves (a single hash of at most 13
     /// key bits, such as `lvl9s12seg`). `GZC_SORTED=0` turns it off.
     pub sorted_finder: bool,
-    /// Threads that copy a batch into its upload buffer. `None` means 4. The pipeline never uses
-    /// more than the machine has. `GZC_UPLOAD_THREADS`.
+    /// Threads that copy a batch into its upload buffer, and in `Compressor::compress` its frames
+    /// out of the readback buffer. `None` means 4. The pipeline never uses more than the machine
+    /// has. `GZC_UPLOAD_THREADS`.
     pub upload_threads: Option<usize>,
     /// Workgroups per K1 dispatch, which is the number of hash tables in use at once. `None`
     /// picks 128 for the subgroup kernel and every table otherwise. `GZC_K1_GROUPS`.
@@ -382,7 +384,7 @@ impl Prepared {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
-        .map_err(|e| anyhow!("no GPU adapter found (wgpu): {e}"))?;
+        .map_err(|e| tagged(Kind::NoAdapter, format!("no GPU adapter found (wgpu): {e}")))?;
         drop(guard);
 
         let al = adapter.limits();
@@ -475,7 +477,7 @@ impl GpuContext {
                 Ok(r) => return Ok(r),
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(why) = self.device_lost() {
-                        anyhow::bail!("GPU device lost: {why}");
+                        return Err(tagged(Kind::DeviceLost, format!("GPU device lost: {why}")));
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => anyhow::bail!("wgpu callback dropped"),
@@ -742,25 +744,28 @@ impl<'c> ErrorScopes<'c> {
         match self.take() {
             None => Ok(()),
             Some(ScopeError::Validation(e)) => Err(anyhow!("wgpu validation error: {e}")),
-            Some(ScopeError::Oom(e)) => Err(anyhow!("wgpu out of memory: {e}")),
-            Some(ScopeError::Lost(why)) => Err(anyhow!("GPU device lost: {why}")),
+            Some(ScopeError::Oom(e)) => Err(tagged(Kind::OutOfMemory, format!("wgpu out of memory: {e}"))),
+            Some(ScopeError::Lost(why)) => Err(tagged(Kind::DeviceLost, format!("GPU device lost: {why}"))),
         }
     }
 
     /// `pop` for a constructor that allocated `bytes` of buffers for `what`: the error names the
     /// allocation (and wgpu's message the failing buffer's label).
     pub(crate) fn pop_alloc(self, what: &str, bytes: u64) -> anyhow::Result<()> {
-        const HINT: &str = "try a smaller --batch or --vram-budget-mb";
+        const HINT: &str = "try a smaller batch or VRAM budget (--batch, --vram-budget-mb)";
         let mib = bytes.div_ceil(1 << 20);
         match self.take() {
             None => Ok(()),
-            Some(ScopeError::Oom(e)) => {
-                Err(anyhow!("GPU allocation of {mib} MiB for {what} failed: out of memory ({HINT}): {e}"))
-            }
+            Some(ScopeError::Oom(e)) => Err(tagged(
+                Kind::OutOfMemory,
+                format!("GPU allocation of {mib} MiB for {what} failed: out of memory ({HINT}): {e}"),
+            )),
             Some(ScopeError::Validation(e)) => {
                 Err(anyhow!("GPU allocation of {mib} MiB for {what} failed ({HINT}): {e}"))
             }
-            Some(ScopeError::Lost(why)) => Err(anyhow!("GPU device lost while allocating {mib} MiB for {what}: {why}")),
+            Some(ScopeError::Lost(why)) => {
+                Err(tagged(Kind::DeviceLost, format!("GPU device lost while allocating {mib} MiB for {what}: {why}")))
+            }
         }
     }
 

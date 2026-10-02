@@ -56,6 +56,7 @@ use crate::sizing::{
 };
 use gzc_core::params::MatchParams;
 use crate::context::{ErrorScopes, GpuContext};
+use crate::error::{Kind, invalid_input, tagged};
 use crate::transfer::{Commands, RawBuffer, StreamingGuard, Timeline, TransferQueue};
 
 mod completion;
@@ -259,10 +260,14 @@ impl Pipeline {
     pub fn new(ctx: &Arc<GpuContext>, cfg: &PipelineConfig) -> anyhow::Result<Self> {
         let m = cfg.params.matching;
         let max = max_batch_blocks(&ctx.device.limits(), &m);
-        anyhow::ensure!(cfg.inflight >= 1, "inflight must be at least 1");
-        anyhow::ensure!(cfg.batch >= 1 && cfg.batch <= max, "batch {} not in 1..={max} for this device", cfg.batch);
+        if cfg.inflight < 1 {
+            return Err(invalid_input("inflight must be at least 1"));
+        }
+        if cfg.batch < 1 || cfg.batch > max {
+            return Err(invalid_input(format!("batch {} not in 1..={max} for this device", cfg.batch)));
+        }
         if let Some(why) = ctx.device_lost() {
-            anyhow::bail!("GPU device lost: {why}");
+            return Err(tagged(Kind::DeviceLost, format!("GPU device lost: {why}")));
         }
 
         let scopes = ErrorScopes::push(ctx);
@@ -408,6 +413,12 @@ impl Pipeline {
         return self.poll_only || self.ctx.poll_only();
         #[cfg(not(test))]
         return self.ctx.poll_only();
+    }
+
+    /// Threads to copy a batch with, into its upload buffer or out of its staging buffer
+    /// (`GpuOptions::upload_threads`, at most the machine's).
+    pub(crate) fn copy_threads(&self) -> usize {
+        self.upload_threads
     }
 
     /// True when batches are read back through the transfer queue (see `Xfer`).
@@ -895,4 +906,43 @@ pub fn vram_bytes_with(cfg: &PipelineConfig, direct_upload: bool) -> u64 {
         - if direct_upload { data_bytes(cfg.batch) } else { 0 }
         + cfg.inflight as u64 * per_slot_bytes(cfg.batch, frames, &cfg.params.matching)
         + if frames { k4_tables_bytes() } else { 0 }
+}
+
+/// The largest batch whose frame or parse pipeline fits `budget_mib` MiB of device memory on
+/// `ctx`, with `inflight` batches in flight. The device's own limit caps it
+/// ([`crate::max_batch_blocks`]). Errors when not even one block fits.
+pub fn max_batch_for_budget(ctx: &GpuContext, params: GpuParams, inflight: u32, budget_mib: u64) -> anyhow::Result<u32> {
+    let device_max = max_batch_blocks(&ctx.device.limits(), &params.matching);
+    max_batch_within(params, inflight, budget_mib, device_max, ctx.direct_upload)
+}
+
+/// [`max_batch_for_budget`] without a device: `device_max` is the device's limit and
+/// `direct_upload` says whether the context reads batches from the upload buffers
+/// ([`GpuContext::direct_upload`]).
+///
+/// [`vram_bytes_with`] never shrinks as the batch grows, so this is a binary search.
+pub fn max_batch_within(
+    params: GpuParams,
+    inflight: u32,
+    budget_mib: u64,
+    device_max: u32,
+    direct_upload: bool,
+) -> anyhow::Result<u32> {
+    let fits = |batch: u32| {
+        vram_bytes_with(&PipelineConfig { batch, inflight, params }, direct_upload).div_ceil(1 << 20) <= budget_mib
+    };
+    if device_max < 1 || !fits(1) {
+        return Err(invalid_input(format!(
+            "a batch of 1 block at inflight {inflight} does not fit {budget_mib} MiB of GPU memory or this device's limits"
+        )));
+    }
+    if fits(device_max) {
+        return Ok(device_max);
+    }
+    let (mut lo, mut hi) = (1u32, device_max); // fits(lo) holds, fits(hi) does not.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) { lo = mid } else { hi = mid }
+    }
+    Ok(lo)
 }

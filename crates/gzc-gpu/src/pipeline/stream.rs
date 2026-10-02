@@ -189,6 +189,32 @@ impl UploadSlot<'_, '_> {
         Ok(out)
     }
 
+    /// Reserves room for payloads of `lens` bytes each, back to back from block `first`. Every
+    /// payload starts on a block boundary. Returns one write-only region per payload, exactly as
+    /// long as the payload. The rest of each payload's last block is zeroed here and the blocks'
+    /// real lengths are recorded here, so the caller cannot get either wrong. Errors on an empty
+    /// payload and when the payloads do not fit the slot.
+    pub(crate) fn payloads_from(&mut self, first: usize, lens: &[usize]) -> anyhow::Result<Vec<Region<'_>>> {
+        if let Some(i) = lens.iter().position(|&l| l == 0) {
+            return Err(invalid_input(format!("payload {i} is empty")));
+        }
+        let (total, cap) = (lens.iter().map(|&l| payload_blocks(l)).sum::<usize>(), self.capacity());
+        if first + total > cap {
+            return Err(invalid_input(format!(
+                "payloads of {total} blocks do not fit: {first} of the batch's {cap} blocks are taken"
+            )));
+        }
+        let (start, end) = (first * BLOCK_SIZE, (first + total) * BLOCK_SIZE);
+        let mut rest = Region { bytes: self.view.slice(start..end), lens: &mut self.lens[first..first + total] };
+        let mut out = Vec::with_capacity(lens.len());
+        for &len in lens {
+            let (region, tail) = rest.split_at(payload_blocks(len) * BLOCK_SIZE);
+            out.push(region.into_payload(len)?);
+            rest = tail;
+        }
+        Ok(out)
+    }
+
     /// Sets block `k`'s real length to `len` (1..=BLOCK_SIZE; every block starts at BLOCK_SIZE):
     /// its frame then declares and holds only the block's first `len` bytes. For blocks written
     /// through `blocks_mut`; the rest of the block must be zero, as `chunk_file` pads a file's last
@@ -276,6 +302,13 @@ impl<'a> Region<'a> {
         Ok(blocks)
     }
 
+    /// `pad(len)`, then the region cut down to the payload's `len` bytes.
+    fn into_payload(mut self, len: usize) -> anyhow::Result<Region<'a>> {
+        let _blocks = self.pad(len)?;
+        let (payload, _padding) = self.bytes.split_at(len);
+        Ok(Region { bytes: payload, lens: Default::default() })
+    }
+
     /// Splits at byte `mid`, a multiple of BLOCK_SIZE.
     pub(super) fn split_at(self, mid: usize) -> (Region<'a>, Region<'a>) {
         debug_assert_eq!(mid % BLOCK_SIZE, 0);
@@ -300,7 +333,7 @@ pub fn payload_real_lens(len: usize) -> impl ExactSizeIterator<Item = usize> {
 /// Every block must be exactly BLOCK_SIZE bytes.
 pub(crate) fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
     if let Some(i) = blocks.iter().position(|b| b.len() != BLOCK_SIZE) {
-        anyhow::bail!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len());
+        return Err(invalid_input(format!("block {i} is {} bytes, expected BLOCK_SIZE {BLOCK_SIZE}", blocks[i].len())));
     }
     Ok(())
 }
@@ -308,7 +341,10 @@ pub(crate) fn check_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
 /// Every block must hold 1..=BLOCK_SIZE bytes (its real bytes; the frame path).
 pub(super) fn check_frame_blocks(blocks: &[&[u8]]) -> anyhow::Result<()> {
     if let Some(i) = blocks.iter().position(|b| !(1..=BLOCK_SIZE).contains(&b.len())) {
-        anyhow::bail!("block {i} is {} bytes, expected 1..=BLOCK_SIZE ({BLOCK_SIZE})", blocks[i].len());
+        return Err(invalid_input(format!(
+            "block {i} is {} bytes, expected 1..=BLOCK_SIZE ({BLOCK_SIZE})",
+            blocks[i].len()
+        )));
     }
     Ok(())
 }
