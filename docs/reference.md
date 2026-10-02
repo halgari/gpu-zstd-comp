@@ -215,10 +215,6 @@ by `0` only.
   bounding (E9 builds them unchecked); a debugging aid.
 - `GZC_DUMP_WGSL=<dir>`: writes every shader module's final WGSL to `<dir>/<label>.<n>.wgsl`
   (a dev aid for offline register and shared-memory statistics).
-- `GZC_PACK` (anything but `0`): GPU-side frame packing instead of the fixed-stride
-  copy; opt-in, since it's slower than the copy on an RTX 5090 but saves PCIe traffic
-  worth it on ×8-lane cards. Packing **disables the transfer-queue readback** (packed frames are
-  read back on the main queue).
 - `GZC_NO_TIMESTAMPS` (anything but `0`): leaves `Features::TIMESTAMP_QUERY` off, to
   time runs without per-kernel timestamp queries.
 - `GZC_EMULATE_SHIFT_MOD32`, `GZC_EMULATE_VEC_RMW` (anything but `0`), **test only**: every
