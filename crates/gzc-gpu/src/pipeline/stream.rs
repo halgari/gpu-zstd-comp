@@ -121,6 +121,12 @@ impl<'p> FrameStream<'p> {
 /// Write it sequentially and never read it back. A decompressor reads its own recent output for
 /// its matches, so do not decode into the slot: decode into a cached buffer (or a streaming
 /// decoder's window) and copy the result in.
+///
+/// **Nothing checks what was written.** The memory is not cleared between batches: a block that
+/// is submitted without every byte written holds whatever an earlier batch left there, possibly
+/// another caller's data, and is compressed as it is. Likewise a short block keeps its full
+/// 64 KiB frame unless `Region::pad` or `set_real_len` recorded its length. `Compressor::stream`
+/// checks both; use it unless you need this layer.
 #[must_use = "an upload slot is wasted unless submitted"]
 pub struct UploadSlot<'s, 'p> {
     stream: &'s mut FrameStream<'p>,
@@ -176,6 +182,8 @@ impl UploadSlot<'_, '_> {
     /// `blocks[i]` whole blocks each: one per payload (a file, or a decompressed chunk of one),
     /// which several threads can fill at once (`Region` is `Send`). Finish each payload with
     /// `Region::pad`; submit the sum of the blocks. Errors if the regions exceed `capacity()`.
+    /// Unchecked: bytes of a submitted block that no one wrote are an earlier batch's (see the
+    /// type's docs).
     pub fn regions_mut(&mut self, blocks: &[usize]) -> anyhow::Result<Vec<Region<'_>>> {
         let (total, cap) = (blocks.iter().sum::<usize>(), self.capacity());
         anyhow::ensure!(total <= cap, "regions of {total} blocks exceed the slot's {cap}");
@@ -250,6 +258,8 @@ impl UploadSlot<'_, '_> {
 }
 
 /// A write-only piece of an upload slot (`UploadSlot::regions_mut`), a whole number of blocks.
+/// Writes are not tracked: every byte of the payload must be written before its blocks are
+/// submitted, or they carry an earlier batch's bytes.
 pub struct Region<'a> {
     bytes: wgpu::WriteOnly<'a, [u8]>,
     /// The real lengths of the region's blocks (`UploadSlot::lens`).

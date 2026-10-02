@@ -1,6 +1,8 @@
 //! The entry point of the crate: [`Compressor`], [`Level`], [`CompressorOptions`], [`Frames`]
 //! and the typed streaming form ([`Stream`], [`Batch`], [`Payload`]).
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::params::{LVL3, LVL9S12SEG, MatchParams, OPT14, OPT16P1};
@@ -84,6 +86,10 @@ pub struct CompressorOptions {
     pub preset: MatchParams,
     /// GPU memory the compressor may allocate, in MiB. The default, 6144, leaves headroom on an
     /// 8 GB card. It sizes the batch when `batch_blocks` is `None`.
+    ///
+    /// It is a cap on what the compressor asks for. It is not checked against the memory the
+    /// adapter has or has free: on a smaller or busy card, building the compressor fails with
+    /// [`Error::OutOfMemory`].
     pub vram_budget_mib: u64,
     /// Blocks per batch. `None` picks the largest batch that fits `vram_budget_mib` and the
     /// device's limits. `Some(n)` uses `n` and ignores the budget.
@@ -100,9 +106,19 @@ impl CompressorOptions {
         Self { preset: level.preset(), vram_budget_mib: 6144, batch_blocks: None, inflight: 3, gpu: GpuOptions::default() }
     }
 
-    /// [`CompressorOptions::new`] with [`GpuOptions::from_env`], so the `GZC_*` variables apply.
+    /// [`CompressorOptions::new`] with [`GpuOptions::try_from_env`], so the `GZC_*` variables
+    /// apply. A variable with a value it does not take is [`Error::InvalidInput`].
+    pub fn try_from_env(level: Level) -> Result<Self, Error> {
+        Ok(Self { gpu: GpuOptions::try_from_env()?, ..Self::new(level) })
+    }
+
+    /// [`CompressorOptions::try_from_env`] for programs that would stop on a bad value anyway.
+    ///
+    /// # Panics
+    ///
+    /// Panics where `try_from_env` returns an error, with the error's message.
     pub fn from_env(level: Level) -> Self {
-        Self { gpu: GpuOptions::from_env(), ..Self::new(level) }
+        Self::try_from_env(level).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -134,8 +150,31 @@ impl From<Level> for CompressorOptions {
 pub struct Compressor {
     ctx: Arc<GpuContext>,
     pipe: Mutex<Pipeline>,
+    /// The threads of the call that holds `pipe`, to refuse a call from inside its closures.
+    busy: Mutex<Busy>,
     preset: MatchParams,
     batch: u32,
+}
+
+/// The threads a running call's closures run on.
+#[derive(Default)]
+struct Busy {
+    /// The thread that called `compress` or `stream`; `produce` runs on it.
+    caller: Option<ThreadId>,
+    /// The thread `on_batch` runs on, once it has run.
+    delivery: Option<ThreadId>,
+}
+
+/// The compressor's pipeline, held for one call.
+struct Held<'c> {
+    pipe: MutexGuard<'c, Pipeline>,
+    busy: &'c Mutex<Busy>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        *self.busy.lock().unwrap_or_else(PoisonError::into_inner) = Busy::default();
+    }
 }
 
 impl Compressor {
@@ -152,9 +191,10 @@ impl Compressor {
 
     /// Builds a compressor on a device that is already open. `options.gpu` is not used.
     ///
-    /// Several compressors can share one context, one at a time: a context that reads frames
-    /// back through a transfer queue ([`GpuContext::transfer_readback`]) serves a single
-    /// compressor, and building a second one while the first is alive fails.
+    /// A context that reads frames back through a transfer queue
+    /// ([`GpuContext::transfer_readback`]) serves one compressor at a time: building a second
+    /// one while the first is alive is [`Error::InvalidInput`]. Open the context with
+    /// [`GpuOptions::transfer_queue`] off to share it between live compressors.
     pub fn with_context(ctx: Arc<GpuContext>, options: &CompressorOptions) -> Result<Self, Error> {
         Self::build(ctx, options).map_err(Error::from_anyhow)
     }
@@ -170,12 +210,16 @@ impl Compressor {
             None => max_batch_for_budget(&ctx, params, options.inflight, options.vram_budget_mib)?,
         };
         let pipe = Pipeline::new(&ctx, &PipelineConfig { batch, inflight: options.inflight, params })?;
-        Ok(Self { ctx, pipe: Mutex::new(pipe), preset: options.preset, batch })
+        Ok(Self { ctx, pipe: Mutex::new(pipe), busy: Mutex::default(), preset: options.preset, batch })
     }
 
     /// Compresses `data`. It is split into 64 KiB blocks; the last block may be shorter. Frame
     /// `i` holds bytes `i * 65536 ..` of `data`, and decodes to exactly those bytes. Empty input
     /// gives zero frames.
+    ///
+    /// The result holds every frame in memory, and its buffer is reserved up front at the size
+    /// of `data` plus 64 bytes per block. For input that should not be held twice, use
+    /// [`Compressor::stream`], which hands out each batch's frames as they finish.
     pub fn compress(&self, data: &[u8]) -> Result<Frames, Error> {
         let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
         self.compress_blocks(&blocks)
@@ -185,7 +229,8 @@ impl Compressor {
     ///
     /// Every block holds 1 to 65536 bytes. Any block may be short, not only the last: blocks are
     /// compressed independently, so this also serves a list of unrelated chunks. An empty block
-    /// or one above 64 KiB is [`Error::InvalidInput`].
+    /// or one above 64 KiB is [`Error::InvalidInput`]. Memory use is as for
+    /// [`Compressor::compress`].
     pub fn compress_blocks(&self, blocks: &[&[u8]]) -> Result<Frames, Error> {
         if let Some(i) = blocks.iter().position(|b| !(1..=BLOCK_SIZE).contains(&b.len())) {
             let msg = format!("block {i} is {} bytes, expected 1..={BLOCK_SIZE}", blocks[i].len());
@@ -198,16 +243,16 @@ impl Compressor {
         frames.ends.reserve_exact(blocks.len());
         // No frame is longer than its block plus `FRAME_OVERHEAD`, so the buffer never moves.
         frames.bytes.reserve_exact(blocks.iter().map(|b| b.len() + FRAME_OVERHEAD).sum());
-        let mut pipe = self.lock();
-        let threads = pipe.copy_threads();
-        let run = pipe.stream_frames(
+        let mut held = self.lock()?;
+        let threads = held.pipe.copy_threads();
+        let run = held.pipe.stream_frames(
             |batch| {
                 frames.push_batch(&batch, threads);
                 Ok(())
             },
             |stream| stream.upload_blocks(blocks),
         );
-        drop(pipe);
+        drop(held);
         run.map_err(|e| self.error(e))?;
         Ok(frames)
     }
@@ -225,7 +270,9 @@ impl Compressor {
     /// batch was delivered and dropped. An error from either closure stops the stream and is
     /// returned as it was. The compressor stays usable.
     ///
-    /// The compressor is busy until `stream` returns. Do not call it from inside the closures.
+    /// The compressor is busy until `stream` returns. A call to `compress`, `compress_blocks`
+    /// or `stream` on the same compressor from inside either closure is
+    /// [`Error::InvalidInput`]; from any other thread it waits.
     ///
     /// ```no_run
     /// use gzc_gpu::{Compressor, Error, Level};
@@ -244,7 +291,7 @@ impl Compressor {
     ///         let lens: Vec<usize> = files.iter().map(Vec::len).collect();
     ///         let mut batch = stream.next_batch()?;
     ///         for (payload, file) in batch.reserve(&lens)?.iter_mut().zip(&files) {
-    ///             payload.write(0, file);
+    ///             payload.write(file);
     ///         }
     ///         batch.submit()?;
     ///         Ok(())
@@ -257,12 +304,17 @@ impl Compressor {
         F: FnMut(FrameBatch) -> Result<(), Error> + Send,
         P: FnOnce(&mut Stream<'_, '_>) -> Result<(), Error>,
     {
-        let mut pipe = self.lock();
-        let run = pipe.stream_frames(
-            |batch| on_batch(batch).map_err(anyhow::Error::new),
+        let mut held = self.lock()?;
+        let busy = &self.busy;
+        let run = held.pipe.stream_frames(
+            |batch| {
+                // One thread delivers every batch of a stream.
+                busy.lock().unwrap_or_else(PoisonError::into_inner).delivery = Some(std::thread::current().id());
+                on_batch(batch).map_err(anyhow::Error::new)
+            },
             |inner| produce(&mut Stream { inner }).map_err(anyhow::Error::new),
         );
-        drop(pipe);
+        drop(held);
         run.map_err(|e| self.error(e))
     }
 
@@ -286,9 +338,22 @@ impl Compressor {
         self.ctx.describe()
     }
 
-    fn lock(&self) -> MutexGuard<'_, Pipeline> {
+    /// Takes the pipeline for one call. Another thread's call is waited for. A call from a
+    /// thread that the running call's closures run on could never finish, so it is an error.
+    fn lock(&self) -> Result<Held<'_>, Error> {
+        let me = std::thread::current().id();
+        let busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        if busy.caller == Some(me) || busy.delivery == Some(me) {
+            return Err(Error::InvalidInput(
+                "the compressor was called from inside its own stream's closure; it is busy until that stream returns"
+                    .to_string(),
+            ));
+        }
+        drop(busy);
         // A stream that panicked has cleaned the pipeline up before the panic went on.
-        self.pipe.lock().unwrap_or_else(PoisonError::into_inner)
+        let pipe = self.pipe.lock().unwrap_or_else(PoisonError::into_inner);
+        self.busy.lock().unwrap_or_else(PoisonError::into_inner).caller = Some(me);
+        Ok(Held { pipe, busy: &self.busy })
     }
 
     /// The typed form of a pipeline error. A failure without a class on a lost device is the
@@ -469,12 +534,13 @@ impl<'p> Stream<'_, 'p> {
     /// [`FrameBatch`]. A batch dropped without [`Batch::submit`] is handed out again.
     pub fn next_batch(&mut self) -> Result<Batch<'_, 'p>, Error> {
         let slot = self.inner.next_upload_slot().map_err(Error::from_anyhow)?;
-        Ok(Batch { slot, used: 0 })
+        Ok(Batch { slot, used: 0, reserved_bytes: 0, written_bytes: AtomicUsize::new(0) })
     }
 
     /// Copies `blocks` into as many batches as they need and submits them. Every block holds 1
-    /// to 65536 bytes, as for [`Compressor::compress_blocks`].
-    pub fn compress_blocks(&mut self, blocks: &[&[u8]]) -> Result<(), Error> {
+    /// to 65536 bytes, as for [`Compressor::compress_blocks`]. Their frames arrive at `on_batch`
+    /// like any other batch's.
+    pub fn submit_blocks(&mut self, blocks: &[&[u8]]) -> Result<(), Error> {
         self.inner.upload_blocks(blocks).map_err(Error::from_anyhow)
     }
 }
@@ -484,11 +550,20 @@ impl<'p> Stream<'_, 'p> {
 /// [`Batch::reserve`] takes each payload's length before any byte is written, and
 /// [`Batch::submit`] takes no block count. The batch therefore always knows the real length of
 /// every block, and a short block always gets a frame of exactly its own bytes.
+///
+/// The memory is reused from batch to batch and is not cleared. Each [`Payload`] counts the
+/// bytes written to it, and [`Batch::submit`] fails unless every reserved byte was written, so
+/// a frame never holds bytes of an earlier batch.
 #[must_use = "a batch does nothing until it is submitted"]
 pub struct Batch<'s, 'p> {
     slot: UploadSlot<'s, 'p>,
     /// Blocks reserved so far.
     used: usize,
+    /// Bytes of the payloads reserved so far.
+    reserved_bytes: usize,
+    /// Bytes written to those payloads. A payload only appends, inside its own range, so this
+    /// equals `reserved_bytes` exactly when every payload was written to its end.
+    written_bytes: AtomicUsize,
 }
 
 impl Batch<'_, '_> {
@@ -517,18 +592,24 @@ impl Batch<'_, '_> {
     /// boundary, takes `lens[i].div_ceil(65536)` blocks, and only its last block may be short.
     ///
     /// Returns one [`Payload`] per entry, in order. They are disjoint, so several threads can
-    /// fill them at once. Write every byte of each one.
+    /// fill them at once, one thread per payload. Every payload must be written to its end
+    /// before [`Batch::submit`].
     ///
     /// A zero length, or payloads that do not fit [`Batch::remaining`], is
     /// [`Error::InvalidInput`]; nothing is reserved then.
     pub fn reserve(&mut self, lens: &[usize]) -> Result<Vec<Payload<'_>>, Error> {
         let regions = self.slot.payloads_from(self.used, lens).map_err(Error::from_anyhow)?;
         self.used += lens.iter().map(|&len| payload_blocks(len)).sum::<usize>();
-        Ok(regions.into_iter().map(|region| Payload { region }).collect())
+        self.reserved_bytes += lens.iter().sum::<usize>();
+        let batch_written = &self.written_bytes;
+        Ok(regions.into_iter().map(|region| Payload { region, written: 0, batch_written }).collect())
     }
 
     /// Submits the reserved blocks. Returns the index of the batch's first block in the stream.
-    /// An empty batch is [`Error::InvalidInput`].
+    ///
+    /// An empty batch is [`Error::InvalidInput`]. So is a batch with a payload that was not
+    /// written to its end; nothing is submitted then, and the stream hands the batch's memory
+    /// out again with the next [`Stream::next_batch`].
     pub fn submit(self) -> Result<usize, Error> {
         self.submit_tagged(0)
     }
@@ -539,17 +620,36 @@ impl Batch<'_, '_> {
         if self.used == 0 {
             return Err(Error::InvalidInput("cannot submit an empty batch".to_string()));
         }
+        let written = self.written_bytes.load(Ordering::Relaxed);
+        if written != self.reserved_bytes {
+            return Err(Error::InvalidInput(format!(
+                "cannot submit the batch: only {written} of its {} reserved payload bytes were written",
+                self.reserved_bytes
+            )));
+        }
         self.slot.submit_with(self.used, tag).map_err(Error::from_anyhow)
     }
 }
 
 /// Write-only GPU upload memory for one payload of a [`Batch`], exactly as long as the payload.
 ///
-/// The memory may be write-combined. Write it front to back and never read it. Do not decode
-/// into it: a decompressor reads its own output. Decode into ordinary memory and copy the result
-/// in.
+/// A payload is written front to back, with [`Payload::write`] or through [`std::io::Write`],
+/// and counts what it was given. [`Batch::submit`] refuses a batch whose payloads were not
+/// written to the end, because the memory is reused: bytes that nobody wrote would be an earlier
+/// batch's.
+///
+/// The memory may be write-combined and cannot be read. Do not decode into it: a decompressor
+/// reads its own output. Decode into ordinary memory and write the result here.
+///
+/// One payload is filled by one thread. To fill a large file from several threads, reserve it
+/// as several payloads of whole blocks (multiples of 65536 bytes, the rest last): the frames are
+/// the same.
 pub struct Payload<'a> {
     region: Region<'a>,
+    /// Bytes written so far; the next write lands here.
+    written: usize,
+    /// The batch's count of written payload bytes.
+    batch_written: &'a AtomicUsize,
 }
 
 impl Payload<'_> {
@@ -563,14 +663,46 @@ impl Payload<'_> {
         self.region.is_empty()
     }
 
-    /// Writes `bytes` at `offset`. Panics when they do not fit.
-    pub fn write(&mut self, offset: usize, bytes: &[u8]) {
-        self.region.write(offset, bytes);
+    /// Bytes written so far.
+    pub fn written(&self) -> usize {
+        self.written
     }
 
-    /// The memory as wgpu's `WriteOnly`, for writers that take one.
-    pub fn write_only(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
-        self.region.write_only()
+    /// Bytes still to write.
+    pub fn remaining(&self) -> usize {
+        self.len() - self.written
+    }
+
+    /// Appends `bytes` after what was written before.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bytes` is longer than [`Payload::remaining`].
+    pub fn write(&mut self, bytes: &[u8]) {
+        assert!(
+            bytes.len() <= self.remaining(),
+            "{} bytes do not fit the {} left of a {}-byte payload",
+            bytes.len(),
+            self.remaining(),
+            self.len()
+        );
+        self.region.write(self.written, bytes);
+        self.written += bytes.len();
+        self.batch_written.fetch_add(bytes.len(), Ordering::Relaxed);
+    }
+}
+
+/// Appends like [`Payload::write`], taking at most [`Payload::remaining`] bytes. A full payload
+/// takes none, which `write_all` and `std::io::copy` report as an error.
+impl std::io::Write for Payload<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = bytes.len().min(self.remaining());
+        Payload::write(self, &bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -595,6 +727,35 @@ mod tests {
             assert_eq!(preset(level.preset_name()), Ok(level.preset()), "{level:?}");
             assert!(crate::gpu_supports(&level.preset()), "{level:?}");
         }
+    }
+
+    /// A failed transfer-queue allocation (injected: this machine cannot run out on demand) is
+    /// `Error::OutOfMemory` from the constructor, whichever buffer it hits, and leaves the
+    /// context usable.
+    #[test]
+    fn a_failed_transfer_allocation_is_out_of_memory() {
+        use crate::transfer::tests::FAIL_ALLOCATION_AFTER;
+        let _gpu = crate::testing::gpu_test_slot();
+        let ctx = crate::testing::gpu();
+        if !ctx.transfer_readback() {
+            eprintln!("skipped: no transfer queue on this adapter");
+            return;
+        }
+        let options = CompressorOptions { batch_blocks: Some(4), inflight: 2, ..CompressorOptions::new(Level::Zstd3) };
+        // Allocations in order: frames, frame_len, then each slot's staging and resolve buffers.
+        for nth in [0, 1, 2, 4] {
+            FAIL_ALLOCATION_AFTER.set(Some(nth));
+            let e = Compressor::with_context(ctx.clone(), &options).err().expect("the allocation failed");
+            assert_eq!(FAIL_ALLOCATION_AFTER.get(), None, "allocation {nth} was never reached");
+            match &e {
+                Error::OutOfMemory(m) => {
+                    assert!(m.contains("out of memory") && m.contains("vram_budget_mib"), "allocation {nth}: {m}")
+                }
+                other => panic!("allocation {nth}: {other:?}"),
+            }
+        }
+        let compressor = Compressor::with_context(ctx, &options).expect("the context still works");
+        assert_eq!(compressor.compress(&[5; 70_000]).unwrap().len(), 2);
     }
 
     #[test]

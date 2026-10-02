@@ -469,15 +469,18 @@ pub(crate) fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
     }
     let min = ctx.adapter_info.subgroup_min_size;
     if !ctx.subgroups {
-        anyhow::ensure!(!force_coop, "k3_kernel Coop (GZC_K3_MODE=coop): the device has no subgroup support");
+        if force_coop {
+            return Err(tagged(Kind::Unsupported, "k3_kernel Coop (GZC_K3_MODE=coop): the device has no subgroup support"));
+        }
         return Ok(K3Mode::Seq);
     }
     let w = match ctx.opts.k3_width {
         Some(w) => {
-            anyhow::ensure!(
-                w.is_power_of_two() && (4..=64).contains(&w) && w <= min,
-                "k3_width {w} (GZC_K3_W): expected a power of two in 4..=64 and at most the minimum subgroup size {min}"
-            );
+            if !(w.is_power_of_two() && (4..=64).contains(&w) && w <= min) {
+                return Err(invalid_input(format!(
+                    "k3_width {w} (GZC_K3_W): expected a power of two in 4..=64 and at most the minimum subgroup size {min}"
+                )));
+            }
             w
         }
         None => {
@@ -486,7 +489,10 @@ pub(crate) fn k3_mode(ctx: &GpuContext) -> anyhow::Result<K3Mode> {
         }
     };
     if !probe_lanes(ctx, w)? {
-        anyhow::ensure!(!force_coop, "k3_kernel Coop (GZC_K3_MODE=coop): subgroup lane probe failed for W = {w}");
+        if force_coop {
+            let msg = format!("k3_kernel Coop (GZC_K3_MODE=coop): subgroup lane probe failed for W = {w}");
+            return Err(tagged(Kind::Unsupported, msg));
+        }
         eprintln!("gzc: subgroup lane probe failed for W = {w}; using the sequential K3");
         return Ok(K3Mode::Seq);
     }

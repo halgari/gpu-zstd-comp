@@ -146,9 +146,10 @@ fn stream_matches_cpu_oracle() {
                             for (region, &p) in regions.iter_mut().zip(members.iter()) {
                                 let payload = &payloads[p];
                                 s.spawn(move || {
-                                    for (k, chunk) in payload.chunks(1000).enumerate() {
-                                        region.write(k * 1000, chunk);
+                                    for chunk in payload.chunks(1000) {
+                                        region.write(chunk);
                                     }
+                                    assert_eq!((region.written(), region.remaining()), (payload.len(), 0));
                                 });
                             }
                         });
@@ -204,7 +205,7 @@ fn stream_rejects_bad_batches_and_passes_errors_through() {
                 assert!(matches!(&e, Error::InvalidInput(m) if m.contains("empty")), "{e:?}");
                 // The batch was not submitted: the stream hands it out again.
                 assert_eq!(stream.submitted_blocks(), 0);
-                stream.compress_blocks(&blocks)?;
+                stream.submit_blocks(&blocks)?;
                 assert_eq!(stream.submitted_blocks(), blocks.len());
                 Ok(())
             },
@@ -217,7 +218,7 @@ fn stream_rejects_bad_batches_and_passes_errors_through() {
 
     // An error from either closure comes back as it was, and the compressor stays usable.
     let e = compressor
-        .stream(|_batch| Err(Error::InvalidInput("from on_batch".to_string())), |stream| stream.compress_blocks(&blocks))
+        .stream(|_batch| Err(Error::InvalidInput("from on_batch".to_string())), |stream| stream.submit_blocks(&blocks))
         .unwrap_err();
     assert!(matches!(&e, Error::InvalidInput(m) if m == "from on_batch"), "{e:?}");
     let io = || Error::Other(Box::new(std::io::Error::other("from produce")));
@@ -264,4 +265,184 @@ fn a_lost_device_is_a_typed_error() {
     drop(compressor);
     let e = Compressor::with_context(ctx, &small(Level::Zstd3)).err().expect("a compressor on a lost device");
     assert!(matches!(e, Error::DeviceLost(_)), "{e:?}");
+}
+
+/// Upload memory is reused and never cleared, so a payload that is not written to its end would
+/// carry an earlier call's bytes. `submit` must refuse it, and nothing of the earlier input may
+/// come out.
+#[test]
+fn an_unwritten_payload_is_refused_and_leaks_nothing() {
+    use std::io::Write as _;
+    let _gpu = gpu_test_slot();
+    let ctx = gpu();
+    let compressor = Compressor::with_context(ctx, &small(Level::Zstd3)).unwrap();
+    // The earlier call: three blocks, which fill the first batch's memory.
+    let secret = synth::text(99, 3 * BLOCK_SIZE);
+    assert_eq!(compressor.compress(&secret).unwrap().len(), 3);
+
+    let fresh = sample(2 * BLOCK_SIZE + 1000);
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    compressor
+        .stream(
+            |batch| {
+                got.extend(batch.frames().map(|(_, f)| f.to_vec()));
+                Ok(())
+            },
+            |stream| {
+                // 132,072 bytes reserved, 10 written.
+                let mut batch = stream.next_batch()?;
+                let mut payloads = batch.reserve(&[2 * BLOCK_SIZE + 1000])?;
+                payloads[0].write(&[7; 10]);
+                assert_eq!((payloads[0].written(), payloads[0].remaining()), (10, 2 * BLOCK_SIZE + 990));
+                drop(payloads);
+                let e = batch.submit().unwrap_err();
+                assert!(matches!(&e, Error::InvalidInput(m) if m.contains("only 10 of its 132072")), "{e:?}");
+                assert_eq!(stream.submitted_blocks(), 0, "the refused batch was submitted");
+
+                // One payload of two complete and one untouched: still refused.
+                let mut batch = stream.next_batch()?;
+                let mut payloads = batch.reserve(&[BLOCK_SIZE, 1000])?;
+                payloads[0].write(&fresh[..BLOCK_SIZE]);
+                drop(payloads);
+                assert!(matches!(batch.submit(), Err(Error::InvalidInput(_))));
+
+                // Written to the end, through `io::Write`: accepted.
+                let mut batch = stream.next_batch()?;
+                let mut payloads = batch.reserve(&[fresh.len()])?;
+                payloads[0].write_all(&fresh).unwrap();
+                assert!(payloads[0].write_all(&[1]).is_err(), "a full payload took another byte");
+                drop(payloads);
+                batch.submit()?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let blocks: Vec<&[u8]> = fresh.chunks(BLOCK_SIZE).collect();
+    assert_eq!(got.len(), blocks.len());
+    for (frame, block) in got.iter().zip(&blocks) {
+        assert!(*frame == compress_block_to_frame(block, LVL3, OPTS), "a frame differs from the oracle");
+        let decoded = zstd::bulk::decompress(frame, BLOCK_SIZE).unwrap();
+        assert!(decoded == *block, "a frame does not decode to its block");
+        assert!(!secret.chunks(BLOCK_SIZE).any(|s| s[..1000] == decoded[..1000]), "the earlier input leaked");
+    }
+}
+
+/// Writing past a payload's end is a panic, not a silent overrun into the next payload.
+#[test]
+#[should_panic(expected = "do not fit")]
+fn writing_past_a_payload_panics() {
+    let _gpu = gpu_test_slot();
+    let compressor = Compressor::with_context(gpu(), &small(Level::Zstd3)).unwrap();
+    let _ = compressor.stream(
+        |_batch| Ok(()),
+        |stream| {
+            let mut batch = stream.next_batch()?;
+            let mut payloads = batch.reserve(&[100, 100])?;
+            payloads[0].write(&[0; 101]);
+            Ok(())
+        },
+    );
+}
+
+/// A call into the compressor from inside its own stream cannot finish. It is an error on both
+/// closures' threads, while a call from another thread waits and then runs.
+#[test]
+fn reentering_the_compressor_is_an_error_not_a_deadlock() {
+    let _gpu = gpu_test_slot();
+    let compressor = Compressor::with_context(gpu(), &small(Level::Zstd3)).unwrap();
+    let data = sample(BLOCK_SIZE + 5);
+    let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
+    let reentered = |e: Result<Frames, Error>| matches!(&e, Err(Error::InvalidInput(m)) if m.contains("inside its own stream"));
+    let mut from_on_batch = Vec::new();
+    std::thread::scope(|s| {
+        let mut other = None;
+        compressor
+            .stream(
+                |_batch| {
+                    from_on_batch.push(reentered(compressor.compress(&data)));
+                    from_on_batch.push(matches!(
+                        compressor.stream(|_| Ok(()), |_| Ok(())),
+                        Err(Error::InvalidInput(_))
+                    ));
+                    Ok(())
+                },
+                |stream| {
+                    assert!(reentered(compressor.compress(&data)), "compress from produce");
+                    assert!(reentered(compressor.compress_blocks(&blocks)), "compress_blocks from produce");
+                    assert!(matches!(compressor.stream(|_| Ok(()), |_| Ok(())), Err(Error::InvalidInput(_))));
+                    // Another thread's call waits for this stream and then succeeds.
+                    other = Some(s.spawn(|| compressor.compress(&data)));
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    stream.submit_blocks(&blocks)
+                },
+            )
+            .unwrap();
+        let frames = other.unwrap().join().unwrap().unwrap();
+        check(&frames, &blocks, LVL3, "a call from another thread");
+    });
+    assert_eq!(from_on_batch, [true, true]);
+    // Not busy any more: the same thread may call again.
+    check(&compressor.compress(&data).unwrap(), &blocks, LVL3, "after the stream");
+}
+
+/// The default path: `Compressor::new` and `with_options` open their own device, with options
+/// that read nothing from the environment, and size the batch by the default budget.
+#[test]
+fn new_and_with_options_run_end_to_end() {
+    let _gpu = gpu_test_slot();
+    let data = sample(5 * BLOCK_SIZE + 321);
+    let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
+    match Compressor::new(Level::Zstd9) {
+        Ok(compressor) => {
+            assert_eq!(compressor.preset(), Level::Zstd9.preset());
+            assert_eq!(compressor.context().options(), &GpuOptions::default());
+            let params = GpuParams { matching: Level::Zstd9.preset(), emit_frames: true, huffman: true };
+            let want = max_batch_for_budget(compressor.context(), params, 3, 6144).unwrap();
+            assert_eq!(compressor.batch_blocks(), want as usize);
+            assert!(compressor.describe().contains("adapter"));
+            check(&compressor.compress(&data).unwrap(), &blocks, Level::Zstd9.preset(), "Compressor::new");
+        }
+        // A card without 6 GiB to spare: the failure must be the typed one.
+        Err(Error::OutOfMemory(m)) => eprintln!("Compressor::new skipped, not enough GPU memory: {m}"),
+        Err(e) => panic!("Compressor::new: {e:?}"),
+    }
+    let options = CompressorOptions { vram_budget_mib: 512, inflight: 2, ..CompressorOptions::new(Level::Zstd16) };
+    let compressor = Compressor::with_options(options).unwrap();
+    assert!(compressor.batch_blocks() > 8);
+    check(&compressor.compress(&data).unwrap(), &blocks, Level::Zstd16.preset(), "Compressor::with_options");
+    drop(compressor);
+    // `From<Level>` and the default options end to end, small.
+    let options = CompressorOptions { vram_budget_mib: 256, ..Level::Zstd3.into() };
+    let compressor = Compressor::with_options(options).unwrap();
+    check(&compressor.compress(&data).unwrap(), &blocks, LVL3, "Level::into");
+}
+
+/// `GpuOptions` values out of range are `InvalidInput` when the device is opened, whatever the
+/// preset, and a second compressor on a transfer-queue context is `InvalidInput` too.
+#[test]
+fn bad_gpu_options_and_a_taken_transfer_queue_are_typed_errors() {
+    let _gpu = gpu_test_slot();
+    for (what, gpu_options) in [
+        ("k3_width", GpuOptions { k3_width: Some(7), ..GpuOptions::default() }),
+        ("k3_width", GpuOptions { k3_width: Some(128), ..GpuOptions::default() }),
+        ("k1_groups", GpuOptions { k1_groups: Some(0), ..GpuOptions::default() }),
+        ("upload_threads", GpuOptions { upload_threads: Some(0), ..GpuOptions::default() }),
+    ] {
+        for level in [Level::Zstd3, Level::Zstd9] {
+            let options = CompressorOptions { gpu: gpu_options.clone(), ..small(level) };
+            let e = Compressor::with_options(options).err().expect("a bad option");
+            assert!(matches!(&e, Error::InvalidInput(m) if m.contains(what)), "{what}: {e:?}");
+        }
+    }
+    let ctx = gpu();
+    let first = Compressor::with_context(ctx.clone(), &small(Level::Zstd3)).unwrap();
+    let second = Compressor::with_context(ctx.clone(), &small(Level::Zstd9));
+    if ctx.transfer_readback() {
+        let e = second.err().expect("a second compressor on a transfer-queue context");
+        assert!(matches!(&e, Error::InvalidInput(m) if m.contains("one Compressor")), "{e:?}");
+        drop(first);
+        Compressor::with_context(ctx, &small(Level::Zstd9)).expect("the queue is free once the first is dropped");
+    } else {
+        second.expect("contexts without a transfer queue serve several compressors");
+    }
 }

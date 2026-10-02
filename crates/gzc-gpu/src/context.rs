@@ -4,7 +4,7 @@ use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS, LOG2_BLOCK, NO_P
 use gzc_core::params::MatchParams;
 
 use crate::emulate::Emulation;
-use crate::error::{Kind, tagged};
+use crate::error::{Error, Kind, invalid_input, tagged};
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
@@ -80,8 +80,10 @@ pub enum K3Kernel {
 /// How a [`GpuContext`] sets up its device and builds its kernels.
 ///
 /// [`GpuOptions::default`] turns on every fast path the adapter supports and reads nothing from
-/// the environment. [`GpuOptions::from_env`] applies the `GZC_*` variables on top; the benchmark
-/// and the tests use it. No option changes the compressed output.
+/// the environment. [`GpuOptions::try_from_env`] applies the `GZC_*` variables on top;
+/// [`GpuOptions::from_env`] is its panicking form, which the benchmark and the tests use. No
+/// option changes the compressed output. A value out of range is [`Error::InvalidInput`] when
+/// the device is opened.
 ///
 /// The backend is wgpu's choice, which wgpu's own `WGPU_BACKEND` variable overrides whatever
 /// these options say.
@@ -104,10 +106,11 @@ pub struct GpuOptions {
     pub sorted_finder: bool,
     /// Threads that copy a batch into its upload buffer, and in `Compressor::compress` its frames
     /// out of the readback buffer. `None` means 4. The pipeline never uses more than the machine
-    /// has. `GZC_UPLOAD_THREADS`.
+    /// has. `Some(0)` is refused. `GZC_UPLOAD_THREADS`.
     pub upload_threads: Option<usize>,
     /// Workgroups per K1 dispatch, which is the number of hash tables in use at once. `None`
-    /// picks 128 for the subgroup kernel and every table otherwise. `GZC_K1_GROUPS`.
+    /// picks 128 for the subgroup kernel and every table otherwise. `Some(0)` is refused.
+    /// `GZC_K1_GROUPS`.
     pub k1_groups: Option<u32>,
     /// Force one K3 kernel for the greedy parse over the whole block. `None` picks the
     /// cooperative kernel where its probe passes. `GZC_K3_MODE=seq|coop`.
@@ -116,7 +119,7 @@ pub struct GpuOptions {
     /// subgroup. `None` derives it from the adapter. `GZC_K3_W`.
     pub k3_width: Option<u32>,
     /// Test aid: every workgroup of the cooperative K3 takes its sequential fallback.
-    /// `GZC_K3_FORCE_FALLBACK=1`.
+    /// `GZC_K3_FORCE_FALLBACK`.
     pub k3_force_fallback: bool,
     /// Debugging aid: build every shader with bounds checks. `GZC_CHECKED_SHADERS`.
     pub checked_shaders: bool,
@@ -159,63 +162,103 @@ impl Default for GpuOptions {
 
 impl GpuOptions {
     /// The defaults with the `GZC_*` environment variables applied. Each field's documentation
-    /// names its variable. This is the only place the crate reads them.
+    /// names its variable. This and [`GpuOptions::from_env`] are the only places the crate reads
+    /// them.
     ///
-    /// A switch that is off by default (`GZC_NO_SUBGROUPS`, `GZC_POISON`, ...) is turned on by
-    /// any value but `0`. A switch that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is
-    /// turned off by `0` only.
+    /// - A switch that is off by default (`GZC_NO_SUBGROUPS`, `GZC_POISON`,
+    ///   `GZC_K3_FORCE_FALLBACK`, ...) is turned on by any value but `0`.
+    /// - A switch that is on by default (`GZC_TRANSFER_QUEUE`, `GZC_SORTED`) is turned off by `0`
+    ///   only.
+    /// - `GZC_DIRECT_UPLOAD` takes `0` or `1`, `GZC_K3_MODE` takes `seq` or `coop`, and the
+    ///   numeric variables take a number.
+    ///
+    /// Any other value, for any variable, is [`Error::InvalidInput`] naming the variable. So is
+    /// a value that is not Unicode, and a combination [`GpuContext::new`] would refuse.
+    pub fn try_from_env() -> Result<Self, Error> {
+        let bad = |key: &str, value: &str, want: &str| Error::InvalidInput(format!("{key}={value}: expected {want}"));
+        // Off by default: on for any value but `0`.
+        let on = |key: &str| Ok::<bool, Error>(env_var(key)?.is_some_and(|v| v != "0"));
+        // On by default: off for `0` only.
+        let off = |key: &str| Ok::<bool, Error>(env_var(key)?.is_some_and(|v| v == "0"));
+        fn number<T: std::str::FromStr>(key: &str) -> Result<Option<T>, Error> {
+            match env_var(key)? {
+                None => Ok(None),
+                Some(v) => match v.parse() {
+                    Ok(n) => Ok(Some(n)),
+                    Err(_) => Err(Error::InvalidInput(format!("{key}={v}: expected a number"))),
+                },
+            }
+        }
+        let options = Self {
+            subgroups: !on("GZC_NO_SUBGROUPS")?,
+            direct_upload: match env_var("GZC_DIRECT_UPLOAD")?.as_deref() {
+                None => None,
+                Some("0") => Some(false),
+                Some("1") => Some(true),
+                Some(v) => return Err(bad("GZC_DIRECT_UPLOAD", v, "0 or 1")),
+            },
+            transfer_queue: !off("GZC_TRANSFER_QUEUE")?,
+            timestamps: !on("GZC_NO_TIMESTAMPS")?,
+            sorted_finder: !off("GZC_SORTED")?,
+            upload_threads: number("GZC_UPLOAD_THREADS")?,
+            k1_groups: number("GZC_K1_GROUPS")?,
+            k3_kernel: match env_var("GZC_K3_MODE")?.as_deref() {
+                None => None,
+                Some("seq") => Some(K3Kernel::Seq),
+                Some("coop") => Some(K3Kernel::Coop),
+                Some(v) => return Err(bad("GZC_K3_MODE", v, "seq or coop")),
+            },
+            k3_width: number("GZC_K3_W")?,
+            k3_force_fallback: on("GZC_K3_FORCE_FALLBACK")?,
+            checked_shaders: on("GZC_CHECKED_SHADERS")?,
+            emulate: Emulation {
+                shift_mod32: on("GZC_EMULATE_SHIFT_MOD32")?,
+                vector_rmw: on("GZC_EMULATE_VEC_RMW")?,
+                skew: on("GZC_EMULATE_SKEW")?,
+            },
+            poison: on("GZC_POISON")?,
+            poison_seed: number("GZC_POISON_SEED")?,
+            dump_wgsl: std::env::var_os("GZC_DUMP_WGSL").map(Into::into),
+        };
+        options.validate().map_err(Error::from_anyhow)?;
+        Ok(options)
+    }
+
+    /// [`GpuOptions::try_from_env`] for programs that would stop on a bad value anyway, such as
+    /// the benchmark and the tests.
     ///
     /// # Panics
     ///
-    /// Panics when a variable holds a value it cannot parse, naming the variable.
+    /// Panics where `try_from_env` returns an error, with the error's message.
     pub fn from_env() -> Self {
-        Self {
-            subgroups: !env_on("GZC_NO_SUBGROUPS"),
-            direct_upload: match std::env::var("GZC_DIRECT_UPLOAD").as_deref() {
-                Ok("0") => Some(false),
-                Ok("1") => Some(true),
-                _ => None,
-            },
-            transfer_queue: !env_off("GZC_TRANSFER_QUEUE"),
-            timestamps: !env_on("GZC_NO_TIMESTAMPS"),
-            sorted_finder: !env_off("GZC_SORTED"),
-            upload_threads: env_number("GZC_UPLOAD_THREADS"),
-            k1_groups: env_number("GZC_K1_GROUPS"),
-            k3_kernel: match std::env::var("GZC_K3_MODE").as_deref() {
-                Err(_) | Ok("") => None,
-                Ok("seq") => Some(K3Kernel::Seq),
-                Ok("coop") => Some(K3Kernel::Coop),
-                Ok(v) => panic!("GZC_K3_MODE={v}: expected seq or coop"),
-            },
-            k3_width: env_number("GZC_K3_W"),
-            k3_force_fallback: std::env::var("GZC_K3_FORCE_FALLBACK").is_ok_and(|v| v == "1"),
-            checked_shaders: env_on("GZC_CHECKED_SHADERS"),
-            emulate: Emulation {
-                shift_mod32: env_on("GZC_EMULATE_SHIFT_MOD32"),
-                vector_rmw: env_on("GZC_EMULATE_VEC_RMW"),
-                skew: env_on("GZC_EMULATE_SKEW"),
-            },
-            poison: env_on("GZC_POISON"),
-            poison_seed: env_number("GZC_POISON_SEED"),
-            dump_wgsl: std::env::var_os("GZC_DUMP_WGSL").map(Into::into),
+        Self::try_from_env().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Ok when every value is in range, as far as that can be said without a device:
+    /// `k1_groups` and `upload_threads` at least 1, `k3_width` a power of two in 4..=64.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.k1_groups == Some(0) {
+            return Err(invalid_input("k1_groups (GZC_K1_GROUPS) must be at least 1"));
         }
+        if self.upload_threads == Some(0) {
+            return Err(invalid_input("upload_threads (GZC_UPLOAD_THREADS) must be at least 1"));
+        }
+        if let Some(w) = self.k3_width
+            && !(w.is_power_of_two() && (4..=64).contains(&w))
+        {
+            return Err(invalid_input(format!("k3_width {w} (GZC_K3_W) must be a power of two in 4..=64")));
+        }
+        Ok(())
     }
 }
 
-/// A switch that is off by default: on for any value but `0`.
-fn env_on(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|v| v != "0")
-}
-
-/// A switch that is on by default: off for `0` only.
-fn env_off(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|v| v == "0")
-}
-
-/// A numeric variable; unset is `None`. Panics on a value that is not a number.
-fn env_number<T: std::str::FromStr>(key: &str) -> Option<T> {
-    let v = std::env::var(key).ok()?;
-    Some(v.parse().unwrap_or_else(|_| panic!("{key}={v}: not a number")))
+/// An environment variable; `None` when unset. A value that is not Unicode is an error.
+fn env_var(key: &str) -> Result<Option<String>, Error> {
+    match std::env::var(key) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidInput(format!("{key}: the value is not Unicode"))),
+    }
 }
 
 /// Writes one module's final source (after emulation rewriting) to `<dir>/<label>.<n>.wgsl`
@@ -242,6 +285,7 @@ impl GpuContext {
     /// (`transfer`); if that fails the context falls back to wgpu's own device (with a warning),
     /// as it does everywhere else.
     pub fn new(options: GpuOptions) -> anyhow::Result<Self> {
+        options.validate()?;
         let p = Prepared::new(options)?;
         let family = p.opts.transfer_queue.then(|| crate::transfer::transfer_family(&p.adapter)).flatten();
         if let Some(family) = family {
@@ -755,7 +799,7 @@ impl<'c> ErrorScopes<'c> {
     /// `pop` for a constructor that allocated `bytes` of buffers for `what`: the error names the
     /// allocation (and wgpu's message the failing buffer's label).
     pub(crate) fn pop_alloc(self, what: &str, bytes: u64) -> anyhow::Result<()> {
-        const HINT: &str = "try a smaller batch or VRAM budget (--batch, --vram-budget-mb)";
+        const HINT: &str = crate::error::OOM_HINT;
         let mib = bytes.div_ceil(1 << 20);
         match self.take() {
             None => Ok(()),

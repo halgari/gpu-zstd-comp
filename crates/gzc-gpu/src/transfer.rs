@@ -159,6 +159,19 @@ impl RawDevice {
     }
 }
 
+/// The error of a failed buffer or memory allocation of `size` bytes: `OutOfMemory` when Vulkan
+/// says so, with what to try next.
+fn alloc_error(call: &str, size: u64, e: vk::Result) -> anyhow::Error {
+    let mib = size.div_ceil(1 << 20);
+    if matches!(e, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY) {
+        let hint = crate::error::OOM_HINT;
+        let msg = format!("GPU allocation of {mib} MiB for a transfer-queue buffer failed: out of memory ({hint}): {call}: {e}");
+        crate::error::tagged(crate::error::Kind::OutOfMemory, msg)
+    } else {
+        anyhow!("{call} ({size} bytes): {e}")
+    }
+}
+
 /// The extra queue of a transfer-only family on the context's `VkDevice`.
 pub(crate) struct TransferQueue {
     owner: Arc<DeviceOwner>,
@@ -201,11 +214,13 @@ impl TransferQueue {
     /// context is still alive: its staged semaphores and timelines assume it is the only one
     /// submitting.
     pub(crate) fn begin_streaming(self: &Arc<Self>) -> anyhow::Result<StreamingGuard> {
-        anyhow::ensure!(
-            self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
-            "another transfer-readback Pipeline is alive on this GpuContext (one per context: drop it first, \
-             or open this context with GpuOptions::transfer_queue off)"
-        );
+        if self.streaming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return Err(crate::error::invalid_input(
+                "this GpuContext reads frames back through its transfer queue, which serves one Compressor (one \
+                 frame Pipeline) at a time, and another one is alive: drop that one first, or open the context \
+                 with GpuOptions::transfer_queue off",
+            ));
+        }
         Ok(StreamingGuard { tq: self.clone() })
     }
 
@@ -245,7 +260,7 @@ impl TransferQueue {
         // SAFETY: plain object creation on a live device; every object is destroyed by RawBuffer
         // (or here on failure).
         unsafe {
-            let buffer = d.create_buffer(&info, None).context("vkCreateBuffer")?;
+            let buffer = d.create_buffer(&info, None).map_err(|e| alloc_error("vkCreateBuffer", size, e))?;
             let req = d.get_buffer_memory_requirements(buffer);
             let pick = if host {
                 self.memory_type(
@@ -273,11 +288,19 @@ impl TransferQueue {
                 .allocation_size(req.size)
                 .memory_type_index(type_index)
                 .push_next(&mut dedicated);
-            let memory = match d.allocate_memory(&alloc, None) {
+            #[cfg(test)]
+            let allocated = if tests::fail_allocation() {
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            } else {
+                d.allocate_memory(&alloc, None)
+            };
+            #[cfg(not(test))]
+            let allocated = d.allocate_memory(&alloc, None);
+            let memory = match allocated {
                 Ok(m) => m,
                 Err(e) => {
                     d.destroy_buffer(buffer, None);
-                    return Err(anyhow!("vkAllocateMemory({size} bytes): {e}"));
+                    return Err(alloc_error("vkAllocateMemory", size, e));
                 }
             };
             let mut raw =
@@ -602,7 +625,28 @@ impl Drop for Commands {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    std::thread_local! {
+        /// Test hook: the transfer-queue allocation after this many more on this thread fails as
+        /// if the device were out of memory (then the hook clears).
+        pub(crate) static FAIL_ALLOCATION_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Counts the hook down; true for the allocation that must fail.
+    pub(super) fn fail_allocation() -> bool {
+        match FAIL_ALLOCATION_AFTER.get() {
+            Some(0) => {
+                FAIL_ALLOCATION_AFTER.set(None);
+                true
+            }
+            Some(k) => {
+                FAIL_ALLOCATION_AFTER.set(Some(k - 1));
+                false
+            }
+            None => false,
+        }
+    }
+
     /// A context with a transfer queue tears down cleanly (the VkDevice goes before the Vulkan
     /// instance), also when a clone of the queue outlives the context.
     #[test]

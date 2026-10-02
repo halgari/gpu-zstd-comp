@@ -20,15 +20,18 @@ use std::fmt;
 pub enum Error {
     /// No usable GPU adapter was found.
     NoAdapter(String),
-    /// The match parameters are valid, but the GPU kernels do not implement them.
+    /// The match parameters or options are valid, but the kernels or this device cannot run
+    /// them.
     Unsupported(String),
     /// A GPU allocation failed. The device stays usable.
     OutOfMemory(String),
     /// The GPU device was lost. Every later call on the same compressor fails too.
     DeviceLost(String),
-    /// An argument or option is out of range: a block that is empty or longer than 64 KiB,
+    /// An argument, an option or a call is wrong: a block that is empty or longer than 64 KiB,
     /// invalid match parameters, zero batches in flight, a batch that does not fit the device or
-    /// the budget.
+    /// the budget, a `GpuOptions` value out of range, a reserved payload that was not fully
+    /// written, a second compressor on a context whose transfer queue is taken, a call into the
+    /// compressor from inside its own stream.
     InvalidInput(String),
     /// Any other failure, with its cause. An error that a caller's own closure returned to
     /// [`crate::Compressor::stream`] comes back unchanged, whatever its variant.
@@ -56,6 +59,10 @@ impl std::error::Error for Error {
         }
     }
 }
+
+/// What to try after an allocation failure, in terms of the options.
+pub(crate) const OOM_HINT: &str =
+    "use a smaller `CompressorOptions::vram_budget_mib` or `batch_blocks` (`PipelineConfig::batch`)";
 
 /// The class of a tagged internal error; one per [`Error`] variant but `Other`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -318,7 +318,9 @@ impl ChainsKernel {
 
     fn build(ctx: &GpuContext, params: &MatchParams, opts: ChainsOptions, subgroups: bool) -> anyhow::Result<Self> {
         let ctx_groups = ctx.opts.k1_groups;
-        anyhow::ensure!(ctx_groups != Some(0), "GpuOptions::k1_groups: expected a positive number");
+        if ctx_groups == Some(0) {
+            return Err(crate::error::invalid_input("k1_groups (GZC_K1_GROUPS) must be at least 1"));
+        }
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,

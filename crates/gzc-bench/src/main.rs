@@ -360,7 +360,7 @@ fn gpu_preflight(presets: &[Preset], sweep: &GpuSweepArgs) -> anyhow::Result<Arc
             }
         }
     }
-    let ctx = Arc::new(GpuContext::new(GpuOptions::from_env())?);
+    let ctx = Arc::new(GpuContext::new(GpuOptions::try_from_env()?)?);
     eprintln!("{}", ctx.describe());
     for p in presets {
         let max = max_batch_blocks(&ctx.device().limits(), &p.params);

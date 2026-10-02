@@ -32,6 +32,7 @@
 //!   of a virtual file system. Any block may be shorter than 64 KiB.
 //! - [`Compressor::stream`] compresses while data arrives. The caller writes payloads straight
 //!   into GPU upload memory and gets finished batches of frames back, with no copy in between.
+//!   [`Compressor::compress`] holds its whole output in memory; `stream` does not.
 //! - [`CompressorOptions`] sets the GPU memory budget (6144 MiB by default, for an 8 GB card),
 //!   the batches in flight, the match parameters and the [`GpuOptions`].
 //!
@@ -42,8 +43,8 @@
 //!
 //! # The environment
 //!
-//! Nothing here reads the environment unless asked. [`GpuOptions::from_env`] and
-//! [`CompressorOptions::from_env`] apply the `GZC_*` variables, which the benchmark and the
+//! Nothing here reads the environment unless asked. [`GpuOptions::try_from_env`] and
+//! [`CompressorOptions::try_from_env`] apply the `GZC_*` variables, which the benchmark and the
 //! tests use. The one exception is wgpu's own `WGPU_BACKEND`, which picks the backend.
 //!
 //! # The pipeline underneath

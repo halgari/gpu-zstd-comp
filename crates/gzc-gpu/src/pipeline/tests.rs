@@ -33,7 +33,7 @@ fn absurd_upload_buffer_fails_cleanly_in_new() {
     assert!(msg.starts_with("GPU allocation of ") || msg.starts_with("GPU device lost while allocating"), "{msg}");
     assert!(msg.contains("batch 4, inflight 2"), "{msg}");
     if msg.starts_with("GPU allocation") {
-        assert!(msg.contains("pipeline.upload") && msg.contains("--batch"), "{msg}");
+        assert!(msg.contains("pipeline.upload") && msg.contains("batch_blocks"), "{msg}");
     }
     // Out of memory and validation errors leave the device usable (a backend that loses the
     // device instead is reported as such above).
@@ -521,7 +521,8 @@ fn second_transfer_pipeline_errors() {
     let mut first = Pipeline::new(&ctx, &pcfg).unwrap();
     assert!(first.transfer_readback(), "{name}");
     let e = Pipeline::new(&ctx, &pcfg).err().expect("a second transfer pipeline must error");
-    assert!(e.to_string().contains("another transfer-readback Pipeline"), "{name}: {e}");
+    assert!(e.to_string().contains("one Compressor (one frame Pipeline) at a time"), "{name}: {e}");
+    assert!(matches!(crate::Error::from_anyhow(e), crate::Error::InvalidInput(_)), "{name}");
     // The parse path does not touch the transfer queue.
     let mut parse_pipe = Pipeline::new(&ctx, &cfg(7, 1)).unwrap();
     parse_pipe.run(&blocks, &mut Collect(vec![None; blocks.len()])).unwrap();
