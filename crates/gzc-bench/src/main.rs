@@ -107,7 +107,7 @@ struct CpuArgs {
 struct RefArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated thread counts.
@@ -210,7 +210,7 @@ struct GpuSweepArgs {
 struct GpuArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16).
+    /// Comma-separated match presets (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     #[command(flatten)]
@@ -228,7 +228,7 @@ struct GpuArgs {
 struct AllArgs {
     #[command(flatten)]
     corpus: CorpusArgs,
-    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16).
+    /// Comma-separated match presets for cpu-ref and gpu (lvl3, rung1, rung2, lvl9, lvl9seg, lvl9s12, lvl9s12seg, lvl9s12d16seg, opt14, opt16, opt16p1).
     #[arg(long, value_delimiter = ',', default_value = DEFAULT_PRESETS, value_parser = parse_preset)]
     preset: Vec<Preset>,
     /// Comma-separated zstd compression levels (cpu-libzstd only; at most 16).
@@ -586,28 +586,24 @@ mod tests {
         assert!(check_presets(&[lvl3], true, true).is_ok());
         assert!(check_presets(&[lvl3, lvl9], true, false).is_ok(), "the cpu implements every preset");
         let all: Vec<Preset> = PRESETS.iter().map(|(n, _)| parse_preset(n).unwrap()).collect();
-        // opt14/opt16 only implement (cpu and gpu) at blocks of at most 64 KiB; above that,
-        // check every other preset instead of the whole list.
-        let all_at_this_block: Vec<Preset> =
-            all.iter().copied().filter(|p| p.params.opt.is_none() || gzc_core::config::LOG2_BLOCK <= 16).collect();
-        assert!(check_presets(&all_at_this_block, true, false).is_ok(), "the cpu implements every preset");
-        // M5 T5: the GPU implements the optimal parse too (blocks of at most 64 KiB).
-        assert!(check_presets(&all_at_this_block, true, true).is_ok(), "cpu and gpu implement every preset");
-        // opt16 only runs on the gpu at blocks of at most 64 KiB.
-        if gzc_core::config::LOG2_BLOCK <= 16 {
-            let opt16 = parse_preset("opt16").unwrap();
-            assert!(check_presets(&[opt16], false, true).is_ok(), "opt16 runs on the gpu");
-        }
+        assert!(check_presets(&all, true, false).is_ok(), "the cpu implements every preset");
+        // M5 T5: the GPU implements the optimal parse too, and since M6 B4 the M6 options
+        // (opt16p1).
+        assert!(check_presets(&all, true, true).is_ok(), "cpu and gpu implement every preset");
+        let p1 = parse_preset("opt16p1").unwrap();
+        assert!(check_presets(&[p1], true, true).is_ok(), "cpu and gpu implement opt16p1");
+        let opt16 = parse_preset("opt16").unwrap();
+        assert!(check_presets(&[opt16], false, true).is_ok(), "opt16 runs on the gpu");
     }
 
     /// `--batch max` for the optimal parse under the 6 GiB budget at `--inflight 3`: its larger
     /// per-block footprint (8 B of candidates and of trace per position, `MAX_SEQS_OPT` seqs,
     /// K3opt's prices and scratch, all in `vram_bytes`) resolves to a smaller batch than
-    /// lvl9s12seg: about 1.78 MiB per block at 64 KiB at b3458 with three slots' upload and staging
+    /// lvl9s12seg: about 1.78 MiB per block at b3458 with three slots' upload and staging
     /// buffers (≈ 1.82 at b1000, where the `head` tables weigh more), so 3458 blocks (copy upload).
     #[test]
     fn resolve_max_batch_shrinks_for_opt() {
-        use gzc_core::params::{LVL9S12SEG, OPT14, OPT16};
+        use gzc_core::params::{LVL9S12SEG, OPT14, OPT16, OPT16P1};
         let (budget_mb, inflight, device_max) = (6144u64, 3u32, 100_000u32);
         let lvl = resolve_max_batch(LVL9S12SEG, inflight, budget_mb, device_max, false).unwrap();
         let o16 = resolve_max_batch(OPT16, inflight, budget_mb, device_max, false).unwrap();
@@ -617,11 +613,17 @@ mod tests {
         assert!(o16 < lvl, "opt {o16} should resolve below lvl9s12seg {lvl}");
         let fits = |b: u32| vram_bytes(&sweep_cfg(OPT16, b, inflight)).div_ceil(1 << 20) <= budget_mb;
         assert!(fits(o16) && !fits(o16 + 1));
-        if gzc_core::config::BLOCK_SIZE == 65536 {
-            let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
-            assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
-            assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
-        }
+        let per_block = vram_bytes(&sweep_cfg(OPT16, 1000, inflight)) as f64 / 1000.0 / (1u64 << 20) as f64;
+        assert!((1.8..1.85).contains(&per_block), "{per_block} MiB per block");
+        assert!((3400..3500).contains(&o16), "opt --batch max {o16} at 6 GiB, i3");
+        // M6 opt16p1: three sparse chains add 3 * BLOCK_SIZE / 4 pred words per block (+192 KiB),
+        // so the budget allows fewer: 3125 blocks. On a device whose storage
+        // bindings stop at 2 GiB (an RTX 5090 under wgpu) `device_max` is lower still: the pred
+        // buffer, 704 KiB per block, caps the batch at 2978 (`max_batch_blocks`).
+        let p1 = resolve_max_batch(OPT16P1, inflight, budget_mb, device_max, false).unwrap();
+        let fits = |b: u32| vram_bytes(&sweep_cfg(OPT16P1, b, inflight)).div_ceil(1 << 20) <= budget_mb;
+        assert!(p1 < o16 && fits(p1) && !fits(p1 + 1), "opt16p1 {p1}, opt16 {o16}");
+        assert_eq!(p1, 3125, "opt16p1 --batch max at 6 GiB, i3");
     }
 
     #[test]

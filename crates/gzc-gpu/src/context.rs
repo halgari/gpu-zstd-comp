@@ -128,6 +128,21 @@ pub(crate) fn env_on(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v != "0")
 }
 
+/// `GZC_DUMP_WGSL=<dir>` (a dev aid): writes every module's final source (after emulation
+/// rewriting) to `<dir>/<label>.<n>.wgsl`, `n` counting modules in creation order, for offline
+/// register / shared-memory statistics (WGSL → SPIR-V → driver pipeline statistics).
+fn dump_wgsl(label: &str, src: &str) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("GZC_DUMP_WGSL") else { return };
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The label becomes one file name inside `dir`: no path separators, no `..`.
+    let label = label.replace(['/', '\\'], "_").replace("..", "_");
+    let path = std::path::Path::new(&dir).join(format!("{label}.{n}.wgsl"));
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, src)) {
+        eprintln!("GZC_DUMP_WGSL: {}: {e}", path.display());
+    }
+}
+
 /// A default-on knob set to `0` (see `env_on`).
 pub(crate) fn env_off(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == "0")
@@ -454,8 +469,8 @@ impl GpuContext {
     ///
     /// K2, K4 and K5 are built with this; their arguments are in `.superpowers/speed2/e3-report.md`
     /// (E9). A loop or index added to them must come with the same argument. RTX 5090, lvl9,
-    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 % (128 KiB: −6 / −17 / −5 %). K1 stays checked: its
-    /// subgroup kernel got 7 % slower at 64 KiB (9 % faster at 128 KiB); K3 keeps
+    /// 64 KiB blocks: K2 −9 %, K4 −18 %, K5 −7 %. K1 stays checked: its subgroup kernel got 7 %
+    /// slower; K3 keeps
     /// `shader_unbounded_loops` (the index clamps cost it nothing).
     /// `GZC_CHECKED_SHADERS=1` builds these modules fully checked instead (debugging aid).
     pub fn shader_trusted(&self, label: &str, body: &str) -> wgpu::ShaderModule {
@@ -484,6 +499,7 @@ impl GpuContext {
         } else {
             src.into()
         };
+        dump_wgsl(label, &src);
         // SAFETY: with loop bounding off the caller guarantees every loop terminates, and with
         // bounds checks off every index is in bounds (`shader_unbounded_loops`, `shader_trusted`;
         // the K3 argument is at its call site in `Kernels::new`). Fully checked modules need no

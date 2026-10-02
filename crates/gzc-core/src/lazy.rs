@@ -783,7 +783,7 @@ pub mod cases {
         vec![case("rung2_min_match6_byte_run_at_start", block, best, vec![(params, want)])]
     }
 
-    /// Segment size of `LVL9SEG` (4 KiB: every case fits the 4 segments of a 16 KiB block).
+    /// Segment size of `LVL9SEG` (4 KiB).
     const SEG: usize = 1 << LVL9SEG.segment_log2;
 
     /// A match running across the end of segment 0 is cut at the segment end (length 6 of 20);

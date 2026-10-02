@@ -43,6 +43,36 @@ pub fn hash_width(b: &[u8], p: usize, width: u32) -> u32 {
     mix(read_u32(b, p), read_u32(b, p + 4) & mask)
 }
 
+/// The low `k` bytes of a little-endian word: `mask(0) = 0`, `mask(k) = (1 << 8k) - 1` for
+/// `k < 4`, `mask(k) = u32::MAX` for `k >= 4`.
+fn byte_mask(k: u32) -> u32 {
+    if k >= 4 { u32::MAX } else { (1u32 << (8 * k)) - 1 }
+}
+
+/// The 16-bit (`HASH_BITS`) key of a sparse candidate chain (`params::SparseChain`, M6 a06/r3):
+/// the `width` bytes at `p`, `5 <= width <= 12`. With `lo`, `hi`, `h2` the little-endian words
+/// at `p`, `p + 4`, `p + 8`:
+///
+/// `hash_sparse = ((lo * 0x9E3779B1) ^ ((hi & mask(width - 4)) * 0x85EBCA77)
+///                 ^ ((h2 & mask(width - 8)) * 0x27D4EB2F)) * 0xC2B2AE3D >> 16`
+///
+/// in wrapping u32 arithmetic, `mask` as in `hash_width`, and the `h2` term 0 (not read) for
+/// `width <= 8`, where this equals `hash_width(b, p, width)`. The `S3_CHAINS` keys, with
+/// `K1 = 0x9E3779B1`, `K2 = 0x85EBCA77`, `K3 = 0x27D4EB2F`, `K4 = 0xC2B2AE3D`:
+/// - width 6: `((lo * K1) ^ ((hi & 0xFFFF) * K2)) * K4 >> 16`, i.e. `hash_width(b, p, 6)`
+///   (reads bytes `p..p + 8`);
+/// - width 10: `((lo * K1) ^ (hi * K2) ^ ((h2 & 0xFFFF) * K3)) * K4 >> 16` (reads `p..p + 12`);
+/// - width 12: `((lo * K1) ^ (hi * K2) ^ (h2 * K3)) * K4 >> 16` (reads `p..p + 12`).
+///
+/// Width 10 is a06's h10 GPU prototype hash.
+pub fn hash_sparse(b: &[u8], p: usize, width: u32) -> u32 {
+    debug_assert!((5..=12).contains(&width), "hash_sparse width {width}");
+    let lo = read_u32(b, p);
+    let hi = read_u32(b, p + 4) & byte_mask(width - 4);
+    let h2 = if width > 8 { read_u32(b, p + 8) & byte_mask(width - 8) } else { 0 };
+    (lo.wrapping_mul(0x9E37_79B1) ^ hi.wrapping_mul(0x85EB_CA77) ^ h2.wrapping_mul(0x27D4_EB2F)).wrapping_mul(0xC2B2_AE3D) >> (32 - HASH_BITS)
+}
+
 /// zstd's `ZSTD_hash3Ptr` with `hBits = HASH_BITS` (16, zstd's hashLog3 at 64 KiB): the 3 bytes at
 /// `p`, `((MEM_readLE32(p) << 8) * 506832829) >> (32 - 16)` in wrapping u32 arithmetic. Reads 4
 /// bytes (`p + 4 <= BLOCK_SIZE`); byte `p + 3` is shifted out. The `Opt3` short chain's key.
@@ -154,6 +184,33 @@ mod tests {
         let mut v = vec![0u8; 8];
         v[..4].copy_from_slice(b"abcX");
         assert_eq!(hash3(&v, 0), (0x6362_6100u32.wrapping_mul(506_832_829)) >> 16);
+    }
+
+    /// `hash_sparse` is `hash_width` up to 8 bytes, depends on exactly its `width` bytes, and
+    /// matches its formula for the S3 widths on hand-built words.
+    #[test]
+    fn hash_sparse_formula_and_width() {
+        let b = crate::synth::random(5, crate::config::BLOCK_SIZE);
+        for p in (0..crate::config::BLOCK_SIZE - 12).step_by(61) {
+            for w in 5..=8 {
+                assert_eq!(hash_sparse(&b, p, w), hash_width(&b, p, w), "p={p} w={w}");
+            }
+            for w in 5..=12u32 {
+                let h = hash_sparse(&b, p, w);
+                assert!(h < 1 << HASH_BITS);
+                let mut c = b.clone();
+                for i in w as usize..12 {
+                    c[p + i] ^= 0x5A; // bytes past the width do not matter
+                }
+                assert_eq!(hash_sparse(&c, p, w), h, "p={p} w={w}");
+            }
+        }
+        let v: Vec<u8> = (1..=16).collect();
+        let (lo, hi, h2) = (0x0403_0201u32, 0x0807_0605u32, 0x0C0B_0A09u32);
+        let f = |hi: u32, h2: u32| (lo.wrapping_mul(0x9E37_79B1) ^ hi.wrapping_mul(0x85EB_CA77) ^ h2.wrapping_mul(0x27D4_EB2F)).wrapping_mul(0xC2B2_AE3D) >> 16;
+        assert_eq!(hash_sparse(&v, 0, 6), f(hi & 0xFFFF, 0));
+        assert_eq!(hash_sparse(&v, 0, 10), f(hi, h2 & 0xFFFF));
+        assert_eq!(hash_sparse(&v, 0, 12), f(hi, h2));
     }
 
     #[test]

@@ -8,8 +8,8 @@ version = "0.1.0"
 rust-version = "1.96"
 
 [workspace.dependencies]
-gzc-core = { path = "crates/gzc-core", default-features = false }
-gzc-gpu = { path = "crates/gzc-gpu", default-features = false }
+gzc-core = { path = "crates/gzc-core" }
+gzc-gpu = { path = "crates/gzc-gpu" }
 wgpu = "30"
 zstd = "0.14"
 pollster = "1"

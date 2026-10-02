@@ -373,7 +373,7 @@ mod tests {
 
     /// ML codes {0, big} leave a gap of more than 24 zero-probability codes, so `write_ncount` takes
     /// its 24-zero-run (0xFFFF) branch; libzstd must still decode the table. The long match is sized
-    /// to the block (code 52 at 128K, code 49 at 16K: both gaps exceed 24).
+    /// to the block (ML code 51, a gap of more than 24).
     #[test]
     fn write_ncount_long_zero_run_roundtrips() {
         let big = BLOCK_SIZE as u32 - 2 * 50 * 4 - 1 - 64;
@@ -492,31 +492,5 @@ mod tests {
         assert_eq!(&section_for(0x7EFF)[..3], &[0x80 + 0x7E, 0xFF, 0]);
         assert_eq!(&section_for(0x7F00)[..4], &[0xFF, 0, 0, 0]);
         assert_eq!(&section_for(0x7F00 + 0x123)[..4], &[0xFF, 0x23, 0x01, 0]);
-    }
-
-    /// With `min_match = 4` a 128K block can hold more than 0x7F00 sequences, so the 3-byte nbSeq
-    /// form is reachable. 4 literals then 32767 matches of length 4 at offset 4 (ll = 0; repcodes
-    /// after the first two) fill the block exactly; the frame must be Compressed and decode. At
-    /// 16K..64K `BLOCK_SIZE / 4 < 0x7F00`, so the form is unreachable there.
-    #[cfg(feature = "block-128k")]
-    #[test]
-    fn nbseq_three_byte_form_roundtrips() {
-        let n = BLOCK_SIZE / 4 - 1;
-        let mut script = vec![(4, 4, 4)];
-        script.extend(std::iter::repeat_n((0, 4, 4), n - 1));
-        let (block, out) = scripted(&script, &mut lit_source(0x7f00));
-        assert_eq!(out.sequences.len(), n);
-        assert!(out.sequences.len() >= 0x7F00);
-        assert_eq!(reconstruct(&out).unwrap(), block);
-        let mut section = Vec::new();
-        write_sequences_section_auto(&out.sequences, &mut section);
-        let extra = (n - 0x7F00) as u16;
-        assert_eq!(section[..3], [0xFF, extra as u8, (extra >> 8) as u8], "3-byte nbSeq header");
-        for opts in [FrameOptions::default(), FrameOptions { checksum: false, huffman: false }] {
-            let frame = write_frame(&block, &out, opts);
-            assert_eq!((frame[frame_header(opts).len()] >> 1) & 3, 2, "Compressed block");
-            let dec = zstd::bulk::decompress(&frame, BLOCK_SIZE).expect("libzstd rejected frame");
-            assert!(dec == block, "decoded block differs");
-        }
     }
 }

@@ -5,11 +5,12 @@
 use gzc_core::block::chunk_file;
 use gzc_core::config::{BLOCK_SIZE, HASHED_POSITIONS};
 use gzc_core::hash::{compute_preds, hash_long, hash_short, hash_width};
-use gzc_core::params::{Hashes, LVL3, LVL9, MatchParams, OPT16, RUNG1};
+use gzc_core::params::{Hashes, LVL3, LVL9, SparseChain, MatchParams, OPT16, OPT16P1, OptParams, RUNG1};
 use gzc_core::reference::chains;
 use gzc_core::synth::test_cases;
 use gzc_gpu::chains::{
-    ChainsKernel, ChainsOptions, PRED_POS, chain_fp, gpu_preds, gpu_preds_with, head_bytes, pred_bytes, pred_of_word,
+    ChainsKernel, ChainsOptions, PRED_POS, chain_fp, chain_pred_bytes, chain_span, expected_words, gpu_preds,
+    gpu_preds_with, head_bytes, pred_bytes, pred_of_word, pred_words_per_block,
 };
 use gzc_gpu::context::{GpuContext, pack_blocks};
 
@@ -117,10 +118,6 @@ fn k1_single_hash_preds_match_cpu() {
 #[test]
 fn k1_opt3_preds_match_cpu() {
     let _gpu = gzc_gpu::test_support::gpu_test_slot();
-    // opt16 only implements at blocks of at most 64 KiB.
-    if gzc_core::config::LOG2_BLOCK > 16 {
-        return;
-    }
     use gzc_core::hash::hash3;
     let blocks = all_blocks();
     let block = &blocks[0].1;
@@ -132,6 +129,42 @@ fn k1_opt3_preds_match_cpu() {
         check(&ctx, &blocks, &OPT16);
         for b in blocks.iter().step_by(5) {
             check(&ctx, std::slice::from_ref(b), &OPT16);
+        }
+    }
+}
+
+/// M6 sparse long chains in other shapes than S3: two chains, stride 8, the extreme
+/// widths 5 and 12 (`long_hash`'s masks), and a 5- and 8-byte key (no third word).
+fn long_chain_variants() -> Vec<MatchParams> {
+    let lc = |width, stride, depth| Some(SparseChain { width, stride, depth });
+    let with = |sparse_chains| {
+        MatchParams { opt: Some(OptParams { sparse_chains, ..OPT16P1.opt.unwrap() }), ..OPT16P1 }
+    };
+    vec![
+        OPT16P1,
+        with([lc(5, 8, 1), lc(12, 4, 64), None]),
+        with([lc(8, 4, 3), lc(7, 8, 16), None]),
+        with([lc(11, 8, 2), None, None]),
+    ]
+}
+
+/// The S3 chains (`opt16p1`): h4, h3, then the 6-, 10- and 12-byte sparse chains on every 4th
+/// position, compact in K1's pred buffer; decoded, they equal `reference::chains`. Also other
+/// long chain shapes (`long_chain_variants`).
+#[test]
+fn k1_long_chains_match_cpu() {
+    let _gpu = gzc_gpu::test_support::gpu_test_slot();
+    let blocks = all_blocks();
+    // Layout: two full chains, then BLOCK_SIZE / 4 words per sparse chain.
+    assert_eq!(pred_words_per_block(&OPT16P1), 2 * BLOCK_SIZE as u64 + 3 * BLOCK_SIZE as u64 / 4);
+    assert_eq!(chain_span(&OPT16P1, 3), (2 * BLOCK_SIZE as u64 + BLOCK_SIZE as u64 / 4, BLOCK_SIZE as u64 / 4));
+    assert_eq!(pred_words_per_block(&OPT16), 2 * BLOCK_SIZE as u64);
+    for ctx in contexts() {
+        for params in long_chain_variants() {
+            check(&ctx, &blocks, &params);
+        }
+        for b in blocks.iter().step_by(5) {
+            check(&ctx, std::slice::from_ref(b), &OPT16P1);
         }
     }
 }
@@ -171,8 +204,8 @@ fn k1_head_reuse_across_dispatches() {
     let blocks = all_blocks();
     for ctx in contexts() {
         let cap = blocks.len() as u32;
-        let head = ctx.storage_buffer("test.head", head_bytes(cap, 2), false);
-        let pred = ctx.storage_buffer("test.pred", pred_bytes(cap, 2), true);
+        let head = ctx.storage_buffer("test.head", head_bytes(cap, 5), false);
+        let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(cap, &OPT16P1).max(pred_bytes(cap, 2)), true);
         let opts = |groups, wide_masks| ChainsOptions { groups, wide_masks, ..ChainsOptions::default() };
         let kernels: Vec<(MatchParams, ChainsKernel)> = [
             (LVL3, opts(None, false)),
@@ -181,11 +214,13 @@ fn k1_head_reuse_across_dispatches() {
             (LVL9, opts(Some(1), false)),
             (RUNG1, opts(None, true)),
             (LVL3, opts(Some(1), false)),
+            (OPT16P1, opts(Some(3), false)),
+            (OPT16P1, opts(Some(1), true)),
         ]
         .into_iter()
         .map(|(p, o)| (p, ChainsKernel::with_options(&ctx, &p, o).unwrap()))
         .collect();
-        for round in 0..18usize {
+        for round in 0..24usize {
             let (params, kernel) = &kernels[round % kernels.len()];
             // Rotating, varying-size subsets, so stale head entries of other blocks are present.
             let n = [blocks.len(), 5, 1, blocks.len() - 3, 9][round % 5];
@@ -231,16 +266,25 @@ fn k1_pred_words_carry_fingerprints() {
     for ctx in contexts() {
         let data = ctx.storage_buffer("test.data", (packed.len() * 4) as u64, false);
         ctx.queue.write_buffer(&data, 0, bytemuck::cast_slice(&packed));
-        for params in [LVL3, LVL9, OPT16] {
-            // opt16 only implements at blocks of at most 64 KiB.
-            if params.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
-                continue;
-            }
+        for params in [LVL3, LVL9, OPT16, OPT16P1] {
             let kernel = ChainsKernel::new(&ctx, &params).unwrap();
             let nh = kernel.n_hashes() as usize;
             let head = ctx.storage_buffer("test.head", head_bytes(n, nh as u32), false);
-            let pred = ctx.storage_buffer("test.pred", pred_bytes(n, nh as u32), true);
+            let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(n, &params), true);
             let words = kernel.run_words(&ctx, &data, &head, &pred, n);
+            let per_block = pred_words_per_block(&params) as usize;
+            if params.opt.is_some_and(|o| o.sparse_chains.iter().any(|c| c.is_some())) {
+                // Sparse long chains: the compact layout (`expected_words`), word for word.
+                for (b, (name, block)) in blocks.iter().enumerate() {
+                    let want = expected_words(&params, block);
+                    let got = &words[b * per_block..][..per_block];
+                    if let Some(i) = (0..per_block).find(|&i| got[i] != want[i]) {
+                        panic!("sg={} {name} word {i}: gpu {:#x} cpu {:#x}", kernel.uses_subgroups(), got[i], want[i]);
+                    }
+                }
+                continue;
+            }
+            assert_eq!(per_block, nh * BLOCK_SIZE);
             for (b, (name, block)) in blocks.iter().enumerate() {
                 let want = chains(block, &params);
                 for (c, want) in want.iter().enumerate() {

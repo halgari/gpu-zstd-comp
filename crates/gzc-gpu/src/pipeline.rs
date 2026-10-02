@@ -818,7 +818,7 @@ impl<'a> Pipeline<'a> {
         let s = &self.bufs;
         // Direct upload: `data` is a slot's upload buffer, counted with the slots.
         let data = if self.direct { 0 } else { size(&s.data) };
-        let k3opt = s.opt.as_ref().map_or(0, |o| size(&o.prices) + size(&o.scratch));
+        let k3opt = s.opt.as_ref().map_or(0, |o| size(&o.prices) + size(&o.scratch) + size(&o.sched));
         let shared = data
             + [&s.head, &s.pred, &s.best, &s.seqs, &s.counts].iter().map(|b| size(b)).sum::<u64>()
             + opt(&s.frames)
@@ -1779,7 +1779,7 @@ mod tests {
     use crate::chains::{head_bytes, pred_bytes};
     use gzc_core::block::chunk_file;
     use gzc_core::frame::write_frame;
-    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, RUNG1};
+    use gzc_core::params::{LVL3, LVL9, LVL9S12SEG, MatchParams, OPT14, OPT16, OPT16P1, RUNG1};
     use gzc_core::reference::compress_block;
     use gzc_core::synth::test_cases;
 
@@ -1973,6 +1973,37 @@ mod tests {
         }
     }
 
+    /// M6 `opt16p1`'s sparse chains cost 3 * BLOCK_SIZE / 4 pred words (192 KiB at 64 KiB) per
+    /// block over opt16 once the head tables are capped, which `vram_bytes` counts, so a VRAM
+    /// budget's largest batch (gzc-bench `--batch max`) is smaller.
+    #[test]
+    fn vram_counts_opt16p1_sparse_chains() {
+        use gzc_core::params::{OPT16, OPT16P1};
+        let frames = |m, batch, inflight| PipelineConfig {
+            params: GpuParams { matching: m, emit_frames: true, huffman: true },
+            ..cfg(batch, inflight)
+        };
+        // At batches whose head tables are capped (5 * n and 2 * n >= HEAD_TABLES).
+        for n in [200u32, 2900] {
+            let extra = vram_bytes(&frames(OPT16P1, n, 2)) - vram_bytes(&frames(OPT16, n, 2));
+            assert_eq!(extra, n as u64 * 3 * BLOCK_SIZE as u64);
+        }
+        let max_at = |m, inflight, budget_mib: u64| {
+            (1..=20_000u32).take_while(|&n| vram_bytes(&frames(m, n, inflight)).div_ceil(1 << 20) <= budget_mib).last().unwrap()
+        };
+        for inflight in [1, 2, 3] {
+            let (a, b) = (max_at(OPT16, inflight, 6144), max_at(OPT16P1, inflight, 6144));
+            assert!(b < a, "inflight {inflight}: opt16 {a} opt16p1 {b}");
+            assert!(vram_bytes(&frames(OPT16P1, b, inflight)) <= 6144 << 20);
+            assert!(vram_bytes(&frames(OPT16P1, b + 1, inflight)).div_ceil(1 << 20) > 6144);
+            eprintln!(
+                "6144 MiB, inflight {inflight}: opt16 batch max {a} ({} B/block), opt16p1 {b} ({} B/block)",
+                vram_bytes(&frames(OPT16, a, inflight)) / a as u64,
+                vram_bytes(&frames(OPT16P1, b, inflight)) / b as u64
+            );
+        }
+    }
+
     #[test]
     fn vram_counts_scratch_once_and_slots_per_inflight() {
         let frames = |batch, inflight| PipelineConfig {
@@ -1993,20 +2024,10 @@ mod tests {
         let raw_lits =
             PipelineConfig { params: GpuParams { huffman: false, ..frames(100, 2).params }, ..frames(100, 2) };
         assert_eq!(vram_bytes(&raw_lits), vram_bytes(&frames(100, 2)));
-        #[cfg(feature = "block-128k")]
-        {
-            // ~2.4 MiB of scratch per block, ~0.25 MiB per block per slot on the frame path.
-            let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((2.3..2.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
-            assert!((0.24..0.26).contains(&mib(per_slot)), "{}", mib(per_slot));
-        }
-        #[cfg(feature = "block-64k")]
-        {
-            // ~1.44 MiB of scratch per block, ~0.125 MiB per block per slot on the frame path.
-            let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
-            assert!((1.4..1.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
-            assert!((0.12..0.13).contains(&mib(per_slot)), "{}", mib(per_slot));
-        }
+        // ~1.44 MiB of scratch per block, ~0.125 MiB per block per slot on the frame path.
+        let mib = |b: u64| b as f64 / (1u64 << 20) as f64 / 100.0;
+        assert!((1.4..1.5).contains(&mib(scratch_bytes(100, &LVL3))), "{}", mib(scratch_bytes(100, &LVL3)));
+        assert!((0.12..0.13).contains(&mib(per_slot)), "{}", mib(per_slot));
     }
 
     /// `vram_bytes` equals the bytes of every buffer a `Pipeline` actually creates (shared scratch
@@ -2017,11 +2038,7 @@ mod tests {
     fn vram_matches_params() {
         let _gpu = crate::test_support::gpu_test_slot();
         let ctx = GpuContext::new().expect("GPU required for gzc-gpu tests");
-        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14] {
-            // opt14/opt16 only implement at blocks of at most 64 KiB.
-            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
-                continue;
-            }
+        for matching in [LVL3, RUNG1, LVL9, OPT16, OPT14, OPT16P1] {
             for (emit_frames, batch, inflight) in [(true, 7, 1), (true, 16, 3), (false, 5, 2)] {
                 let cfg =
                     PipelineConfig { batch, inflight, params: GpuParams { matching, emit_frames, huffman: true } };
@@ -2042,34 +2059,33 @@ mod tests {
         };
         // One chain instead of two: head and pred halve.
         assert_eq!(scratch(LVL3) - scratch(RUNG1), head_bytes(10, 1) + pred_bytes(10, 1));
-        // opt14/opt16 only implement at blocks of at most 64 KiB.
-        if gzc_core::config::LOG2_BLOCK <= 16 {
-            // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging
-            // only on the parse path), K3opt's prices and scratch.
-            let opt_extra = crate::compressor::best_bytes(10)
-                + crate::compressor::seqs_bytes_for(10, &OPT16)
-                - crate::compressor::seqs_bytes(10)
-                + crate::compressor::opt_bytes(10, &OPT16);
-            assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
-            assert_eq!(scratch(OPT14), scratch(OPT16));
-        }
+        // The optimal parse over lvl3 (two chains too): candidates, seqs (in `slots` staging
+        // only on the parse path), K3opt's prices and scratch.
+        let opt_extra = crate::compressor::best_bytes(10)
+            + crate::compressor::seqs_bytes_for(10, &OPT16)
+            - crate::compressor::seqs_bytes(10)
+            + crate::compressor::opt_bytes(10, &OPT16);
+        assert_eq!(scratch(OPT16) - scratch(LVL3), opt_extra);
+        assert_eq!(scratch(OPT14), scratch(OPT16));
+        // opt16p1 (M6): three more head tables and sparse pred words; K3opt's buffers (and the
+        // drop pass, which has none) are the same.
+        let p1_extra = crate::compressor::pred_bytes_for(10, &OPT16P1) - crate::compressor::pred_bytes_for(10, &OPT16)
+            + head_bytes(10, 5)
+            - head_bytes(10, 2);
+        assert_eq!(scratch(OPT16P1) - scratch(OPT16), p1_extra);
     }
 
-    /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4) through the streaming
-    /// pipeline in every upload/readback mode, over partial batches and reuse, equals the CPU
-    /// oracle's frames (which libzstd decodes); the parse path too. `allocated_bytes` equals
-    /// `vram_bytes` in every mode.
+    /// M5 T5: the optimal parse (K1 Opt3 → K2opt → K3opt passes → K5 → K4; M6 B4: opt16p1 with
+    /// its sparse chains and drop pass) through the streaming pipeline in every upload/readback
+    /// mode, over partial batches and reuse, equals the CPU oracle's frames (which libzstd
+    /// decodes); the parse path too. `allocated_bytes` equals `vram_bytes` in every mode.
     #[test]
     fn opt_stream_every_mode_matches_cpu() {
         let _gpu = crate::test_support::gpu_test_slot();
-        // opt14/opt16 only implement at blocks of at most 64 KiB.
-        if gzc_core::config::LOG2_BLOCK > 16 {
-            return;
-        }
         let distinct = distinct_blocks();
         let blocks: Vec<&[u8]> = (0..50).map(|i| distinct[i % distinct.len()].as_slice()).collect();
         let modes = mode_contexts();
-        for matching in [OPT14, OPT16] {
+        for matching in [OPT14, OPT16, OPT16P1] {
             let params = GpuParams { matching, emit_frames: true, huffman: true };
             let want: Vec<Vec<u8>> = distinct.iter().map(|b| cpu_frame(b, params)).collect();
             for (w, b) in want.iter().zip(&distinct) {
@@ -2337,12 +2353,9 @@ mod tests {
         let _gpu = crate::test_support::gpu_test_slot();
         let distinct = distinct_blocks();
         // M5 T5: the optimal parse too (its K3opt reads one word past each block: the slot's
-        // trailing zero word after partial batches of stale blocks). opt14 only implements at
-        // blocks of at most 64 KiB.
-        for matching in [LVL9S12SEG, OPT14] {
-            if matching.opt.is_some() && gzc_core::config::LOG2_BLOCK > 16 {
-                continue;
-            }
+        // trailing zero word after partial batches of stale blocks). M6 B4: opt16p1 (sparse
+        // chains, drop pass) as well.
+        for matching in [LVL9S12SEG, OPT14, OPT16P1] {
             zero_copy_every_mode(&distinct, GpuParams { matching, emit_frames: true, huffman: true });
         }
     }
