@@ -94,6 +94,7 @@ impl FseCTable {
         FseCTable { state_table: vec![0], symbol_tt: vec![(0, 0); symbol as usize + 1], table_log: 0 }
     }
 
+    /// The table's log2 size.
     pub fn table_log(&self) -> u32 {
         self.table_log
     }

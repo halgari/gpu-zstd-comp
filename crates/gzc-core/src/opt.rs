@@ -86,9 +86,13 @@ pub fn frac_weight(raw: u32) -> u32 {
 /// Symbol counts of one parse: literal bytes, and LL / ML / OF codes of its sequences.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hist {
+    /// Literal bytes by value.
     pub lit: [u32; 256],
+    /// Sequences by LL code.
     pub ll: [u32; 36],
+    /// Sequences by ML code.
     pub ml: [u32; 53],
+    /// Sequences by OF code.
     pub of: [u32; 32],
 }
 
@@ -126,9 +130,13 @@ impl Hist {
 /// with `W = frac_weight`. Every entry is in 0..65536 (fits the GPU's u16 tables).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prices {
+    /// Price of a literal byte, by value.
     pub lit: [i32; 256],
+    /// Price of an LL code, extra bits included.
     pub ll: [i32; 36],
+    /// Price of an ML code, extra bits included.
     pub ml: [i32; 53],
+    /// Price of an OF code, extra bits included.
     pub of: [i32; 32],
 }
 
@@ -859,7 +867,9 @@ struct SegState {
 ///   Debug builds assert that every ring read finds the position it expects in its slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
+    /// zstd's `opt[]` array.
     Linear,
+    /// The GPU's ring of nodes and per-position trace.
     Ring,
 }
 
@@ -923,8 +933,11 @@ pub fn dp_pass_with(
 /// One pass of `passes`: the prices it ran with, its optLevel, and its output.
 #[derive(Clone, Debug)]
 pub struct Pass {
+    /// The static prices the pass ran with.
     pub prices: Prices,
+    /// The pass's optLevel: 0 or 2.
     pub level: u8,
+    /// The block's parse after this pass.
     pub out: BlockOutput,
 }
 
@@ -1087,9 +1100,14 @@ pub mod cases {
 
     /// One scripted block: `expect` lists `(params, prices, sequences)` runs.
     pub struct OptCase {
+        /// The case's name, for failure messages.
         pub name: String,
+        /// The block, `BLOCK_SIZE` bytes.
         pub block: Vec<u8>,
+        /// The scripted candidate words, one pair per position.
         pub cands: Vec<CandWords>,
+        /// The runs: params, the price tables or `None` for the full parse, and the sequences
+        /// the run must produce.
         pub expect: Vec<(MatchParams, Option<Prices>, Vec<Sequence>)>,
     }
 
@@ -1696,12 +1714,19 @@ pub mod cases {
     /// `prices` and `max_len` of `super::drop_decisions`, and the expected decisions and output
     /// (`super::apply_drops`). Segments are `OPT16.segment_log2` (4 KiB).
     pub struct DropCase {
+        /// The case's name, for failure messages.
         pub name: String,
+        /// The block, `BLOCK_SIZE` bytes.
         pub block: Vec<u8>,
+        /// The parse the drop pass starts from.
         pub input: BlockOutput,
+        /// The drop prices.
         pub prices: Prices,
+        /// `OptParams::drop_max_len`.
         pub max_len: u32,
+        /// The expected decision for each input sequence.
         pub dropped: Vec<bool>,
+        /// The expected sequences after the drops.
         pub expect: Vec<Sequence>,
     }
 

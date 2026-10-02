@@ -1,44 +1,55 @@
-//! In-flight streaming submission and GPU timestamp queries.
+//! The streaming pipeline under [`crate::Compressor`]: batches in flight on one device, their
+//! readback, and per-kernel timing.
 //!
-//! `inflight` slots each own a mappable upload buffer and a mappable staging (readback) buffer.
-//! Every device-side buffer, the kernels' input (`data`), scratch and outputs (`frames`,
-//! `frame_len`) included, is shared by all slots: the queue runs one submission after another
-//! and each submission consumes what it produced (its outputs are copied into the slot's staging
-//! buffer before the next submission's kernels start, which wgpu orders with a barrier), so only
-//! the host-visible buffers need one copy per batch in flight (see `vram_bytes`). A batch is
-//! written into a free slot's upload buffer; the upload copy, the kernels and the readback into
-//! the slot's staging buffer (plus resolved timestamps) are recorded in one submission, and the
-//! staging buffer is mapped once. Completed slots are handed to the sink in submission order while
-//! later batches keep the GPU busy.
+//! # Slots
 //!
-//! Threads: the caller's thread is the producer: it writes each batch into a slot's mapped upload
-//! buffer (itself with `stream_frames`, or `FrameStream::upload_blocks` copying from `&[&[u8]]`)
-//! and submits it. A completion thread (one per `run*` / `stream_frames` call) waits for the
-//! batches in submission order and lends each one's staging bytes to the sink (`Lease`,
-//! `FrameBatch`); a slot is reused once its batch is released, so delivery overlaps the next
-//! uploads instead of following them on one thread. Slot states live in `Shared`.
+//! A pipeline has `inflight` slots. Each owns a mappable upload buffer and a mappable staging
+//! (readback) buffer. Every device-side buffer is shared by all slots: the kernels' input
+//! (`data`), their scratch and their outputs (`frames`, `frame_len`). That works because the
+//! queue runs one submission after another and each submission consumes what it produced: its
+//! outputs are copied into the slot's staging buffer before the next submission's kernels start.
+//! So only the host-visible buffers need one copy per batch in flight (see `vram_bytes`).
 //!
-//! Direct upload (`GpuContext::direct_upload`, full ReBAR): there is no shared `data` and no
-//! upload copy; each submission binds its slot's upload buffer (device-local, mapped for the
-//! host between submissions) as `data`.
+//! A batch is written into a free slot's upload buffer. The upload copy, the kernels, the
+//! readback into the slot's staging buffer and the timestamp resolve are recorded in one
+//! submission, and the staging buffer is mapped once. Completed slots go to the sink in
+//! submission order while later batches keep the GPU busy.
 //!
-//! Transfer readback (`GpuContext::transfer`, frame path; see `Xfer`): each batch
-//! is two main-queue submissions (K1–K3, then K5/K4 and the timestamps) and a copy on the
-//! transfer queue into the slot's host staging buffer, ordered by timeline semaphores; `frames`
-//! and `frame_len` are buffers both queue families share. The readback then overlaps the next
-//! batch's kernels instead of following its batch's K4 on the main queue. The `gpu_readback`
-//! entry of `PipelineStats::transfer_ms` is K4's end to the batch's end marker, so it only counts
-//! the main queue's share (about 0 on this path).
+//! # Threads
 //!
-//! Two output paths, chosen by `GpuParams::emit_frames` when the pipeline is built:
-//! - parses (`run`, `BlockSink`): K1→K2→K3, staging holds `counts` and the full fixed-stride
-//!   `seqs` region; the host decodes a `BlockOutput` per block, gathering its literals from the
-//!   block (K3 writes no literals).
-//! - frames (`run_frames`, `FrameSink`): K1→K2→K3→K5→K4, staging holds `frame_len` and the
-//!   `frames` region, a copy of the fixed-stride buffer; the sink reads each frame in place
-//!   (`FrameBatch`). K5 (the literals
-//!   section, Huffman-coded with `GpuParams::huffman`) gathers the literals from `data` and writes
-//!   into the same `frames` / `frame_len` buffers, so it adds no memory.
+//! The caller's thread is the producer. It writes each batch into a slot's mapped upload buffer
+//! (itself with `stream_frames`, or through `FrameStream::upload_blocks`, which copies from
+//! `&[&[u8]]`) and submits it. A completion thread, one per `run*` / `stream_frames` call, waits
+//! for the batches in submission order and lends each one's staging bytes to the sink (`Lease`,
+//! `FrameBatch`). A slot is reused once its batch is released, so delivery overlaps the next
+//! uploads. Slot states live in `Shared`.
+//!
+//! # Direct upload
+//!
+//! With `GpuContext::direct_upload` (full ReBAR) there is no shared `data` and no upload copy.
+//! Each submission binds its slot's upload buffer as `data`; the buffer is device-local and
+//! mapped for the host between submissions.
+//!
+//! # Transfer readback
+//!
+//! With `GpuContext::transfer_readback`, on the frame path (see `Xfer`), each batch is two
+//! main-queue submissions (K1–K3, then K5/K4 and the timestamps) and a copy on the transfer
+//! queue into the slot's host staging buffer, ordered by timeline semaphores. `frames` and
+//! `frame_len` are buffers both queue families share. The readback then overlaps the next
+//! batch's kernels. The `gpu_readback` entry of `PipelineStats::transfer_ms` is K4's end to the
+//! batch's end marker, so it only counts the main queue's share, about 0 on this path.
+//!
+//! # Output paths
+//!
+//! `GpuParams::emit_frames` chooses one when the pipeline is built.
+//! - Parses (`run`, `BlockSink`): K1→K2→K3. Staging holds `counts` and the full fixed-stride
+//!   `seqs` region. The host decodes a `BlockOutput` per block and gathers its literals from the
+//!   block, because K3 writes no literals.
+//! - Frames (`run_frames`, `FrameSink`): K1→K2→K3→K5→K4. Staging holds `frame_len` and a copy
+//!   of the fixed-stride `frames` region, and the sink reads each frame in place (`FrameBatch`).
+//!   K5 writes the literals section, Huffman-coded with `GpuParams::huffman`. It gathers the
+//!   literals from `data` and writes into the same `frames` / `frame_len` buffers, so it adds no
+//!   memory.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Instant;
@@ -86,26 +97,23 @@ pub struct PipelineConfig {
 /// Where the time of one stream went.
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
-    /// GPU time summed over all batches per kernel ("k1_chains", "k2_best", "k3_parse", plus
-    /// "k4_entropy" on the frame path and "k5_huffman" with Huffman literals, and last "k3_trunc"
-    /// when some batch held a partial block and so ran K3t), in milliseconds;
-    /// empty when the device has no timestamp queries; a kernel whose timestamps the device left
-    /// unwritten (in any batch) is left out. That happens on Metal (an M4 Pro): with counters
-    /// sampled at stage boundaries only (no `TIMESTAMP_QUERY_INSIDE_ENCODERS`) it left K4's pair,
-    /// the last kernel's, unwritten in some batch of the optimal parse's frame-path test (batches
-    /// of 16 and 2 blocks; the bench's larger batches time it), though that pass samples like
-    /// every other kernel's: its own compute encoder, begin and end on the pass, every slot
-    /// written before the resolve in the same submission.
+    /// GPU time per kernel, summed over all batches, in milliseconds: `k1_chains` (or
+    /// `k1_sort`), `k2_best` (or `k2_window`), `k3_parse`, plus `k4_entropy` and `k5_huffman` on
+    /// the frame path, and last `k3_trunc` when some batch held a partial block and so ran K3t.
+    ///
+    /// Empty when the device has no timestamp queries. A kernel is left out when the device left
+    /// one of its timestamps unwritten in any batch. Metal sometimes does that; it samples
+    /// counters at stage boundaries only (`GpuContext::timestamps_inside_encoders`).
     pub kernel_ms: Vec<(String, f64)>,
     /// Wall time from the first upload to the last block handed to the sink.
     pub wall_s: f64,
     /// Number of batches submitted.
     pub batches: u32,
     /// Where the time outside the kernels goes, summed over all batches, in milliseconds (see
-    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps (left out without them, or
-    /// when the device left a marker timestamp unwritten, which Metal apparently does for the
-    /// empty marker passes); the `host_*` ones are wall time on the producer or the completion
-    /// thread.
+    /// `TRANSFER_NAMES`). The `gpu_*` entries come from timestamps. They are left out without
+    /// timestamps, and when the device left a marker timestamp unwritten, which Metal may do
+    /// for the empty marker passes. The `host_*` entries are wall time on the producer or the
+    /// completion thread.
     pub transfer_ms: Vec<(String, f64)>,
 }
 
@@ -189,13 +197,16 @@ struct Job {
     partial: bool,
 }
 
-/// Transfer readback (frame path, `GpuContext::transfer`): K4 writes `frames` /
-/// `frame_len` (shared by both queue families, imported into `bufs`); each batch's main-queue work
-/// is two submissions, K1–K3 and then K5/K4 (+ timestamps), the second signalling `k_done` = the
-/// batch's `seq`; the transfer queue waits for that, copies frame_len, frames and the timestamps
-/// into the slot's host staging buffer and signals `t_done` = `seq`, which the host waits for. The
-/// K5/K4 submission of the next batch waits for the previous `t_done` before overwriting `frames`
-/// (long passed by then: K1–K3 run in between). The readback so leaves the main queue.
+/// Transfer readback (frame path, `GpuContext::transfer`), which takes the readback off the
+/// main queue.
+///
+/// K4 writes `frames` / `frame_len`, which both queue families share and `bufs` imports. Each
+/// batch's main-queue work is two submissions: K1–K3, then K5/K4 and the timestamps. The second
+/// signals `k_done` = the batch's `seq`. The transfer queue waits for that, copies frame_len,
+/// frames and the timestamps into the slot's host staging buffer and signals `t_done` = `seq`,
+/// which the host waits for. The next batch's K5/K4 submission waits for the previous `t_done`
+/// before it overwrites `frames`; that value is long passed by then, because K1–K3 run in
+/// between.
 struct Xfer {
     frames: RawBuffer,
     frame_len: RawBuffer,
@@ -706,7 +717,7 @@ impl Pipeline {
     fn submit(&mut self, i: usize, first: usize, n: u32, tag: u64, lens: &[u32]) -> anyhow::Result<Job> {
         debug_assert_eq!(lens.len(), n as usize);
         // A batch holding a partial block runs K3t (`Kernels::record_truncate`) on the blocks'
-        // real lengths; a batch of full blocks records exactly what it always did.
+        // real lengths. A batch of full blocks records nothing for it.
         let partial = self.layout.frames && lens.iter().any(|&l| l < BLOCK_SIZE as u32);
         if partial {
             // Applied at the start of this batch's first submission below, so after every earlier
@@ -892,14 +903,16 @@ fn per_slot_bytes(batch: u32, frames: bool, m: &MatchParams) -> u64 {
     data_bytes(batch) + StagingLayout::new(batch, frames, m).size
 }
 
-/// Device memory a `Pipeline` for `cfg` allocates: the shared buffers once (the scratch buffers,
-/// their hash chain buffers sized by `cfg.params.matching`: one chain for single-hash presets, two
-/// for Dfast and Opt3; the optimal parse's 8 B per position of candidates and of trace, its
-/// larger `seqs` and K3opt's prices and scratch; plus `data` and, on the frame path, `frames` and
-/// `frame_len`), per slot its upload and staging buffers, plus K4's constant tables. K5 has no buffers of its own. Uploads go
-/// through the persistent upload buffers only, so no transient staging adds to this. Timestamp
-/// query sets are not counted.
-/// This is the copy-upload footprint, an upper bound for any context (`vram_bytes_with`).
+/// Device memory a `Pipeline` for `cfg` allocates.
+///
+/// - The shared buffers, once: the scratch buffers (`sizing::BufferSizes`, sized by
+///   `cfg.params.matching`), `data`, and on the frame path `frames` and `frame_len`.
+/// - Per slot: its upload buffer and its staging buffer.
+/// - K4's constant tables. K5 has no buffers of its own.
+///
+/// Uploads go through the persistent upload buffers only, so no transient staging adds to this.
+/// Timestamp query sets are not counted. This is the copy-upload footprint, an upper bound for
+/// any context; see `vram_bytes_with`.
 pub fn vram_bytes(cfg: &PipelineConfig) -> u64 {
     vram_bytes_with(cfg, false)
 }

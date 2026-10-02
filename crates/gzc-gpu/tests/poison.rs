@@ -21,7 +21,7 @@ fn presets() -> Vec<(&'static str, MatchParams)> {
         ("lvl9seg", LVL9SEG),
         ("lvl9s12seg", LVL9S12SEG),
         ("opt14", OPT14),
-        // M6 B4: sparse chains, gap3, top-4 and the drop pass.
+        // Sparse chains, gap3, top-4 and the drop pass.
         ("opt16p1", OPT16P1),
     ]
 }

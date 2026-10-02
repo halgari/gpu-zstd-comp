@@ -9,6 +9,7 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
+    /// An empty writer.
     pub fn new() -> Self {
         Self::default()
     }

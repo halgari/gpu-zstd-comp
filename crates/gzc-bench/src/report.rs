@@ -59,7 +59,7 @@ fn kind_name(kind: Kind) -> &'static str {
 
 /// Fixed categorical palette (light-mode hexes; dark-mode values are set via
 /// CSS custom properties, see `palette_style`), assigned to series in a
-/// fixed order — never cycled per re-render for the same input.
+/// fixed order, never cycled per re-render for the same input.
 const SERIES_SLOTS: usize = 8;
 
 fn series_color_var(slot: usize) -> String {

@@ -52,6 +52,8 @@
 //! [`pipeline`] is the layer the compressor is built on: a [`pipeline::Pipeline`] on a shared
 //! [`GpuContext`], with timing statistics, the parse-only path and raw upload slots. Its upload
 //! slots leave the block lengths to the caller. Prefer [`Compressor::stream`].
+#![warn(missing_docs)]
+
 mod chains;
 mod compressor;
 mod context;

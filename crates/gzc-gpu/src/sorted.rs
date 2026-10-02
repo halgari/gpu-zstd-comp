@@ -1,22 +1,24 @@
-//! Host side of the bucket-sorted K1 (speed2 E2, `k1_sort_sg.wgsl`) and its window K2
+//! Host side of the bucket-sorted K1 (`k1_sort.wgsl`, `k1_sort_sg.wgsl`) and its window K2
 //! (`k2_window.wgsl`).
 //!
-//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s12seg`), K1 builds, per block, every hashed position ordered
-//! by key and position (`gzc_core::hash::bucket_sort`) into the `pred` buffer: a counting sort in
-//! workgroup memory (one 32-lane subgroup per block) ranks the positions into `best` (scratch),
-//! then a block-major scatter places them. K2 then walks, for each slot, the entries just below
-//! it that share its key, which is its position's hash chain. Both are byte-identical to
-//! `gzc_core::reference::find_best`. VRAM is unchanged (the chain kernels' `head` buffer is left
-//! unused).
+//! For Single-hash params with a key of at most `MAX_SORT_KEY_BITS` bits (`lvl9s12seg`), K1
+//! writes, per block, every hashed position ordered by key and position
+//! (`gzc_core::hash::bucket_sort`) into the `pred` buffer. A counting sort in workgroup memory
+//! ranks the positions into `best` (used as scratch), then a block-major scatter places them. K2
+//! walks, for each slot, the entries just below it that share its key: its position's hash
+//! chain. The result is byte-identical to `gzc_core::reference::find_best`. The chain kernels'
+//! `head` buffer stays allocated and unused, so VRAM is the same as with the chains.
 //!
-//! K1 has a subgroup version (`k1_sort_sg.wgsl`: ballots and shuffles, subgroups of at least 32
-//! lanes) and a workgroup-memory version without subgroups (`k1_sort.wgsl`), picked like the chain
-//! K1's two kernels: the subgroup one when the device has suitable subgroups and it passes its
-//! self-test. Each needs its `workgroup_bytes` within the device's limit (the context keeps wgpu's
-//! default 16 KiB: a 12-bit key fits both versions; a 13-bit key fits only the subgroup
-//! version); otherwise (or
-//! with `GpuOptions::sorted_finder` off) `Kernels` runs the chain kernels, which build the same chains over the
-//! same key (byte-identical, just slower: K2 walks the denser chains of the shorter key).
+//! K1 has two versions, picked like the chain K1's two kernels:
+//! - `k1_sort_sg.wgsl` uses ballots and shuffles and needs subgroups of at least 32 lanes. It
+//!   runs when the device has them and the kernel passes its self-test.
+//! - `k1_sort.wgsl` uses workgroup memory only.
+//!
+//! Each needs its `workgroup_bytes` within the device's workgroup-storage limit. At wgpu's
+//! minimum of 16 KiB a 12-bit key fits both versions and a 13-bit key only the subgroup version.
+//! Where neither fits, or with `GpuOptions::sorted_finder` off, `Kernels` runs the chain
+//! kernels. They build the same chains over the same key, so the output is the same; they are
+//! slower, because K2 walks the denser chains of the shorter key.
 use crate::chains::finder_wgsl;
 use crate::context::{GpuContext, pack_blocks};
 use gzc_core::config::{BLOCK_SIZE, HASH_BITS, HASHED_POSITIONS};
@@ -56,10 +58,11 @@ pub struct SortKernel {
 }
 
 impl SortKernel {
-    /// Builds and self-tests the kernel; `Ok(None)` when `params` or the device do not suit it
-    /// (see the module doc) or `GpuOptions::sorted_finder` is off. The subgroup version runs when `ctx.subgroups`, the
-    /// subgroups have at least 32 lanes and its self-test passes; otherwise the workgroup-memory
-    /// version (whose failed build or self-test, reported on stderr, also gives `None`).
+    /// Builds and self-tests the kernel. `Ok(None)` when `params` or the device do not suit it
+    /// (see the module doc) or `GpuOptions::sorted_finder` is off. The subgroup version runs
+    /// when `ctx.subgroups`, the subgroups have at least 32 lanes and its self-test passes;
+    /// otherwise the workgroup-memory version. A failed build or self-test of that one is
+    /// reported on stderr and also gives `None`.
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
         if !sorted_params(params) || !ctx.opts.sorted_finder {
             return Ok(None);

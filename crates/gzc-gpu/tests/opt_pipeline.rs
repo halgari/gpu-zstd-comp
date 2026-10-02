@@ -1,4 +1,4 @@
-//! M5 T5: the optimal-parse presets (`opt14`, `opt16`, and since M6 B4 `opt16p1`) through the
+//! The optimal-parse presets (`opt14`, `opt16` and `opt16p1`) through the
 //! full GPU pipeline (K1 Opt3 chains, plus opt16p1's three sparse chains → K2opt → the K3opt
 //! passes, then opt16p1's drop pass → K5 → K4), byte-identical to the CPU oracle
 //! (`reference::compress_block` + `write_frame`) on synthetic blocks and on real corpus blocks, in
@@ -119,7 +119,7 @@ fn opt_matches_oracle_synthetic() {
     }
 }
 
-/// M6 B4: `gpu_supports` accepts the M6 options at every valid value (sparse chains of stride 4 or
+/// `gpu_supports` accepts the DP options at every valid value (sparse chains of stride 4 or
 /// 8), not just opt16p1's. A few such combinations through `compress_frames` on synthetic blocks:
 /// frames equal the oracle's.
 #[test]
@@ -134,7 +134,7 @@ fn option_variants_match_oracle_synthetic() {
     let variants = [
         // opt16's schedule and candidates with the longest drop and the tightest pruning.
         ("opt16 drop32 top1", MatchParams { opt: Some(OptParams { drop_max_len: 32, relax_lengths: Some(1), inner_gap: 3, ..o16 }), ..OPT16 }),
-        // Two sparse chains at stride 8, a cheap pass, the M5 prior, drop 3.
+        // Two sparse chains at stride 8, a cheap pass, the base prior, drop 3.
         (
             "s8 x1 base-prior drop3",
             MatchParams {
@@ -181,7 +181,7 @@ fn opt_corpus_matches_oracle() {
     }
 }
 
-/// `gpu_supports` accepts the whole valid M6 option space (kernels take the options as injected
+/// `gpu_supports` accepts the whole valid option space (kernels take the options as injected
 /// constants, not per-value code paths). This sweep backs that up: a fixed pseudo-random spread
 /// of option combinations, each one byte-identical to the oracle end to end on the synthetic
 /// blocks. `GZC_SWEEP_N` sets the number of combinations (default 16).

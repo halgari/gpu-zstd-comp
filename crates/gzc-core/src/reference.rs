@@ -14,7 +14,9 @@ use crate::seq::{apply_off_base, off_base_for, truncate_output, BlockOutput, Seq
 /// `len == 0` means no match was found (or none met `min_match`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Match {
+    /// Distance back to the match's source.
     pub offset: u32,
+    /// Match length, capped at `search_cap`; 0 for no match.
     pub len: u32,
 }
 
@@ -94,7 +96,9 @@ pub fn sparse_chain_preds(block: &[u8], c: &SparseChain) -> Vec<u32> {
 /// One `find_cands` record: offset back from the position and capped length (`len == 0`: none).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cand {
+    /// Distance back to the candidate's source.
     pub offset: u32,
+    /// Length, capped at `search_cap`; 0 for no record.
     pub len: u32,
 }
 

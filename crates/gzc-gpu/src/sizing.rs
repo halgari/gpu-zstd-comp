@@ -54,8 +54,8 @@ pub(crate) fn seqs_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
 
 /// Bytes of the `pred` buffer under match params `m`: K1's chains (`chain_pred_bytes`),
 /// and for the optimal parse at least K3opt's DP trace, which reuses the buffer once K2opt has
-/// read the chains (`trace_bytes`). Opt3 has two full chains, so the two are equal; M6's sparse
-/// long chains add `BLOCK_SIZE / stride` words per block each (S3: 11 B per position).
+/// read the chains (`trace_bytes`). Opt3 has two full chains, so the two are equal. Each sparse
+/// long chain adds `BLOCK_SIZE / stride` words per block (`opt16p1`: 11 B per position in all).
 pub(crate) fn pred_bytes_for(n_blocks: u32, m: &MatchParams) -> u64 {
     let chains = chain_pred_bytes(n_blocks, m);
     if m.opt.is_some() { chains.max(trace_bytes(n_blocks)) } else { chains }
@@ -87,7 +87,7 @@ pub(crate) fn prices_bytes(n: u32) -> u64 {
     n as u64 * PRICE_WORDS as u64 * 4
 }
 
-/// Bytes of K3opt's `sched` buffer for `n` blocks (M6 A4): the header, then each block's weight,
+/// Bytes of K3opt's `sched` buffer for `n` blocks: the header, then each block's weight,
 /// the heavy-first block order and each block's rank in it (4 B per block each).
 pub(crate) fn sched_bytes(n: u32) -> u64 {
     (SCHED_HDR as u64 + 3 * n as u64) * 4

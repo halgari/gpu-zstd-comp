@@ -13,16 +13,16 @@ pub(super) struct Completion<'c> {
     /// Index of the last kernel's end query.
     pub(super) last_kernel_end: usize,
     pub(super) timed: bool,
-    /// Wait for a batch by polling (`PollType::Poll`) until its staging map completes, never with
-    /// `PollType::Wait`; on Metal. wgpu-hal 30's Metal `Device::wait` errors with
-    /// `DeviceError::Lost` ("No active command buffers for fence value") when it runs while a
-    /// `queue.submit` on another thread (the producer's next batch) is between `Fence::maintain`,
-    /// which drops command buffers whose status is already `Completed` although their completion
-    /// handler has not yet raised the fence value, and pushing its own command buffer: it then
-    /// finds the fence below the value and no pending command buffer that will reach it.
-    /// wgpu-core turns that into a lost device and destroys every buffer (which surfaced as
-    /// "Buffer with 'pipeline.staging' label has been destroyed" from `abandon`'s unmap). A
-    /// non-blocking poll never calls `Device::wait`.
+    /// Wait for a batch by polling (`PollType::Poll`) until its staging map completes, never
+    /// with `PollType::Wait`. True on Metal.
+    ///
+    /// wgpu-hal 30's Metal `Device::wait` can fail with `DeviceError::Lost` ("No active command
+    /// buffers for fence value") when it runs while a `queue.submit` on another thread, the
+    /// producer's next batch, is between `Fence::maintain` and pushing its own command buffer.
+    /// `maintain` drops command buffers whose status is `Completed` although their completion
+    /// handler has not yet raised the fence value. The wait then finds the fence below the
+    /// value and no pending command buffer that will reach it. wgpu-core turns that into a lost
+    /// device and destroys every buffer. A non-blocking poll never calls `Device::wait`.
     pub(super) poll_only: bool,
     /// Test hook: the delivery after this many more fails (then the hook clears).
     pub(super) fail_after: Option<u32>,
@@ -35,8 +35,8 @@ pub(super) struct CompletionProfile {
     pub(super) ticks: Vec<u64>,
     /// Per kernel: some batch had an unwritten begin or end timestamp (`unwritten_stamp`).
     pub(super) ticks_bad: Vec<bool>,
-    /// Some batch had an unwritten marker timestamp: `upload_copy`, `readback` and `idle` are
-    /// meaningless (Metal apparently writes none for the empty marker passes).
+    /// Some batch had an unwritten marker timestamp, so `upload_copy`, `readback` and `idle`
+    /// are meaningless. Metal may write none for the empty marker passes.
     pub(super) markers_bad: bool,
     pub(super) upload_copy: u64,
     pub(super) readback: u64,
@@ -200,9 +200,8 @@ impl Completion<'_> {
     }
 }
 
-/// A timestamp the GPU did not write: resolved as 0 (an M4 Pro printed a `gpu_upload_copy` of
-/// about 1.9e6 ms, the absolute GPU clock minus a zero start marker: Metal apparently samples
-/// nothing for the empty marker passes) or as Metal's `MTLCounterErrorValue` (all ones).
+/// A timestamp the GPU did not write: it resolves as 0, or as Metal's `MTLCounterErrorValue`
+/// (all ones). Metal may sample nothing for the empty marker passes.
 pub(super) fn unwritten_stamp(t: u64) -> bool {
     t == 0 || t == u64::MAX
 }

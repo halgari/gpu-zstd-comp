@@ -4,11 +4,10 @@
 //!
 //! `gpu_test_slot`: tests that open a device of their own and build full-size pipelines or batch
 //! buffers take one of `GZC_GPU_TEST_SLOTS` (default 2) slots first, so a parallel `cargo test`
-//! does not run a dozen of them on one GPU at once. On an M4 Pro (Metal) twelve such tests at
-//! once lost devices and left buffers invalid ("Buffer with 'pipeline.upload' label is
-//! invalid"); with two at a time they pass. Light tests (one small kernel, CPU-only checks) need
-//! no slot and keep running beside them. Each test binary has its own slots (a runner that
-//! starts several binaries at once, such as nextest, can still put more on the GPU).
+//! does not run a dozen of them on one GPU at once. Twelve such tests at once lose devices on
+//! an M4 Pro (Metal); two at a time pass. Light tests (one small kernel, CPU-only checks) need
+//! no slot and keep running beside them. Each test binary has its own slots, so a runner that
+//! starts several binaries at once, such as nextest, can still put more on the GPU.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 

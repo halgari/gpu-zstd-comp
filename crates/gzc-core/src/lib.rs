@@ -27,6 +27,8 @@
 //!     .collect();
 //! assert_eq!(frames.len(), 2); // 65536 bytes, then 34464
 //! ```
+#![warn(missing_docs)]
+
 pub mod config;
 pub mod block;
 pub mod seq;

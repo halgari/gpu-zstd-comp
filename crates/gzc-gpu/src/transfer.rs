@@ -1,17 +1,17 @@
-//! A dedicated transfer queue next to wgpu's queue (speed-2 E3).
+//! A dedicated transfer queue next to wgpu's queue.
 //!
-//! wgpu runs every submission on one queue, strictly one after another, so the readback copy of
-//! batch i (frames -> host) used to sit between batch i's K4 and batch i+1's K1. On the RTX 5090
-//! the copy engine behind a transfer-only queue family runs that copy concurrently with the next
-//! batch's kernels at no measurable cost to them (measured: `docs/results/speed2-log.md`).
+//! wgpu runs every submission on one queue, strictly one after another, so a readback copy of
+//! batch i (frames to host) on that queue sits between batch i's K4 and batch i+1's K1. On a
+//! transfer-only queue family the copy runs on the copy engine, alongside the next batch's
+//! kernels and at no measurable cost to them (RTX 5090).
 //!
-//! `GpuContext::new` creates the `VkDevice` itself (with one extra queue of a
-//! transfer-only family) when the adapter is Vulkan 1.2 with timeline semaphores and has such a
-//! family, and wraps its queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
-//! `create_device_from_hal`); the extra queue is driven here with raw Vulkan (ash): a command
-//! pool, timeline semaphores and the buffers both queues touch, created `CONCURRENT` over the two
-//! families (so no queue-family ownership transfers are needed) and imported into wgpu with
-//! `create_buffer_from_hal`.
+//! `GpuContext::new` creates the `VkDevice` itself, with one extra queue of a transfer-only
+//! family, when the adapter is Vulkan 1.2 with timeline semaphores and has such a family. It
+//! wraps queue 0 of family 0 in the usual `wgpu::Device` (`device_from_raw` +
+//! `create_device_from_hal`). The extra queue is driven here with raw Vulkan (ash): a command
+//! pool, timeline semaphores and the buffers both queues touch. Those buffers are created
+//! `CONCURRENT` over the two families, so no queue-family ownership transfers are needed, and
+//! imported into wgpu with `create_buffer_from_hal`.
 //!
 //! Lifetimes: every object here holds an `Arc<DeviceOwner>`, which destroys the `VkDevice` after
 //! the last of them (and the wgpu device) is gone and keeps the Vulkan instance alive until then.
@@ -442,7 +442,7 @@ impl TransferQueue {
     ) -> anyhow::Result<wgpu::SubmissionIndex> {
         let _guard = self.wgpu_submit.lock().unwrap_or_else(|e| e.into_inner());
         {
-            // SAFETY: see the contract; the hal queue is only used to stage the semaphores.
+            // SAFETY: see the contract; the hal queue only stages the semaphores here.
             let hal = unsafe { wgpu_queue.as_hal::<wgpu::hal::api::Vulkan>() }
                 .ok_or_else(|| anyhow!("not a Vulkan queue"))?;
             if let Some((t, v)) = wait {
@@ -465,7 +465,7 @@ impl TransferQueue {
                 if wait.is_none() && signal.is_none() {
                     return false;
                 }
-                // SAFETY: only used to unstage semaphores this call staged.
+                // SAFETY: this only unstages semaphores this call staged.
                 let Some(hal) = (unsafe { self.queue.as_hal::<wgpu::hal::api::Vulkan>() }) else { return false };
                 let w = wait.is_some_and(|s| hal.remove_wait_semaphore(s));
                 let s = signal.is_some_and(|s| hal.remove_signal_semaphore(s));

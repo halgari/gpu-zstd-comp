@@ -89,8 +89,11 @@ pub type RawSeq = (u32, u32, u32);
 /// `Seg::whole_block()`; `lazy_parse_segmented` uses `Seg::segment`.
 #[derive(Clone, Copy, Debug)]
 pub struct Seg {
+    /// Where the parse starts.
     pub ip0: usize,
+    /// Start of the parsed range: the first literal.
     pub anchor0: usize,
+    /// The rep history the parse starts with.
     pub reps0: Reps,
     /// End of the parsed range: match lengths are bounded by it.
     pub lim: usize,

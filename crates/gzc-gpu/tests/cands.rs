@@ -69,7 +69,7 @@ fn check(ctx: &GpuContext, blocks: &[(String, Vec<u8>)], params: &MatchParams) {
 
 /// K2opt's h4 fingerprint skip (k2_opt.wgsl header): the 16-bit 4-byte hash is injective in
 /// byte 3 for fixed bytes 0..3, so an h4-chain entry whose first 4 bytes differ from p's shares
-/// fewer than 3 bytes with it (the spec's fingerprint caveat never applies). Exhaustive over byte 3
+/// fewer than 3 bytes with it (`find_cands`' fingerprint caveat never applies). Exhaustive over byte 3
 /// for random prefixes.
 #[test]
 fn h4_hash_is_injective_in_byte_3() {
@@ -108,7 +108,7 @@ fn gpu_cands_match_cpu_other_depths() {
     }
 }
 
-/// M6 `opt16p1` (S3 candidates): h4 depth 8, h3 depth 4 and the 6-, 10- and 12-byte sparse
+/// `opt16p1`'s candidates: h4 depth 8, h3 depth 4 and the 6-, 10- and 12-byte sparse
 /// chains on every 4th position, 16 deep, in one merged walk; and other long chain shapes (
 /// one, two or three chains, stride 8, depths 1 and 64, widths 5 to 12) and h4 depths.
 #[test]

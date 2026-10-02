@@ -1,7 +1,7 @@
-//! K3opt (M5 T3): one GPU DP pass against the CPU oracle `opt::dp_pass_with(.., Engine::Ring)`,
-//! fed `reference::find_cands` words (or `opt::cases`' scripted ones) from the host.
-//! M5 T4: every pass of `OptPasses` (seeds, cheap passes with their histograms, final pass)
-//! against `opt::passes`.
+//! K3opt: one GPU DP pass against the CPU oracle `opt::dp_pass_with(.., Engine::Ring)`, fed
+//! `reference::find_cands` words (or `opt::cases`' scripted ones) from the host; every pass of
+//! `OptPasses` (seeds, cheap passes with their histograms, final pass) against `opt::passes`;
+//! the DP options and the drop pass against `opt::parse`.
 use gzc_core::block::chunk_file;
 use gzc_core::config::BLOCK_SIZE;
 use gzc_core::frame::write_frame;
@@ -49,7 +49,7 @@ fn oracle(block: &[u8], cands: &[CandWords], prices: &Prices, level: u8) -> Bloc
     oracle_m(&OPT16, block, cands, prices, level)
 }
 
-/// `oracle` under opt params `m` (its M6 DP options: gap, relaxation pruning).
+/// `oracle` under opt params `m` (its DP options: gap, relaxation pruning).
 fn oracle_m(m: &MatchParams, block: &[u8], cands: &[CandWords], prices: &Prices, level: u8) -> BlockOutput {
     dp_pass_with(block, cands, m, prices, level, m.opt.unwrap().target_length, Engine::Ring)
 }
@@ -189,7 +189,7 @@ fn check_blocks_m(
     }
 }
 
-/// The workgroup memory of the pass kernels (M5 T3b, M6 A1): the rings and tables fit WebGPU's
+/// The workgroup memory of the pass kernels: the rings and tables fit WebGPU's
 /// minimum limit with room to spare, and a limit below them fails cleanly in `check_ring_fits` (before
 /// any pipeline is created).
 #[test]
@@ -198,9 +198,9 @@ fn k3opt_workgroup_memory() {
     let target = OPT16.opt.unwrap().target_length;
     let need = workgroup_bytes(&OPT16, &auto);
     assert_eq!(ring_bytes(&OPT16), 16 * (target + 1) * 4);
-    // M6 A1: the footprint of every pass kernel: at most 4068 B (24 resident blocks per SM
-    // on an RTX 5090 with 100 KB of shared memory), the final pass (no histogram) 1020 B below
-    // its cheap-pass twin. Every kernel within 16384 B (WebGPU's minimum limit).
+    // The footprint of every pass kernel: at most 4068 B (24 resident blocks per SM on an
+    // RTX 5090 with 100 KB of shared memory), the final pass (no histogram) 1020 B below its
+    // cheap-pass twin. Every kernel within 16384 B (WebGPU's minimum limit).
     for (level, prices, hist_out) in [
         (0, PriceSrc::BlockInit, true),
         (0, PriceSrc::Prior, true),
@@ -357,7 +357,7 @@ fn k3opt_corpus() {
     );
 }
 
-// ---- M5 T4: passes ----
+// ---- Pass schedules ----
 
 /// `f` over `items` on up to 16 threads.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(usize, &T) -> R + Sync) -> Vec<R> {
@@ -377,7 +377,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(usize, &T) -> R + Sync) -> 
     out.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
 }
 
-/// The schedules T4 gates: cheap passes {0, 1, 3} × seeds {BlockInit, Prior}, the final pass at
+/// The schedules under test: cheap passes {0, 1, 3} × seeds {BlockInit, Prior}, the final pass at
 /// OPT16's optLevel 2. (BlockInit 3 is `opt16`, Prior 1 is `opt14`.)
 fn schedules() -> Vec<(String, MatchParams)> {
     let mut v = Vec::new();
@@ -455,7 +455,7 @@ fn check_passes(
     live
 }
 
-/// The later-pass Buffer-price configs (T3 review): opt16's pass-1 prices (from pass 0's
+/// The later-pass Buffer-price configs: opt16's pass-1 prices (from pass 0's
 /// histogram) uploaded as tables, one pass at optLevel 2 and 0. Returns the number of blocks
 /// whose tables have `ll[1] < ll[0]`.
 fn check_later_pass_tables(ctx: &GpuContext, names: &[String], blocks: &[Vec<u8>], cands: &[Vec<CandWords>]) -> usize {
@@ -504,14 +504,14 @@ fn k3opt_passes_synthetic() {
     let cands = cands_of(&blocks);
     let live = check_passes(&ctx, &names, &blocks, &cands, &schedules(), K3OptConfig::default());
     eprintln!("final passes with ll[1] < ll[0]: {live}");
-    // M6 A4: the persistent passes with 3 workgroups (each runs several blocks, so every
-    // per-block state must follow the block, not the workgroup).
+    // The persistent passes with 3 workgroups: each runs several blocks, so every per-block
+    // state must follow the block, not the workgroup.
     let looped = K3OptConfig { grid: Some(3), ..K3OptConfig::default() };
     check_passes(&ctx, &names, &blocks, &cands, &schedules(), looped);
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
-/// The persistent passes' block order (M6 A4, `k3_sched.wgsl`): each block's weight (positions
+/// The persistent passes' block order (`k3_sched.wgsl`): each block's weight (positions
 /// whose longest candidate is 3..32, in the sampled runs) and the order, blocks by
 /// descending weight with ties by ascending block id. 600 blocks (3 tiles of the rank sort), each
 /// synthetic block several times (ties).
@@ -554,7 +554,7 @@ fn k3opt_block_order() {
     assert!(distinct.len() > 3 && distinct.len() < n, "ties and distinct weights both present");
 }
 
-/// A block for the rep-length memo's edges (M6 A2/A3): random bytes overwritten with short copies
+/// A block for the rep-length memo's edges: random bytes overwritten with short copies
 /// at offsets from `offs` (small, close offsets, so rep histories with two equal offsets are
 /// common, e.g. rep0 - 1 == rep2 under ll0), random stretches (dead positions between searches),
 /// and in every segment a rep tail ending exactly at the segment's end: a copy at offset o, one
@@ -638,7 +638,7 @@ fn memo_edge_witnesses(out: &BlockOutput) -> (usize, usize) {
     (dup, tail)
 }
 
-/// The rep-length memo's edges (M6 A2 review, A3): a rep match ending exactly at seg_end() with
+/// The rep-length memo's edges: a rep match ending exactly at seg_end() with
 /// lim > 8, and searches with two rep probes of the same offset, through single passes (both
 /// levels) and the opt16 / opt14 schedules, against the oracle.
 #[test]
@@ -689,14 +689,14 @@ fn k3opt_passes_corpus() {
     let live = check_passes(&ctx, &names, &blocks, &cands, &schedules(), K3OptConfig::default());
     eprintln!("final passes with ll[1] < ll[0]: {live}");
     let presets = [("opt16".to_string(), OPT16), ("opt14".to_string(), OPT14)];
-    // M6 A4: the persistent passes on 37 workgroups (about 7 blocks each per 256-block batch).
+    // The persistent passes on 37 workgroups (about 7 blocks each per 256-block batch).
     let looped = K3OptConfig { grid: Some(37), ..K3OptConfig::default() };
     check_passes(&ctx, &names, &blocks, &cands, &presets, looped);
     assert!(check_later_pass_tables(&ctx, &names, &blocks, &cands) > 0, "no block exercises ll_inc1 < 0");
 }
 
 /// Informal: GPU time of every pass of opt14, opt16 and opt16p1 (its single final pass and the
-/// drop pass, on its S3 candidates; `GZC_TIMING_PRESETS`, comma-separated names, picks presets),
+/// drop pass, on its own candidates; `GZC_TIMING_PRESETS`, comma-separated names, picks presets),
 /// `GZC_CORPUS_BLOCKS`, default 2900 corpus blocks, one batch (the persistent kernel orders
 /// blocks heavy-first itself, `k3_sched.wgsl`).
 /// `cargo test --release -p gzc-gpu --test k3opt k3opt_passes_timing -- --ignored --nocapture`
@@ -726,9 +726,9 @@ fn k3opt_passes_timing() {
     let bufs = OptBuffers::new(&ctx, &OPT16, blocks.len() as u32).unwrap();
     let us = |ms: f64| ms * 1000.0 / blocks.len() as f64;
     // GZC_TIMING_WARMUP: one untimed opt16 run first, so the first timed preset does not pay the
-    // GPU's clock ramp. (M6 A2: opt14 still shows a bimodal per-process state on an RTX 5090,
-    // every pass about 10 % slower with the fix-up at 0.37 instead of 0.27 us/block; compare
-    // runs in the same state.)
+    // GPU's clock ramp. opt14 still shows a bimodal per-process state on an RTX 5090: every
+    // pass about 10 % slower, with the fix-up at 0.37 instead of 0.27 us/block. Compare runs in
+    // the same state.
     if std::env::var("GZC_TIMING_WARMUP").is_ok() {
         let p = OptPasses::new(&ctx, &OPT16, K3OptConfig::default()).expect("OptPasses::new");
         time_passes(&ctx, &p, &bufs, blocks.len() as u32, 5, || {
@@ -757,7 +757,7 @@ fn k3opt_passes_timing() {
     }
 }
 
-// ---- M6 B3: opt16p1's DP options (gap3, top-4 pruning, S3 prior, one pass) and the drop pass ----
+// ---- opt16p1's DP options (gap3, top-4 pruning, sparse prior, one pass) and the drop pass ----
 
 /// `MatchParams` with `OPT16P1`'s match finder and the opt params `o`.
 fn on_p1(o: OptParams) -> MatchParams {
@@ -769,7 +769,7 @@ fn on_16(o: OptParams) -> MatchParams {
     MatchParams { opt: Some(o), ..OPT16 }
 }
 
-/// The M6 DP options one at a time and together, for single passes (`check_blocks_m`; no drop
+/// The DP options one at a time and together, for single passes (`check_blocks_m`; no drop
 /// pass there): gap3, top-4 pruning, both, and top-2 (more lengths pruned).
 fn dp_option_params() -> Vec<(String, MatchParams)> {
     let p1 = OPT16P1.opt.unwrap();
@@ -781,8 +781,8 @@ fn dp_option_params() -> Vec<(String, MatchParams)> {
     ]
 }
 
-/// The M6 schedules over `OPT16P1`'s candidates (`OptPasses`, the drop pass included): opt16p1
-/// itself (Prior S3 seed, one optLevel-2 pass with gap3 and top-4, the drop pass), without the
+/// The schedules over `OPT16P1`'s candidates (`OptPasses`, the drop pass included): opt16p1
+/// itself (sparse Prior seed, one optLevel-2 pass with gap3 and top-4, the drop pass), without the
 /// drop pass, with a cheap pass first (gap3 and pruning in a `hist_out` pass), with a block-init
 /// seed, and with an optLevel-0 final pass.
 fn opt16p1_schedules() -> Vec<(String, MatchParams)> {
@@ -796,7 +796,7 @@ fn opt16p1_schedules() -> Vec<(String, MatchParams)> {
     ]
 }
 
-/// M6 options on `OPT16`'s candidates (no sparse chains): the drop pass alone, and the S3 prior
+/// Options on `OPT16`'s candidates (no sparse chains): the drop pass alone, and the sparse prior
 /// with a cheap pass.
 fn opt16_schedules() -> Vec<(String, MatchParams)> {
     let o16 = OPT16.opt.unwrap();
@@ -806,7 +806,7 @@ fn opt16_schedules() -> Vec<(String, MatchParams)> {
     ]
 }
 
-/// Single M6 passes (`dp_option_params`) on `OPT16P1`'s candidates: block-init prices at optLevel 2
+/// Single option passes (`dp_option_params`) on `OPT16P1`'s candidates: block-init prices at optLevel 2
 /// and 0, and uploaded tables.
 fn check_option_single(ctx: &GpuContext, names: &[String], blocks: &[Vec<u8>], cands: &[Vec<CandWords>]) {
     let bi: Vec<Prices> = blocks.iter().map(|b| Prices::block_init(b)).collect();
@@ -848,7 +848,8 @@ fn frame_kernels(ctx: &GpuContext) -> Kernels {
     Kernels::new(ctx, GpuParams { matching: LVL9SEG, emit_frames: true, huffman: true }).unwrap()
 }
 
-/// `opt::cases::option_test_cases` (gap3, top-4 pruning) with their tables, at their level; and every `opt::cases` block (with its scripted candidates) through the M6 schedules.
+/// `opt::cases::option_test_cases` (gap3, top-4 pruning) with their tables, at their level; and
+/// every `opt::cases` block (with its scripted candidates) through the option schedules.
 #[test]
 fn k3opt_option_cases() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -901,9 +902,10 @@ fn k3drop_matches_drop_cases() {
     eprintln!("{} drop cases equal", cases.len());
 }
 
-/// Every synthetic block: the single M6 passes, the M6 schedules (default and looped
+/// Every synthetic block: the single option passes, the option schedules (default and looped
 /// persistent), opt16p1's frames from the oracle's candidates and from K1/K2opt's
-/// (the same frames), and the memo-edge blocks through the M6 passes (gap3 searches at lim 3..7).
+/// (the same frames), and the memo-edge blocks through the option passes (gap3 searches at lim
+/// 3..7).
 #[test]
 fn k3opt_options_synthetic() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -939,7 +941,7 @@ fn k3opt_options_synthetic() {
 }
 
 /// Informal (reads the real corpus; skips when it is missing): `GZC_CORPUS_BLOCKS` (default 4000)
-/// corpus blocks: the single M6 passes, the M6 schedules, opt16p1 on the looped persistent passes,
+/// corpus blocks: the single option passes, the option schedules, opt16p1 on the looped persistent passes,
 /// and opt16p1's frames from the oracle's and from K1/K2opt's candidates.
 /// `GZC_CORPUS=… cargo test --release -p gzc-gpu --test k3opt k3opt_options_corpus -- --ignored --nocapture`
 #[test]
