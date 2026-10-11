@@ -172,15 +172,18 @@ fn k1_long_chains_match_cpu() {
     }
 }
 
-/// The context picks the kernel: the subgroup one exactly when the device has subgroups of
-/// suitable sizes (`ChainsKernel::subgroup_kernel_possible`; not Metal, which reports 4..=64).
+/// The context picks the kernel: the subgroup one exactly when every subgroup size the device
+/// reports lies in 16..=128 (`ChainsKernel::subgroup_kernel_possible`; so Intel's 16..=32, but not
+/// Metal, which reports 4..=64).
 #[test]
 fn k1_kernel_follows_context() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
     for ctx in contexts() {
         let i = &ctx.adapter_info();
         eprintln!("{}: subgroups {} (sizes {}..={})", i.name, ctx.subgroups(), i.subgroup_min_size, i.subgroup_max_size);
-        assert_eq!(ChainsKernel::new(&ctx, &LVL9SEG).unwrap().uses_subgroups(), ChainsKernel::subgroup_kernel_possible(&ctx));
+        let sizes_ok = ctx.subgroups() && i.subgroup_min_size >= 16 && i.subgroup_max_size <= 128;
+        assert_eq!(ChainsKernel::subgroup_kernel_possible(&ctx), sizes_ok);
+        assert_eq!(ChainsKernel::new(&ctx, &LVL9SEG).unwrap().uses_subgroups(), sizes_ok);
     }
 }
 
@@ -200,7 +203,8 @@ fn run_check(ctx: &GpuContext, kernel: &ChainsKernel, params: &MatchParams, bloc
 /// reused across dispatches of varying size (stale entries of other blocks and presets in it),
 /// must give the CPU chains every time. `groups` 1 makes one workgroup build every chain of the
 /// dispatch in a row (tags 1..=n on one table), 3 a few each; `wide_masks` covers the kernel's
-/// path for subgroups wider than 32 lanes.
+/// path for subgroups wider than 32 lanes, `narrow_chunks` its 16-lane chunks on devices whose
+/// subgroups all have 32 or more lanes.
 #[test]
 fn k1_head_reuse_across_dispatches() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -209,16 +213,17 @@ fn k1_head_reuse_across_dispatches() {
         let cap = blocks.len() as u32;
         let head = ctx.storage_buffer("test.head", head_bytes(cap, 5), false);
         let pred = ctx.storage_buffer("test.pred", chain_pred_bytes(cap, &OPT16P1).max(chain_pred_bytes(cap, &LVL3)), true);
-        let opts = |groups, wide_masks| ChainsOptions { groups, wide_masks, ..ChainsOptions::default() };
+        let opts = |groups, wide_masks, narrow_chunks| ChainsOptions { groups, wide_masks, narrow_chunks, ..ChainsOptions::default() };
         let kernels: Vec<(MatchParams, ChainsKernel)> = [
-            (LVL3, opts(None, false)),
-            (RUNG1, opts(Some(1), false)),
-            (LVL3, opts(Some(3), true)),
-            (LVL9SEG, opts(Some(1), false)),
-            (RUNG1, opts(None, true)),
-            (LVL3, opts(Some(1), false)),
-            (OPT16P1, opts(Some(3), false)),
-            (OPT16P1, opts(Some(1), true)),
+            (LVL3, opts(None, false, false)),
+            (RUNG1, opts(Some(1), false, true)),
+            (LVL3, opts(Some(3), true, false)),
+            (LVL9SEG, opts(Some(1), false, false)),
+            (RUNG1, opts(None, true, true)),
+            (LVL3, opts(Some(1), false, false)),
+            (OPT16P1, opts(Some(3), false, true)),
+            (OPT16P1, opts(Some(1), true, false)),
+            (LVL9SEG, opts(None, false, true)),
         ]
         .into_iter()
         .map(|(p, o)| (p, ChainsKernel::with_options(&ctx, &p, o).unwrap()))

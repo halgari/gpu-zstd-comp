@@ -5,10 +5,10 @@
 //! it builds (workgroup w: chains w, w + G, ..), so `head` holds at most `HEAD_TABLES` tables
 //! (64 MiB) however large the batch, and the live tables stay in L2 (one table per block, 410 MB
 //! for a 1638-block batch, makes K1 DRAM-bound):
-//! - with subgroups (`GpuContext::subgroups`, subgroup sizes 32..=128, and a passing self-test)
+//! - with subgroups (`GpuContext::subgroups`, subgroup sizes 16..=128, and a passing self-test)
 //!   `k1_chains_sg.wgsl`: a table clear per workgroup per dispatch, tag-stamped entries so the
-//!   table is not cleared between chains, and ballot-matched tiles with 2 barriers per 256
-//!   positions;
+//!   table is not cleared between chains, and ballot-matched tiles (16- or 32-lane chunks) with 2
+//!   barriers per 256 positions;
 //! - otherwise `k1_chains.wgsl`: a table clear per chain and a bitonic sort per 256-position tile
 //!   (38 barriers).
 //!
@@ -261,6 +261,9 @@ pub struct ChainsOptions {
     /// Test only: build the subgroup kernel with a deliberately wrong in-chunk link, so its
     /// self-test fails and `ChainsKernel::with_options` falls back.
     pub break_subgroup_kernel: bool,
+    /// Split tiles into 16-lane chunks even where every subgroup has at least 32 lanes (tests use
+    /// it to cover the 16-lane build that devices with 16-lane subgroups run).
+    pub narrow_chunks: bool,
 }
 
 /// K1 pipeline, built for one `MatchParams`' chains; `record` lets later stages run it on their
@@ -286,12 +289,13 @@ impl ChainsKernel {
     }
 
     /// Whether `ctx` may run the subgroup kernel (it then still has to pass its self-test): the
-    /// kernel splits its 256-lane tiles into 32-lane chunks, each inside one subgroup, and reads
-    /// ballots of up to 128 lanes, so every subgroup size the adapter reports must lie in 32..=128.
-    /// Metal reports 4..=64 (its SIMD width is per pipeline), so Apple GPUs take the fallback.
+    /// kernel splits its 256-lane tiles into 16- or 32-lane chunks, each inside one subgroup, and
+    /// reads ballots of up to 128 lanes, so every subgroup size the adapter reports must lie in
+    /// 16..=128. Intel reports 16..=32 and gets 16-lane chunks; Metal reports 4..=64 (its SIMD
+    /// width is per pipeline), so Apple GPUs take the fallback.
     pub fn subgroup_kernel_possible(ctx: &GpuContext) -> bool {
         let info = &ctx.adapter_info;
-        ctx.subgroups && info.subgroup_min_size >= 32 && info.subgroup_max_size <= 128
+        ctx.subgroups && info.subgroup_min_size >= 16 && info.subgroup_max_size <= 128
     }
 
     /// `new` with explicit options.
@@ -344,8 +348,10 @@ impl ChainsKernel {
             // naga (wgpu 30) takes subgroup operations from Features::SUBGROUP and rejects the
             // `enable subgroups;` directive.
             let wide = opts.wide_masks || ctx.adapter_info.subgroup_max_size > 32;
+            let narrow = opts.narrow_chunks || ctx.adapter_info.subgroup_min_size < 32;
             let mut src = format!("{}{}", finder_wgsl(params), K1_SG_WGSL)
-                .replace("K1_BALLOT_WORD", if wide { "[word]" } else { ".x" });
+                .replace("K1_BALLOT_WORD", if wide { "[word]" } else { ".x" })
+                .replace("K1_CW", if narrow { "16u" } else { "32u" });
             if opts.break_subgroup_kernel {
                 src = src.replace("firstLeadingBit(lower)", "firstTrailingBit(lower)");
             }
