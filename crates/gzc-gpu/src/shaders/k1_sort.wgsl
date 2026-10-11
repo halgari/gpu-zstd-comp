@@ -16,7 +16,7 @@
 //    position's slot is written to rankw[p] (coalesced) with its fingerprint;
 // 4. `scatter`, a second dispatch, moves every position to its slot.
 // Two versions of 1-3: `main` below needs no subgroups (lanes compare keys through workgroup
-// memory); `main_sg` (k1_sort_sg.wgsl, appended when the device has subgroups of >= 32 lanes)
+// memory); `main_sg` (k1_sort_sg.wgsl, appended when the device can run 32-lane subgroups)
 // uses ballots and shuffles. Their output is identical. No device-scope state: nothing is carried
 // between blocks or dispatches.
 

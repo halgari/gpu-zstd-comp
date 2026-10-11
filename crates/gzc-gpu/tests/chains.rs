@@ -377,7 +377,8 @@ fn chains_over_short_keys() {
 /// and fingerprint bits), for 11..=13-bit keys and min_match 4 and 6, in one batch and block by
 /// block, for both versions (subgroup and workgroup-memory). The sorted K1 is selected for the
 /// sorted presets whenever the table fits the device's workgroup memory, never for 16-bit keys;
-/// its subgroup version exactly when the device has subgroups of >= 32 lanes.
+/// its subgroup version exactly when the device can run 32-lane subgroups (max size >= 32, so
+/// also Intel's 16..=32, where a 32-invocation workgroup compiles 32 wide).
 #[test]
 fn sorted_k1_matches_bucket_sort() {
     let _gpu = gzc_gpu::testing::gpu_test_slot();
@@ -390,7 +391,7 @@ fn sorted_k1_matches_bucket_sort() {
     let variants = [MatchParams { hash_bits: 13, ..LVL9SEG }, LVL9S12SEG, MatchParams { hash_bits: 11, min_match: 6, ..LVL9SEG }];
     for (ctx, params) in [&ctx, &fallback].into_iter().flat_map(|c| variants.map(|p| (c, p))) {
         let limit = ctx.device().limits().max_compute_workgroup_storage_size;
-        let sg_ok = ctx.subgroups() && ctx.adapter_info().subgroup_min_size >= 32 && workgroup_bytes(&params, true) <= limit;
+        let sg_ok = ctx.subgroups() && ctx.adapter_info().subgroup_max_size >= 32 && workgroup_bytes(&params, true) <= limit;
         let wg_ok = workgroup_bytes(&params, false) <= limit;
         let Some(k1) = SortKernel::new(ctx, &params).unwrap() else {
             assert!(!sg_ok && !wg_ok, "{params:?}: sorted K1 not selected on a device that supports it");

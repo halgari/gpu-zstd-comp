@@ -10,8 +10,10 @@
 //! `head` buffer stays allocated and unused, so VRAM is the same as with the chains.
 //!
 //! K1 has two versions, picked like the chain K1's two kernels:
-//! - `k1_sort_sg.wgsl` uses ballots and shuffles and needs subgroups of at least 32 lanes. It
-//!   runs when the device has them and the kernel passes its self-test.
+//! - `k1_sort_sg.wgsl` uses ballots and shuffles and needs its 32-invocation workgroup to be one
+//!   32-lane subgroup. It is tried when the device can run 32-lane subgroups (max size >= 32;
+//!   Intel reports 16..=32 and compiles such a workgroup 32 wide) and runs if it passes its
+//!   self-test, which fails on a narrower subgroup.
 //! - `k1_sort.wgsl` uses workgroup memory only.
 //!
 //! Each needs its `workgroup_bytes` within the device's workgroup-storage limit. At wgpu's
@@ -60,7 +62,7 @@ pub struct SortKernel {
 impl SortKernel {
     /// Builds and self-tests the kernel. `Ok(None)` when `params` or the device do not suit it
     /// (see the module doc) or `GpuOptions::sorted_finder` is off. The subgroup version runs
-    /// when `ctx.subgroups`, the subgroups have at least 32 lanes and its self-test passes;
+    /// when `ctx.subgroups`, the device can run 32-lane subgroups and its self-test passes;
     /// otherwise the workgroup-memory version. A failed build or self-test of that one is
     /// reported on stderr and also gives `None`.
     pub fn new(ctx: &GpuContext, params: &MatchParams) -> anyhow::Result<Option<Self>> {
@@ -68,7 +70,7 @@ impl SortKernel {
             return Ok(None);
         }
         let limit = ctx.device.limits().max_compute_workgroup_storage_size;
-        if ctx.subgroups && ctx.adapter_info.subgroup_min_size >= 32 && workgroup_bytes(params, true) <= limit {
+        if ctx.subgroups && ctx.adapter_info.subgroup_max_size >= 32 && workgroup_bytes(params, true) <= limit {
             let built = crate::kernels::with_error_scopes(ctx, || {
                 let k = Self::build(ctx, params, true);
                 k.self_test(ctx, params)?;

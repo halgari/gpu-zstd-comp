@@ -1,5 +1,5 @@
 // K1 bucket sort, subgroup version (`main_sg`), appended to k1_sort.wgsl (its bindings, counters
-// and `scatter`; the steps are described there) when the device has subgroups of >= 32 lanes: one
+// and `scatter`; the steps are described there) when the device can run 32-lane subgroups: one
 // workgroup of 32 lanes per block, which must be one subgroup (checked by the host's self-test).
 // It loads each 128-position chunk's words once, one per lane, and builds the keys with shuffles;
 // the histogram adds once per tile when all 32 keys are equal (constant runs); the scan uses
